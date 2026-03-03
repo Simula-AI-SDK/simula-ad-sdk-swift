@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Simula Ad SDK - SKAdNetwork Configuration
+  Required for iOS ad attribution (iOS 14+)
+
+  INSTALLATION:
+  1. Open your app's Info.plist in Xcode
+  2. Add a new key: SKAdNetworkItems (Array)
+  3. Copy the SKAdNetworkIdentifier entries below into your Info.plist
+
+  Or merge this entire array into your existing SKAdNetworkItems if you have other ad SDKs.
+
+  For more info: https://developer.apple.com/documentation/storekit/skadnetwork
+-->
+<plist version="1.0">
+<dict>
+    <key>SKAdNetworkItems</key>
+    <array>
+        <!-- Simula Ad Network -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>simula123456.skadnetwork</string>
+        </dict>
+
+        <!--
+          Common DSP/SSP Partners
+          These are standard ad network identifiers that may serve ads through Simula.
+          Including them ensures attribution works for all demand sources.
+        -->
+
+        <!-- Google Ads -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>cstr6suwn9.skadnetwork</string>
+        </dict>
+
+        <!-- Meta/Facebook -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>v9wttpbfk9.skadnetwork</string>
+        </dict>
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>n38lu8286q.skadnetwork</string>
+        </dict>
+
+        <!-- Unity Ads -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>4dzt52r2t5.skadnetwork</string>
+        </dict>
+
+        <!-- AppLovin -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>ludvb6z3bs.skadnetwork</string>
+        </dict>
+
+        <!-- ironSource -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>su67r6k2v3.skadnetwork</string>
+        </dict>
+
+        <!-- AdColony -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>4pfyvq9l8r.skadnetwork</string>
+        </dict>
+
+        <!-- Vungle -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>gta9lk7p23.skadnetwork</string>
+        </dict>
+
+        <!-- Chartboost -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>f38h382jlk.skadnetwork</string>
+        </dict>
+
+        <!-- InMobi -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>wzmmz9fp6w.skadnetwork</string>
+        </dict>
+
+        <!-- Mintegral -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>kbd757ywx3.skadnetwork</string>
+        </dict>
+
+        <!-- Tapjoy -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>ecpz2srf59.skadnetwork</string>
+        </dict>
+
+        <!-- Liftoff/Vungle -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>7ug5zh24hu.skadnetwork</string>
+        </dict>
+
+        <!-- Digital Turbine -->
+        <dict>
+            <key>SKAdNetworkIdentifier</key>
+            <string>m8dbw4sv7c.skadnetwork</string>
+        </dict>
+    </array>
+</dict>
+</plist>

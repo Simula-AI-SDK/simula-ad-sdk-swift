@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Simula Ad SDK - Privacy Manifest
+  Required for iOS 17+ App Store submission
+
+  This file is bundled automatically when using Swift Package Manager.
+
+  For more info: https://developer.apple.com/documentation/bundleresources/privacy_manifest_files
+-->
+<plist version="1.0">
+<dict>
+    <!-- Privacy Tracking Enabled: NO - We don't track users across apps/websites -->
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <!-- Tracking Domains: None - We don't use tracking domains -->
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <!-- Required Reason APIs -->
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <!--
+          User Defaults API
+          Used for: Storing consent state and session information locally
+          Reason: CA92.1 - Access info from same app
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+
+        <!--
+          System Boot Time / Date APIs
+          Used for: Generating session IDs, request timestamps, viewability timing
+          Reason: 35F9.1 - Measure time elapsed between events in app
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- Data Collection Types -->
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array>
+        <!--
+          Other Usage Data - Ad impressions and clicks
+          NOT linked to identity, NOT used for tracking
+        -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeOtherUsageData</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeAdvertising</string>
+            </array>
+        </dict>
+
+        <!--
+          Other Data - Conversation context (messages) for contextual targeting
+          NOT linked to identity, NOT used for tracking
+        -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeOtherData</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAdvertising</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
