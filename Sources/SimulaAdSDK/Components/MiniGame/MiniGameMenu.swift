@@ -390,7 +390,7 @@ public struct MiniGameMenu: View {
                 .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
 
             // Text field
-            TextField("Search games...", text: $searchQuery)
+            TextField("Search games...", text: $searchQuery, prompt: Text("Search games...").foregroundColor(Color(hex: theme.resolvedSecondaryFontColor)))
                 .font(.custom(theme.resolvedSecondaryFont, size: 14))
                 .foregroundColor(Color(hex: theme.resolvedTitleFontColor))
                 .autocorrectionDisabled()

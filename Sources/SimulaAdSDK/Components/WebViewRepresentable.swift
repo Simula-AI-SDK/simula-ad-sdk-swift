@@ -70,6 +70,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.scrollView.isScrollEnabled = true
         webView.isOpaque = false
         webView.backgroundColor = .clear
@@ -109,7 +110,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     // MARK: - Coordinator
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
@@ -118,6 +119,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         var currentURL: URL?
         /// Tracks the currently loaded HTML to avoid redundant loads
         var currentHTML: String?
+
+        /// Schemes that should be handled within the webview
+        private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
         init(
             onNavigationFinished: (() -> Void)?,
@@ -143,20 +147,74 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFailed?(error)
         }
 
-        // Allow navigation to external URLs (for ad click-throughs)
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            // Open external links in the system browser (like target="_blank" in React iframes)
-            if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url {
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            let scheme = url.scheme?.lowercased() ?? ""
+
+            // Allow internal schemes (about:blank, about:srcdoc, data:, blob:)
+            if internalSchemes.contains(scheme) {
+                decisionHandler(.allow)
+                return
+            }
+
+            // Block javascript: URLs for security
+            if scheme == "javascript" {
+                decisionHandler(.cancel)
+                return
+            }
+
+            // For user-initiated link clicks, open externally in Safari
+            if navigationAction.navigationType == .linkActivated {
                 UIApplication.shared.open(url)
                 decisionHandler(.cancel)
                 return
             }
+
+            // For navigations from subframes (iframe links) that go to external http(s) URLs,
+            // open in Safari rather than replacing the game content
+            if navigationAction.targetFrame == nil || !navigationAction.targetFrame!.isMainFrame {
+                if scheme == "http" || scheme == "https" {
+                    // Allow the initial iframe load (same URL as what we loaded)
+                    if url == currentURL {
+                        decisionHandler(.allow)
+                        return
+                    }
+                    // External navigation from iframe → open in Safari
+                    if navigationAction.navigationType == .other || navigationAction.navigationType == .formSubmitted {
+                        UIApplication.shared.open(url)
+                        decisionHandler(.cancel)
+                        return
+                    }
+                }
+            }
+
             decisionHandler(.allow)
+        }
+
+        // MARK: - WKUIDelegate
+
+        /// Handles target="_blank" links and window.open() calls from the iframe
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if let url = navigationAction.request.url {
+                let scheme = url.scheme?.lowercased() ?? ""
+                if scheme == "http" || scheme == "https" {
+                    UIApplication.shared.open(url)
+                }
+            }
+            return nil
         }
 
         // MARK: - WKScriptMessageHandler
@@ -227,6 +285,7 @@ struct WebViewRepresentable: NSViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         return webView
     }
 
@@ -253,12 +312,14 @@ struct WebViewRepresentable: NSViewRepresentable {
         )
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var currentURL: URL?
         var currentHTML: String?
+
+        private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
         init(
             onNavigationFinished: (() -> Void)?,
@@ -280,6 +341,66 @@ struct WebViewRepresentable: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             onNavigationFailed?(error)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            let scheme = url.scheme?.lowercased() ?? ""
+
+            if internalSchemes.contains(scheme) {
+                decisionHandler(.allow)
+                return
+            }
+
+            if scheme == "javascript" {
+                decisionHandler(.cancel)
+                return
+            }
+
+            if navigationAction.navigationType == .linkActivated {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+
+            if navigationAction.targetFrame == nil || !navigationAction.targetFrame!.isMainFrame {
+                if scheme == "http" || scheme == "https" {
+                    if url == currentURL {
+                        decisionHandler(.allow)
+                        return
+                    }
+                    if navigationAction.navigationType == .other || navigationAction.navigationType == .formSubmitted {
+                        NSWorkspace.shared.open(url)
+                        decisionHandler(.cancel)
+                        return
+                    }
+                }
+            }
+
+            decisionHandler(.allow)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if let url = navigationAction.request.url {
+                let scheme = url.scheme?.lowercased() ?? ""
+                if scheme == "http" || scheme == "https" {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            return nil
         }
 
         func userContentController(
