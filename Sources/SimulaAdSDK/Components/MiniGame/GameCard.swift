@@ -21,7 +21,6 @@ public struct GameCard: View {
 
     @State private var imageError = false
     @State private var imageLoading = true
-    @State private var isPressed = false
     @State private var randomFallback: String
 
     public init(
@@ -51,35 +50,34 @@ public struct GameCard: View {
     private var iconCornerRadius: CGFloat { theme.resolvedIconCornerRadius }
 
     public var body: some View {
-        Button(action: { onGameSelect(game.id) }) {
-            VStack(spacing: isCompact ? 8 : 12) {
-                // Game Icon
-                gameIconView
-                    .frame(width: iconSize, height: iconSize)
-                    .clipShape(RoundedRectangle(cornerRadius: iconCornerRadius))
+        VStack(spacing: isCompact ? 8 : 12) {
+            // Game Icon
+            gameIconView
+                .frame(width: iconSize, height: iconSize)
+                .clipShape(RoundedRectangle(cornerRadius: iconCornerRadius))
 
-                // Game Name
-                Text(game.name)
-                    .font(.system(size: nameFontSize, weight: .medium))
-                    .foregroundColor(Color(hex: theme.resolvedTitleFontColor))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(cardPadding)
-            .frame(minHeight: cardMinHeight)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(hex: theme.resolvedBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color(hex: theme.resolvedBorderColor), lineWidth: 1)
-            )
+            // Game Name
+            Text(game.name)
+                .font(.system(size: nameFontSize, weight: .medium))
+                .foregroundColor(Color(hex: theme.resolvedTitleFontColor))
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .buttonStyle(ScaleButtonStyle())
+        .padding(cardPadding)
+        .frame(minHeight: cardMinHeight)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(hex: theme.resolvedBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(hex: theme.resolvedBorderColor), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { onGameSelect(game.id) }
         .accessibilityLabel("Play \(game.name)")
     }
 
@@ -121,17 +119,5 @@ public struct GameCard: View {
                 }
             }
         }
-    }
-}
-
-// MARK: - ScaleButtonStyle
-
-/// Button style that provides scale + shadow hover/press effect.
-/// Matches the React `onMouseOver` transform: scale(1.05) + box-shadow behavior.
-private struct ScaleButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
     }
 }

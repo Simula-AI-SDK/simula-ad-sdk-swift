@@ -37,6 +37,22 @@ public struct MiniGameButton: View {
     /// Click handler
     let onClick: () -> Void
 
+    public init(
+        text: String? = nil,
+        showPulsate: Bool = false,
+        showBadge: Bool = false,
+        theme: MiniGameButtonTheme = MiniGameButtonTheme(),
+        width: CGFloat? = nil,
+        onClick: @escaping () -> Void
+    ) {
+        self.text = text
+        self.showPulsate = showPulsate
+        self.showBadge = showBadge
+        self.theme = theme
+        self.width = width
+        self.onClick = onClick
+    }
+
     // MARK: - State
 
     @State private var pulsatePhase: CGFloat = 0

@@ -31,6 +31,7 @@ public struct GameGrid: View {
     @State private var isAnimating = false
     @State private var slideDirection: SlideDirection? = nil
     @State private var dragOffset: CGFloat = 0
+    @State private var gridWidth: CGFloat = 300
 
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -139,6 +140,9 @@ public struct GameGrid: View {
                 .padding(.top, 4)
             }
         }
+        .background(GeometryReader { geometry in
+            Color.clear.onAppear { gridWidth = geometry.size.width }
+        })
         .onChange(of: games.count) { _ in
             // Reset to valid page if current page is out of bounds (matching React useEffect)
             if currentPage >= totalPages && totalPages > 0 {
@@ -187,13 +191,13 @@ public struct GameGrid: View {
 
         // Animate out
         withAnimation(.easeOut(duration: ANIMATION_DURATION / 2)) {
-            dragOffset = direction == .left ? -UIScreen.main.bounds.width * 0.3 : UIScreen.main.bounds.width * 0.3
+            dragOffset = direction == .left ? -gridWidth * 0.3 : gridWidth * 0.3
         }
 
         // After half animation, switch page and animate in
         DispatchQueue.main.asyncAfter(deadline: .now() + ANIMATION_DURATION / 2) {
             currentPage = newPage
-            dragOffset = direction == .left ? UIScreen.main.bounds.width * 0.15 : -UIScreen.main.bounds.width * 0.15
+            dragOffset = direction == .left ? gridWidth * 0.15 : -gridWidth * 0.15
             withAnimation(.easeOut(duration: ANIMATION_DURATION / 2)) {
                 dragOffset = 0
             }

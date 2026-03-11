@@ -86,9 +86,9 @@ public struct AdOverlayView: View {
                                 // Close button (matching Kotlin's CloseButton with size=44)
                                 Button(action: onClose) {
                                     Image(systemName: "xmark")
-                                        .font(.system(size: 20, weight: .bold))
+                                        .font(.system(size: 16, weight: .bold))
                                         .foregroundColor(Color(hex: "#1F2937"))
-                                        .frame(width: 48, height: 48)
+                                        .frame(width: 44, height: 44)
                                         .background(
                                             Circle()
                                                 .fill(Color.white.opacity(0.9))

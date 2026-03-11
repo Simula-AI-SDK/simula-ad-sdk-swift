@@ -44,6 +44,34 @@ public struct MiniGameInvitation: View {
     let onClick: () -> Void
     var onClose: (() -> Void)?
 
+    public init(
+        titleText: String = "Want to play a game?",
+        subText: String = "Take a break and challenge yourself!",
+        ctaText: String = "Play a Game",
+        charImage: String,
+        animation: MiniGameInvitationAnimation = .auto,
+        theme: MiniGameInvitationTheme = MiniGameInvitationTheme(),
+        isOpen: Bool = false,
+        autoCloseDuration: TimeInterval? = nil,
+        width: CGFloat? = nil,
+        topOffset: CGFloat? = nil,
+        onClick: @escaping () -> Void,
+        onClose: (() -> Void)? = nil
+    ) {
+        self.titleText = titleText
+        self.subText = subText
+        self.ctaText = ctaText
+        self.charImage = charImage
+        self.animation = animation
+        self.theme = theme
+        self.isOpen = isOpen
+        self.autoCloseDuration = autoCloseDuration
+        self.width = width
+        self.topOffset = topOffset
+        self.onClick = onClick
+        self.onClose = onClose
+    }
+
     // MARK: - State (matching React's useState calls)
 
     @State private var imageError = false

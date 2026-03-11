@@ -55,6 +55,26 @@ public struct MiniGameInterstitial: View {
     let onClick: () -> Void
     var onClose: (() -> Void)?
 
+    public init(
+        charImage: String,
+        invitationText: String = "Want to play a game?",
+        ctaText: String = "Play a Game",
+        backgroundImage: String? = nil,
+        theme: MiniGameInterstitialTheme = MiniGameInterstitialTheme(),
+        isOpen: Bool = false,
+        onClick: @escaping () -> Void,
+        onClose: (() -> Void)? = nil
+    ) {
+        self.charImage = charImage
+        self.invitationText = invitationText
+        self.ctaText = ctaText
+        self.backgroundImage = backgroundImage
+        self.theme = theme
+        self.isOpen = isOpen
+        self.onClick = onClick
+        self.onClose = onClose
+    }
+
     // MARK: - State (matching React's useState calls)
 
     @State private var imageError = false
@@ -85,7 +105,7 @@ public struct MiniGameInterstitial: View {
                         .font(fontForFamily(theme.fontFamily, size: theme.resolvedTitleFontSize, weight: .bold))
                         .foregroundColor(Color(hex: theme.resolvedTitleTextColor))
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 320)
+                        .padding(.horizontal, 40)
                         .lineSpacing(theme.resolvedTitleFontSize * 0.3) // lineHeight: 1.3
 
                     // CTA button (matching React's CTA button)
@@ -113,12 +133,12 @@ public struct MiniGameInterstitial: View {
                         Spacer()
                         Button(action: { handleClose() }) {
                             Image(systemName: "xmark")
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundColor(Color(hex: theme.resolvedTitleTextColor))
-                                .frame(width: 32, height: 32)
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(Color(hex: "#1F2937"))
+                                .frame(width: 44, height: 44)
                                 .background(
                                     Circle()
-                                        .fill(Color.black.opacity(0.3))
+                                        .fill(Color.white.opacity(0.9))
                                 )
                         }
                         .buttonStyle(.plain)
@@ -133,6 +153,9 @@ public struct MiniGameInterstitial: View {
             .contentShape(Rectangle())
             .onTapGesture { handleCtaClick() }
             .ignoresSafeArea()
+            #if os(iOS)
+            .statusBarHidden()
+            #endif
             .opacity(appeared ? 1 : 0)
             .animation(.easeIn(duration: 0.3), value: appeared)
             .onAppear { appeared = true }

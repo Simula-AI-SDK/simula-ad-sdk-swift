@@ -62,6 +62,30 @@ public struct MiniGameMenu: View {
     var theme: MiniGameTheme = MiniGameTheme()
     var delegateChar: Bool = true
 
+    public init(
+        isOpen: Binding<Bool>,
+        onClose: @escaping () -> Void,
+        charName: String,
+        charID: String,
+        charImage: String,
+        messages: [Message] = [],
+        charDesc: String? = nil,
+        maxGamesToShow: MaxGamesToShow = .six,
+        theme: MiniGameTheme = MiniGameTheme(),
+        delegateChar: Bool = true
+    ) {
+        self._isOpen = isOpen
+        self.onClose = onClose
+        self.charName = charName
+        self.charID = charID
+        self.charImage = charImage
+        self.messages = messages
+        self.charDesc = charDesc
+        self.maxGamesToShow = maxGamesToShow
+        self.theme = theme
+        self.delegateChar = delegateChar
+    }
+
     // MARK: - State (matching React's useState calls)
 
     @EnvironmentObject private var provider: SimulaProvider
@@ -167,8 +191,7 @@ public struct MiniGameMenu: View {
                     // Content area
                     contentArea
                 }
-                .frame(maxWidth: 600, minHeight: 400)
-                .frame(maxHeight: UIScreen.main.bounds.height * 0.9)
+                .frame(maxWidth: 600)
                 .background(
                     RoundedRectangle(cornerRadius: 16)
                         .fill(Color(hex: theme.resolvedBackgroundColor))
@@ -252,11 +275,11 @@ public struct MiniGameMenu: View {
             // Close Button (matching React's × button)
             Button(action: { handleClose() }) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
                     .frame(width: 44, height: 44)
                     .background(
-                        Circle()
+                        RoundedRectangle(cornerRadius: 4)
                             .fill(Color.clear)
                     )
             }
@@ -321,37 +344,35 @@ public struct MiniGameMenu: View {
                 }
                 Spacer()
             } else {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        // Search Bar (matching React's search input)
-                        if !games.isEmpty {
-                            searchBarView
-                                .padding(.horizontal, 20)
-                                .padding(.top, 20)
-                                .padding(.bottom, 16)
-                        }
-
-                        // No results message
-                        if filteredGames.isEmpty && !searchQuery.isEmpty {
-                            Text("No games found for \"\(searchQuery)\"")
-                                .font(.custom(theme.resolvedSecondaryFont, size: 14))
-                                .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
-                                .padding(.vertical, 24)
-                        } else {
-                            // Game Grid
-                            GameGrid(
-                                games: filteredGames,
-                                maxGamesToShow: maxGamesToShow.rawValue,
-                                charID: charID,
-                                theme: theme,
-                                onGameSelect: { gameId, gameName in
-                                    handleGameSelect(gameId: gameId, gameName: gameName)
-                                },
-                                menuId: menuId
-                            )
+                VStack(spacing: 0) {
+                    // Search Bar (matching React's search input)
+                    if !games.isEmpty {
+                        searchBarView
                             .padding(.horizontal, 20)
-                            .padding(.bottom, 20)
-                        }
+                            .padding(.top, 20)
+                            .padding(.bottom, 16)
+                    }
+
+                    // No results message
+                    if filteredGames.isEmpty && !searchQuery.isEmpty {
+                        Text("No games found for \"\(searchQuery)\"")
+                            .font(.custom(theme.resolvedSecondaryFont, size: 14))
+                            .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
+                            .padding(.vertical, 24)
+                    } else {
+                        // Game Grid (outside ScrollView so swipe gestures work)
+                        GameGrid(
+                            games: filteredGames,
+                            maxGamesToShow: maxGamesToShow.rawValue,
+                            charID: charID,
+                            theme: theme,
+                            onGameSelect: { gameId, gameName in
+                                handleGameSelect(gameId: gameId, gameName: gameName)
+                            },
+                            menuId: menuId
+                        )
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 20)
                     }
                 }
             }
