@@ -108,6 +108,8 @@ public struct GameCard: View {
                     image
                         .resizable()
                         .aspectRatio(contentMode: .fill)
+                        .frame(width: iconSize, height: iconSize)
+                        .clipped()
                 case .failure:
                     // Error fallback
                     Text(game.iconFallback ?? randomFallback)

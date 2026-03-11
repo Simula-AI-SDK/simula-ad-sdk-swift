@@ -29,9 +29,8 @@ public struct GameGrid: View {
 
     @State private var currentPage = 0
     @State private var isAnimating = false
-    @State private var slideDirection: SlideDirection? = nil
     @State private var dragOffset: CGFloat = 0
-    @State private var gridWidth: CGFloat = 300
+    @State private var pageWidth: CGFloat = 0
 
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -64,8 +63,8 @@ public struct GameGrid: View {
         max(1, Int(ceil(Double(games.count) / Double(maxGamesToShow))))
     }
 
-    private var currentGames: [GameData] {
-        let start = currentPage * maxGamesToShow
+    private func gamesForPage(_ page: Int) -> [GameData] {
+        let start = page * maxGamesToShow
         let end = min(start + maxGamesToShow, games.count)
         guard start < games.count else { return [] }
         return Array(games[start..<end])
@@ -84,36 +83,51 @@ public struct GameGrid: View {
 
     public var body: some View {
         VStack(spacing: 8) {
-            // Game Grid
-            LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: isCompact ? 8 : 12), count: columns),
-                spacing: isCompact ? 8 : 12
-            ) {
-                ForEach(currentGames) { game in
-                    GameCard(
-                        game: game,
-                        isCompact: isCompact,
-                        theme: theme,
-                        onGameSelect: { gameId in
-                            onGameSelect(gameId, game.name)
+            // Measure parent-offered width without constraining the layout
+            Color.clear.frame(height: 0)
+                .background(GeometryReader { geometry in
+                    Color.clear.onAppear { pageWidth = geometry.size.width }
+                        .onChange(of: geometry.size.width) { newWidth in
+                            pageWidth = newWidth
                         }
-                    )
+                })
+
+            // Game Grid — HStack of all pages for smooth sliding
+            HStack(spacing: 0) {
+                ForEach(0..<totalPages, id: \.self) { pageIndex in
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.flexible(), spacing: isCompact ? 8 : 12), count: columns),
+                        spacing: isCompact ? 8 : 12
+                    ) {
+                        ForEach(gamesForPage(pageIndex)) { game in
+                            GameCard(
+                                game: game,
+                                isCompact: isCompact,
+                                theme: theme,
+                                onGameSelect: { gameId in
+                                    onGameSelect(gameId, game.name)
+                                }
+                            )
+                        }
+                    }
+                    .frame(width: pageWidth)
                 }
             }
-            .offset(x: dragOffset)
+            .offset(x: -CGFloat(currentPage) * pageWidth + dragOffset)
+            .frame(width: pageWidth, alignment: .leading)
+            .clipped()
             .gesture(
                 totalPages > 1 ?
                 DragGesture()
                     .onChanged { value in
-                        if !isAnimating {
-                            dragOffset = value.translation.width
-                        }
+                        if !isAnimating { dragOffset = value.translation.width }
                     }
                     .onEnded { value in
                         handleSwipeEnd(translation: value.translation)
                     }
                 : nil
             )
+            .animation(.easeOut(duration: ANIMATION_DURATION), value: currentPage)
             .animation(.easeOut(duration: ANIMATION_DURATION), value: dragOffset)
 
             // Dot Pagination (matching React's dot pagination exactly)
@@ -140,9 +154,6 @@ public struct GameGrid: View {
                 .padding(.top, 4)
             }
         }
-        .background(GeometryReader { geometry in
-            Color.clear.onAppear { gridWidth = geometry.size.width }
-        })
         .onChange(of: games.count) { _ in
             // Reset to valid page if current page is out of bounds (matching React useEffect)
             if currentPage >= totalPages && totalPages > 0 {
@@ -173,10 +184,10 @@ public struct GameGrid: View {
 
         if deltaX < 0, currentPage < totalPages - 1 {
             // Swiped left → next page
-            animateToPage(currentPage + 1, direction: .left)
+            animateToPage(currentPage + 1)
         } else if deltaX > 0, currentPage > 0 {
             // Swiped right → previous page
-            animateToPage(currentPage - 1, direction: .right)
+            animateToPage(currentPage - 1)
         } else {
             withAnimation(.easeOut(duration: ANIMATION_DURATION)) {
                 dragOffset = 0
@@ -184,43 +195,25 @@ public struct GameGrid: View {
         }
     }
 
-    private func animateToPage(_ newPage: Int, direction: SlideDirection) {
+    private func animateToPage(_ newPage: Int) {
         guard !isAnimating else { return }
         isAnimating = true
-        slideDirection = direction
-
-        // Animate out
-        withAnimation(.easeOut(duration: ANIMATION_DURATION / 2)) {
-            dragOffset = direction == .left ? -gridWidth * 0.3 : gridWidth * 0.3
-        }
-
-        // After half animation, switch page and animate in
-        DispatchQueue.main.asyncAfter(deadline: .now() + ANIMATION_DURATION / 2) {
+        withAnimation(.easeOut(duration: ANIMATION_DURATION)) {
             currentPage = newPage
-            dragOffset = direction == .left ? gridWidth * 0.15 : -gridWidth * 0.15
-            withAnimation(.easeOut(duration: ANIMATION_DURATION / 2)) {
-                dragOffset = 0
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + ANIMATION_DURATION / 2) {
-                slideDirection = nil
-                isAnimating = false
-            }
+            dragOffset = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + ANIMATION_DURATION) {
+            isAnimating = false
         }
     }
 
     private func handleDotClick(pageIndex: Int) {
         guard pageIndex != currentPage, !isAnimating else { return }
-        let direction: SlideDirection = pageIndex > currentPage ? .left : .right
-        animateToPage(pageIndex, direction: direction)
+        animateToPage(pageIndex)
     }
 }
 
 // MARK: - Helper Types
-
-private enum SlideDirection {
-    case left
-    case right
-}
 
 private struct DotInfo {
     let pageIndex: Int

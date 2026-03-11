@@ -189,12 +189,13 @@ public struct MiniGameInterstitial: View {
                     case .success(let image):
                         image
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
+                            .scaledToFill()
                     default:
                         Color.black
                     }
                 }
                 .ignoresSafeArea()
+                .clipped()
             } else {
                 // Bundled default background image (matching Kotlin's painterResource(R.drawable.minigame_interstitial_background))
                 bundledBackgroundImage
@@ -216,7 +217,9 @@ public struct MiniGameInterstitial: View {
            let platformImg = InterstitialPlatformImage(data: imageData) {
             Image(interstitialPlatformImage: platformImg)
                 .resizable()
-                .aspectRatio(contentMode: .fill)
+                .scaledToFill()
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                .clipped()
         } else {
             Color(hex: "#1a1a2e")
         }
