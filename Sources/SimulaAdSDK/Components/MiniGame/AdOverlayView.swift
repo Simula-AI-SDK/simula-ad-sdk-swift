@@ -83,45 +83,42 @@ public struct AdOverlayView: View {
                         HStack {
                             Spacer()
                             if adCountdown <= 0 {
-                                // Close button (matching Kotlin's CloseButton with size=44)
+                                // Close button (matching React Native's CloseButton style)
                                 Button(action: onClose) {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 16, weight: .bold))
-                                        .foregroundColor(Color(hex: "#1F2937"))
-                                        .frame(width: 44, height: 44)
+                                    Text("\u{00D7}")
+                                        .font(.system(size: 18, weight: .regular))
+                                        .foregroundColor(.white)
+                                        .frame(width: 32, height: 32)
                                         .background(
                                             Circle()
-                                                .fill(Color.white.opacity(0.9))
+                                                .fill(Color.black.opacity(0.6))
                                         )
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(AdCloseButtonStyle())
                                 .padding(.top, 16)
                                 .padding(.trailing, 16)
                                 .accessibilityLabel("Close ad")
                             } else {
-                                // Countdown ring (matching Kotlin's Canvas-drawn countdown)
+                                // Countdown ring
                                 ZStack {
-                                    // Semi-transparent black circle background
                                     Circle()
                                         .fill(Color.black.opacity(0.4))
-                                        .frame(width: 44, height: 44)
+                                        .frame(width: 32, height: 32)
 
-                                    // White arc that drains from full to empty
                                     Circle()
                                         .trim(from: 1 - ringProgress, to: 1)
                                         .stroke(
                                             Color.white,
-                                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                                            style: StrokeStyle(lineWidth: 2, lineCap: .round)
                                         )
-                                        .frame(width: 38, height: 38)
+                                        .frame(width: 26, height: 26)
                                         .rotationEffect(.degrees(-90))
 
-                                    // Countdown number
                                     Text("\(adCountdown)")
-                                        .font(.system(size: 16, weight: .bold))
+                                        .font(.system(size: 14, weight: .bold))
                                         .foregroundColor(.white)
                                 }
-                                .frame(width: 44, height: 44)
+                                .frame(width: 32, height: 32)
                                 .padding(.top, 16)
                                 .padding(.trailing, 16)
                             }
@@ -134,9 +131,7 @@ public struct AdOverlayView: View {
                 .frame(maxHeight: isBottomSheet ? nil : .infinity)
             }
         }
-        #if os(iOS)
-        .statusBarHidden(shouldHideStatusBar)
-        #endif
+        .hideStatusBar(shouldHideStatusBar)
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
@@ -159,6 +154,15 @@ public struct AdOverlayView: View {
                 adCountdown = 5 - second
             }
         }
+    }
+}
+
+// MARK: - AdCloseButtonStyle (matching React Native's pressed opacity)
+
+private struct AdCloseButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.5 : 1.0)
     }
 }
 

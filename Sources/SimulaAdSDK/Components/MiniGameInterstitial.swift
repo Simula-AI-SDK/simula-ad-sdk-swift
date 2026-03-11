@@ -153,9 +153,7 @@ public struct MiniGameInterstitial: View {
             .contentShape(Rectangle())
             .onTapGesture { handleCtaClick() }
             .ignoresSafeArea()
-            #if os(iOS)
-            .statusBarHidden()
-            #endif
+            .hideStatusBar(true)
             .opacity(appeared ? 1 : 0)
             .animation(.easeIn(duration: 0.3), value: appeared)
             .onAppear { appeared = true }

@@ -43,8 +43,8 @@ public struct GameIframeView: View {
     @State private var appeared = false
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
-    /// Accumulated drag offset during a gesture
-    @State private var dragOffset: CGFloat = 0
+    /// Accumulated drag offset during a gesture (auto-resets to 0 when gesture ends)
+    @GestureState private var dragOffset: CGFloat = 0
 
     private let api = SimulaAPI()
 
@@ -79,7 +79,7 @@ public struct GameIframeView: View {
 
     /// Whether the sheet covers >= 95% of the screen (triggers status bar hide + snap)
     private var isNearFullScreen: Bool {
-        displayHeight >= screenHeight * 0.95
+        currentHeight >= screenHeight * 0.95
     }
 
     // MARK: - Body
@@ -111,23 +111,20 @@ public struct GameIframeView: View {
                     .clipShape(TopRoundedRectangle(radius: 16))
                     .gesture(
                         DragGesture()
-                            .onChanged { value in
-                                dragOffset = value.translation.height
+                            .updating($dragOffset) { value, state, _ in
+                                state = value.translation.height
                             }
                             .onEnded { value in
                                 let finalHeight = currentHeight - value.translation.height
                                 let clamped = min(max(finalHeight, 500), screenHeight)
-                                dragOffset = 0
 
                                 if clamped >= screenHeight * 0.95 {
                                     // Snap to full screen with spring animation
-                                    withAnimation(.spring(response: 0.4, dampingFraction: 0.5)) {
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                                         currentHeight = screenHeight
                                     }
                                 } else {
-                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                        currentHeight = clamped
-                                    }
+                                    currentHeight = clamped
                                 }
                             }
                     )
@@ -167,40 +164,37 @@ public struct GameIframeView: View {
                             }
                         )
                     }
+
+                    // Close button — top right of content area
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button(action: {
+                                handleClose()
+                            }) {
+                                Text("\u{00D7}")
+                                    .font(.system(size: 18, weight: .regular))
+                                    .foregroundColor(.white)
+                                    .frame(width: 32, height: 32)
+                                    .background(
+                                        Circle()
+                                            .fill(Color.black.opacity(0.6))
+                                    )
+                            }
+                            .buttonStyle(GameCloseButtonStyle())
+                            .padding(.top, 16)
+                            .padding(.trailing, 16)
+                            .accessibilityLabel("Close game")
+                        }
+                        Spacer()
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: isBottomSheetMode ? displayHeight : nil)
                 .frame(maxHeight: isBottomSheetMode ? nil : .infinity)
             }
-            .animation(isBottomSheetMode ? .easeOut(duration: 0.3) : nil, value: appeared)
-
-            // Close button (matching React's close button positioning and style)
-            VStack {
-                HStack {
-                    Spacer()
-                    Button(action: {
-                        handleClose()
-                    }) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(Color(hex: "#1F2937"))
-                            .frame(width: 44, height: 44)
-                            .background(
-                                Circle()
-                                    .fill(Color.white.opacity(0.9))
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.top, isBottomSheetMode ? 4 : 16)
-                    .padding(.trailing, 16)
-                    .accessibilityLabel("Close game")
-                }
-                Spacer()
-            }
         }
-        #if os(iOS)
-        .statusBarHidden(isBottomSheetMode ? isNearFullScreen : true)
-        #endif
+        .hideStatusBar(isBottomSheetMode ? isNearFullScreen : true)
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .task {
@@ -278,6 +272,15 @@ public struct GameIframeView: View {
         // The React SDK doesn't explicitly handle specific messages in GameIframe,
         // but this hook is available for future use
         print("[GameIframeView] Received message from game: \(message)")
+    }
+}
+
+// MARK: - GameCloseButtonStyle (matching React Native's pressed opacity)
+
+private struct GameCloseButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.5 : 1.0)
     }
 }
 
