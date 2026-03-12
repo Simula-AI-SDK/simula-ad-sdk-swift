@@ -87,8 +87,9 @@ public struct GameIframeView: View {
     }
 
     /// Whether the sheet covers >= 95% of the screen (triggers status bar hide + snap)
+    /// Uses displayHeight (live during drag) so status bar hides/shows during drag.
     private var isNearFullScreen: Bool {
-        currentHeight >= screenHeight * 0.95
+        displayHeight >= screenHeight * 0.95
     }
 
     // MARK: - Body
@@ -100,107 +101,110 @@ public struct GameIframeView: View {
                 .ignoresSafeArea()
                 .onTapGesture { handleClose() }
 
-            // Content container
-            VStack(spacing: 0) {
-                if isBottomSheetMode {
-                    Spacer()
-                }
-
-                // Bottom sheet header with drag handle (matching React/Kotlin bottom sheet header)
-                if isBottomSheetMode {
-                    VStack(spacing: 0) {
-                        // Drag handle
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white.opacity(0.3))
-                            .frame(width: 40, height: 4)
-                            .padding(.vertical, 12)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .background(Color(hex: playableBorderColor))
-                    .clipShape(TopRoundedRectangle(radius: 16))
-                    .gesture(
-                        DragGesture()
-                            .updating($dragOffset) { value, state, _ in
-                                state = value.translation.height
-                            }
-                            .onEnded { value in
-                                let finalHeight = currentHeight - value.translation.height
-                                let clamped = min(max(finalHeight, 500), screenHeight)
-
-                                if clamped >= screenHeight * 0.95 {
-                                    // Snap to full screen with spring animation
-                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                                        currentHeight = screenHeight
-                                    }
-                                } else {
-                                    currentHeight = clamped
+            // Sheet container (matching React Native's Animated.View with height: animatedHeight)
+            // Uses GeometryReader to get actual full-screen size for bottom-aligned positioning
+            GeometryReader { geo in
+                VStack(spacing: 0) {
+                    // Drag handle header
+                    if isBottomSheetMode {
+                        VStack(spacing: 0) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.white.opacity(0.3))
+                                .frame(width: 40, height: 4)
+                                .padding(.vertical, 12)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .background(Color(hex: playableBorderColor))
+                        .clipShape(TopRoundedRectangle(radius: 16))
+                        .gesture(
+                            DragGesture()
+                                .updating($dragOffset) { value, state, _ in
+                                    state = value.translation.height
                                 }
-                            }
-                    )
-                }
+                                .onEnded { value in
+                                    let finalHeight = currentHeight - value.translation.height
+                                    let clamped = min(max(finalHeight, 500), screenHeight)
 
-                // Main content area
-                ZStack {
-                    if loading {
-                        // Loading state (matching React)
-                        VStack {
-                            Spacer()
-                            Text("Loading game...")
-                                .font(.system(size: 18, weight: .medium))
-                                .foregroundColor(.white)
-                            Spacer()
-                        }
-                    } else if let error = error {
-                        // Error state (matching React)
-                        VStack {
-                            Spacer()
-                            Text(error)
-                                .font(.system(size: 18, weight: .medium))
-                                .foregroundColor(.white)
-                                .multilineTextAlignment(.center)
-                                .padding(20)
-                            Spacer()
-                        }
-                    } else if let urlString = iframeUrl, let url = URL(string: urlString) {
-                        // Game WebView (matching React's <iframe>)
-                        WebViewRepresentable(
-                            url: url,
-                            onNavigationFailed: { err in
-                                self.error = "Failed to load game. Please try again."
-                            },
-                            onMessageReceived: { message in
-                                handleMessage(message)
-                            }
+                                    if clamped >= screenHeight * 0.95 {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                            currentHeight = screenHeight
+                                        }
+                                    } else {
+                                        currentHeight = clamped
+                                    }
+                                }
                         )
                     }
 
-                    // Close button — top right of content area
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Button(action: {
-                                handleClose()
-                            }) {
-                                Text("\u{00D7}")
-                                    .font(.system(size: 18, weight: .regular))
+                    // Main content area (flex: 1 — fills remaining space in sheet)
+                    ZStack {
+                        if loading {
+                            VStack {
+                                Spacer()
+                                Text("Loading game...")
+                                    .font(.system(size: 18, weight: .medium))
                                     .foregroundColor(.white)
-                                    .frame(width: 32, height: 32)
-                                    .background(
-                                        Circle()
-                                            .fill(Color.black.opacity(0.6))
-                                    )
+                                Spacer()
                             }
-                            .buttonStyle(GameCloseButtonStyle())
-                            .padding(.top, 16)
-                            .padding(.trailing, 16)
-                            .accessibilityLabel("Close game")
+                        } else if let error = error {
+                            VStack {
+                                Spacer()
+                                Text(error)
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .multilineTextAlignment(.center)
+                                    .padding(20)
+                                Spacer()
+                            }
+                        } else if let urlString = iframeUrl, let url = URL(string: urlString) {
+                            WebViewRepresentable(
+                                url: url,
+                                onNavigationFailed: { err in
+                                    self.error = "Failed to load game. Please try again."
+                                },
+                                onMessageReceived: { message in
+                                    handleMessage(message)
+                                }
+                            )
                         }
-                        Spacer()
+
+                        // Close button — top right of content area
+                        VStack {
+                            HStack {
+                                Spacer()
+                                Button(action: {
+                                    handleClose()
+                                }) {
+                                    Text("\u{00D7}")
+                                        .font(.system(size: 18, weight: .regular))
+                                        .foregroundColor(.white)
+                                        .frame(width: 32, height: 32)
+                                        .background(
+                                            Circle()
+                                                .fill(Color.black.opacity(0.6))
+                                        )
+                                }
+                                .buttonStyle(GameCloseButtonStyle())
+                                .padding(.top, 16)
+                                .padding(.trailing, 16)
+                                .accessibilityLabel("Close game")
+                            }
+                            Spacer()
+                        }
                     }
+                    .frame(maxWidth: .infinity)
+                    .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: isBottomSheetMode ? displayHeight : nil)
                 .frame(maxHeight: isBottomSheetMode ? nil : .infinity)
+                // Position at bottom of GeometryReader (matching React Native's justifyContent: 'flex-end')
+                .position(
+                    x: geo.size.width / 2,
+                    y: isBottomSheetMode
+                        ? geo.size.height - displayHeight / 2
+                        : geo.size.height / 2
+                )
             }
             .ignoresSafeArea()
         }
