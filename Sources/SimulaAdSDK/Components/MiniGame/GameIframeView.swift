@@ -50,7 +50,16 @@ public struct GameIframeView: View {
 
     // MARK: - Computed
 
-    private var isBottomSheetMode: Bool { playableHeight != nil }
+    private var isBottomSheetMode: Bool {
+        guard let ph = playableHeight else { return false }
+        // Match React Native: >= 95% treated as full screen (no bottom sheet UI)
+        switch ph {
+        case .pixels(let px):
+            return max(px, 500) < screenHeight * 0.95
+        case .percent(let pct):
+            return pct < 0.95
+        }
+    }
 
     private var screenHeight: CGFloat {
         #if os(iOS)
@@ -193,12 +202,18 @@ public struct GameIframeView: View {
                 .frame(height: isBottomSheetMode ? displayHeight : nil)
                 .frame(maxHeight: isBottomSheetMode ? nil : .infinity)
             }
+            .ignoresSafeArea()
         }
+        .ignoresSafeArea()
         .hideStatusBar(isBottomSheetMode ? isNearFullScreen : true)
+        .onChange(of: currentHeight) { newHeight in
+            print("[GameIframeView] currentHeight=\(newHeight), screenHeight=\(screenHeight), isNearFullScreen=\(newHeight >= screenHeight * 0.95), isBottomSheetMode=\(isBottomSheetMode)")
+        }
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .task {
             currentHeight = calculateInitialHeight()
+            print("[GameIframeView] initialHeight=\(currentHeight), screenHeight=\(screenHeight), isBottomSheetMode=\(isBottomSheetMode), hideStatusBar=\(isBottomSheetMode ? isNearFullScreen : true)")
             appeared = true
             await loadMinigame()
         }

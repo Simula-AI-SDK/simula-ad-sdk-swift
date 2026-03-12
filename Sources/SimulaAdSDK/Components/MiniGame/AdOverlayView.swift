@@ -26,7 +26,11 @@ public struct AdOverlayView: View {
     /// Ring progress (1.0 = full, 0.0 = empty)
     @State private var ringProgress: CGFloat = 1.0
 
-    private var isBottomSheet: Bool { playableHeightDp != nil }
+    private var isBottomSheet: Bool {
+        guard let h = playableHeightDp else { return false }
+        // Match React Native: >= 95% of screen treated as full screen (no bottom sheet UI)
+        return h < screenHeight * 0.95
+    }
 
     private var screenHeight: CGFloat {
         #if os(iOS)
@@ -130,11 +134,14 @@ public struct AdOverlayView: View {
                 .frame(height: isBottomSheet ? playableHeightDp : nil)
                 .frame(maxHeight: isBottomSheet ? nil : .infinity)
             }
+            .ignoresSafeArea()
         }
+        .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
+            print("[AdOverlayView] playableHeightDp=\(String(describing: playableHeightDp)), screenHeight=\(screenHeight), isBottomSheet=\(isBottomSheet), shouldHideStatusBar=\(shouldHideStatusBar)")
             appeared = true
             startCountdown()
         }

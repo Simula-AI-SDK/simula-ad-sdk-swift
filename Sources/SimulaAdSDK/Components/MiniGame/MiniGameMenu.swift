@@ -208,6 +208,7 @@ public struct MiniGameMenu: View {
                 .zIndex(1)
             }
         }
+        .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.2), value: isOpen)
         .animation(.easeInOut(duration: 0.2), value: showGameIframe)
         .animation(.easeInOut(duration: 0.2), value: showAdOverlay)
