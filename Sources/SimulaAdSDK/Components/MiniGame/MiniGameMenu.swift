@@ -300,7 +300,6 @@ public struct MiniGameMenu: View {
         VStack(spacing: 0) {
             if catalogLoading {
                 // Loading state (matching React's loading spinner + "Loading games...")
-                Spacer()
                 VStack(spacing: 12) {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(
@@ -312,10 +311,9 @@ public struct MiniGameMenu: View {
                         .font(.custom(theme.resolvedSecondaryFont, size: 14))
                         .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
                 }
-                Spacer()
+                .padding(.vertical, 40)
             } else if catalogError {
                 // Error state (matching Kotlin's games_unavailable image)
-                Spacer()
                 VStack(spacing: 16) {
                     // Bundled games unavailable image (matching Kotlin's painterResource(R.drawable.games_unavailable))
                     if let imageUrl = Bundle.module.url(forResource: "games_unavailable", withExtension: "png"),
@@ -343,7 +341,7 @@ public struct MiniGameMenu: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 20)
                 }
-                Spacer()
+                .padding(.vertical, 40)
             } else {
                 VStack(spacing: 0) {
                     // Search Bar (matching React's search input)
