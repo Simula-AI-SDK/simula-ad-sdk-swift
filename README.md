@@ -187,7 +187,7 @@ For the full App Store privacy guide, see [docs/IOS_APP_PRIVACY.md](docs/IOS_APP
 
 For complete documentation including all props, theming options, and advanced usage, visit:
 
-[Full Documentation](https://simula-ad.notion.site/Simula-x-Saylo-Minigame-SDK-2f4af70f6f0d804e805dcb2726f29079)
+[Full Documentation](https://simula-ad.notion.site/Simula-x-Dippy-Swift-Mini-Games-SDK-Overview-321af70f6f0d801ea116d754424f10dd?pvs=73)
 
 ## Support
 
