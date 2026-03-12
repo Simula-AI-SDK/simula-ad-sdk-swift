@@ -59,7 +59,6 @@ Add the mini-game menu to your view:
 import SimulaAdSDK
 
 struct ChatView: View {
-    @EnvironmentObject var provider: SimulaProvider
     @State private var showGames = false
 
     var body: some View {
@@ -68,6 +67,7 @@ struct ChatView: View {
 
             MiniGameMenu(
                 isOpen: $showGames,
+                onClose: { showGames = false },
                 charName: "Luna",
                 charID: "char_123",
                 charImage: "https://example.com/avatar.png",
@@ -84,22 +84,22 @@ The SDK provides three invite components for triggering the game menu:
 
 ```swift
 // CTA Button with pulsating animation
-MiniGameInviteKit.Button(onClick: { showGames = true })
+MiniGameButton(onClick: { showGames = true })
 
 // Top banner invitation card
-MiniGameInviteKit.Invitation(
-    isOpen: $showInvitation,
-    onPlay: { showGames = true },
-    charName: "Luna",
-    charImage: "https://example.com/avatar.png"
+MiniGameInvitation(
+    charImage: "https://example.com/avatar.png",
+    isOpen: showInvitation,
+    onClick: { showGames = true },
+    onClose: { showInvitation = false }
 )
 
 // Full-screen interstitial overlay
-MiniGameInviteKit.Interstitial(
-    isOpen: $showInterstitial,
-    onPlay: { showGames = true },
-    charName: "Luna",
-    charImage: "https://example.com/avatar.png"
+MiniGameInterstitial(
+    charImage: "https://example.com/avatar.png",
+    isOpen: showInterstitial,
+    onClick: { showGames = true },
+    onClose: { showInterstitial = false }
 )
 ```
 
@@ -108,7 +108,7 @@ MiniGameInviteKit.Interstitial(
 | Component | Description |
 |-----------|-------------|
 | `SimulaProviderView` | Required wrapper that manages API session and state |
-| `MiniGameMenu` | Modal game catalog with search, pagination, and ad display |
+| `MiniGameMenu` | Modal game catalog with search, pagination, and ad display. Requires `onClose` callback. |
 | `MiniGameButton` | Animated CTA button to launch the game menu |
 | `MiniGameInvitation` | Slide-in banner card with character image |
 | `MiniGameInterstitial` | Full-screen overlay invitation |
@@ -127,8 +127,10 @@ let menuTheme = MiniGameTheme(
 
 MiniGameMenu(
     isOpen: $showGames,
+    onClose: { showGames = false },
     charName: "Luna",
     charID: "char_123",
+    charImage: "https://example.com/avatar.png",
     theme: menuTheme
 )
 ```

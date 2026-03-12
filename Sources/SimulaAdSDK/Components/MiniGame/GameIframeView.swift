@@ -43,8 +43,8 @@ public struct GameIframeView: View {
     @State private var appeared = false
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
-    /// Accumulated drag offset during a gesture (reset to 0 in onEnded)
-    @State private var dragOffset: CGFloat = 0
+    /// Height captured at drag start, used to compute live height from translation
+    @State private var dragStartHeight: CGFloat = 0
 
     private let api = SimulaAPI()
 
@@ -115,19 +115,18 @@ public struct GameIframeView: View {
                         .gesture(
                             DragGesture(coordinateSpace: .global)
                                 .onChanged { value in
-                                    dragOffset = value.translation.height
+                                    if dragStartHeight == 0 {
+                                        dragStartHeight = currentHeight
+                                    }
+                                    let newHeight = dragStartHeight - value.translation.height
+                                    currentHeight = min(max(newHeight, 500), screenHeight)
                                 }
-                                .onEnded { value in
-                                    dragOffset = 0
-                                    let finalHeight = currentHeight - value.translation.height
-                                    let clamped = min(max(finalHeight, 500), screenHeight)
-
-                                    if clamped >= screenHeight * 0.95 {
+                                .onEnded { _ in
+                                    dragStartHeight = 0
+                                    if currentHeight >= screenHeight * 0.95 {
                                         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                                             currentHeight = screenHeight
                                         }
-                                    } else {
-                                        currentHeight = clamped
                                     }
                                 }
                         )
@@ -193,10 +192,9 @@ public struct GameIframeView: View {
                     .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
-                // Frame uses currentHeight (stable, only changes on drag end)
                 .frame(height: isBottomSheetMode ? currentHeight : geo.size.height)
-                // Offset pins sheet to bottom + shifts visually during drag (no layout recalc)
-                .offset(y: isBottomSheetMode ? geo.size.height - currentHeight + dragOffset : 0)
+                // Offset pins sheet to bottom of screen
+                .offset(y: isBottomSheetMode ? geo.size.height - currentHeight : 0)
             }
             .ignoresSafeArea()
         }
