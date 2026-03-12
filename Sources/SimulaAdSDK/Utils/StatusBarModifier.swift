@@ -16,8 +16,6 @@ private class StatusBarOverlayWindow {
     private var overlayWindow: UIWindow?
 
     func setHidden(_ hidden: Bool, in scene: UIWindowScene) {
-        print("[StatusBarModifier] setHidden(\(hidden)) called")
-
         if hidden {
             if overlayWindow == nil {
                 let win = UIWindow(windowScene: scene)
@@ -26,13 +24,10 @@ private class StatusBarOverlayWindow {
                 win.isUserInteractionEnabled = false
                 win.backgroundColor = .clear
                 overlayWindow = win
-                print("[StatusBarModifier] Created overlay window")
             }
             overlayWindow?.isHidden = false
-            print("[StatusBarModifier] Overlay window shown — status bar should be hidden")
         } else {
             overlayWindow?.isHidden = true
-            print("[StatusBarModifier] Overlay window hidden — status bar should be visible")
         }
     }
 
@@ -61,8 +56,6 @@ private struct StatusBarHiddenViewController: UIViewControllerRepresentable {
             if let windowScene = UIApplication.shared.connectedScenes
                 .compactMap({ $0 as? UIWindowScene }).first {
                 StatusBarOverlayWindow.shared.setHidden(self.hidden, in: windowScene)
-            } else {
-                print("[StatusBarModifier] No UIWindowScene found")
             }
         }
     }

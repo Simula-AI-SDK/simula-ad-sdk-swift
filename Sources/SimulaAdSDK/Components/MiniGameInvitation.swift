@@ -213,7 +213,7 @@ public struct MiniGameInvitation: View {
         VStack(alignment: .leading, spacing: 4) {
             // Title text (uses resolvedTitleTextColor matching Kotlin's titleTextColor)
             Text(titleText)
-                .font(fontForFamily(theme.fontFamily, size: theme.resolvedFontSize, weight: .bold))
+                .font(fontForFamily(theme.fontFamily, size: 16, weight: .bold))
                 .foregroundColor(Color(hex: theme.resolvedTitleTextColor))
                 .lineLimit(2)
 
@@ -247,15 +247,6 @@ public struct MiniGameInvitation: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    // MARK: - Font Helper
-
-    private func fontForFamily(_ family: String?, size: CGFloat, weight: Font.Weight) -> Font {
-        if let family = family {
-            return .custom(family, size: size).weight(weight)
-        }
-        return .system(size: size, weight: weight)
     }
 
     // MARK: - Transition Helpers

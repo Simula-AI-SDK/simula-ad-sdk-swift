@@ -270,15 +270,6 @@ public struct MiniGameInterstitial: View {
             )
     }
 
-    // MARK: - Font Helper
-
-    private func fontForFamily(_ family: String?, size: CGFloat, weight: Font.Weight) -> Font {
-        if let family = family {
-            return .custom(family, size: size).weight(weight)
-        }
-        return .system(size: size, weight: weight)
-    }
-
     // MARK: - Actions (matching React's handler functions)
 
     private func handleClose() {

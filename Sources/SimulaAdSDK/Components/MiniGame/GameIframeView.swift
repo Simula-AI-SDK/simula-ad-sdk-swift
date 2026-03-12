@@ -155,12 +155,10 @@ public struct GameIframeView: View {
                         } else if let urlString = iframeUrl, let url = URL(string: urlString) {
                             WebViewRepresentable(
                                 url: url,
-                                onNavigationFailed: { err in
+                                onNavigationFailed: { _ in
                                     self.error = "Failed to load game. Please try again."
                                 },
-                                onMessageReceived: { message in
-                                    handleMessage(message)
-                                }
+                                onMessageReceived: { _ in }
                             )
                         }
 
@@ -180,7 +178,7 @@ public struct GameIframeView: View {
                                                 .fill(Color.black.opacity(0.6))
                                         )
                                 }
-                                .buttonStyle(GameCloseButtonStyle())
+                                .buttonStyle(CloseButtonStyle())
                                 .padding(.top, 16)
                                 .padding(.trailing, 16)
                                 .accessibilityLabel("Close game")
@@ -269,47 +267,5 @@ public struct GameIframeView: View {
         }
     }
 
-    // MARK: - Message Handling
-
-    /// Handles postMessage from the game iframe.
-    private func handleMessage(_ message: String) {
-        // Games may send messages for various events
-        // The React SDK doesn't explicitly handle specific messages in GameIframe,
-        // but this hook is available for future use
-        print("[GameIframeView] Received message from game: \(message)")
-    }
 }
 
-// MARK: - GameCloseButtonStyle (matching React Native's pressed opacity)
-
-private struct GameCloseButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.5 : 1.0)
-    }
-}
-
-// MARK: - TopRoundedRectangle
-
-/// A shape with rounded top corners only (for the bottom sheet header).
-private struct TopRoundedRectangle: Shape {
-    var radius: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + radius))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX + radius, y: rect.minY),
-            control: CGPoint(x: rect.minX, y: rect.minY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.minY + radius),
-            control: CGPoint(x: rect.maxX, y: rect.minY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        path.closeSubpath()
-        return path
-    }
-}

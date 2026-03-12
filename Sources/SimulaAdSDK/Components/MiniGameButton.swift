@@ -55,7 +55,6 @@ public struct MiniGameButton: View {
 
     // MARK: - State
 
-    @State private var pulsatePhase: CGFloat = 0
     @State private var badgePingScale: CGFloat = 1
     @State private var badgePingOpacity: Double = 1
 
@@ -63,10 +62,6 @@ public struct MiniGameButton: View {
 
     private var displayText: String {
         text ?? "\u{1F3AE} Play a Game"
-    }
-
-    private var pulsateColor: String {
-        theme.resolvedPulsateColor
     }
 
     // MARK: - Body
@@ -107,15 +102,6 @@ public struct MiniGameButton: View {
             }
         }
         .frame(width: width)
-    }
-
-    // MARK: - Font Helper
-
-    private func fontForFamily(_ family: String?, size: CGFloat, weight: Font.Weight) -> Font {
-        if let family = family {
-            return .custom(family, size: size).weight(weight)
-        }
-        return .system(size: size, weight: weight)
     }
 
     // MARK: - Badge Ping Animation

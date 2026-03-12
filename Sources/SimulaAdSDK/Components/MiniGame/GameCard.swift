@@ -20,7 +20,6 @@ public struct GameCard: View {
     private static let fallbackIcons = ["🎲", "🎮", "🎰", "🧩", "🎯"]
 
     @State private var imageError = false
-    @State private var imageLoading = true
     @State private var randomFallback: String
 
     public init(

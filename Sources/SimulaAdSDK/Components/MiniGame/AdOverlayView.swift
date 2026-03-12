@@ -56,83 +56,85 @@ public struct AdOverlayView: View {
                     if adCountdown <= 0 { onClose() }
                 }
 
-            // Content: bottom sheet or fullscreen
-            VStack(spacing: 0) {
-                if isBottomSheet {
-                    Spacer()
-                }
+            // Content: bottom sheet or fullscreen (GeometryReader layout matches GameIframeView)
+            GeometryReader { geo in
+                VStack(spacing: 0) {
+                    // Visual-only drag handle for bottom sheet mode (no gesture, matching Kotlin)
+                    if isBottomSheet {
+                        VStack(spacing: 0) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.white.opacity(0.3))
+                                .frame(width: 40, height: 4)
+                                .padding(.vertical, 12)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .background(Color(hex: playableBorderColor))
+                        .clipShape(TopRoundedRectangle(radius: 16))
+                    }
 
-                // Visual-only drag handle for bottom sheet mode (no gesture, matching Kotlin)
-                if isBottomSheet {
-                    VStack(spacing: 0) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white.opacity(0.3))
-                            .frame(width: 40, height: 4)
-                            .padding(.vertical, 12)
+                    // Main content area
+                    ZStack {
+                        // Ad iframe
+                        if let url = URL(string: iframeUrl) {
+                            WebViewRepresentable(url: url)
+                        }
+
+                        // Close button / countdown ring — top right
+                        VStack {
+                            HStack {
+                                Spacer()
+                                if adCountdown <= 0 {
+                                    // Close button (matching React Native's CloseButton style)
+                                    Button(action: onClose) {
+                                        Text("\u{00D7}")
+                                            .font(.system(size: 18, weight: .regular))
+                                            .foregroundColor(.white)
+                                            .frame(width: 32, height: 32)
+                                            .background(
+                                                Circle()
+                                                    .fill(Color.black.opacity(0.6))
+                                            )
+                                    }
+                                    .buttonStyle(CloseButtonStyle())
+                                    .padding(.top, 16)
+                                    .padding(.trailing, 16)
+                                    .accessibilityLabel("Close ad")
+                                } else {
+                                    // Countdown ring
+                                    ZStack {
+                                        Circle()
+                                            .fill(Color.black.opacity(0.4))
+                                            .frame(width: 32, height: 32)
+
+                                        Circle()
+                                            .trim(from: 1 - ringProgress, to: 1)
+                                            .stroke(
+                                                Color.white,
+                                                style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                                            )
+                                            .frame(width: 26, height: 26)
+                                            .rotationEffect(.degrees(-90))
+
+                                        Text("\(adCountdown)")
+                                            .font(.system(size: 14, weight: .bold))
+                                            .foregroundColor(.white)
+                                    }
+                                    .frame(width: 32, height: 32)
+                                    .padding(.top, 16)
+                                    .padding(.trailing, 16)
+                                }
+                            }
+                            Spacer()
+                        }
                     }
                     .frame(maxWidth: .infinity)
-                    .background(Color(hex: playableBorderColor))
-                    .clipShape(TopRoundedRectangle(radius: 16))
-                }
-
-                // Main content area
-                ZStack {
-                    // Ad iframe
-                    if let url = URL(string: iframeUrl) {
-                        WebViewRepresentable(url: url)
-                    }
-
-                    // Close button / countdown ring — top right
-                    VStack {
-                        HStack {
-                            Spacer()
-                            if adCountdown <= 0 {
-                                // Close button (matching React Native's CloseButton style)
-                                Button(action: onClose) {
-                                    Text("\u{00D7}")
-                                        .font(.system(size: 18, weight: .regular))
-                                        .foregroundColor(.white)
-                                        .frame(width: 32, height: 32)
-                                        .background(
-                                            Circle()
-                                                .fill(Color.black.opacity(0.6))
-                                        )
-                                }
-                                .buttonStyle(AdCloseButtonStyle())
-                                .padding(.top, 16)
-                                .padding(.trailing, 16)
-                                .accessibilityLabel("Close ad")
-                            } else {
-                                // Countdown ring
-                                ZStack {
-                                    Circle()
-                                        .fill(Color.black.opacity(0.4))
-                                        .frame(width: 32, height: 32)
-
-                                    Circle()
-                                        .trim(from: 1 - ringProgress, to: 1)
-                                        .stroke(
-                                            Color.white,
-                                            style: StrokeStyle(lineWidth: 2, lineCap: .round)
-                                        )
-                                        .frame(width: 26, height: 26)
-                                        .rotationEffect(.degrees(-90))
-
-                                    Text("\(adCountdown)")
-                                        .font(.system(size: 14, weight: .bold))
-                                        .foregroundColor(.white)
-                                }
-                                .frame(width: 32, height: 32)
-                                .padding(.top, 16)
-                                .padding(.trailing, 16)
-                            }
-                        }
-                        Spacer()
-                    }
+                    .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: isBottomSheet ? playableHeightDp : nil)
-                .frame(maxHeight: isBottomSheet ? nil : .infinity)
+                // Height on outer VStack (handle + content) — matches GameIframeView
+                .frame(height: isBottomSheet ? playableHeightDp : geo.size.height)
+                // Pin to bottom of screen
+                .offset(y: isBottomSheet ? geo.size.height - (playableHeightDp ?? geo.size.height) : 0)
             }
             .ignoresSafeArea()
         }
@@ -141,7 +143,6 @@ public struct AdOverlayView: View {
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
-            print("[AdOverlayView] playableHeightDp=\(String(describing: playableHeightDp)), screenHeight=\(screenHeight), isBottomSheet=\(isBottomSheet), shouldHideStatusBar=\(shouldHideStatusBar)")
             appeared = true
             startCountdown()
         }
@@ -164,37 +165,3 @@ public struct AdOverlayView: View {
     }
 }
 
-// MARK: - AdCloseButtonStyle (matching React Native's pressed opacity)
-
-private struct AdCloseButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.5 : 1.0)
-    }
-}
-
-// MARK: - TopRoundedRectangle (reused from GameIframeView)
-// Note: This is defined privately in GameIframeView as well.
-// For AdOverlayView to use it, we define it here too.
-
-private struct TopRoundedRectangle: Shape {
-    var radius: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + radius))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX + radius, y: rect.minY),
-            control: CGPoint(x: rect.minX, y: rect.minY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.minY + radius),
-            control: CGPoint(x: rect.maxX, y: rect.minY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        path.closeSubpath()
-        return path
-    }
-}

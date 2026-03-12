@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-import Combine
 
 // MARK: - SimulaProvider
 
@@ -92,9 +91,7 @@ public final class SimulaProvider: ObservableObject {
             if let id = id {
                 self.sessionId = id
             }
-        } catch {
-            print("[SimulaSDK] Failed to create session: \(error.localizedDescription)")
-        }
+        } catch { }
     }
 
     // MARK: - Cache Key Helper

@@ -473,9 +473,7 @@ public struct MiniGameMenu: View {
                                 self.showAdOverlay = true
                             }
                         }
-                    } catch {
-                        print("[MiniGameMenu] Error fetching ad: \(error)")
-                    }
+                    } catch { }
                 }
             }
             showGameIframe = false
@@ -517,7 +515,6 @@ public struct MiniGameMenu: View {
                 self.catalogLoading = false
             }
         } catch {
-            print("[MiniGameMenu] Failed to load game catalog: \(error)")
             await MainActor.run {
                 self.catalogError = true
                 self.games = []

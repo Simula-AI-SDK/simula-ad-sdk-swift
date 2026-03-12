@@ -180,8 +180,6 @@ public struct MiniGameInvitationTheme: Sendable, Equatable {
     public var borderColor: String?
     /// Font family name (e.g. "Inter"). Default: system font.
     public var fontFamily: String?
-    public var fontSize: CGFloat?
-
     public enum CharImageAnchor: String, Sendable, Equatable {
         case left
         case right
@@ -199,8 +197,7 @@ public struct MiniGameInvitationTheme: Sendable, Equatable {
         charImageAnchor: CharImageAnchor? = nil,
         borderWidth: CGFloat? = nil,
         borderColor: String? = nil,
-        fontFamily: String? = nil,
-        fontSize: CGFloat? = nil
+        fontFamily: String? = nil
     ) {
         self.cornerRadius = cornerRadius
         self.backgroundColor = backgroundColor
@@ -214,7 +211,6 @@ public struct MiniGameInvitationTheme: Sendable, Equatable {
         self.borderWidth = borderWidth
         self.borderColor = borderColor
         self.fontFamily = fontFamily
-        self.fontSize = fontSize
     }
 
     // Resolved defaults matching Kotlin's fallback pattern
@@ -229,7 +225,6 @@ public struct MiniGameInvitationTheme: Sendable, Equatable {
     public var resolvedCharImageAnchor: CharImageAnchor { charImageAnchor ?? .left }
     public var resolvedBorderWidth: CGFloat { borderWidth ?? 1 }
     public var resolvedBorderColor: String { borderColor ?? "rgba(255, 255, 255, 0.1)" }
-    public var resolvedFontSize: CGFloat { fontSize ?? 16 }
 }
 
 // MARK: - MiniGameButtonTheme
