@@ -43,8 +43,8 @@ public struct GameIframeView: View {
     @State private var appeared = false
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
-    /// Accumulated drag offset during a gesture (auto-resets to 0 when gesture ends)
-    @GestureState private var dragOffset: CGFloat = 0
+    /// Accumulated drag offset during a gesture (reset to 0 in onEnded)
+    @State private var dragOffset: CGFloat = 0
 
     private let api = SimulaAPI()
 
@@ -80,16 +80,9 @@ public struct GameIframeView: View {
         }
     }
 
-    /// The effective display height, accounting for drag
-    private var displayHeight: CGFloat {
-        let h = currentHeight - dragOffset
-        return min(max(h, 500), screenHeight)
-    }
-
-    /// Whether the sheet covers >= 95% of the screen (triggers status bar hide + snap)
-    /// Uses displayHeight (live during drag) so status bar hides/shows during drag.
+    /// Whether the sheet covers >= 95% of the screen (triggers status bar hide + snap).
     private var isNearFullScreen: Bool {
-        displayHeight >= screenHeight * 0.95
+        currentHeight >= screenHeight * 0.95
     }
 
     // MARK: - Body
@@ -102,7 +95,10 @@ public struct GameIframeView: View {
                 .onTapGesture { handleClose() }
 
             // Sheet container (matching React Native's Animated.View with height: animatedHeight)
-            // Uses GeometryReader to get actual full-screen size for bottom-aligned positioning
+            // Uses GeometryReader for bottom-aligned positioning.
+            // Frame height stays at currentHeight (stable during drag) — only .offset(y: dragOffset)
+            // moves the sheet visually, avoiding the feedback loop where layout changes shift
+            // the gesture reference point.
             GeometryReader { geo in
                 VStack(spacing: 0) {
                     // Drag handle header
@@ -117,11 +113,12 @@ public struct GameIframeView: View {
                         .background(Color(hex: playableBorderColor))
                         .clipShape(TopRoundedRectangle(radius: 16))
                         .gesture(
-                            DragGesture()
-                                .updating($dragOffset) { value, state, _ in
-                                    state = value.translation.height
+                            DragGesture(coordinateSpace: .global)
+                                .onChanged { value in
+                                    dragOffset = value.translation.height
                                 }
                                 .onEnded { value in
+                                    dragOffset = 0
                                     let finalHeight = currentHeight - value.translation.height
                                     let clamped = min(max(finalHeight, 500), screenHeight)
 
@@ -196,28 +193,19 @@ public struct GameIframeView: View {
                     .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: isBottomSheetMode ? displayHeight : nil)
-                .frame(maxHeight: isBottomSheetMode ? nil : .infinity)
-                // Position at bottom of GeometryReader (matching React Native's justifyContent: 'flex-end')
-                .position(
-                    x: geo.size.width / 2,
-                    y: isBottomSheetMode
-                        ? geo.size.height - displayHeight / 2
-                        : geo.size.height / 2
-                )
+                // Frame uses currentHeight (stable, only changes on drag end)
+                .frame(height: isBottomSheetMode ? currentHeight : geo.size.height)
+                // Offset pins sheet to bottom + shifts visually during drag (no layout recalc)
+                .offset(y: isBottomSheetMode ? geo.size.height - currentHeight + dragOffset : 0)
             }
             .ignoresSafeArea()
         }
         .ignoresSafeArea()
         .hideStatusBar(isBottomSheetMode ? isNearFullScreen : true)
-        .onChange(of: currentHeight) { newHeight in
-            print("[GameIframeView] currentHeight=\(newHeight), screenHeight=\(screenHeight), isNearFullScreen=\(newHeight >= screenHeight * 0.95), isBottomSheetMode=\(isBottomSheetMode)")
-        }
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
         .task {
             currentHeight = calculateInitialHeight()
-            print("[GameIframeView] initialHeight=\(currentHeight), screenHeight=\(screenHeight), isBottomSheetMode=\(isBottomSheetMode), hideStatusBar=\(isBottomSheetMode ? isNearFullScreen : true)")
             appeared = true
             await loadMinigame()
         }
