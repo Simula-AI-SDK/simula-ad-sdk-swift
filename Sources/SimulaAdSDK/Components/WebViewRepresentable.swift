@@ -1,6 +1,8 @@
 #if os(iOS)
 import SwiftUI
 import WebKit
+import StoreKit
+import SafariServices
 
 // MARK: - WebViewRepresentable
 
@@ -124,6 +126,47 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
+        /// Extracts App Store ID from URLs like:
+        /// - https://apps.apple.com/app/id123456789
+        /// - https://itunes.apple.com/app/id123456789
+        /// - itms-apps://apps.apple.com/app/id123456789
+        private func appStoreID(from url: URL) -> String? {
+            let host = url.host?.lowercased() ?? ""
+            guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
+                return nil
+            }
+            if let range = url.path.range(of: #"/id(\d+)"#, options: .regularExpression) {
+                let match = url.path[range]
+                return String(match.dropFirst(3)) // drop "/id"
+            }
+            return nil
+        }
+
+        /// Presents SKStoreProductViewController in-app for the given App Store ID
+        private func presentStoreProduct(appID: String) {
+            let storeVC = SKStoreProductViewController()
+            storeVC.loadProduct(withParameters: [
+                SKStoreProductParameterITunesItemIdentifier: appID
+            ])
+            presentViewController(storeVC)
+        }
+
+        /// Presents SFSafariViewController for external links
+        private func presentSafari(url: URL) {
+            let safariVC = SFSafariViewController(url: url)
+            presentViewController(safariVC)
+        }
+
+        private func presentViewController(_ vc: UIViewController) {
+            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                  let rootVC = scene.windows.first(where: \.isKeyWindow)?.rootViewController else { return }
+            var topVC = rootVC
+            while let presented = topVC.presentedViewController {
+                topVC = presented
+            }
+            topVC.present(vc, animated: true)
+        }
+
         init(
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
@@ -138,6 +181,22 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             onNavigationFinished?()
+
+            // If the webview landed on a cross-domain page (e.g. after following
+            // a redirect chain that didn't end at the App Store), open the final
+            // destination in SFSafariViewController and restore the original content.
+            if let finalURL = webView.url,
+               let originalHost = currentURL?.host?.lowercased(),
+               let finalHost = finalURL.host?.lowercased(),
+               originalHost != finalHost,
+               finalURL.scheme == "https" || finalURL.scheme == "http" {
+                presentSafari(url: finalURL)
+                if let original = currentURL {
+                    webView.load(URLRequest(url: original))
+                } else if webView.canGoBack {
+                    webView.goBack()
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -172,37 +231,29 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // For user-initiated link clicks, open externally in Safari
-            if navigationAction.navigationType == .linkActivated {
-                UIApplication.shared.open(url)
+            // Intercept App Store URLs → show in-app store sheet
+            if let appID = appStoreID(from: url) {
+                presentStoreProduct(appID: appID)
                 decisionHandler(.cancel)
                 return
             }
 
-            // For navigations from subframes (iframe links) that go to external http(s) URLs,
-            // open in Safari rather than replacing the game content
-            if navigationAction.targetFrame == nil || !navigationAction.targetFrame!.isMainFrame {
-                if scheme == "http" || scheme == "https" {
-                    // Allow the initial iframe load (same URL as what we loaded)
-                    if url == currentURL {
-                        decisionHandler(.allow)
-                        return
-                    }
-                    // External navigation from iframe → open in Safari
-                    if navigationAction.navigationType == .other || navigationAction.navigationType == .formSubmitted {
-                        UIApplication.shared.open(url)
-                        decisionHandler(.cancel)
-                        return
-                    }
-                }
+            // Intercept itms-apps:// and itms:// schemes (direct App Store links)
+            if scheme == "itms-apps" || scheme == "itms" {
+                decisionHandler(.cancel)
+                return
             }
 
+            // Allow all http/https — let WKWebView follow redirect chains.
+            // App Store URLs are caught above. Cross-domain final destinations
+            // are caught in didFinish and opened in SFSafariViewController.
             decisionHandler(.allow)
         }
 
         // MARK: - WKUIDelegate
 
-        /// Handles target="_blank" links and window.open() calls from the iframe
+        /// Handles target="_blank" and window.open() — load in the same webview
+        /// so the redirect chain goes through decidePolicyFor for each hop.
         func webView(
             _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
@@ -210,10 +261,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
             if let url = navigationAction.request.url {
-                let scheme = url.scheme?.lowercased() ?? ""
-                if scheme == "http" || scheme == "https" {
-                    UIApplication.shared.open(url)
-                }
+                webView.load(URLRequest(url: url))
             }
             return nil
         }

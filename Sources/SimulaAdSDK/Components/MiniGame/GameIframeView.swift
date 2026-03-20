@@ -92,7 +92,6 @@ public struct GameIframeView: View {
             // Backdrop (matching React's backgroundColor: 'rgba(0, 0, 0, 0.8)')
             Color.black.opacity(0.8)
                 .ignoresSafeArea()
-                .onTapGesture { handleClose() }
 
             // Sheet container (matching React Native's Animated.View with height: animatedHeight)
             // Uses GeometryReader for bottom-aligned positioning.
