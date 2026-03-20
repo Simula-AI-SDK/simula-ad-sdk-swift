@@ -167,7 +167,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             storeVC.delegate = self
             objc_setAssociatedObject(storeVC, &Self.coordinatorKey, self, .OBJC_ASSOCIATION_RETAIN)
             storeVC.loadProduct(withParameters: [
-                SKStoreProductParameterITunesItemIdentifier: appID
+                SKStoreProductParameterITunesItemIdentifier: NSNumber(value: Int(appID) ?? 0)
             ])
             presentViewController(storeVC)
         }

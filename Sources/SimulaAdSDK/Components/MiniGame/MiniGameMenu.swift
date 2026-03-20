@@ -60,6 +60,7 @@ public struct MiniGameMenu: View {
     @State private var showAdOverlay = false
     @State private var lastGameHeightDp: CGFloat?
     @State private var lastGameWasBottomSheet = false
+    @State private var adLoading = false
 
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -111,6 +112,52 @@ public struct MiniGameMenu: View {
                 )
                 .transition(.opacity)
                 .zIndex(2)
+            }
+
+            // Ad loading screen (shown while fetching post-game ad)
+            if adLoading {
+                ZStack {
+                    Color.black.opacity(0.8).ignoresSafeArea()
+
+                    GeometryReader { geo in
+                        let sheetHeight = lastGameWasBottomSheet ? (lastGameHeightDp ?? geo.size.height) : geo.size.height
+                        let isSheet = lastGameWasBottomSheet && sheetHeight < geo.size.height * 0.95
+
+                        VStack(spacing: 0) {
+                            if isSheet {
+                                VStack(spacing: 0) {
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.white.opacity(0.3))
+                                        .frame(width: 40, height: 4)
+                                        .padding(.vertical, 12)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .background(Color(hex: theme.resolvedPlayableBorderColor))
+                                .clipShape(TopRoundedRectangle(radius: 16))
+                            }
+
+                            ZStack {
+                                VStack(spacing: 12) {
+                                    Spacer()
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(1.2)
+                                    Text("Loading...")
+                                        .font(.system(size: 18, weight: .medium))
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                }
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: sheetHeight)
+                        .offset(y: isSheet ? geo.size.height - sheetHeight : 0)
+                    }
+                    .ignoresSafeArea()
+                }
+                .transition(.opacity)
+                .zIndex(2.5)
             }
 
             // Ad Overlay (full-screen cover)
@@ -436,26 +483,28 @@ public struct MiniGameMenu: View {
     }
 
     private func handleIframeClose() {
-        if !adFetched {
-            if let adId = currentAdId {
-                Task {
-                    do {
-                        let iframeUrl = try await api.fetchAdForMinigame(aid: adId)
+        showGameIframe = false
+        selectedGameId = nil
+
+        if !adFetched, let adId = currentAdId {
+            adLoading = true
+            Task {
+                do {
+                    let iframeUrl = try await api.fetchAdForMinigame(aid: adId)
+                    await MainActor.run {
+                        adLoading = false
                         if let url = iframeUrl {
-                            await MainActor.run {
-                                self.adIframeUrl = url
-                                self.adFetched = true
-                                self.showAdOverlay = true
-                            }
+                            self.adIframeUrl = url
+                            self.adFetched = true
+                            self.showAdOverlay = true
                         }
-                    } catch { }
+                    }
+                } catch {
+                    await MainActor.run {
+                        adLoading = false
+                    }
                 }
             }
-            showGameIframe = false
-            selectedGameId = nil
-        } else {
-            showGameIframe = false
-            selectedGameId = nil
         }
     }
 

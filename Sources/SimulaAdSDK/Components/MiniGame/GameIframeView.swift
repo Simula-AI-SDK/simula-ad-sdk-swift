@@ -134,8 +134,11 @@ public struct GameIframeView: View {
                     // Main content area (flex: 1 — fills remaining space in sheet)
                     ZStack {
                         if loading {
-                            VStack {
+                            VStack(spacing: 12) {
                                 Spacer()
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                    .scaleEffect(1.2)
                                 Text("Loading game...")
                                     .font(.system(size: 18, weight: .medium))
                                     .foregroundColor(.white)
