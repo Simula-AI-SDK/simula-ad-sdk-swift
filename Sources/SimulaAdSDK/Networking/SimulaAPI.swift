@@ -270,12 +270,14 @@ public final class SimulaAPI: @unchecked Sendable {
             let iconUrl = game["icon"] as? String ?? ""
             let description = game["description"] as? String ?? ""
             let iconFallback = game["iconFallback"] as? String
+            let gifCover = (game["gif_cover"] as? String) ?? (game["gifCover"] as? String)
             return GameData(
                 id: id,
                 name: name,
                 iconUrl: iconUrl,
                 description: description,
-                iconFallback: iconFallback
+                iconFallback: iconFallback,
+                gifCover: gifCover
             )
         }
 

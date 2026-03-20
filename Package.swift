@@ -20,7 +20,8 @@ let package = Package(
             resources: [
                 .copy("Resources/PrivacyInfo.xcprivacy"),
                 .copy("Resources/games_unavailable.png"),
-                .copy("Resources/minigame_interstitial_background.png")
+                .copy("Resources/minigame_interstitial_background.png"),
+                .copy("Resources/game_icon.png")
             ]
         ),
         .testTarget(

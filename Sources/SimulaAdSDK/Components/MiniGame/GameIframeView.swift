@@ -92,7 +92,6 @@ public struct GameIframeView: View {
             // Backdrop (matching React's backgroundColor: 'rgba(0, 0, 0, 0.8)')
             Color.black.opacity(0.8)
                 .ignoresSafeArea()
-                .onTapGesture { handleClose() }
 
             // Sheet container (matching React Native's Animated.View with height: animatedHeight)
             // Uses GeometryReader for bottom-aligned positioning.
@@ -135,8 +134,11 @@ public struct GameIframeView: View {
                     // Main content area (flex: 1 — fills remaining space in sheet)
                     ZStack {
                         if loading {
-                            VStack {
+                            VStack(spacing: 12) {
                                 Spacer()
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                    .scaleEffect(1.2)
                                 Text("Loading game...")
                                     .font(.system(size: 18, weight: .medium))
                                     .foregroundColor(.white)

@@ -1,6 +1,8 @@
 #if os(iOS)
 import SwiftUI
 import WebKit
+import StoreKit
+import SafariServices
 
 // MARK: - WebViewRepresentable
 
@@ -111,7 +113,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     // MARK: - Coordinator
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, SKStoreProductViewControllerDelegate {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
@@ -123,6 +125,103 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
+
+        /// Extracts App Store ID from URLs like:
+        /// - https://apps.apple.com/app/id123456789
+        /// - https://itunes.apple.com/app/id123456789
+        /// - itms-apps://apps.apple.com/app/id123456789
+        /// - itms-apps://itunes.apple.com/app/id123456789
+        private func appStoreID(from url: URL) -> String? {
+            let scheme = url.scheme?.lowercased() ?? ""
+            let host = url.host?.lowercased() ?? ""
+
+            // For itms-apps:// and itms:// schemes, search the path for /id\d+
+            // regardless of host (these are always App Store URLs)
+            if scheme == "itms-apps" || scheme == "itms" {
+                if let range = url.absoluteString.range(of: #"id(\d+)"#, options: .regularExpression) {
+                    let match = url.absoluteString[range]
+                    return String(match.dropFirst(2)) // drop "id"
+                }
+                return nil
+            }
+
+            // For http/https, require known App Store hosts
+            guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
+                return nil
+            }
+            if let range = url.path.range(of: #"/id(\d+)"#, options: .regularExpression) {
+                let match = url.path[range]
+                return String(match.dropFirst(3)) // drop "/id"
+            }
+            return nil
+        }
+
+        private static var coordinatorKey: UInt8 = 0
+        private var isShowingStoreProduct = false
+
+        /// Presents SKStoreProductViewController in-app for the given App Store ID
+        private func presentStoreProduct(appID: String) {
+            guard !isShowingStoreProduct else { return }
+            isShowingStoreProduct = true
+            let storeVC = SKStoreProductViewController()
+            storeVC.delegate = self
+            objc_setAssociatedObject(storeVC, &Self.coordinatorKey, self, .OBJC_ASSOCIATION_RETAIN)
+            storeVC.loadProduct(withParameters: [
+                SKStoreProductParameterITunesItemIdentifier: NSNumber(value: Int(appID) ?? 0)
+            ])
+            presentViewController(storeVC)
+        }
+
+        // MARK: - SKStoreProductViewControllerDelegate
+
+        func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
+            isShowingStoreProduct = false
+            viewController.dismiss(animated: true)
+        }
+
+        /// Presents SFSafariViewController for external links
+        private func presentSafari(url: URL) {
+            let safariVC = SFSafariViewController(url: url)
+            presentViewController(safariVC)
+        }
+
+        private func presentViewController(_ vc: UIViewController) {
+            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                  let rootVC = scene.windows.first(where: \.isKeyWindow)?.rootViewController else { return }
+            var topVC = rootVC
+            while let presented = topVC.presentedViewController {
+                topVC = presented
+            }
+            topVC.present(vc, animated: true)
+        }
+
+        /// Follows HTTP redirect chain to determine the final destination.
+        /// If it resolves to an App Store URL → SKStoreProductViewController.
+        /// Otherwise → SFSafariViewController with the final URL.
+        private func resolveAndRoute(url: URL) {
+            // Quick check — already an App Store URL?
+            if let appID = appStoreID(from: url) {
+                presentStoreProduct(appID: appID)
+                return
+            }
+
+            let resolver = RedirectResolver { [weak self] finalURL in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if let appID = self.appStoreID(from: finalURL) {
+                        self.presentStoreProduct(appID: appID)
+                    } else {
+                        self.presentSafari(url: finalURL)
+                    }
+                }
+            }
+            // Keep a strong reference so it isn't deallocated during the request
+            self.activeResolver = resolver
+            let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+            session.dataTask(with: URLRequest(url: url)).resume()
+        }
+
+        private var activeResolver: RedirectResolver?
 
         init(
             onNavigationFinished: (() -> Void)?,
@@ -172,37 +271,45 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // For user-initiated link clicks, open externally in Safari
-            if navigationAction.navigationType == .linkActivated {
-                UIApplication.shared.open(url)
+            // Intercept App Store URLs → show in-app store sheet
+            if let appID = appStoreID(from: url) {
+                presentStoreProduct(appID: appID)
                 decisionHandler(.cancel)
                 return
             }
 
-            // For navigations from subframes (iframe links) that go to external http(s) URLs,
-            // open in Safari rather than replacing the game content
-            if navigationAction.targetFrame == nil || !navigationAction.targetFrame!.isMainFrame {
-                if scheme == "http" || scheme == "https" {
-                    // Allow the initial iframe load (same URL as what we loaded)
-                    if url == currentURL {
-                        decisionHandler(.allow)
-                        return
-                    }
-                    // External navigation from iframe → open in Safari
-                    if navigationAction.navigationType == .other || navigationAction.navigationType == .formSubmitted {
-                        UIApplication.shared.open(url)
-                        decisionHandler(.cancel)
-                        return
-                    }
+            // Intercept itms-apps:// and itms:// schemes (direct App Store links)
+            if scheme == "itms-apps" || scheme == "itms" {
+                if let appID = appStoreID(from: url) {
+                    presentStoreProduct(appID: appID)
+                } else {
+                    // Couldn't extract app ID — let the system handle it
+                    UIApplication.shared.open(url)
+                }
+                decisionHandler(.cancel)
+                return
+            }
+
+            // User-initiated cross-domain clicks → resolve redirect chain first,
+            // then open SKStoreProductViewController (App Store) or SFSafariViewController (other)
+            if navigationAction.navigationType == .linkActivated,
+               scheme == "http" || scheme == "https" {
+                let currentHost = currentURL?.host?.lowercased() ?? ""
+                let targetHost = url.host?.lowercased() ?? ""
+                if !targetHost.isEmpty && currentHost != targetHost {
+                    resolveAndRoute(url: url)
+                    decisionHandler(.cancel)
+                    return
                 }
             }
 
+            // Same-origin navigations and server redirects → stay in webview
             decisionHandler(.allow)
         }
 
         // MARK: - WKUIDelegate
 
-        /// Handles target="_blank" links and window.open() calls from the iframe
+        /// Handles target="_blank" and window.open()
         func webView(
             _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
@@ -212,7 +319,15 @@ struct WebViewRepresentable: UIViewRepresentable {
             if let url = navigationAction.request.url {
                 let scheme = url.scheme?.lowercased() ?? ""
                 if scheme == "http" || scheme == "https" {
-                    UIApplication.shared.open(url)
+                    let currentHost = currentURL?.host?.lowercased() ?? ""
+                    let targetHost = url.host?.lowercased() ?? ""
+                    if !targetHost.isEmpty && currentHost != targetHost {
+                        // Cross-domain → resolve redirects then route
+                        resolveAndRoute(url: url)
+                    } else {
+                        // Same-origin → load in webview
+                        webView.load(URLRequest(url: url))
+                    }
                 }
             }
             return nil
@@ -232,6 +347,62 @@ struct WebViewRepresentable: UIViewRepresentable {
                 onMessageReceived?(str)
             }
         }
+    }
+}
+
+// MARK: - RedirectResolver
+
+/// URLSession delegate that follows HTTP redirect chains and stops when it
+/// encounters an App Store URL or non-HTTP scheme. Used to pre-resolve
+/// AppsFlyer/onelink redirects before deciding whether to show
+/// SKStoreProductViewController or SFSafariViewController.
+private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
+    let completion: (URL) -> Void
+    private var completed = false
+
+    init(completion: @escaping (URL) -> Void) {
+        self.completion = completion
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let redirectURL = request.url else {
+            finish(with: task.currentRequest?.url ?? request.url!)
+            completionHandler(nil)
+            return
+        }
+
+        let scheme = redirectURL.scheme?.lowercased() ?? ""
+        let host = redirectURL.host?.lowercased() ?? ""
+
+        // Stop at App Store URLs or non-HTTP schemes
+        if host.contains("apps.apple.com") || host.contains("itunes.apple.com")
+            || scheme == "itms-apps" || scheme == "itms" {
+            finish(with: redirectURL)
+            completionHandler(nil)
+            return
+        }
+
+        // Continue following redirect chain
+        completionHandler(request)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Chain completed (no more redirects) — use the final URL
+        if let finalURL = task.currentRequest?.url {
+            finish(with: finalURL)
+        }
+    }
+
+    private func finish(with url: URL) {
+        guard !completed else { return }
+        completed = true
+        completion(url)
     }
 }
 

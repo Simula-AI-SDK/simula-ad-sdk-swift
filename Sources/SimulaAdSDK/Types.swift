@@ -65,13 +65,15 @@ public struct GameData: Codable, Identifiable, Sendable, Equatable {
     public let iconUrl: String
     public let description: String
     public let iconFallback: String?
+    public let gifCover: String?
 
-    public init(id: String, name: String, iconUrl: String, description: String, iconFallback: String? = nil) {
+    public init(id: String, name: String, iconUrl: String, description: String, iconFallback: String? = nil, gifCover: String? = nil) {
         self.id = id
         self.name = name
         self.iconUrl = iconUrl
         self.description = description
         self.iconFallback = iconFallback
+        self.gifCover = gifCover
     }
 }
 
@@ -138,12 +140,12 @@ public struct MiniGameTheme: Sendable, Equatable {
     // Resolved defaults matching React's defaultTheme
     public var resolvedTitleFont: String { titleFont ?? "Inter" }
     public var resolvedSecondaryFont: String { secondaryFont ?? "Inter" }
-    public var resolvedTitleFontColor: String { titleFontColor ?? "#1F2937" }
-    public var resolvedSecondaryFontColor: String { secondaryFontColor ?? "#6B7280" }
+    public var resolvedTitleFontColor: String { titleFontColor ?? "#ffffff" }
+    public var resolvedSecondaryFontColor: String { secondaryFontColor ?? "rgba(255, 255, 255, 0.75)" }
     public var resolvedIconCornerRadius: CGFloat { iconCornerRadius ?? 8 }
-    public var resolvedBorderColor: String { borderColor ?? "rgba(0, 0, 0, 0.08)" }
+    public var resolvedBorderColor: String { borderColor ?? "rgba(255, 255, 255, 0.06)" }
     public var resolvedAccentColor: String { accentColor ?? "#3B82F6" }
-    public var resolvedBackgroundColor: String { backgroundColor ?? "#FFFFFF" }
+    public var resolvedBackgroundColor: String { backgroundColor ?? "#0b0b0f" }
     public var resolvedPlayableBorderColor: String { playableBorderColor ?? "#262626" }
 }
 
