@@ -164,6 +164,8 @@ private struct AnimatedGIFView: View {
         Image(platformImage: frames[currentFrame].image)
             .resizable()
             .aspectRatio(contentMode: .fill)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
             .onAppear { startTimer() }
             .onDisappear { stopTimer() }
     }
@@ -209,10 +211,14 @@ struct CachedCoverImage: View {
                     Image(platformImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(1.04)
+                        .clipped()
                 } else if let frames = coverImage.gifFrames, !frames.isEmpty {
                     AnimatedGIFView(frames: frames)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(1.04)
+                        .clipped()
                 } else {
                     emojiFallback
                 }

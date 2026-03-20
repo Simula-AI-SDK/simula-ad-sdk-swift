@@ -199,7 +199,12 @@ private struct MobileCarouselView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let screenHeight = geometry.size.height
+            // Use full screen height for sizing (matching Kotlin's LocalConfiguration.current.screenHeightDp)
+            #if os(iOS)
+            let screenHeight = UIScreen.main.bounds.height
+            #else
+            let screenHeight = NSScreen.main?.frame.height ?? geometry.size.height
+            #endif
             let carouselHeight = min(640, max(450, screenHeight * 0.62))
             let cardHeight = carouselHeight * 0.78
             let cardWidth = cardHeight * 9.0 / 16.0
@@ -234,6 +239,7 @@ private struct MobileCarouselView: View {
                 }
             }
             .frame(width: geometry.size.width, height: carouselHeight)
+            .frame(maxWidth: .infinity, maxHeight: .infinity) // Center carousel within GeometryReader
             .contentShape(Rectangle())
             .gesture(
                 DragGesture()

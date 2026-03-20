@@ -166,7 +166,7 @@ public struct MiniGameMenu: View {
 
                             // Content area
                             contentArea
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         }
                         .padding(
                             EdgeInsets(
