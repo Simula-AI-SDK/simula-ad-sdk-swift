@@ -113,7 +113,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     // MARK: - Coordinator
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, SKStoreProductViewControllerDelegate {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
@@ -156,13 +156,27 @@ struct WebViewRepresentable: UIViewRepresentable {
             return nil
         }
 
+        private static var coordinatorKey: UInt8 = 0
+        private var isShowingStoreProduct = false
+
         /// Presents SKStoreProductViewController in-app for the given App Store ID
         private func presentStoreProduct(appID: String) {
+            guard !isShowingStoreProduct else { return }
+            isShowingStoreProduct = true
             let storeVC = SKStoreProductViewController()
+            storeVC.delegate = self
+            objc_setAssociatedObject(storeVC, &Self.coordinatorKey, self, .OBJC_ASSOCIATION_RETAIN)
             storeVC.loadProduct(withParameters: [
                 SKStoreProductParameterITunesItemIdentifier: appID
             ])
             presentViewController(storeVC)
+        }
+
+        // MARK: - SKStoreProductViewControllerDelegate
+
+        func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
+            isShowingStoreProduct = false
+            viewController.dismiss(animated: true)
         }
 
         /// Presents SFSafariViewController for external links
