@@ -25,6 +25,8 @@ public struct AdOverlayView: View {
     @State private var adCountdown: Int = 5
     /// Ring progress (1.0 = full, 0.0 = empty)
     @State private var ringProgress: CGFloat = 1.0
+    /// Guards against countdown restarting when modals are dismissed
+    @State private var countdownStarted = false
 
     private var isBottomSheet: Bool {
         guard let h = playableHeightDp else { return false }
@@ -151,6 +153,9 @@ public struct AdOverlayView: View {
     // MARK: - Countdown
 
     private func startCountdown() {
+        guard !countdownStarted else { return }
+        countdownStarted = true
+
         // Animate ring from 1.0 to 0.0 over 5 seconds (matching Kotlin's tween(5000))
         withAnimation(.linear(duration: 5.0)) {
             ringProgress = 0
