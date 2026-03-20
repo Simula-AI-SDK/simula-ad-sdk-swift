@@ -321,6 +321,7 @@ private struct DesktopGridView: View {
                 }
                 .offset(x: slideOffset * geometry.size.width)
                 .opacity(Double(1 - abs(slideOffset) * 2))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .gesture(
                 DragGesture()
