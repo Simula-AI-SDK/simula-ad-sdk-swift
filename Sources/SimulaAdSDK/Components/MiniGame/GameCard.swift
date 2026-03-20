@@ -28,7 +28,7 @@ public struct GameCard: View {
 
     // Press scale animation (matching Kotlin: tween 200ms, target 0.95)
     private var pressScale: CGFloat {
-        isPressed ? 0.95 : 1.0
+        isPressed ? 1.05 : 1.0
     }
 
     public var body: some View {

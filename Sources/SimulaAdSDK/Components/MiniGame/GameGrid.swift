@@ -256,10 +256,10 @@ private struct MobileCarouselView: View {
                     .onEnded { _ in
                         lastDragValue = 0
 
-                        // Velocity-based fling with snap (matching Kotlin)
+                        // Velocity-based fling with snap
                         let velocityPx = velocityTracker.estimateVelocity()
                         let velocityCards = -velocityPx / cardStep
-                        let decayFactor: CGFloat = 0.4
+                        let decayFactor: CGFloat = 0.15
                         let projected = animator.scrollPosition + velocityCards * decayFactor
                         let snapTarget = projected.rounded()
 

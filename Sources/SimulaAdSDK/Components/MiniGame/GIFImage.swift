@@ -3,22 +3,22 @@ import ImageIO
 
 #if os(iOS)
 import UIKit
-private typealias PlatformImage = UIImage
-private func makePlatformImage(cgImage: CGImage) -> PlatformImage {
+typealias PlatformImage = UIImage
+func makePlatformImage(cgImage: CGImage) -> PlatformImage {
     UIImage(cgImage: cgImage)
 }
-private extension Image {
+extension Image {
     init(platformImage: UIImage) {
         self.init(uiImage: platformImage)
     }
 }
 #elseif os(macOS)
 import AppKit
-private typealias PlatformImage = NSImage
-private func makePlatformImage(cgImage: CGImage) -> PlatformImage {
+typealias PlatformImage = NSImage
+func makePlatformImage(cgImage: CGImage) -> PlatformImage {
     NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
 }
-private extension Image {
+extension Image {
     init(platformImage: NSImage) {
         self.init(nsImage: platformImage)
     }
@@ -33,24 +33,9 @@ final class CoverImageCache {
     static let shared = CoverImageCache()
 
     enum CoverImage {
-        case staticImage(Any) // PlatformImage stored as Any to avoid private type leak
-        case animatedGIF(frames: [(image: Any, duration: TimeInterval)])
+        case staticImage(PlatformImage)
+        case animatedGIF(frames: [(image: PlatformImage, duration: TimeInterval)])
         case failed
-
-        fileprivate var platformImage: PlatformImage? {
-            if case .staticImage(let img) = self { return img as? PlatformImage }
-            return nil
-        }
-
-        fileprivate var gifFrames: [(image: PlatformImage, duration: TimeInterval)]? {
-            if case .animatedGIF(let frames) = self {
-                return frames.compactMap { f in
-                    guard let img = f.image as? PlatformImage else { return nil }
-                    return (img, f.duration)
-                }
-            }
-            return nil
-        }
     }
 
     private var cache: [String: CoverImage] = [:]
@@ -109,9 +94,9 @@ final class CoverImageCache {
         }
         // Static image
         #if os(iOS)
-        if let img = UIImage(data: data) { return .staticImage(img as Any) }
+        if let img = UIImage(data: data) { return .staticImage(img) }
         #elseif os(macOS)
-        if let img = NSImage(data: data) { return .staticImage(img as Any) }
+        if let img = NSImage(data: data) { return .staticImage(img) }
         #endif
         return .failed
     }
@@ -123,15 +108,15 @@ final class CoverImageCache {
 
         if count == 1 {
             guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return .failed }
-            return .staticImage(makePlatformImage(cgImage: cgImage) as Any)
+            return .staticImage(makePlatformImage(cgImage: cgImage))
         }
 
-        var frames: [(Any, TimeInterval)] = []
+        var frames: [(PlatformImage, TimeInterval)] = []
         frames.reserveCapacity(count)
         for i in 0..<count {
             guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
             let duration = gifFrameDuration(source: source, index: i)
-            frames.append((makePlatformImage(cgImage: cgImage) as Any, duration))
+            frames.append((makePlatformImage(cgImage: cgImage), duration))
         }
         return frames.isEmpty ? .failed : .animatedGIF(frames: frames)
     }
@@ -164,8 +149,6 @@ private struct AnimatedGIFView: View {
         Image(platformImage: frames[currentFrame].image)
             .resizable()
             .aspectRatio(contentMode: .fill)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
             .onAppear { startTimer() }
             .onDisappear { stopTimer() }
     }
@@ -207,19 +190,20 @@ struct CachedCoverImage: View {
     var body: some View {
         Group {
             if let coverImage = coverImage {
-                if let img = coverImage.platformImage {
+                switch coverImage {
+                case .staticImage(let img):
                     Image(platformImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(1.04)
                         .clipped()
-                } else if let frames = coverImage.gifFrames, !frames.isEmpty {
+                case .animatedGIF(let frames):
                     AnimatedGIFView(frames: frames)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(1.04)
                         .clipped()
-                } else {
+                case .failed:
                     emojiFallback
                 }
             } else if loaded {

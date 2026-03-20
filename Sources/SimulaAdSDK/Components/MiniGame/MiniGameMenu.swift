@@ -1,23 +1,5 @@
 import SwiftUI
 
-// MARK: - Platform Image Helpers
-
-#if os(iOS)
-private typealias PlatformImage = UIImage
-private extension Image {
-    init(platformImage: UIImage) {
-        self.init(uiImage: platformImage)
-    }
-}
-#elseif os(macOS)
-private typealias PlatformImage = NSImage
-private extension Image {
-    init(platformImage: NSImage) {
-        self.init(nsImage: platformImage)
-    }
-}
-#endif
-
 // MARK: - MiniGameMenu
 
 /// A modal game catalog menu that displays available games and launches game iframes.
@@ -166,7 +148,7 @@ public struct MiniGameMenu: View {
 
                             // Content area
                             contentArea
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                         .padding(
                             EdgeInsets(
