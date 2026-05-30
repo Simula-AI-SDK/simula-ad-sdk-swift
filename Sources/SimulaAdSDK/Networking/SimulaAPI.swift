@@ -238,7 +238,6 @@ private struct MinigameAdResponse: Decodable {
 /// Centralized API client for all Simula endpoints (translates api.ts)
 public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
-    private let decoder: JSONDecoder
 
     /// Shared session tuned for the ad path. The default `URLSession.shared`
     /// uses a 60s request timeout, which would let a hung ad/init request stall
@@ -258,7 +257,6 @@ public final class SimulaAPI: @unchecked Sendable {
 
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
-        self.decoder = JSONDecoder()
     }
 
     // MARK: - Common Headers
@@ -318,7 +316,7 @@ public final class SimulaAPI: @unchecked Sendable {
             return nil
         }
 
-        let json = try decoder.decode(CreateSessionResponse.self, from: data)
+        let json = try JSONDecoder().decode(CreateSessionResponse.self, from: data)
         if let sid = json.sessionId, !sid.isEmpty {
             return sid
         }
@@ -393,7 +391,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try decoder.decode(MinigameAPIResponse.self, from: data)
+        let apiResponse = try JSONDecoder().decode(MinigameAPIResponse.self, from: data)
 
         guard let adResponse = apiResponse.adResponse,
               let adId = adResponse.adId,
@@ -432,7 +430,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try decoder.decode(MinigameAPIResponse.self, from: data)
+        let apiResponse = try JSONDecoder().decode(MinigameAPIResponse.self, from: data)
 
         if let adResponse = apiResponse.adResponse,
            let iframeUrl = adResponse.iframeUrl, !iframeUrl.isEmpty {

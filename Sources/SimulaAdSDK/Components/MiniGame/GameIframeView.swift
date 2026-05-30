@@ -231,8 +231,14 @@ public struct GameIframeView: View {
 
     /// Fetches the minigame iframe URL from the API.
     /// Translates the useEffect that calls `getMinigame()` in GameIframe.tsx.
+    /// `@MainActor` so the `@State` writes after the `await` resume on the main
+    /// thread (otherwise the URLSession continuation can land off-main).
+    @MainActor
     private func loadMinigame() async {
-        guard let sessionId = provider.sessionId, !sessionId.isEmpty else {
+        // Wait for the session to be ready (or retried) rather than failing the
+        // instant it isn't — a fast tap during launch, or a transient launch
+        // failure, no longer hard-fails the minigame.
+        guard let sessionId = await provider.ensureSession(), !sessionId.isEmpty else {
             error = "Session invalid, cannot initialize minigame"
             loading = false
             return

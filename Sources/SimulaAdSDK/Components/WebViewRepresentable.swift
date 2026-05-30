@@ -371,7 +371,8 @@ private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionData
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         guard let redirectURL = request.url else {
-            finish(with: task.currentRequest?.url ?? request.url!)
+            // request.url is nil here; never force-unwrap it.
+            finish(with: task.currentRequest?.url)
             completionHandler(nil)
             return
         }
@@ -392,19 +393,19 @@ private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionData
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // Chain completed (no more redirects) — use the final URL
-        if let finalURL = task.currentRequest?.url {
-            finish(with: finalURL)
-        }
+        // Terminal callback on every path (success or error). Always finish so
+        // the session is invalidated even when there's no final URL to route to.
+        finish(with: task.currentRequest?.url)
     }
 
-    private func finish(with url: URL) {
+    /// Terminates the resolution. Always invalidates the session — so its
+    /// delegate (self) and backing thread are released on every path — and
+    /// routes to `url` only when one is available.
+    private func finish(with url: URL?) {
         guard !completed else { return }
         completed = true
-        // Allow the in-flight task to finish, then tear down the session so its
-        // delegate (self) and backing thread are released.
         session?.finishTasksAndInvalidate()
-        completion(url)
+        if let url { completion(url) }
     }
 }
 

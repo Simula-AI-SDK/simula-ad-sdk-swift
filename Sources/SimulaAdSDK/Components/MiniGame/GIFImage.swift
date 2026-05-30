@@ -64,6 +64,17 @@ final class CoverImageCache: @unchecked Sendable {
         return c
     }()
 
+    /// Tracks in-flight downloads so concurrent loads of the same URL (e.g. the
+    /// catalog preload and a visible card requesting the same cover) share one
+    /// network request + decode instead of duplicating them.
+    private final class InFlight {
+        var task: Task<CoverImage, Never>!
+        var waiters: Int
+        init(waiters: Int) { self.waiters = waiters }
+    }
+    private let lock = NSLock()
+    private var inFlight: [String: InFlight] = [:]
+
     private init() {}
 
     /// Preload multiple URLs in parallel. Completes when all are cached.
@@ -78,12 +89,72 @@ final class CoverImageCache: @unchecked Sendable {
         }
     }
 
-    /// Load a single URL, returning cached result if available.
+    /// Load a single URL, returning the cached result if available. Concurrent
+    /// loads of the same URL are coalesced onto a single shared download.
     func load(url: String) async -> CoverImage {
         if let cached = cache.object(forKey: url as NSString) {
             return cached.image
         }
 
+        let task = registerWaiter(for: url)
+        // Each caller can cancel independently; the shared download is only
+        // cancelled once its last waiter goes away — this preserves the
+        // menu-close cancellation behavior while still de-duplicating requests.
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            self.releaseWaiter(for: url)
+        }
+    }
+
+    /// Returns the shared download task for `url`, creating it (and registering
+    /// this caller as a waiter) if none is already in flight.
+    private func registerWaiter(for url: String) -> Task<CoverImage, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let existing = inFlight[url] {
+            existing.waiters += 1
+            return existing.task
+        }
+
+        let box = InFlight(waiters: 1)
+        let task = Task<CoverImage, Never> { [weak self] in
+            guard let self else { return .failed }
+            let result = await self.performLoad(url: url)
+            self.clearInFlight(url, ifMatches: box)
+            return result
+        }
+        box.task = task
+        inFlight[url] = box
+        return task
+    }
+
+    /// Clears the in-flight entry for `url` once its download finishes, but only
+    /// if it's still `box` — a cancelled-and-replaced entry may already point at
+    /// a newer task. Synchronous so it never holds the lock across a suspension
+    /// (and avoids `NSLock`'s `noasync` lock/unlock in the async task body).
+    private func clearInFlight(_ url: String, ifMatches box: InFlight) {
+        lock.lock()
+        if inFlight[url] === box { inFlight[url] = nil }
+        lock.unlock()
+    }
+
+    /// A waiter went away (cancelled). Cancel the shared download once no
+    /// waiters remain.
+    private func releaseWaiter(for url: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let box = inFlight[url] else { return }
+        box.waiters -= 1
+        if box.waiters <= 0 {
+            inFlight[url] = nil
+            box.task.cancel()
+        }
+    }
+
+    /// Performs the actual download + decode for `url` and caches the result.
+    private func performLoad(url: String) async -> CoverImage {
         guard let requestUrl = URL(string: url) else {
             store(.failed, cost: 1, for: url)
             return .failed
@@ -95,9 +166,9 @@ final class CoverImageCache: @unchecked Sendable {
             store(result, cost: cost, for: url)
             return result
         } catch {
-            // If the surrounding task was cancelled (e.g. the menu closed
-            // mid-preload), don't poison the cache with a failure — leave the
-            // URL uncached so it retries the next time a card requests it.
+            // If the shared download was cancelled (its last waiter went away,
+            // e.g. the menu closed mid-load), don't poison the cache with a
+            // failure — leave the URL uncached so it retries when next requested.
             if Task.isCancelled { return .failed }
             store(.failed, cost: 1, for: url)
             return .failed
