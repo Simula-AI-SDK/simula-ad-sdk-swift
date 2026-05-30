@@ -180,6 +180,14 @@ public struct MiniGameMenu: View {
                     .onTapGesture { handleClose() }
                     .transition(.opacity)
                     .zIndex(1)
+                    .onAppear {
+                        // Warm a web view as soon as the menu opens so the game
+                        // (and post-game ad) load from a warm process instead of
+                        // paying cold-start right after the user taps.
+                        #if os(iOS)
+                        WebViewPool.shared.prewarm()
+                        #endif
+                    }
 
                 // Modal content
                 GeometryReader { geometry in

@@ -45,46 +45,22 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
-        let config = WKWebViewConfiguration()
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        // Add message handler for game→SDK communication (equivalent to window.postMessage listener)
-        let contentController = WKUserContentController()
-        contentController.add(context.coordinator, name: "simulaSDK")
-
-        // Inject a script that forwards window.postMessage to our handler
-        let postMessageScript = WKUserScript(
-            source: """
-            window.addEventListener('message', function(event) {
-                if (event.data && typeof event.data === 'string') {
-                    window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
-                } else if (event.data && typeof event.data === 'object') {
-                    window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify(event.data));
-                }
-            });
-            """,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        )
-        contentController.addUserScript(postMessageScript)
-        config.userContentController = contentController
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator
-        webView.scrollView.isScrollEnabled = true
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-
+        // Pull a prewarmed web view from the pool when one is available so the
+        // expensive allocation / process spin-up was already paid off the
+        // critical path. The pool wires the shared process pool and the
+        // postMessage-forwarding script; we only attach this instance's
+        // coordinator (navigation/UI delegate) and message callback here.
+        //
         // Match the iframe sandbox attributes from React:
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
-
-        SimulaTelemetry.shared.endSpan("WKWebViewColdStart")
+        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
+        let coordinator = context.coordinator
+        let (webView, wasPooled) = WebViewPool.shared.acquire(
+            delegate: coordinator,
+            onMessage: { [weak coordinator] body in coordinator?.onMessageReceived?(body) }
+        )
+        SimulaTelemetry.shared.endSpan("WKWebViewColdStart", additionalInfo: wasPooled ? "pooled" : "fresh")
         return webView
     }
 
@@ -241,15 +217,25 @@ struct WebViewRepresentable: UIViewRepresentable {
         // MARK: - WKNavigationDelegate
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Ignore the pool's prewarm load — only the real content load counts.
+            if webView.url?.absoluteString == "about:blank" { return }
             onNavigationFinished?()
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            if isCancelled(error) { return }
             onNavigationFailed?(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            // A cancelled provisional load happens when the real URL supersedes
+            // the prewarm's about:blank load; it isn't a genuine failure.
+            if isCancelled(error) { return }
             onNavigationFailed?(error)
+        }
+
+        private func isCancelled(_ error: Error) -> Bool {
+            (error as NSError).code == NSURLErrorCancelled
         }
 
         func webView(

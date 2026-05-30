@@ -206,6 +206,13 @@ public struct GameIframeView: View {
         .hideStatusBar(isBottomSheetMode ? isNearFullScreen : true)
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
+        .onAppear {
+            // Backstop prewarm: warms a web view in parallel with the getMinigame
+            // network round-trip in case the pool was drained.
+            #if os(iOS)
+            WebViewPool.shared.prewarm()
+            #endif
+        }
         .task {
             currentHeight = calculateInitialHeight()
             appeared = true
