@@ -63,7 +63,7 @@ public struct GameIframeView: View {
 
     private var screenHeight: CGFloat {
         #if os(iOS)
-        UIScreen.main.bounds.height
+        simulaScreenSize().height
         #else
         768
         #endif
@@ -157,12 +157,8 @@ public struct GameIframeView: View {
                         } else if let urlString = iframeUrl, let url = URL(string: urlString) {
                             WebViewRepresentable(
                                 url: url,
-                                onNavigationFinished: {
-                                    SimulaTelemetry.shared.endSpan("TimeToPlayable", additionalInfo: "gameId: \(gameId)")
-                                },
                                 onNavigationFailed: { _ in
                                     self.error = "Failed to load game. Please try again."
-                                    SimulaTelemetry.shared.endSpan("TimeToPlayable", additionalInfo: "Failed loading url")
                                 },
                                 onMessageReceived: { _ in }
                             )
@@ -216,7 +212,6 @@ public struct GameIframeView: View {
         .task {
             currentHeight = calculateInitialHeight()
             appeared = true
-            SimulaTelemetry.shared.startSpan("TimeToPlayable")
             await loadMinigame()
         }
     }
@@ -244,8 +239,9 @@ public struct GameIframeView: View {
         }
 
         #if os(iOS)
-        let screenWidth = UIScreen.main.bounds.width
-        let screenHeight = UIScreen.main.bounds.height
+        let screenSize = simulaScreenSize()
+        let screenWidth = screenSize.width
+        let screenHeight = screenSize.height
         #else
         let screenWidth: CGFloat = 1024
         let screenHeight: CGFloat = 768

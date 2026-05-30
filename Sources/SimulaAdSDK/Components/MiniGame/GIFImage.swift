@@ -29,7 +29,13 @@ extension Image {
 
 /// In-memory image cache with GIF support using ImageIO (no external dependencies).
 /// Downloads and decodes images, caching results for reuse across carousel scrolls.
-final class CoverImageCache {
+///
+/// Decoded bitmaps are downsampled to roughly the on-screen card size and stored
+/// in an `NSCache` with a cost limit, so a long, high-resolution GIF can't pin
+/// hundreds of MB and the cache evicts under memory pressure. (The previous
+/// implementation decoded every frame at full resolution into an unbounded
+/// dictionary that was never evicted.)
+final class CoverImageCache: @unchecked Sendable {
     static let shared = CoverImageCache()
 
     enum CoverImage {
@@ -38,8 +44,25 @@ final class CoverImageCache {
         case failed
     }
 
-    private var cache: [String: CoverImage] = [:]
-    private let queue = DispatchQueue(label: "com.simula.coverImageCache")
+    /// Cover cards are small on screen; cap the long edge so decoded bitmaps stay
+    /// modest regardless of the source resolution.
+    private static let maxPixelSize: CGFloat = 800
+    /// Sample frames of very long GIFs so frame count can't blow up memory/CPU.
+    private static let maxFrames = 60
+    /// ~96 MB ceiling for all decoded covers combined; NSCache evicts past this.
+    private static let totalCostLimit = 96 * 1024 * 1024
+
+    /// Boxes the enum so it can live in NSCache (which requires class values).
+    private final class Entry {
+        let image: CoverImage
+        init(_ image: CoverImage) { self.image = image }
+    }
+
+    private let cache: NSCache<NSString, Entry> = {
+        let c = NSCache<NSString, Entry>()
+        c.totalCostLimit = CoverImageCache.totalCostLimit
+        return c
+    }()
 
     private init() {}
 
@@ -47,8 +70,7 @@ final class CoverImageCache {
     func preload(urls: [String]) async {
         await withTaskGroup(of: Void.self) { group in
             for url in urls {
-                let alreadyCached = queue.sync { cache[url] != nil }
-                guard !alreadyCached else { continue }
+                guard cache.object(forKey: url as NSString) == nil else { continue }
                 group.addTask { [weak self] in
                     _ = await self?.load(url: url)
                 }
@@ -58,71 +80,98 @@ final class CoverImageCache {
 
     /// Load a single URL, returning cached result if available.
     func load(url: String) async -> CoverImage {
-        if let cached = queue.sync(execute: { cache[url] }) {
-            return cached
+        if let cached = cache.object(forKey: url as NSString) {
+            return cached.image
         }
 
         guard let requestUrl = URL(string: url) else {
-            let result = CoverImage.failed
-            queue.sync { cache[url] = result }
-            return result
+            store(.failed, cost: 1, for: url)
+            return .failed
         }
 
         do {
             let (data, _) = try await URLSession.shared.data(from: requestUrl)
-            let result = decodeImage(data: data)
-            queue.sync { cache[url] = result }
+            let (result, cost) = decodeImage(data: data)
+            store(result, cost: cost, for: url)
             return result
         } catch {
             // If the surrounding task was cancelled (e.g. the menu closed
             // mid-preload), don't poison the cache with a failure — leave the
             // URL uncached so it retries the next time a card requests it.
             if Task.isCancelled { return .failed }
-            let result = CoverImage.failed
-            queue.sync { cache[url] = result }
-            return result
+            store(.failed, cost: 1, for: url)
+            return .failed
         }
     }
 
     func clearCache() {
-        queue.sync { cache.removeAll() }
+        cache.removeAllObjects()
+    }
+
+    private func store(_ image: CoverImage, cost: Int, for url: String) {
+        cache.setObject(Entry(image), forKey: url as NSString, cost: max(cost, 1))
     }
 
     // MARK: - Decoding
 
-    private func decodeImage(data: Data) -> CoverImage {
-        // Check GIF magic bytes: GIF87a or GIF89a
-        let isGIF = data.count >= 6 && data.prefix(3) == Data([0x47, 0x49, 0x46])
-        if isGIF {
-            return decodeGIF(data: data)
-        }
-        // Static image
-        #if os(iOS)
-        if let img = UIImage(data: data) { return .staticImage(img) }
-        #elseif os(macOS)
-        if let img = NSImage(data: data) { return .staticImage(img) }
-        #endif
-        return .failed
+    /// Downsampling options shared by static and GIF frame decodes. Decodes the
+    /// bitmap immediately (off the main thread, here) instead of lazily on first
+    /// draw, and caps the long edge at `maxPixelSize`.
+    private static let thumbnailOptions: CFDictionary = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+    ] as CFDictionary
+
+    private func downsample(source: CGImageSource, index: Int) -> CGImage? {
+        CGImageSourceCreateThumbnailAtIndex(source, index, CoverImageCache.thumbnailOptions)
     }
 
-    private func decodeGIF(data: Data) -> CoverImage {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return .failed }
-        let count = CGImageSourceGetCount(source)
-        guard count > 0 else { return .failed }
-
-        if count == 1 {
-            guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return .failed }
-            return .staticImage(makePlatformImage(cgImage: cgImage))
+    /// Returns the decoded cover plus its approximate byte cost for NSCache.
+    private func decodeImage(data: Data) -> (CoverImage, Int) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return (.failed, 1)
         }
+        let count = CGImageSourceGetCount(source)
+        guard count > 0 else { return (.failed, 1) }
+
+        // Treat multi-frame GIFs as animated; everything else as a static image.
+        let isGIF = data.count >= 6 && data.prefix(3) == Data([0x47, 0x49, 0x46])
+        if isGIF && count > 1 {
+            return decodeGIF(source: source, count: count)
+        }
+
+        guard let cgImage = downsample(source: source, index: 0) else { return (.failed, 1) }
+        return (.staticImage(makePlatformImage(cgImage: cgImage)), bytes(cgImage))
+    }
+
+    private func decodeGIF(source: CGImageSource, count: Int) -> (CoverImage, Int) {
+        // Sample every `step`-th frame so a GIF with hundreds of frames is bounded.
+        let step = max(1, Int(ceil(Double(count) / Double(CoverImageCache.maxFrames))))
 
         var frames: [(PlatformImage, TimeInterval)] = []
-        frames.reserveCapacity(count)
-        for i in 0..<count {
-            guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
-            let duration = gifFrameDuration(source: source, index: i)
-            frames.append((makePlatformImage(cgImage: cgImage), duration))
+        frames.reserveCapacity(min(count, CoverImageCache.maxFrames))
+        var cost = 0
+        var i = 0
+        while i < count {
+            if let cgImage = downsample(source: source, index: i) {
+                // Fold the durations of any skipped frames into this one so the
+                // overall animation length is preserved.
+                var duration: TimeInterval = 0
+                for j in i..<min(i + step, count) {
+                    duration += gifFrameDuration(source: source, index: j)
+                }
+                frames.append((makePlatformImage(cgImage: cgImage), duration))
+                cost += bytes(cgImage)
+            }
+            i += step
         }
-        return frames.isEmpty ? .failed : .animatedGIF(frames: frames)
+        return frames.isEmpty ? (.failed, 1) : (.animatedGIF(frames: frames), cost)
+    }
+
+    private func bytes(_ image: CGImage) -> Int {
+        image.bytesPerRow * image.height
     }
 
     private func gifFrameDuration(source: CGImageSource, index: Int) -> TimeInterval {
@@ -142,39 +191,62 @@ final class CoverImageCache {
 
 // MARK: - AnimatedGIFView
 
-/// Cycles through decoded GIF frames using a Timer.
+/// Plays decoded GIF frames off a single `TimelineView(.animation)` clock rather
+/// than a per-view `Timer`. The previous Timer approach rescheduled itself and
+/// hopped to the main queue every frame, for every visible card simultaneously.
+/// TimelineView is driven by the system's display refresh and pauses on its own
+/// when the view isn't visible. When `isAnimating` is false the view shows a
+/// single static frame and runs no clock at all.
 private struct AnimatedGIFView: View {
     let frames: [(image: PlatformImage, duration: TimeInterval)]
+    var isAnimating: Bool = true
 
-    @State private var currentFrame = 0
-    @State private var timer: Timer?
+    /// Cumulative start time of each frame, and the total loop duration.
+    private let frameStarts: [TimeInterval]
+    private let totalDuration: TimeInterval
+
+    init(frames: [(image: PlatformImage, duration: TimeInterval)], isAnimating: Bool = true) {
+        self.frames = frames
+        self.isAnimating = isAnimating
+        var starts: [TimeInterval] = []
+        starts.reserveCapacity(frames.count)
+        var t: TimeInterval = 0
+        for frame in frames {
+            starts.append(t)
+            t += max(frame.duration, 0.02)
+        }
+        self.frameStarts = starts
+        self.totalDuration = max(t, 0.02)
+    }
 
     var body: some View {
-        Image(platformImage: frames[currentFrame].image)
-            .resizable()
-            .aspectRatio(contentMode: .fill)
-            .onAppear { startTimer() }
-            .onDisappear { stopTimer() }
-    }
-
-    private func startTimer() {
-        guard frames.count > 1 else { return }
-        scheduleNext()
-    }
-
-    private func stopTimer() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    private func scheduleNext() {
-        let duration = frames[currentFrame].duration
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { _ in
-            DispatchQueue.main.async {
-                currentFrame = (currentFrame + 1) % frames.count
-                scheduleNext()
+        if isAnimating && frames.count > 1 {
+            TimelineView(.animation) { context in
+                image(for: frameIndex(at: context.date.timeIntervalSinceReferenceDate))
             }
+        } else {
+            image(for: 0)
+        }
+    }
+
+    /// The frame whose interval contains the current loop phase.
+    private func frameIndex(at time: TimeInterval) -> Int {
+        let phase = time.truncatingRemainder(dividingBy: totalDuration)
+        var index = 0
+        for (i, start) in frameStarts.enumerated() {
+            if phase >= start { index = i } else { break }
+        }
+        return index
+    }
+
+    @ViewBuilder
+    private func image(for index: Int) -> some View {
+        if frames.indices.contains(index) {
+            Image(platformImage: frames[index].image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+        } else {
+            Color.clear
         }
     }
 }
@@ -187,6 +259,9 @@ struct CachedCoverImage: View {
     let gifCover: String?
     let iconUrl: String
     let fallbackEmoji: String
+    /// When false, an animated cover renders a single static frame (used to keep
+    /// only the centered carousel card animating).
+    var isAnimating: Bool = true
 
     @State private var coverImage: CoverImageCache.CoverImage?
     @State private var loaded = false
@@ -203,7 +278,7 @@ struct CachedCoverImage: View {
                         .scaleEffect(1.04)
                         .clipped()
                 case .animatedGIF(let frames):
-                    AnimatedGIFView(frames: frames)
+                    AnimatedGIFView(frames: frames, isAnimating: isAnimating)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(1.04)
                         .clipped()

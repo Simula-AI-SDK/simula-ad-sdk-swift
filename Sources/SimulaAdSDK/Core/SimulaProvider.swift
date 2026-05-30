@@ -81,7 +81,6 @@ public final class SimulaProvider: ObservableObject {
     /// Translates the `useEffect(() => { ensureSession() }, [...])` from SimulaProvider.tsx.
     @MainActor
     public func createSession() async {
-        SimulaTelemetry.shared.startSpan("CreateSession")
         let effectiveUserID = hasPrivacyConsent ? primaryUserID : nil
         do {
             let id = try await api.createSession(
@@ -93,7 +92,6 @@ public final class SimulaProvider: ObservableObject {
                 self.sessionId = id
             }
         } catch { }
-        SimulaTelemetry.shared.endSpan("CreateSession", additionalInfo: "apiKey: \(apiKey)")
     }
 
     // MARK: - Cache Key Helper

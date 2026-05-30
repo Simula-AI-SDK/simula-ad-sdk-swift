@@ -54,14 +54,11 @@ struct WebViewRepresentable: UIViewRepresentable {
         // Match the iframe sandbox attributes from React:
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
-        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
         let coordinator = context.coordinator
-        let (webView, wasPooled) = WebViewPool.shared.acquire(
+        return WebViewPool.shared.acquire(
             delegate: coordinator,
             onMessage: { [weak coordinator] body in coordinator?.onMessageReceived?(body) }
         )
-        SimulaTelemetry.shared.endSpan("WKWebViewColdStart", additionalInfo: wasPooled ? "pooled" : "fresh")
-        return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
@@ -109,6 +106,21 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// - https://itunes.apple.com/app/id123456789
         /// - itms-apps://apps.apple.com/app/id123456789
         /// - itms-apps://itunes.apple.com/app/id123456789
+        // Precompiled once — `range(of:options:.regularExpression)` would compile
+        // the pattern on every navigation. Group 1 captures the numeric ID.
+        private static let appStoreIDRegex = try! NSRegularExpression(pattern: #"id(\d+)"#)
+        private static let appStorePathIDRegex = try! NSRegularExpression(pattern: #"/id(\d+)"#)
+
+        private func capturedID(_ regex: NSRegularExpression, in string: String) -> String? {
+            let range = NSRange(string.startIndex..., in: string)
+            guard let match = regex.firstMatch(in: string, range: range),
+                  match.numberOfRanges >= 2,
+                  let idRange = Range(match.range(at: 1), in: string) else {
+                return nil
+            }
+            return String(string[idRange])
+        }
+
         private func appStoreID(from url: URL) -> String? {
             let scheme = url.scheme?.lowercased() ?? ""
             let host = url.host?.lowercased() ?? ""
@@ -116,22 +128,14 @@ struct WebViewRepresentable: UIViewRepresentable {
             // For itms-apps:// and itms:// schemes, search the path for /id\d+
             // regardless of host (these are always App Store URLs)
             if scheme == "itms-apps" || scheme == "itms" {
-                if let range = url.absoluteString.range(of: #"id(\d+)"#, options: .regularExpression) {
-                    let match = url.absoluteString[range]
-                    return String(match.dropFirst(2)) // drop "id"
-                }
-                return nil
+                return capturedID(Self.appStoreIDRegex, in: url.absoluteString)
             }
 
             // For http/https, require known App Store hosts
             guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
                 return nil
             }
-            if let range = url.path.range(of: #"/id(\d+)"#, options: .regularExpression) {
-                let match = url.path[range]
-                return String(match.dropFirst(3)) // drop "/id"
-            }
-            return nil
+            return capturedID(Self.appStorePathIDRegex, in: url.path)
         }
 
         private static var coordinatorKey: UInt8 = 0
@@ -432,7 +436,6 @@ struct WebViewRepresentable: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
         let config = WKWebViewConfiguration()
 
         let contentController = WKUserContentController()
@@ -457,8 +460,6 @@ struct WebViewRepresentable: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
-        
-        SimulaTelemetry.shared.endSpan("WKWebViewColdStart")
         return webView
     }
 

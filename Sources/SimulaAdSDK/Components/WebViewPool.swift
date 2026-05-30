@@ -37,18 +37,16 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
 /// initializes WebKit, and brings up a Web Content process. By creating a web
 /// view *before* the user taps a game (when the menu opens), that cost overlaps
 /// with menu browsing and the `getMinigame` network round-trip instead of being
-/// paid serially right before the game must appear. All web views also share a
-/// single `WKProcessPool` so they reuse process infrastructure.
+/// paid serially right before the game must appear.
+///
+/// (WebKit manages Web Content process sharing automatically on iOS 15+, so no
+/// explicit `WKProcessPool` is needed — the win here is the prewarm handoff.)
 @MainActor
 final class WebViewPool {
     static let shared = WebViewPool()
 
     /// JS → native channel name. Must match the injected script below.
     static let messageHandlerName = "simulaSDK"
-
-    /// Shared so every SDK web view reuses one Web Content process pool rather
-    /// than each spinning up its own.
-    private let processPool = WKProcessPool()
 
     private struct Pooled {
         let webView: WKWebView
@@ -86,7 +84,6 @@ final class WebViewPool {
         controller.addUserScript(WebViewPool.postMessageScript)
 
         let config = WKWebViewConfiguration()
-        config.processPool = processPool
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.userContentController = controller
@@ -107,23 +104,20 @@ final class WebViewPool {
     /// never reaches the consumer's load callbacks.
     func prewarm() {
         guard idle.count < maxIdle else { return }
-        SimulaTelemetry.shared.startSpan("WKWebViewPrewarm")
         let pooled = makePooled()
         if let blank = URL(string: "about:blank") {
             pooled.webView.load(URLRequest(url: blank))
         }
         idle.append(pooled)
-        SimulaTelemetry.shared.endSpan("WKWebViewPrewarm", additionalInfo: "idle: \(idle.count)")
     }
 
     /// Returns a web view wired to `delegate` and `onMessage`, reusing a
-    /// prewarmed one when available. Schedules a refill so the next acquire is
-    /// also warm. `wasPooled` indicates whether a warm view was reused.
+    /// prewarmed one when available. Schedules a refill so the next acquire
+    /// (e.g. the post-game ad) is also warm.
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (String) -> Void
-    ) -> (webView: WKWebView, wasPooled: Bool) {
-        let wasPooled = !idle.isEmpty
+    ) -> WKWebView {
         let pooled = idle.popLast() ?? makePooled()
 
         pooled.forwarder.onMessage = onMessage
@@ -134,7 +128,7 @@ final class WebViewPool {
         // the following one (e.g. the post-game ad) is also warm.
         Task { @MainActor [weak self] in self?.prewarm() }
 
-        return (pooled.webView, wasPooled)
+        return pooled.webView
     }
 }
 #endif

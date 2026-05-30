@@ -491,7 +491,6 @@ public struct MiniGameMenu: View {
 
         if !adFetched, let adId = currentAdId {
             adLoading = true
-            SimulaTelemetry.shared.startSpan("AdTimeToShow")
             Task {
                 do {
                     let iframeUrl = try await api.fetchAdForMinigame(aid: adId)
@@ -501,15 +500,11 @@ public struct MiniGameMenu: View {
                             self.adIframeUrl = url
                             self.adFetched = true
                             self.showAdOverlay = true
-                            SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "adId: \(adId)")
-                        } else {
-                            SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "Failed: no ad url")
                         }
                     }
                 } catch {
                     await MainActor.run {
                         adLoading = false
-                        SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "Failed: \(error.localizedDescription)")
                     }
                 }
             }
@@ -524,7 +519,6 @@ public struct MiniGameMenu: View {
     private func loadCatalog() async {
         catalogLoading = true
         catalogError = false
-        SimulaTelemetry.shared.startSpan("LoadCatalog")
         do {
             let response = try await api.fetchCatalog()
 
@@ -535,7 +529,6 @@ public struct MiniGameMenu: View {
                 self.games = response.games
                 self.menuId = response.menuId.isEmpty ? nil : response.menuId
                 self.catalogLoading = false
-                SimulaTelemetry.shared.endSpan("LoadCatalog", additionalInfo: "Games fetched: \(response.games.count)")
             }
 
             // Warm the cover cache to smooth subsequent scrolling. The grid is
@@ -554,7 +547,6 @@ public struct MiniGameMenu: View {
                 self.games = []
                 self.menuId = nil
                 self.catalogLoading = false
-                SimulaTelemetry.shared.endSpan("LoadCatalog", additionalInfo: "Failed: \(error.localizedDescription)")
             }
         }
     }
