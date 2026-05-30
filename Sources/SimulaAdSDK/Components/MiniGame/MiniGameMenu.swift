@@ -345,9 +345,7 @@ public struct MiniGameMenu: View {
                         )
                         .frame(width: 80, height: 80)
 
-                    if let imageUrl = Bundle.module.url(forResource: "game_icon", withExtension: "png"),
-                       let imageData = try? Data(contentsOf: imageUrl),
-                       let uiImage = platformImage(from: imageData) {
+                    if let uiImage = BundledImageCache.image(named: "game_icon") {
                         Image(platformImage: uiImage)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
@@ -415,9 +413,7 @@ public struct MiniGameMenu: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if catalogError {
             VStack(spacing: 16) {
-                if let imageUrl = Bundle.module.url(forResource: "games_unavailable", withExtension: "png"),
-                   let imageData = try? Data(contentsOf: imageUrl),
-                   let uiImage = platformImage(from: imageData) {
+                if let uiImage = BundledImageCache.image(named: "games_unavailable") {
                     Image(platformImage: uiImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
@@ -471,7 +467,6 @@ public struct MiniGameMenu: View {
             }
         }
 
-        handleClose()
         selectedGameId = gameId
         showGameIframe = true
         adFetched = false
@@ -488,6 +483,7 @@ public struct MiniGameMenu: View {
 
         if !adFetched, let adId = currentAdId {
             adLoading = true
+            SimulaTelemetry.shared.startSpan("AdTimeToShow")
             Task {
                 do {
                     let iframeUrl = try await api.fetchAdForMinigame(aid: adId)
@@ -497,11 +493,15 @@ public struct MiniGameMenu: View {
                             self.adIframeUrl = url
                             self.adFetched = true
                             self.showAdOverlay = true
+                            SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "adId: \(adId)")
+                        } else {
+                            SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "Failed: no ad url")
                         }
                     }
                 } catch {
                     await MainActor.run {
                         adLoading = false
+                        SimulaTelemetry.shared.endSpan("AdTimeToShow", additionalInfo: "Failed: \(error.localizedDescription)")
                     }
                 }
             }
@@ -513,42 +513,40 @@ public struct MiniGameMenu: View {
         adIframeUrl = nil
     }
 
-    // MARK: - Bundled Image Helpers
-
-    private func platformImage(from data: Data) -> PlatformImage? {
-        #if os(iOS)
-        return UIImage(data: data)
-        #elseif os(macOS)
-        return NSImage(data: data)
-        #else
-        return nil
-        #endif
-    }
-
     private func loadCatalog() async {
         catalogLoading = true
         catalogError = false
+        SimulaTelemetry.shared.startSpan("LoadCatalog")
         do {
             let response = try await api.fetchCatalog()
 
-            // Preload all cover images before showing grid (matching Kotlin's awaitAll)
+            // Show the grid immediately. Each card lazy-loads its own cover via
+            // CachedCoverImage, so we no longer block the menu on downloading and
+            // decoding every cover (GIFs included) up front.
+            await MainActor.run {
+                self.games = response.games
+                self.menuId = response.menuId.isEmpty ? nil : response.menuId
+                self.catalogLoading = false
+                SimulaTelemetry.shared.endSpan("LoadCatalog", additionalInfo: "Games fetched: \(response.games.count)")
+            }
+
+            // Warm the cover cache to smooth subsequent scrolling. The grid is
+            // already visible, so this only runs after the fact. We await it
+            // (rather than detaching) so it inherits this task's cancellation:
+            // if the menu closes mid-load, the in-flight downloads are cancelled
+            // instead of running to completion in the background.
             let coverUrls = response.games.compactMap { game -> String? in
                 let url = game.gifCover ?? game.iconUrl
                 return url.isEmpty ? nil : url
             }
             await CoverImageCache.shared.preload(urls: coverUrls)
-
-            await MainActor.run {
-                self.games = response.games
-                self.menuId = response.menuId.isEmpty ? nil : response.menuId
-                self.catalogLoading = false
-            }
         } catch {
             await MainActor.run {
                 self.catalogError = true
                 self.games = []
                 self.menuId = nil
                 self.catalogLoading = false
+                SimulaTelemetry.shared.endSpan("LoadCatalog", additionalInfo: "Failed: \(error.localizedDescription)")
             }
         }
     }

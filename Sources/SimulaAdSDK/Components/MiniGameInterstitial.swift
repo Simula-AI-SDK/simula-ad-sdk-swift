@@ -1,23 +1,5 @@
 import SwiftUI
 
-// MARK: - Platform Image Helpers (for bundled assets)
-
-#if os(iOS)
-private typealias InterstitialPlatformImage = UIImage
-private extension Image {
-    init(interstitialPlatformImage: UIImage) {
-        self.init(uiImage: interstitialPlatformImage)
-    }
-}
-#elseif os(macOS)
-private typealias InterstitialPlatformImage = NSImage
-private extension Image {
-    init(interstitialPlatformImage: NSImage) {
-        self.init(nsImage: interstitialPlatformImage)
-    }
-}
-#endif
-
 // MARK: - MiniGameInterstitial
 
 /// A full-screen interstitial overlay that invites the user to play a game.
@@ -209,11 +191,8 @@ public struct MiniGameInterstitial: View {
     /// Loads the bundled interstitial background image, falling back to solid color.
     @ViewBuilder
     private var bundledBackgroundImage: some View {
-        #if os(iOS) || os(macOS)
-        if let imageUrl = Bundle.module.url(forResource: "minigame_interstitial_background", withExtension: "png"),
-           let imageData = try? Data(contentsOf: imageUrl),
-           let platformImg = InterstitialPlatformImage(data: imageData) {
-            Image(interstitialPlatformImage: platformImg)
+        if let platformImg = BundledImageCache.image(named: "minigame_interstitial_background") {
+            Image(platformImage: platformImg)
                 .resizable()
                 .scaledToFill()
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
@@ -221,9 +200,6 @@ public struct MiniGameInterstitial: View {
         } else {
             Color(hex: "#1a1a2e")
         }
-        #else
-        Color(hex: "#1a1a2e")
-        #endif
     }
 
     // MARK: - Character Circle (matching React's circular character image with fallback)

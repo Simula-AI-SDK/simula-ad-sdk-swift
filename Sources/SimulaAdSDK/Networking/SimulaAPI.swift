@@ -151,8 +151,24 @@ public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
     private let decoder: JSONDecoder
 
-    public init(session: URLSession = .shared) {
-        self.session = session
+    /// Shared session tuned for the ad path. The default `URLSession.shared`
+    /// uses a 60s request timeout, which would let a hung ad/init request stall
+    /// the experience. These tighter limits fail fast instead.
+    private static let defaultSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
+        config.timeoutIntervalForResource = 20  // overall ceiling for one resource
+        config.waitsForConnectivity = false     // fail fast when offline
+        return URLSession(configuration: config)
+    }()
+
+    /// Cached ISO-8601 formatter. `ISO8601DateFormatter` construction is costly,
+    /// and the viewport tracking calls would otherwise allocate one per event.
+    /// `string(from:)` is thread-safe, so a single shared instance is fine.
+    private static let iso8601Formatter = ISO8601DateFormatter()
+
+    public init(session: URLSession? = nil) {
+        self.session = session ?? SimulaAPI.defaultSession
         self.decoder = JSONDecoder()
     }
 
@@ -426,7 +442,7 @@ public final class SimulaAPI: @unchecked Sendable {
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         let body: [String: Any] = [
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
@@ -445,7 +461,7 @@ public final class SimulaAPI: @unchecked Sendable {
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         let body: [String: Any] = [
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 

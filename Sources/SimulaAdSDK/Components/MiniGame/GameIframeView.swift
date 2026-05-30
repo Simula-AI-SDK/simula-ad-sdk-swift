@@ -157,8 +157,12 @@ public struct GameIframeView: View {
                         } else if let urlString = iframeUrl, let url = URL(string: urlString) {
                             WebViewRepresentable(
                                 url: url,
+                                onNavigationFinished: {
+                                    SimulaTelemetry.shared.endSpan("TimeToPlayable", additionalInfo: "gameId: \(gameId)")
+                                },
                                 onNavigationFailed: { _ in
                                     self.error = "Failed to load game. Please try again."
+                                    SimulaTelemetry.shared.endSpan("TimeToPlayable", additionalInfo: "Failed loading url")
                                 },
                                 onMessageReceived: { _ in }
                             )
@@ -205,6 +209,7 @@ public struct GameIframeView: View {
         .task {
             currentHeight = calculateInitialHeight()
             appeared = true
+            SimulaTelemetry.shared.startSpan("TimeToPlayable")
             await loadMinigame()
         }
     }

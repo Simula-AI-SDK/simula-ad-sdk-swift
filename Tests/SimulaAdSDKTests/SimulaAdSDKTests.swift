@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import SimulaAdSDK
 
 final class SimulaAdSDKTests: XCTestCase {
@@ -26,7 +27,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testThemeDefaults() {
         let theme = MiniGameTheme()
-        XCTAssertEqual(theme.resolvedBackgroundColor, "#FFFFFF")
+        XCTAssertEqual(theme.resolvedBackgroundColor, "#0b0b0f")
         XCTAssertEqual(theme.resolvedAccentColor, "#3B82F6")
         XCTAssertEqual(theme.resolvedIconCornerRadius, 8)
     }

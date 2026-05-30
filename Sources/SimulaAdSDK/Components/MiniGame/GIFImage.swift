@@ -74,6 +74,10 @@ final class CoverImageCache {
             queue.sync { cache[url] = result }
             return result
         } catch {
+            // If the surrounding task was cancelled (e.g. the menu closed
+            // mid-preload), don't poison the cache with a failure — leave the
+            // URL uncached so it retries the next time a card requests it.
+            if Task.isCancelled { return .failed }
             let result = CoverImage.failed
             queue.sync { cache[url] = result }
             return result

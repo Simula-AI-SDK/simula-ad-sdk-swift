@@ -45,6 +45,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
+        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -83,6 +84,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
 
+        SimulaTelemetry.shared.endSpan("WKWebViewColdStart")
         return webView
     }
 
@@ -213,11 +215,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                     } else {
                         self.presentSafari(url: finalURL)
                     }
+                    // Release the resolver and its (now-invalidated) session.
+                    self.activeResolver = nil
                 }
             }
             // Keep a strong reference so it isn't deallocated during the request
             self.activeResolver = resolver
             let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+            resolver.session = session
             session.dataTask(with: URLRequest(url: url)).resume()
         }
 
@@ -358,6 +363,10 @@ struct WebViewRepresentable: UIViewRepresentable {
 /// SKStoreProductViewController or SFSafariViewController.
 private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
     let completion: (URL) -> Void
+    /// The session driving this resolution. Held so it can be invalidated on
+    /// completion: a delegate-based URLSession otherwise retains its delegate
+    /// (and an operation-queue thread) indefinitely until `invalidate` is called.
+    var session: URLSession?
     private var completed = false
 
     init(completion: @escaping (URL) -> Void) {
@@ -402,6 +411,9 @@ private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionData
     private func finish(with url: URL) {
         guard !completed else { return }
         completed = true
+        // Allow the in-flight task to finish, then tear down the session so its
+        // delegate (self) and backing thread are released.
+        session?.finishTasksAndInvalidate()
         completion(url)
     }
 }
@@ -434,6 +446,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
+        SimulaTelemetry.shared.startSpan("WKWebViewColdStart")
         let config = WKWebViewConfiguration()
 
         let contentController = WKUserContentController()
@@ -458,6 +471,8 @@ struct WebViewRepresentable: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        
+        SimulaTelemetry.shared.endSpan("WKWebViewColdStart")
         return webView
     }
 
