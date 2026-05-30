@@ -303,7 +303,7 @@ public struct MiniGameMenu: View {
                         .fill(Color.white.opacity(0.08))
 
                     if !imageError, !charImage.isEmpty {
-                        AsyncImage(url: URL(string: charImage)) { phase in
+                        CachedAsyncImage(url: URL(string: charImage)) { phase in
                             switch phase {
                             case .success(let image):
                                 image

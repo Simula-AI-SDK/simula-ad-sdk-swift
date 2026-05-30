@@ -373,6 +373,9 @@ struct CachedCoverImage: View {
         }
     }
 
+    /// `@MainActor` so the `@State` writes after each `await` resume on the main
+    /// thread (the cache resumes on a background executor otherwise).
+    @MainActor
     private func loadImage() async {
         // Try gifCover first
         if let gif = gifCover, !gif.isEmpty {

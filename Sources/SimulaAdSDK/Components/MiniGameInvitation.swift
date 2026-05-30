@@ -173,7 +173,7 @@ public struct MiniGameInvitation: View {
 
         VStack {
             if !imageError {
-                AsyncImage(url: URL(string: charImage)) { phase in
+                CachedAsyncImage(url: URL(string: charImage)) { phase in
                     switch phase {
                     case .success(let image):
                         image
