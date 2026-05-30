@@ -75,7 +75,22 @@ final class CoverImageCache: @unchecked Sendable {
     private let lock = NSLock()
     private var inFlight: [String: InFlight] = [:]
 
-    private init() {}
+    private init() {
+        // Drop all decoded covers under system memory pressure. NSCache evicts on
+        // its own, but this is a prompt, explicit belt-and-suspenders alongside
+        // the cost limit — relevant with multi-frame GIFs held in memory.
+        // (Block-based observer because this isn't an NSObject; the cache is a
+        // lifelong singleton, so no removeObserver is needed.)
+        #if os(iOS)
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.clearCache()
+        }
+        #endif
+    }
 
     /// Preload multiple URLs in parallel. Completes when all are cached.
     func preload(urls: [String]) async {
