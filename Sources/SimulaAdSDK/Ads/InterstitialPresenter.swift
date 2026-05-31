@@ -17,6 +17,9 @@ import UIKit
 final class InterstitialPresenter {
     private var window: UIWindow?
     private var onClose: (() -> Void)?
+    /// The host's key window, captured before we take key. Restored on dismiss so
+    /// the host regains touch/keyboard focus (a new key window doesn't auto-revert).
+    private weak var originalKeyWindow: UIWindow?
 
     /// Presents the teaser. `onClick` fires when the CTA is tapped (CLICKED);
     /// `onClose` fires once the window has been torn down (CLOSED).
@@ -67,6 +70,9 @@ final class InterstitialPresenter {
         let hosting = UIHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 
+        // Remember who held key so we can hand it back on dismiss.
+        originalKeyWindow = scene.keyWindow
+
         let window = UIWindow(windowScene: scene)
         window.windowLevel = .normal + 1
         window.backgroundColor = .clear
@@ -80,6 +86,9 @@ final class InterstitialPresenter {
         window?.isHidden = true
         window?.rootViewController = nil
         window = nil
+        // Restore the host's key window so it regains touch/keyboard focus.
+        originalKeyWindow?.makeKey()
+        originalKeyWindow = nil
         let callback = onClose
         onClose = nil
         callback?()

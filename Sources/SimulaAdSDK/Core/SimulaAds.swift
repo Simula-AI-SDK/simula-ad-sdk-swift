@@ -22,6 +22,11 @@ import Foundation
 /// interstitial.delegate = self
 /// interstitial.load()
 /// ```
+///
+/// Main-actor isolated: the shared mutable state (`shared`) is only ever touched
+/// on the main thread, which keeps it free of data races under strict concurrency.
+/// Call `initialize` from the main thread (app launch is already on it).
+@MainActor
 public enum SimulaAds {
     /// The shared provider built by `initialize`. `nil` until initialization.
     /// Imperative ads read the session and API key from here.
@@ -74,7 +79,8 @@ public enum SimulaAds {
         shared = provider
 
         // Warm the session so the first `load()` doesn't pay session creation.
-        Task { @MainActor in
+        // Inherits the main actor from the enclosing `@MainActor` context.
+        Task {
             await provider.createSession()
         }
     }
