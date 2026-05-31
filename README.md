@@ -80,7 +80,7 @@ struct ChatView: View {
 
 ### 3. Invitation Components
 
-The SDK provides three invite components for triggering the game menu:
+The SDK provides two declarative invite components for triggering the game menu:
 
 ```swift
 // CTA Button with pulsating animation
@@ -93,15 +93,76 @@ MiniGameInvitation(
     onClick: { showGames = true },
     onClose: { showInvitation = false }
 )
-
-// Full-screen interstitial overlay
-MiniGameInterstitial(
-    charImage: "https://example.com/avatar.png",
-    isOpen: showInterstitial,
-    onClick: { showGames = true },
-    onClose: { showInterstitial = false }
-)
 ```
+
+### 4. Interstitial Ad (Imperative)
+
+The interstitial is a preloadable full-screen ad with a standard load/show
+lifecycle. Initialize the SDK once, preload with `load()`, then present with
+`show(...)`. Showing presents an invite teaser
+(`DISPLAYED`); tapping its CTA (`CLICKED`) opens the game menu → game →
+post-game ad. The teaser + menu + game + ad together are the ad unit.
+
+```swift
+import SimulaAdSDK
+
+// 1. Initialize once at launch (does not require SimulaProviderView).
+SimulaAds.initialize(apiKey: "YOUR_API_KEY", devMode: true)
+
+// 2. Create, configure, and preload.
+final class GameAds: SimulaInterstitialAdDelegate {
+    let interstitial = SimulaInterstitialAd(adUnitId: "your_placement_id")
+
+    init() {
+        interstitial.delegate = self
+        interstitial.load()
+    }
+
+    func showGame() {
+        interstitial.show(
+            charID: "char_123",
+            charName: "Luna",
+            charImage: "https://example.com/avatar.png",
+            charDesc: "A playful companion"
+        )
+    }
+
+    // 3. Lifecycle events (all optional):
+    func interstitialDidLoad(_ ad: SimulaInterstitialAd) { /* ready to show */ }
+    func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
+    func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
+    func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
+    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* CTA tapped → menu opens */ }
+    func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
+}
+```
+
+**Lifecycle notes**
+
+- A single load is in flight per instance; the next ad is preloaded automatically
+  after `CLOSED`.
+- `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called.
+- The teaser is configurable via `invitationText`, `ctaText`, `backgroundImage`,
+  and `inviteTheme` (`MiniGameInterstitialTheme`). The menu is themed via `theme`
+  (`MiniGameTheme`); `messages`, `maxGamesToShow`, and `delegateChar` are also
+  configurable on the instance.
+- `EARNED_REWARD` / `REWARD_VERIFICATION_FAILED` and `minPlayThreshold` are reserved
+  for an upcoming reward feature and are not active yet.
+- Imperative presentation is iOS-only; on other platforms `show(...)` reports
+  `DISPLAY_FAILED(.unsupportedPlatform)`.
+
+| Event | Delegate method |
+|-------|-----------------|
+| LOADED | `interstitialDidLoad(_:)` |
+| LOAD_FAILED | `interstitialDidFailToLoad(_:error:)` |
+| DISPLAYED | `interstitialDidDisplay(_:)` |
+| DISPLAY_FAILED | `interstitialDidFailToDisplay(_:error:)` |
+| CLICKED | `interstitialDidClick(_:)` |
+| CLOSED | `interstitialDidClose(_:)` |
+| EARNED_REWARD\* | `interstitialDidEarnReward(_:)` |
+| REWARD_VERIFICATION_FAILED\* | `interstitialRewardVerificationDidFail(_:)` |
+
+\* Reserved — not emitted yet.
 
 ## Components
 
@@ -111,7 +172,8 @@ MiniGameInterstitial(
 | `MiniGameMenu` | Modal game catalog with search, pagination, and ad display. Requires `onClose` callback. |
 | `MiniGameButton` | Animated CTA button to launch the game menu |
 | `MiniGameInvitation` | Slide-in banner card with character image |
-| `MiniGameInterstitial` | Full-screen overlay invitation |
+| `SimulaAds` | Global entry point — `initialize(apiKey:)` for the imperative API |
+| `SimulaInterstitialAd` | Imperative preloadable full-screen interstitial ad |
 
 ## Theming
 
@@ -135,7 +197,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, `MiniGameButtonTheme`, and `MiniGameInterstitialTheme` for all available properties.
+See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` themes its invite teaser via `MiniGameInterstitialTheme` (the `inviteTheme` property) and its game menu via `MiniGameTheme` (the `theme` property).
 
 ## Privacy & App Store Compliance
 

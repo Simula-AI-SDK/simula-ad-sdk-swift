@@ -13,10 +13,50 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testMiniGameInviteKitTypes() {
-        // Verify that the MiniGameInviteKit namespace correctly aliases types
+        // Verify that the MiniGameInviteKit namespace correctly aliases types.
+        // The interstitial is no longer part of the namespace — it is the
+        // imperative `SimulaInterstitialAd` (see interstitial tests below).
         XCTAssertTrue(MiniGameInviteKit.Invitation.self == MiniGameInvitation.self)
         XCTAssertTrue(MiniGameInviteKit.Button.self == MiniGameButton.self)
-        XCTAssertTrue(MiniGameInviteKit.Interstitial.self == MiniGameInterstitial.self)
+    }
+
+    // MARK: - Imperative interstitial (SimulaInterstitialAd) state guards
+
+    @MainActor
+    func testLoadBeforeInitFiresLoadFailedNotInitialized() {
+        // This test assumes the SDK has not been initialized in the test process
+        // (no test calls SimulaAds.initialize), so load() must fail fast.
+        XCTAssertFalse(SimulaAds.isInitialized, "Test assumes SimulaAds is not initialized")
+
+        let delegate = InterstitialMockDelegate()
+        let ad = SimulaInterstitialAd(adUnitId: "test_unit")
+        ad.delegate = delegate
+
+        ad.load()
+
+        guard case .notInitialized? = delegate.loadFailedError else {
+            return XCTFail("Expected .notInitialized, got \(String(describing: delegate.loadFailedError))")
+        }
+    }
+
+    @MainActor
+    func testShowBeforeLoadFiresDisplayFailedNotReady() {
+        let delegate = InterstitialMockDelegate()
+        let ad = SimulaInterstitialAd(adUnitId: "test_unit")
+        ad.delegate = delegate
+
+        ad.show(charID: "c1", charName: "Char", charImage: "https://example.com/i.png")
+
+        guard case .notReady? = delegate.displayFailedError else {
+            return XCTFail("Expected .notReady, got \(String(describing: delegate.displayFailedError))")
+        }
+    }
+
+    @MainActor
+    func testInterstitialStoresConfiguration() {
+        let ad = SimulaInterstitialAd(adUnitId: "unit_42", minPlayThreshold: 5)
+        XCTAssertEqual(ad.adUnitId, "unit_42")
+        XCTAssertEqual(ad.minPlayThreshold, 5)
     }
 
     func testMaxGamesToShowValues() {
@@ -91,5 +131,21 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testParseCatalogInvalidJSONThrows() {
         XCTAssertThrowsError(try parseCatalog(data("not json")))
+    }
+}
+
+// MARK: - Test doubles
+
+/// Captures the most recent failure events from a `SimulaInterstitialAd`.
+final class InterstitialMockDelegate: SimulaInterstitialAdDelegate {
+    var loadFailedError: SimulaAdError?
+    var displayFailedError: SimulaAdError?
+
+    func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {
+        loadFailedError = error
+    }
+
+    func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {
+        displayFailedError = error
     }
 }

@@ -1,25 +1,24 @@
 // SimulaAdSDK — Public API Surface
-// Translates `index.ts` from the React SDK.
 //
-// All public types and views are exported from their respective files.
-// This file provides the MiniGameInviteKit namespace for grouped access,
-// matching React's:
-//   export const MiniGameInviteKit = { Invitation, Button, Interstitial }
+// The mini-game invite components (Invitation, Button) are exported from their
+// respective files. The interstitial is an imperative ad (`SimulaInterstitialAd`),
+// initialized via `SimulaAds.initialize(apiKey:)` — see those types.
 
 import SwiftUI
 
-// MARK: - MiniGameInviteKit (matching React's grouped export)
+// MARK: - MiniGameInviteKit (grouped access for the declarative invite components)
 
-/// Grouped access to mini game invite components.
+/// Grouped access to the declarative mini game invite components.
 ///
 /// Usage:
 /// ```swift
 /// MiniGameInviteKit.Invitation(...)
 /// MiniGameInviteKit.Button(...)
-/// MiniGameInviteKit.Interstitial(...)
 /// ```
+///
+/// The interstitial is no longer a declarative view. Use the imperative
+/// `SimulaInterstitialAd` (configured with `SimulaAds.initialize(apiKey:)`) instead.
 public enum MiniGameInviteKit {
     public typealias Invitation = MiniGameInvitation
     public typealias Button = MiniGameButton
-    public typealias Interstitial = MiniGameInterstitial
 }
