@@ -23,6 +23,10 @@ final class InterstitialPresenter {
 
     /// Presents the teaser. `onClick` fires when the CTA is tapped (CLICKED);
     /// `onClose` fires once the window has been torn down (CLOSED).
+    ///
+    /// - Returns: `true` if the overlay was presented; `false` if no window scene
+    ///   was available (in which case `onClose` is never called).
+    @discardableResult
     func present(
         provider: SimulaProvider,
         preloadedCatalog: CatalogResponse,
@@ -40,11 +44,10 @@ final class InterstitialPresenter {
         delegateChar: Bool,
         onClick: @escaping () -> Void,
         onClose: @escaping () -> Void
-    ) {
+    ) -> Bool {
         guard let scene = Self.activeWindowScene() else {
-            // No scene to present in — reset the ad immediately.
-            onClose()
-            return
+            // No scene to present in — caller decides how to surface this.
+            return false
         }
         self.onClose = onClose
 
@@ -79,6 +82,7 @@ final class InterstitialPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        return true
     }
 
     /// Tears down the presentation window and fires the CLOSED callback once.

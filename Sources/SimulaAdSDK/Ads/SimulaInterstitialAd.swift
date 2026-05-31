@@ -23,7 +23,7 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `DISPLAY_FAILED` — `show()` could not present the ad.
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError)
 
-    /// `CLICKED` — the user selected a game in the menu.
+    /// `CLICKED` — the user tapped the teaser CTA (which opens the game menu).
     func interstitialDidClick(_ ad: SimulaInterstitialAd)
 
     /// `EARNED_REWARD` — reserved for a future reward feature. Not emitted yet.
@@ -61,6 +61,8 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case notReady
     /// `show()` was called while an ad was already showing.
     case alreadyShowing
+    /// No active window scene was available to present in.
+    case noPresentationContext
     /// Imperative presentation is unavailable on this platform (iOS-only).
     case unsupportedPlatform
     /// An underlying networking error.
@@ -78,6 +80,8 @@ public enum SimulaAdError: LocalizedError, Sendable {
             return "No ad is ready. Call load() and wait for LOADED before show()."
         case .alreadyShowing:
             return "An interstitial is already being shown."
+        case .noPresentationContext:
+            return "No active window scene is available to present the ad."
         case .unsupportedPlatform:
             return "The imperative interstitial is only supported on iOS."
         case .network(let underlying):
@@ -266,10 +270,9 @@ public final class SimulaInterstitialAd {
         }
 
         let presenter = InterstitialPresenter()
-        self.presenter = presenter
         state = .showing
 
-        presenter.present(
+        let didPresent = presenter.present(
             provider: provider,
             preloadedCatalog: catalog,
             charID: charID,
@@ -298,6 +301,15 @@ public final class SimulaInterstitialAd {
             }
         )
 
+        guard didPresent else {
+            // Couldn't present (no window scene). Keep the loaded ad so the host
+            // can retry; report DISPLAY_FAILED without a bogus DISPLAYED/CLOSED.
+            state = .ready(catalog)
+            failDisplay(.noPresentationContext)
+            return
+        }
+
+        self.presenter = presenter
         delegate?.interstitialDidDisplay(self)
         #else
         failDisplay(.unsupportedPlatform)
