@@ -9,6 +9,9 @@ public struct GameCard: View {
     let game: GameData
     let theme: MiniGameTheme
     let onGameSelect: (String) -> Void
+    /// Whether this card should animate its (GIF) cover. The carousel sets this
+    /// only for the centered card so peripheral cards don't burn cycles.
+    var isActive: Bool = true
 
     private static let fallbackIcons = ["🎲", "🎮", "🎰", "🧩", "🎯"]
 
@@ -18,11 +21,13 @@ public struct GameCard: View {
     public init(
         game: GameData,
         theme: MiniGameTheme,
-        onGameSelect: @escaping (String) -> Void
+        onGameSelect: @escaping (String) -> Void,
+        isActive: Bool = true
     ) {
         self.game = game
         self.theme = theme
         self.onGameSelect = onGameSelect
+        self.isActive = isActive
         self._randomFallback = State(initialValue: Self.fallbackIcons.randomElement() ?? "🎮")
     }
 
@@ -40,7 +45,8 @@ public struct GameCard: View {
             CachedCoverImage(
                 gifCover: game.gifCover,
                 iconUrl: game.iconUrl,
-                fallbackEmoji: game.iconFallback ?? randomFallback
+                fallbackEmoji: game.iconFallback ?? randomFallback,
+                isAnimating: isActive
             )
 
             // Dark gradient overlay (matching Kotlin's verticalGradient colorStops exactly)

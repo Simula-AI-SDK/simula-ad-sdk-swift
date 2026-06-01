@@ -37,6 +37,11 @@ public final class SimulaProvider: ObservableObject {
     /// The server session ID, set after successful session creation
     @Published public private(set) var sessionId: String?
 
+    /// The in-flight session-creation task, if any. Lets concurrent callers
+    /// coalesce onto a single request instead of each firing their own.
+    /// Touched only from `@MainActor` methods.
+    private var sessionTask: Task<String?, Never>?
+
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
 
     /// Cache of fetched ads keyed by "slot:position"
@@ -81,17 +86,46 @@ public final class SimulaProvider: ObservableObject {
     /// Translates the `useEffect(() => { ensureSession() }, [...])` from SimulaProvider.tsx.
     @MainActor
     public func createSession() async {
+        _ = await ensureSession()
+    }
+
+    /// Returns a valid session id, creating one on demand if needed.
+    ///
+    /// - Returns the existing id immediately if a session already exists.
+    /// - Coalesces concurrent callers onto a single in-flight request, so a
+    ///   fast game tap during launch awaits the same session creation instead
+    ///   of racing it (previously this surfaced as "Session invalid").
+    /// - Retries on the next call after a failed attempt (the failed task is
+    ///   cleared), so a transient network error at launch no longer disables
+    ///   minigames for the whole app session.
+    @MainActor
+    @discardableResult
+    public func ensureSession() async -> String? {
+        if let sessionId, !sessionId.isEmpty { return sessionId }
+        if let sessionTask { return await sessionTask.value }
+
         let effectiveUserID = hasPrivacyConsent ? primaryUserID : nil
-        do {
-            let id = try await api.createSession(
-                apiKey: apiKey,
-                devMode: devMode,
-                primaryUserID: effectiveUserID
-            )
-            if let id = id {
-                self.sessionId = id
+        let task = Task<String?, Never> { [api, apiKey, devMode] in
+            do {
+                let id = try await api.createSession(
+                    apiKey: apiKey,
+                    devMode: devMode,
+                    primaryUserID: effectiveUserID
+                )
+                return (id?.isEmpty == false) ? id : nil
+            } catch {
+                return nil
             }
-        } catch { }
+        }
+        sessionTask = task
+
+        let id = await task.value
+        // Clear the task so a failed attempt can be retried on the next call.
+        sessionTask = nil
+        if let id, !id.isEmpty {
+            sessionId = id
+        }
+        return sessionId
     }
 
     // MARK: - Cache Key Helper

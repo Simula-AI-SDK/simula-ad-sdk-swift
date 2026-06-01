@@ -40,36 +40,125 @@ struct CreateSessionResponse: Decodable {
     let sessionId: String?
 }
 
-/// Response from GET /minigames/catalogv2
-struct CatalogAPIResponse: Decodable {
-    let menuId: String?
-    let catalog: CatalogData?
-    let data: [CatalogGameItem]?
-
-    enum CodingKeys: String, CodingKey {
-        case menuId = "menu_id"
-        case catalog
-        case data
+/// Wraps a decode so failure yields `nil` instead of throwing. Because its own
+/// `init` never throws, decoding it from an unkeyed container always advances
+/// the container — the basis for lossy array decoding below.
+private struct FailableDecodable<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws {
+        self.value = try? T(from: decoder)
     }
 }
 
-struct CatalogData: Decodable {
-    let data: [CatalogGameItem]?
-    // catalog might also be a direct array — handled separately
+/// Decodes a games array element-by-element, skipping any entry that fails to
+/// decode so a single malformed game can't drop the entire catalog.
+struct LossyCatalogItems: Decodable {
+    let items: [CatalogGameItem]
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var items: [CatalogGameItem] = []
+        while !container.isAtEnd {
+            let wrapped = try container.decode(FailableDecodable<CatalogGameItem>.self)
+            if let item = wrapped.value { items.append(item) }
+        }
+        self.items = items
+    }
 }
 
+/// A single game as returned by the catalog endpoint. `id`/`name` are required
+/// (a game missing either is dropped by `LossyCatalogItems`); everything else is
+/// optional. The cover may arrive as either `gif_cover` or `gifCover`.
 struct CatalogGameItem: Decodable {
     let id: String
     let name: String
     let icon: String?
     let description: String?
     let iconFallback: String?
+    let gifCover: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, icon, description, iconFallback
+        case gifCoverSnake = "gif_cover"
+        case gifCoverCamel = "gifCover"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.icon = try? c.decode(String.self, forKey: .icon)
+        self.description = try? c.decode(String.self, forKey: .description)
+        self.iconFallback = try? c.decode(String.self, forKey: .iconFallback)
+        self.gifCover = (try? c.decode(String.self, forKey: .gifCoverSnake))
+            ?? (try? c.decode(String.self, forKey: .gifCoverCamel))
+    }
+
+    func toGameData() -> GameData {
+        GameData(
+            id: id,
+            name: name,
+            iconUrl: icon ?? "",
+            description: description ?? "",
+            iconFallback: iconFallback,
+            gifCover: gifCover
+        )
+    }
+}
+
+/// The `catalog` field when it arrives as an object wrapping a `data` array.
+private struct CatalogDataObject: Decodable {
+    let data: LossyCatalogItems?
+}
+
+/// Top-level catalog response. `catalog` may be a direct array of games, an
+/// object with a `data` array, or absent (games then come from top-level `data`).
+struct CatalogAPIResponse: Decodable {
+    let menuId: String
+    let games: [CatalogGameItem]
+
+    enum CodingKeys: String, CodingKey {
+        case menuId = "menu_id"
+        case catalog
+        case data
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.menuId = (try? c.decode(String.self, forKey: .menuId)) ?? ""
+
+        if let array = try? c.decode(LossyCatalogItems.self, forKey: .catalog) {
+            self.games = array.items                       // catalog: [ … ]
+        } else if let object = try? c.decode(CatalogDataObject.self, forKey: .catalog) {
+            self.games = object.data?.items ?? []          // catalog: { data: [ … ] }
+        } else if let array = try? c.decode(LossyCatalogItems.self, forKey: .data) {
+            self.games = array.items                       // data: [ … ]
+        } else {
+            self.games = []
+        }
+    }
 }
 
 /// Internal catalog result matching React's CatalogResponse
 public struct CatalogResponse: Sendable {
     public let menuId: String
     public let games: [GameData]
+}
+
+/// Decodes a catalog response payload into a `CatalogResponse`.
+///
+/// Pure and testable. Tolerant of the shapes the server may return (object with
+/// `catalog` array / `catalog.data` / top-level `data`, or a bare array), and
+/// lossy per game so one bad entry can't drop the rest. Throws only when the
+/// payload is neither a JSON object nor array (e.g. malformed JSON), so genuine
+/// contract breaks surface as an error rather than a silently empty catalog.
+func parseCatalog(_ data: Data) throws -> CatalogResponse {
+    let decoder = JSONDecoder()
+    if let response = try? decoder.decode(CatalogAPIResponse.self, from: data) {
+        return CatalogResponse(menuId: response.menuId, games: response.games.map { $0.toGameData() })
+    }
+    // Some deployments return a bare array of games.
+    let items = try decoder.decode(LossyCatalogItems.self, from: data)
+    return CatalogResponse(menuId: "", games: items.items.map { $0.toGameData() })
 }
 
 /// Request body for POST /minigames/init
@@ -149,11 +238,25 @@ private struct MinigameAdResponse: Decodable {
 /// Centralized API client for all Simula endpoints (translates api.ts)
 public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
-    private let decoder: JSONDecoder
 
-    public init(session: URLSession = .shared) {
-        self.session = session
-        self.decoder = JSONDecoder()
+    /// Shared session tuned for the ad path. The default `URLSession.shared`
+    /// uses a 60s request timeout, which would let a hung ad/init request stall
+    /// the experience. These tighter limits fail fast instead.
+    private static let defaultSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
+        config.timeoutIntervalForResource = 20  // overall ceiling for one resource
+        config.waitsForConnectivity = false     // fail fast when offline
+        return URLSession(configuration: config)
+    }()
+
+    /// Cached ISO-8601 formatter. `ISO8601DateFormatter` construction is costly,
+    /// and the viewport tracking calls would otherwise allocate one per event.
+    /// `string(from:)` is thread-safe, so a single shared instance is fine.
+    private static let iso8601Formatter = ISO8601DateFormatter()
+
+    public init(session: URLSession? = nil) {
+        self.session = session ?? SimulaAPI.defaultSession
     }
 
     // MARK: - Common Headers
@@ -213,7 +316,7 @@ public final class SimulaAPI: @unchecked Sendable {
             return nil
         }
 
-        let json = try decoder.decode(CreateSessionResponse.self, from: data)
+        let json = try JSONDecoder().decode(CreateSessionResponse.self, from: data)
         if let sid = json.sessionId, !sid.isEmpty {
             return sid
         }
@@ -242,46 +345,8 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        // Parse flexibly to handle different response formats (matching api.ts logic)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let menuId = json["menu_id"] as? String ?? ""
-
-        var gamesList: [[String: Any]] = []
-
-        if let catalog = json["catalog"] {
-            if let catalogArray = catalog as? [[String: Any]] {
-                // catalog is a direct array
-                gamesList = catalogArray
-            } else if let catalogObj = catalog as? [String: Any],
-                      let catalogData = catalogObj["data"] as? [[String: Any]] {
-                // Nested: catalog.data
-                gamesList = catalogData
-            } else {
-                // Fallback
-                gamesList = json["data"] as? [[String: Any]] ?? []
-            }
-        } else {
-            gamesList = json["data"] as? [[String: Any]] ?? []
-        }
-
-        let games: [GameData] = gamesList.compactMap { game in
-            guard let id = game["id"] as? String,
-                  let name = game["name"] as? String else { return nil }
-            let iconUrl = game["icon"] as? String ?? ""
-            let description = game["description"] as? String ?? ""
-            let iconFallback = game["iconFallback"] as? String
-            let gifCover = (game["gif_cover"] as? String) ?? (game["gifCover"] as? String)
-            return GameData(
-                id: id,
-                name: name,
-                iconUrl: iconUrl,
-                description: description,
-                iconFallback: iconFallback,
-                gifCover: gifCover
-            )
-        }
-
-        return CatalogResponse(menuId: menuId, games: games)
+        // Decode flexibly into the SDK's CatalogResponse (see parseCatalog).
+        return try parseCatalog(data)
     }
 
     // MARK: - Init Minigame
@@ -326,7 +391,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try decoder.decode(MinigameAPIResponse.self, from: data)
+        let apiResponse = try JSONDecoder().decode(MinigameAPIResponse.self, from: data)
 
         guard let adResponse = apiResponse.adResponse,
               let adId = adResponse.adId,
@@ -365,7 +430,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try decoder.decode(MinigameAPIResponse.self, from: data)
+        let apiResponse = try JSONDecoder().decode(MinigameAPIResponse.self, from: data)
 
         if let adResponse = apiResponse.adResponse,
            let iframeUrl = adResponse.iframeUrl, !iframeUrl.isEmpty {
@@ -426,7 +491,7 @@ public final class SimulaAPI: @unchecked Sendable {
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         let body: [String: Any] = [
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
@@ -445,7 +510,7 @@ public final class SimulaAPI: @unchecked Sendable {
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         let body: [String: Any] = [
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 

@@ -45,45 +45,20 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        // Add message handler for game→SDK communication (equivalent to window.postMessage listener)
-        let contentController = WKUserContentController()
-        contentController.add(context.coordinator, name: "simulaSDK")
-
-        // Inject a script that forwards window.postMessage to our handler
-        let postMessageScript = WKUserScript(
-            source: """
-            window.addEventListener('message', function(event) {
-                if (event.data && typeof event.data === 'string') {
-                    window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
-                } else if (event.data && typeof event.data === 'object') {
-                    window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify(event.data));
-                }
-            });
-            """,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        )
-        contentController.addUserScript(postMessageScript)
-        config.userContentController = contentController
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator
-        webView.scrollView.isScrollEnabled = true
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-
+        // Pull a prewarmed web view from the pool when one is available so the
+        // expensive allocation / process spin-up was already paid off the
+        // critical path. The pool wires the shared process pool and the
+        // postMessage-forwarding script; we only attach this instance's
+        // coordinator (navigation/UI delegate) and message callback here.
+        //
         // Match the iframe sandbox attributes from React:
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
-
-        return webView
+        let coordinator = context.coordinator
+        return WebViewPool.shared.acquire(
+            delegate: coordinator,
+            onMessage: { [weak coordinator] body in coordinator?.onMessageReceived?(body) }
+        )
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
@@ -131,6 +106,21 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// - https://itunes.apple.com/app/id123456789
         /// - itms-apps://apps.apple.com/app/id123456789
         /// - itms-apps://itunes.apple.com/app/id123456789
+        // Precompiled once — `range(of:options:.regularExpression)` would compile
+        // the pattern on every navigation. Group 1 captures the numeric ID.
+        private static let appStoreIDRegex = try! NSRegularExpression(pattern: #"id(\d+)"#)
+        private static let appStorePathIDRegex = try! NSRegularExpression(pattern: #"/id(\d+)"#)
+
+        private func capturedID(_ regex: NSRegularExpression, in string: String) -> String? {
+            let range = NSRange(string.startIndex..., in: string)
+            guard let match = regex.firstMatch(in: string, range: range),
+                  match.numberOfRanges >= 2,
+                  let idRange = Range(match.range(at: 1), in: string) else {
+                return nil
+            }
+            return String(string[idRange])
+        }
+
         private func appStoreID(from url: URL) -> String? {
             let scheme = url.scheme?.lowercased() ?? ""
             let host = url.host?.lowercased() ?? ""
@@ -138,22 +128,14 @@ struct WebViewRepresentable: UIViewRepresentable {
             // For itms-apps:// and itms:// schemes, search the path for /id\d+
             // regardless of host (these are always App Store URLs)
             if scheme == "itms-apps" || scheme == "itms" {
-                if let range = url.absoluteString.range(of: #"id(\d+)"#, options: .regularExpression) {
-                    let match = url.absoluteString[range]
-                    return String(match.dropFirst(2)) // drop "id"
-                }
-                return nil
+                return capturedID(Self.appStoreIDRegex, in: url.absoluteString)
             }
 
             // For http/https, require known App Store hosts
             guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
                 return nil
             }
-            if let range = url.path.range(of: #"/id(\d+)"#, options: .regularExpression) {
-                let match = url.path[range]
-                return String(match.dropFirst(3)) // drop "/id"
-            }
-            return nil
+            return capturedID(Self.appStorePathIDRegex, in: url.path)
         }
 
         private static var coordinatorKey: UInt8 = 0
@@ -213,11 +195,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                     } else {
                         self.presentSafari(url: finalURL)
                     }
+                    // Release the resolver and its (now-invalidated) session.
+                    self.activeResolver = nil
                 }
             }
             // Keep a strong reference so it isn't deallocated during the request
             self.activeResolver = resolver
             let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+            resolver.session = session
             session.dataTask(with: URLRequest(url: url)).resume()
         }
 
@@ -236,15 +221,25 @@ struct WebViewRepresentable: UIViewRepresentable {
         // MARK: - WKNavigationDelegate
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Ignore the pool's prewarm load — only the real content load counts.
+            if webView.url?.absoluteString == "about:blank" { return }
             onNavigationFinished?()
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            if isCancelled(error) { return }
             onNavigationFailed?(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            // A cancelled provisional load happens when the real URL supersedes
+            // the prewarm's about:blank load; it isn't a genuine failure.
+            if isCancelled(error) { return }
             onNavigationFailed?(error)
+        }
+
+        private func isCancelled(_ error: Error) -> Bool {
+            (error as NSError).code == NSURLErrorCancelled
         }
 
         func webView(
@@ -358,6 +353,10 @@ struct WebViewRepresentable: UIViewRepresentable {
 /// SKStoreProductViewController or SFSafariViewController.
 private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
     let completion: (URL) -> Void
+    /// The session driving this resolution. Held so it can be invalidated on
+    /// completion: a delegate-based URLSession otherwise retains its delegate
+    /// (and an operation-queue thread) indefinitely until `invalidate` is called.
+    var session: URLSession?
     private var completed = false
 
     init(completion: @escaping (URL) -> Void) {
@@ -372,7 +371,8 @@ private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionData
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         guard let redirectURL = request.url else {
-            finish(with: task.currentRequest?.url ?? request.url!)
+            // request.url is nil here; never force-unwrap it.
+            finish(with: task.currentRequest?.url)
             completionHandler(nil)
             return
         }
@@ -393,16 +393,19 @@ private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionData
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // Chain completed (no more redirects) — use the final URL
-        if let finalURL = task.currentRequest?.url {
-            finish(with: finalURL)
-        }
+        // Terminal callback on every path (success or error). Always finish so
+        // the session is invalidated even when there's no final URL to route to.
+        finish(with: task.currentRequest?.url)
     }
 
-    private func finish(with url: URL) {
+    /// Terminates the resolution. Always invalidates the session — so its
+    /// delegate (self) and backing thread are released on every path — and
+    /// routes to `url` only when one is available.
+    private func finish(with url: URL?) {
         guard !completed else { return }
         completed = true
-        completion(url)
+        session?.finishTasksAndInvalidate()
+        if let url { completion(url) }
     }
 }
 

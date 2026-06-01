@@ -201,7 +201,7 @@ private struct MobileCarouselView: View {
         GeometryReader { geometry in
             // Use full screen height for sizing (matching Kotlin's LocalConfiguration.current.screenHeightDp)
             #if os(iOS)
-            let screenHeight = UIScreen.main.bounds.height
+            let screenHeight = simulaScreenSize().height
             #else
             let screenHeight = NSScreen.main?.frame.height ?? geometry.size.height
             #endif
@@ -229,7 +229,8 @@ private struct MobileCarouselView: View {
                         GameCard(
                             game: game,
                             theme: theme,
-                            onGameSelect: { id in onGameSelect(id, game.name) }
+                            onGameSelect: { id in onGameSelect(id, game.name) },
+                            isActive: cardOffset == 0
                         )
                         .frame(width: cardWidth, height: cardHeight)
                         .scaleEffect(scale)

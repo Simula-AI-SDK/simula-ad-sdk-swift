@@ -36,7 +36,7 @@ public struct AdOverlayView: View {
 
     private var screenHeight: CGFloat {
         #if os(iOS)
-        UIScreen.main.bounds.height
+        simulaScreenSize().height
         #else
         768
         #endif

@@ -63,7 +63,7 @@ public struct GameIframeView: View {
 
     private var screenHeight: CGFloat {
         #if os(iOS)
-        UIScreen.main.bounds.height
+        simulaScreenSize().height
         #else
         768
         #endif
@@ -202,6 +202,13 @@ public struct GameIframeView: View {
         .hideStatusBar(isBottomSheetMode ? isNearFullScreen : true)
         .opacity(appeared ? 1 : 0)
         .animation(.easeIn(duration: 0.2), value: appeared)
+        .onAppear {
+            // Backstop prewarm: warms a web view in parallel with the getMinigame
+            // network round-trip in case the pool was drained.
+            #if os(iOS)
+            WebViewPool.shared.prewarm()
+            #endif
+        }
         .task {
             currentHeight = calculateInitialHeight()
             appeared = true
@@ -224,16 +231,23 @@ public struct GameIframeView: View {
 
     /// Fetches the minigame iframe URL from the API.
     /// Translates the useEffect that calls `getMinigame()` in GameIframe.tsx.
+    /// `@MainActor` so the `@State` writes after the `await` resume on the main
+    /// thread (otherwise the URLSession continuation can land off-main).
+    @MainActor
     private func loadMinigame() async {
-        guard let sessionId = provider.sessionId, !sessionId.isEmpty else {
+        // Wait for the session to be ready (or retried) rather than failing the
+        // instant it isn't — a fast tap during launch, or a transient launch
+        // failure, no longer hard-fails the minigame.
+        guard let sessionId = await provider.ensureSession(), !sessionId.isEmpty else {
             error = "Session invalid, cannot initialize minigame"
             loading = false
             return
         }
 
         #if os(iOS)
-        let screenWidth = UIScreen.main.bounds.width
-        let screenHeight = UIScreen.main.bounds.height
+        let screenSize = simulaScreenSize()
+        let screenWidth = screenSize.width
+        let screenHeight = screenSize.height
         #else
         let screenWidth: CGFloat = 1024
         let screenHeight: CGFloat = 768

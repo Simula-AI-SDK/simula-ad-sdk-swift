@@ -180,6 +180,14 @@ public struct MiniGameMenu: View {
                     .onTapGesture { handleClose() }
                     .transition(.opacity)
                     .zIndex(1)
+                    .onAppear {
+                        // Warm a web view as soon as the menu opens so the game
+                        // (and post-game ad) load from a warm process instead of
+                        // paying cold-start right after the user taps.
+                        #if os(iOS)
+                        WebViewPool.shared.prewarm()
+                        #endif
+                    }
 
                 // Modal content
                 GeometryReader { geometry in
@@ -295,7 +303,7 @@ public struct MiniGameMenu: View {
                         .fill(Color.white.opacity(0.08))
 
                     if !imageError, !charImage.isEmpty {
-                        AsyncImage(url: URL(string: charImage)) { phase in
+                        CachedAsyncImage(url: URL(string: charImage)) { phase in
                             switch phase {
                             case .success(let image):
                                 image
@@ -345,9 +353,7 @@ public struct MiniGameMenu: View {
                         )
                         .frame(width: 80, height: 80)
 
-                    if let imageUrl = Bundle.module.url(forResource: "game_icon", withExtension: "png"),
-                       let imageData = try? Data(contentsOf: imageUrl),
-                       let uiImage = platformImage(from: imageData) {
+                    if let uiImage = BundledImageCache.image(named: "game_icon") {
                         Image(platformImage: uiImage)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
@@ -415,9 +421,7 @@ public struct MiniGameMenu: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if catalogError {
             VStack(spacing: 16) {
-                if let imageUrl = Bundle.module.url(forResource: "games_unavailable", withExtension: "png"),
-                   let imageData = try? Data(contentsOf: imageUrl),
-                   let uiImage = platformImage(from: imageData) {
+                if let uiImage = BundledImageCache.image(named: "games_unavailable") {
                     Image(platformImage: uiImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
@@ -471,7 +475,6 @@ public struct MiniGameMenu: View {
             }
         }
 
-        handleClose()
         selectedGameId = gameId
         showGameIframe = true
         adFetched = false
@@ -513,36 +516,31 @@ public struct MiniGameMenu: View {
         adIframeUrl = nil
     }
 
-    // MARK: - Bundled Image Helpers
-
-    private func platformImage(from data: Data) -> PlatformImage? {
-        #if os(iOS)
-        return UIImage(data: data)
-        #elseif os(macOS)
-        return NSImage(data: data)
-        #else
-        return nil
-        #endif
-    }
-
     private func loadCatalog() async {
         catalogLoading = true
         catalogError = false
         do {
             let response = try await api.fetchCatalog()
 
-            // Preload all cover images before showing grid (matching Kotlin's awaitAll)
-            let coverUrls = response.games.compactMap { game -> String? in
-                let url = game.gifCover ?? game.iconUrl
-                return url.isEmpty ? nil : url
-            }
-            await CoverImageCache.shared.preload(urls: coverUrls)
-
+            // Show the grid immediately. Each card lazy-loads its own cover via
+            // CachedCoverImage, so we no longer block the menu on downloading and
+            // decoding every cover (GIFs included) up front.
             await MainActor.run {
                 self.games = response.games
                 self.menuId = response.menuId.isEmpty ? nil : response.menuId
                 self.catalogLoading = false
             }
+
+            // Warm the cover cache to smooth subsequent scrolling. The grid is
+            // already visible, so this only runs after the fact. We await it
+            // (rather than detaching) so it inherits this task's cancellation:
+            // if the menu closes mid-load, the in-flight downloads are cancelled
+            // instead of running to completion in the background.
+            let coverUrls = response.games.compactMap { game -> String? in
+                let url = game.gifCover ?? game.iconUrl
+                return url.isEmpty ? nil : url
+            }
+            await CoverImageCache.shared.preload(urls: coverUrls)
         } catch {
             await MainActor.run {
                 self.catalogError = true
