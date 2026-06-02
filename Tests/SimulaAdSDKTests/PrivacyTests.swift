@@ -116,6 +116,14 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(store.currentSnapshot.gdprApplies, true)
     }
 
+    func testGppSidParsesArrayStringAndNumber() {
+        // CMPs write IABGPP_GppSID inconsistently: array, underscore string, or number.
+        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": [2, 6]])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2_6"])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2,6"])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": 2])).currentSnapshot.gppSid, "2")
+    }
+
     func testStorePurpose1Denied() {
         let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "0111"]))
         XCTAssertEqual(store.currentSnapshot.tcfPurpose1Consent, false)

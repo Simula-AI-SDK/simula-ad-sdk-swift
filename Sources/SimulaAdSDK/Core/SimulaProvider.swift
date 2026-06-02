@@ -105,7 +105,9 @@ public final class SimulaProvider: ObservableObject {
         SimulaPrivacy.shared.$snapshot
             .dropFirst()
             .removeDuplicates()
-            .receive(on: DispatchQueue.main)
+            // CMPs write the IAB keys in a burst; coalesce so a settled consent
+            // state triggers exactly one /session/create instead of a race.
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
                 Task { await self?.resyncSession() }
             }
@@ -270,6 +272,9 @@ public final class SimulaProvider: ObservableObject {
 public struct SimulaProviderView<Content: View>: View {
     @StateObject private var provider: SimulaProvider
     private let content: () -> Content
+    /// The resolved config, kept so prop changes can be pushed to the store —
+    /// `@StateObject` is initialized only once and ignores later init args.
+    private let resolvedConfig: SimulaPrivacyConfig
 
     public init(
         apiKey: String,
@@ -279,6 +284,9 @@ public struct SimulaProviderView<Content: View>: View {
         privacy: SimulaPrivacyConfig? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) {
+        var resolved = privacy ?? SimulaPrivacyConfig()
+        if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
+        self.resolvedConfig = resolved
         self._provider = StateObject(wrappedValue: SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,
@@ -294,6 +302,12 @@ public struct SimulaProviderView<Content: View>: View {
             .environmentObject(provider)
             .task {
                 await provider.createSession()
+            }
+            // Push privacy-prop changes into the store. SwiftUI does not re-init
+            // the @StateObject when the `privacy`/`hasPrivacyConsent` props change,
+            // so without this a host updating them at render time would be ignored.
+            .task(id: resolvedConfig) {
+                provider.updateConsent(resolvedConfig)
             }
     }
 }

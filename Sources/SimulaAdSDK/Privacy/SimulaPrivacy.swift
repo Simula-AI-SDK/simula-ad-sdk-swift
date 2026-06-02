@@ -267,11 +267,26 @@ public final class SimulaPrivacy: ObservableObject {
         return s == "1"
     }
 
-    /// `IABGPP_GppSID` is an underscore-separated string of section IDs (e.g.
-    /// `"2_6"`), or a bare Number for a single section. Normalize to comma-separated.
+    /// `IABGPP_GppSID` may arrive as an Array of section IDs (`[2, 6]`), an
+    /// underscore-/comma-separated String (`"2_6"`), or a single Number — CMPs
+    /// differ. Normalize them all to a comma-separated string.
     private func readGppSid() -> String? {
-        guard let s = coercedString(IABKey.gppSid) else { return nil }
-        return s.replacingOccurrences(of: "_", with: ",")
+        guard let obj = defaults.object(forKey: IABKey.gppSid) else { return nil }
+        if let array = obj as? [Any] {
+            let ids = array.compactMap { element -> String? in
+                if let n = element as? NSNumber { return n.stringValue }
+                if let s = element as? String, !s.isEmpty { return s }
+                return nil
+            }
+            return ids.isEmpty ? nil : ids.joined(separator: ",")
+        }
+        if let s = obj as? String {
+            return s.isEmpty ? nil : s.replacingOccurrences(of: "_", with: ",")
+        }
+        if let n = obj as? NSNumber {
+            return n.stringValue
+        }
+        return nil
     }
 
     /// TCF Purpose 1 consent = first character of `IABTCF_PurposeConsents` (a
