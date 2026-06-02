@@ -26,6 +26,10 @@ The `PrivacyInfo.xcprivacy` is bundled as a resource inside the `SimulaAdSDK` Sw
 | User Defaults | CA92.1 | Store consent state locally |
 | System Boot Time | 35F9.1 | Measure viewability timing |
 
+Collected data types declared: *Other Usage Data*, *Other Data* (contextual), and
+*Device ID* — all **not linked, not tracking** (temporary session IDs, not IDFA).
+IDFA is opt-in and declared at the app level only (see §4).
+
 ### Verification
 
 After building, check your app's privacy report:
@@ -146,43 +150,104 @@ Select "No" for all of these:
 
 ---
 
-## 4. ATT (App Tracking Transparency)
+## 4. ATT (App Tracking Transparency) & Consent
 
-### Do You Need ATT Permission?
+### Default: contextual, no ATT required
 
-**Likely NO** for Simula SDK because:
+Out of the box the SDK is **contextual-only**: it does **not** read the IDFA,
+does not track across apps, and its bundled `PrivacyInfo.xcprivacy` keeps
+`NSPrivacyTracking = false`. Most integrations need no ATT prompt.
 
-- We don't access IDFA
-- We don't track users across apps
-- We use contextual targeting (content-based, not user-based)
+### Passing consent signals (GDPR / CCPA / GPP / COPPA)
 
-### When ATT IS Required
+The SDK consumes — it does not gather — consent. Supply signals two ways:
 
-You need ATT permission if your app (not just Simula SDK) does ANY of:
+1. **Automatic (recommended).** If your app uses an IAB-registered CMP, the SDK
+   auto-reads the standard `UserDefaults` keys it writes (`IABTCF_TCString`,
+   `IABTCF_gdprApplies`, `IABTCF_PurposeConsents`, `IABUSPrivacy_String`,
+   `IABGPP_HDR_GppString`, `IABGPP_GppSID`) and refreshes when they change.
+2. **Explicit overrides** via `SimulaPrivacyConfig`:
 
-- Accesses IDFA via `ASIdentifierManager`
-- Uses other SDKs that track users
-- Shares user data with data brokers
-- Links user data across apps you don't own
+```swift
+SimulaProviderView(
+    apiKey: "your-key",
+    privacy: SimulaPrivacyConfig(
+        tcString: tc, uspString: usp, gppString: gpp,
+        coppaApplies: false
+    )
+) { ContentView() }
+```
 
-### If You Need ATT
+Refresh at runtime when your CMP updates (handle inside child views via
+`@EnvironmentObject var simula: SimulaProvider`):
 
-Add to `Info.plist`:
+```swift
+simula.updateConsent(tcString: newTC, gppString: newGPP)
+```
+
+`coppaApplies: true` suppresses the `ppid` and the IDFA regardless of ATT.
+
+### Enabling IDFA attribution (opt-in)
+
+IDFA collection is **off by default**. To turn it on:
+
+**1. Opt in** when configuring the provider:
+
+```swift
+SimulaProviderView(
+    apiKey: "your-key",
+    privacy: SimulaPrivacyConfig(enableAdvertisingId: true)
+) { ContentView() }
+```
+
+**2. Request authorization** (the SDK reads the IDFA only on `.authorized`):
+
+```swift
+// From your launch flow or a post-CMP callback:
+await simula.requestTrackingAuthorization()
+```
+
+**3. Add the usage string** to your app's `Info.plist`:
 
 ```xml
 <key>NSUserTrackingUsageDescription</key>
 <string>This allows us to show you relevant ads based on your interests.</string>
 ```
 
-And request permission in code:
+**4. Declare tracking at the APP level.** Because Apple's privacy manifest is
+static and the SDK keeps its bundled manifest contextual, when you enable IDFA
+you must add an **app-level** `PrivacyInfo.xcprivacy` (or merge into your
+existing one) declaring tracking + the IDFA data type:
 
-```swift
-import AppTrackingTransparency
-
-ATTrackingManager.requestTrackingAuthorization { status in
-    // Handle status
-}
+```xml
+<key>NSPrivacyTracking</key>
+<true/>
+<key>NSPrivacyTrackingDomains</key>
+<array>
+    <string>simula-api-701226639755.us-central1.run.app</string>
+</array>
+<key>NSPrivacyCollectedDataTypes</key>
+<array>
+    <dict>
+        <key>NSPrivacyCollectedDataType</key>
+        <string>NSPrivacyCollectedDataTypeDeviceID</string>
+        <key>NSPrivacyCollectedDataTypeLinked</key>
+        <false/>
+        <key>NSPrivacyCollectedDataTypeTracking</key>
+        <true/>
+        <key>NSPrivacyCollectedDataTypePurposes</key>
+        <array>
+            <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
+        </array>
+    </dict>
+</array>
 ```
+
+Then update your App Store Connect nutrition labels: **Data Used to Track You →
+Yes** for *Device ID*.
+
+> ⚠️ If you do **not** enable IDFA, change nothing here — the contextual default
+> keeps your app out of "tracking" territory.
 
 ---
 
@@ -255,7 +320,7 @@ To request data deletion, contact support@simula.ad.
 | Privacy Manifest | Included (automatic via SPM) | `PrivacyInfo.xcprivacy` |
 | SKAdNetwork | Recommended | `docs/SKAdNetworkItems.plist` |
 | App Privacy Labels | Required | App Store Connect |
-| ATT Permission | Not required | — |
+| ATT Permission | Not required by default | Opt-in for IDFA attribution (§4) |
 | Privacy Policy | Required | Your website |
 
 ---
