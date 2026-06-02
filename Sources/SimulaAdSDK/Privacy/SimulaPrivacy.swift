@@ -116,6 +116,7 @@ public final class SimulaPrivacy: ObservableObject {
         gppString: String? = nil,
         gppSid: String? = nil,
         gdprApplies: Bool? = nil,
+        tcfPurpose1Consent: Bool? = nil,
         coppaApplies: Bool? = nil,
         enableAdvertisingId: Bool? = nil
     ) {
@@ -127,12 +128,37 @@ public final class SimulaPrivacy: ObservableObject {
         if let gppString { c.gppString = gppString }
         if let gppSid { c.gppSid = gppSid }
         if let gdprApplies { c.gdprApplies = gdprApplies }
+        if let tcfPurpose1Consent { c.tcfPurpose1Consent = tcfPurpose1Consent }
         if let coppaApplies { c.coppaApplies = coppaApplies }
         if let enableAdvertisingId { c.enableAdvertisingId = enableAdvertisingId }
         explicitConfig = c
         if !c.enableAdvertisingId || c.coppaApplies { collectedAdvertisingId = nil }
         lock.unlock()
         refreshAdvertisingIdIfNeeded()
+        recompute()
+    }
+
+    /// Clears the named explicit consent overrides back to "unset". The store then
+    /// falls back to any auto-read IAB value (or `nil`). Unlike `update(...)`, where
+    /// `nil` means "leave unchanged", this is how you *remove* a signal you set.
+    public func clearConsent(
+        tcString: Bool = false,
+        uspString: Bool = false,
+        gppString: Bool = false,
+        gppSid: Bool = false,
+        gdprApplies: Bool = false,
+        tcfPurpose1Consent: Bool = false
+    ) {
+        lock.lock()
+        var c = explicitConfig
+        if tcString { c.tcString = nil }
+        if uspString { c.uspString = nil }
+        if gppString { c.gppString = nil }
+        if gppSid { c.gppSid = nil }
+        if gdprApplies { c.gdprApplies = nil }
+        if tcfPurpose1Consent { c.tcfPurpose1Consent = nil }
+        explicitConfig = c
+        lock.unlock()
         recompute()
     }
 
@@ -242,7 +268,7 @@ public final class SimulaPrivacy: ObservableObject {
             gppSid: cfg.gppSid ?? readGppSid(),
             gdprApplies: cfg.gdprApplies ?? readGdprApplies(),
             coppaApplies: cfg.coppaApplies,
-            tcfPurpose1Consent: readPurpose1Consent(),
+            tcfPurpose1Consent: cfg.tcfPurpose1Consent ?? readPurpose1Consent(),
             advertisingId: cfg.coppaApplies ? nil : adId,
             attStatus: att
         )

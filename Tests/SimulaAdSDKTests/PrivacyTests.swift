@@ -22,6 +22,7 @@ final class PrivacyTests: XCTestCase {
             tcString: "CPtc", uspString: "1YNN",
             gppString: "DBABgpp", gppSid: "2,6",
             gdprApplies: true, coppaApplies: false,
+            tcfPurpose1Consent: false,
             advertisingId: "AAAA"
         )
         let h = snap.consentHeaders()
@@ -30,6 +31,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(h["X-Simula-Consent-USP"], "1YNN")
         XCTAssertEqual(h["X-Simula-Consent-GPP"], "DBABgpp")
         XCTAssertEqual(h["X-Simula-Consent-GPP-SID"], "2,6")
+        XCTAssertEqual(h["X-Simula-Consent-Purpose1"], "0")
         XCTAssertEqual(h["X-Simula-COPPA"], "0")
         // The raw advertising id is intentionally NOT in headers (session body only).
         XCTAssertNil(h["X-Simula-IDFA"])
@@ -48,6 +50,7 @@ final class PrivacyTests: XCTestCase {
         let snap = ConsentSnapshot(
             hasPrivacyConsent: true, tcString: "CPtc",
             gdprApplies: true, coppaApplies: true,
+            tcfPurpose1Consent: true,
             advertisingId: "IDFA1", attStatus: 3
         )
         let b = snap.privacyBody()
@@ -55,6 +58,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(b["coppaApplies"] as? Bool, true)
         XCTAssertEqual(b["gdprApplies"] as? Int, 1)
         XCTAssertEqual(b["tcString"] as? String, "CPtc")
+        XCTAssertEqual(b["tcfPurpose1Consent"] as? Bool, true)
         XCTAssertEqual(b["attStatus"] as? Int, 3)
         XCTAssertEqual(b["idfa"] as? String, "IDFA1")
         XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: b))
@@ -138,10 +142,34 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(store.currentSnapshot.tcString, "EXPLICIT")
     }
 
+    func testExplicitPurpose1OverrideWinsOverIAB() {
+        // IAB says Purpose 1 granted ("1..."), explicit override denies it.
+        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "10000"]))
+        store.apply(SimulaPrivacyConfig(gdprApplies: true, tcfPurpose1Consent: false))
+        XCTAssertEqual(store.currentSnapshot.tcfPurpose1Consent, false)
+        XCTAssertFalse(store.currentSnapshot.allowsLocalStorage)
+    }
+
     func testExplicitNilFallsBackToIAB() {
         let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
         store.apply(SimulaPrivacyConfig(tcString: nil))
         XCTAssertEqual(store.currentSnapshot.tcString, "IAB_VALUE")
+    }
+
+    func testClearConsentFallsBackToIAB() {
+        // Clearing an explicit override falls back to the auto-read IAB value.
+        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_TC"]))
+        store.apply(SimulaPrivacyConfig(tcString: "EXPLICIT", uspString: "1YNN"))
+        store.clearConsent(tcString: true)
+        XCTAssertEqual(store.currentSnapshot.tcString, "IAB_TC")  // fell back to IAB
+        XCTAssertEqual(store.currentSnapshot.uspString, "1YNN")   // untouched
+    }
+
+    func testClearConsentToNilWhenNoIAB() {
+        let store = SimulaPrivacy(defaults: makeDefaults())
+        store.apply(SimulaPrivacyConfig(gppString: "GPP"))
+        store.clearConsent(gppString: true)
+        XCTAssertNil(store.currentSnapshot.gppString)
     }
 
     func testUpdatePartialMergeKeepsOtherFields() {

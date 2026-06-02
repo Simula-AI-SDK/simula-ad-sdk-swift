@@ -28,6 +28,11 @@ public struct SimulaPrivacyConfig: Sendable, Equatable {
     /// Whether GDPR applies. `nil` = unknown/unset (mirror of `IABTCF_gdprApplies`).
     public var gdprApplies: Bool?
 
+    /// Explicit TCF Purpose 1 ("store/access information on a device") consent. When
+    /// set, takes precedence over the auto-read `IABTCF_PurposeConsents`. Useful for
+    /// hosts without a TCF CMP and for testing storage-degradation behavior.
+    public var tcfPurpose1Consent: Bool?
+
     /// Whether COPPA (child-directed) treatment applies. When `true`, PII and the
     /// advertising identifier are suppressed regardless of ATT / consent.
     public var coppaApplies: Bool
@@ -44,6 +49,7 @@ public struct SimulaPrivacyConfig: Sendable, Equatable {
         gppString: String? = nil,
         gppSid: String? = nil,
         gdprApplies: Bool? = nil,
+        tcfPurpose1Consent: Bool? = nil,
         coppaApplies: Bool = false,
         enableAdvertisingId: Bool = false
     ) {
@@ -53,6 +59,7 @@ public struct SimulaPrivacyConfig: Sendable, Equatable {
         self.gppString = gppString
         self.gppSid = gppSid
         self.gdprApplies = gdprApplies
+        self.tcfPurpose1Consent = tcfPurpose1Consent
         self.coppaApplies = coppaApplies
         self.enableAdvertisingId = enableAdvertisingId
     }
@@ -133,6 +140,7 @@ public struct ConsentSnapshot: Sendable, Equatable {
         if let uspString, !uspString.isEmpty { h["X-Simula-Consent-USP"] = uspString }
         if let gppString, !gppString.isEmpty { h["X-Simula-Consent-GPP"] = gppString }
         if let gppSid, !gppSid.isEmpty { h["X-Simula-Consent-GPP-SID"] = gppSid }
+        if let tcfPurpose1Consent { h["X-Simula-Consent-Purpose1"] = tcfPurpose1Consent ? "1" : "0" }
         h["X-Simula-COPPA"] = coppaApplies ? "1" : "0"
         return h
     }
@@ -148,6 +156,7 @@ public struct ConsentSnapshot: Sendable, Equatable {
         if let uspString, !uspString.isEmpty { b["uspString"] = uspString }
         if let gppString, !gppString.isEmpty { b["gppString"] = gppString }
         if let gppSid, !gppSid.isEmpty { b["gppSid"] = gppSid }
+        if let tcfPurpose1Consent { b["tcfPurpose1Consent"] = tcfPurpose1Consent }
         if let attStatus { b["attStatus"] = attStatus }
         if let advertisingId, !advertisingId.isEmpty { b["idfa"] = advertisingId }
         return b

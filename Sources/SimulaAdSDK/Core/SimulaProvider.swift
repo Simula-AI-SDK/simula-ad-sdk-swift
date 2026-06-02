@@ -109,7 +109,16 @@ public final class SimulaProvider: ObservableObject {
             // state triggers exactly one /session/create instead of a race.
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
-                Task { await self?.resyncSession() }
+                Task { @MainActor in
+                    #if os(iOS)
+                    // The storage policy may have flipped (TCF Purpose 1 / GDPR);
+                    // drop prewarmed web views so the next game/ad is built with a
+                    // data store matching the new consent. (`acquire` also guards
+                    // this lazily; this just frees stale views proactively.)
+                    WebViewPool.shared.clear()
+                    #endif
+                    await self?.resyncSession()
+                }
             }
             .store(in: &cancellables)
     }
@@ -191,6 +200,7 @@ public final class SimulaProvider: ObservableObject {
         gppString: String? = nil,
         gppSid: String? = nil,
         gdprApplies: Bool? = nil,
+        tcfPurpose1Consent: Bool? = nil,
         coppaApplies: Bool? = nil,
         enableAdvertisingId: Bool? = nil
     ) {
@@ -201,8 +211,30 @@ public final class SimulaProvider: ObservableObject {
             gppString: gppString,
             gppSid: gppSid,
             gdprApplies: gdprApplies,
+            tcfPurpose1Consent: tcfPurpose1Consent,
             coppaApplies: coppaApplies,
             enableAdvertisingId: enableAdvertisingId
+        )
+    }
+
+    /// Clears the named explicit consent overrides (the store then falls back to any
+    /// auto-read IAB value). Use to *remove* a signal you previously set — `update`
+    /// can only change or leave fields, not clear them.
+    public func clearConsent(
+        tcString: Bool = false,
+        uspString: Bool = false,
+        gppString: Bool = false,
+        gppSid: Bool = false,
+        gdprApplies: Bool = false,
+        tcfPurpose1Consent: Bool = false
+    ) {
+        SimulaPrivacy.shared.clearConsent(
+            tcString: tcString,
+            uspString: uspString,
+            gppString: gppString,
+            gppSid: gppSid,
+            gdprApplies: gdprApplies,
+            tcfPurpose1Consent: tcfPurpose1Consent
         )
     }
 

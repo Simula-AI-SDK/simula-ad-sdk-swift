@@ -187,6 +187,12 @@ simula.updateConsent(tcString: newTC, gppString: newGPP)
 
 `coppaApplies: true` suppresses the `ppid` and the IDFA regardless of ATT.
 
+**Storage degradation (TCF Purpose 1).** When Purpose 1 ("store/access information
+on a device") is denied — or GDPR applies and it's unknown — the SDK's WebViews use
+a **non-persistent** `WKWebsiteDataStore`: cookies and `localStorage` work in memory
+for the session but nothing is written to disk. If you don't use a TCF CMP you can
+drive this directly with `SimulaPrivacyConfig(tcfPurpose1Consent: false)`.
+
 ### Enabling IDFA attribution (opt-in)
 
 IDFA collection is **off by default**. To turn it on:
