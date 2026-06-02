@@ -112,14 +112,20 @@ public struct ConsentSnapshot: Sendable, Equatable {
     public var allowsPrimaryUserID: Bool { hasPrivacyConsent && !coppaApplies }
 
     /// Whether non-essential local storage / caching is permitted. Under TCF a
-    /// denied Purpose 1 means the SDK must avoid non-essential on-device storage;
-    /// when unknown we permit (contextual default).
-    public var allowsLocalStorage: Bool { tcfPurpose1Consent ?? true }
+    /// denied Purpose 1 means the SDK must avoid non-essential on-device storage.
+    /// When GDPR applies, an *unknown* Purpose 1 is treated as denied (consent
+    /// must be explicit); outside GDPR we permit by default (contextual).
+    public var allowsLocalStorage: Bool {
+        if gdprApplies == true { return tcfPurpose1Consent == true }
+        return tcfPurpose1Consent ?? true
+    }
 
     // MARK: Wire formats
 
-    /// Consent signals as request headers — used when the backend wants consent
-    /// on ad-serving / tracking calls in addition to the session body.
+    /// Consent *metadata* as request headers — used when the backend wants consent
+    /// on ad-serving / tracking calls in addition to the session body. The raw
+    /// advertising identifier is intentionally **not** included here (it travels
+    /// only in the session body) to minimize PII exposure on per-request calls.
     public func consentHeaders() -> [String: String] {
         var h: [String: String] = [:]
         if let gdprApplies { h["X-Simula-GDPR-Applies"] = gdprApplies ? "1" : "0" }
@@ -128,7 +134,6 @@ public struct ConsentSnapshot: Sendable, Equatable {
         if let gppString, !gppString.isEmpty { h["X-Simula-Consent-GPP"] = gppString }
         if let gppSid, !gppSid.isEmpty { h["X-Simula-Consent-GPP-SID"] = gppSid }
         h["X-Simula-COPPA"] = coppaApplies ? "1" : "0"
-        if let advertisingId, !advertisingId.isEmpty { h["X-Simula-IDFA"] = advertisingId }
         return h
     }
 

@@ -31,7 +31,9 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(h["X-Simula-Consent-GPP"], "DBABgpp")
         XCTAssertEqual(h["X-Simula-Consent-GPP-SID"], "2,6")
         XCTAssertEqual(h["X-Simula-COPPA"], "0")
-        XCTAssertEqual(h["X-Simula-IDFA"], "AAAA")
+        // The raw advertising id is intentionally NOT in headers (session body only).
+        XCTAssertNil(h["X-Simula-IDFA"])
+        XCTAssertEqual(snap.privacyBody()["idfa"] as? String, "AAAA")
     }
 
     func testConsentHeadersOmitsEmptyButKeepsCoppa() {
@@ -66,10 +68,17 @@ final class PrivacyTests: XCTestCase {
         XCTAssertFalse(ConsentSnapshot(hasPrivacyConsent: false, coppaApplies: false).allowsPrimaryUserID)
     }
 
-    func testPurpose1GatesLocalStorage() {
+    func testPurpose1GatesLocalStorageOutsideGdpr() {
         XCTAssertTrue(ConsentSnapshot(tcfPurpose1Consent: nil).allowsLocalStorage)  // unknown → permit
         XCTAssertTrue(ConsentSnapshot(tcfPurpose1Consent: true).allowsLocalStorage)
         XCTAssertFalse(ConsentSnapshot(tcfPurpose1Consent: false).allowsLocalStorage)
+    }
+
+    func testUnknownPurpose1DeniedUnderGdpr() {
+        // Under GDPR an unknown Purpose 1 must be treated as denied.
+        XCTAssertFalse(ConsentSnapshot(gdprApplies: true, tcfPurpose1Consent: nil).allowsLocalStorage)
+        XCTAssertFalse(ConsentSnapshot(gdprApplies: true, tcfPurpose1Consent: false).allowsLocalStorage)
+        XCTAssertTrue(ConsentSnapshot(gdprApplies: true, tcfPurpose1Consent: true).allowsLocalStorage)
     }
 
     // MARK: - Store: IAB auto-read
@@ -95,6 +104,16 @@ final class PrivacyTests: XCTestCase {
     func testStoreUnsetGdprAppliesIsNil() {
         let store = SimulaPrivacy(defaults: makeDefaults())
         XCTAssertNil(store.currentSnapshot.gdprApplies)
+    }
+
+    func testStoreCoercesNumericIABValues() {
+        // Some CMPs store a single-section GppSID (and gdprApplies) as Numbers.
+        let store = SimulaPrivacy(defaults: makeDefaults([
+            "IABGPP_GppSID": 2,
+            "IABTCF_gdprApplies": 1,
+        ]))
+        XCTAssertEqual(store.currentSnapshot.gppSid, "2")
+        XCTAssertEqual(store.currentSnapshot.gdprApplies, true)
     }
 
     func testStorePurpose1Denied() {

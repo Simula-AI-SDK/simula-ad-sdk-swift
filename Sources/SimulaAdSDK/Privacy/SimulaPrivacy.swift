@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 #if os(iOS)
+import UIKit
 import AppTrackingTransparency
 import AdSupport
 #endif
@@ -39,6 +40,7 @@ public final class SimulaPrivacy: ObservableObject {
     private var attStatusRaw: Int?
     private var lockedSnapshot = ConsentSnapshot()
     private var observer: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
 
     /// IAB-standard `UserDefaults` keys, written by an in-app CMP.
     private enum IABKey {
@@ -67,10 +69,23 @@ public final class SimulaPrivacy: ObservableObject {
         ) { [weak self] _ in
             self?.recompute()
         }
+        #if os(iOS)
+        // ATT/IDFA can change while backgrounded (Settings, GAID reset). Re-read
+        // the advertising id when the app returns to the foreground.
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshAdvertisingIdIfNeeded()
+            self?.recompute()
+        }
+        #endif
     }
 
     deinit {
         if let observer { NotificationCenter.default.removeObserver(observer) }
+        if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
     }
 
     // MARK: - Public API
@@ -137,6 +152,14 @@ public final class SimulaPrivacy: ObservableObject {
     @MainActor
     @discardableResult
     public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {
+        // Calling the ATT API without NSUserTrackingUsageDescription terminates the
+        // app. Fail safe: skip the prompt and return the current status instead.
+        guard Bundle.main.object(forInfoDictionaryKey: "NSUserTrackingUsageDescription") != nil else {
+            assertionFailure("[SimulaSDK] NSUserTrackingUsageDescription is missing from Info.plist; ATT prompt skipped.")
+            let status = ATTrackingManager.trackingAuthorizationStatus
+            applyTrackingStatus(status)
+            return status
+        }
         let status = await ATTrackingManager.requestTrackingAuthorization()
         applyTrackingStatus(status)
         return status
@@ -188,8 +211,11 @@ public final class SimulaPrivacy: ObservableObject {
     // MARK: - Snapshot building
 
     private func recompute() {
-        let new = buildSnapshot()
+        // Build and publish the snapshot atomically under a single lock so two
+        // concurrent updates can't interleave and let an older snapshot clobber a
+        // newer one. Reading UserDefaults under the lock is cheap (in-memory).
         lock.lock()
+        let new = buildSnapshotLocked()
         let changed = lockedSnapshot != new
         if changed { lockedSnapshot = new }
         lock.unlock()
@@ -201,19 +227,18 @@ public final class SimulaPrivacy: ObservableObject {
         }
     }
 
-    private func buildSnapshot() -> ConsentSnapshot {
-        lock.lock()
+    /// Builds the resolved snapshot. The caller MUST hold `lock`.
+    private func buildSnapshotLocked() -> ConsentSnapshot {
         let cfg = explicitConfig
         let adId = collectedAdvertisingId
         let att = attStatusRaw
-        lock.unlock()
 
         // Explicit (provider/CMP) values win; otherwise fall back to IAB-read keys.
         return ConsentSnapshot(
             hasPrivacyConsent: cfg.hasPrivacyConsent,
-            tcString: cfg.tcString ?? nonEmpty(defaults.string(forKey: IABKey.tcString)),
-            uspString: cfg.uspString ?? nonEmpty(defaults.string(forKey: IABKey.uspString)),
-            gppString: cfg.gppString ?? nonEmpty(defaults.string(forKey: IABKey.gppString)),
+            tcString: cfg.tcString ?? coercedString(IABKey.tcString),
+            uspString: cfg.uspString ?? coercedString(IABKey.uspString),
+            gppString: cfg.gppString ?? coercedString(IABKey.gppString),
             gppSid: cfg.gppSid ?? readGppSid(),
             gdprApplies: cfg.gdprApplies ?? readGdprApplies(),
             coppaApplies: cfg.coppaApplies,
@@ -225,28 +250,34 @@ public final class SimulaPrivacy: ObservableObject {
 
     // MARK: - IAB key readers
 
-    private func nonEmpty(_ s: String?) -> String? {
-        guard let s, !s.isEmpty else { return nil }
-        return s
+    /// Reads a key as a non-empty string, coercing Numbers (some CMPs store IAB
+    /// fields as Numbers, e.g. a single-section `IABGPP_GppSID`). Returns nil for
+    /// missing / empty / uncoercible values.
+    private func coercedString(_ key: String) -> String? {
+        guard let obj = defaults.object(forKey: key) else { return nil }
+        if let s = obj as? String { return s.isEmpty ? nil : s }
+        if let n = obj as? NSNumber { return n.stringValue }
+        return nil
     }
 
-    /// `IABTCF_gdprApplies` is stored as a Number (0/1). `nil` when unset.
+    /// `IABTCF_gdprApplies` is stored as a Number (0/1), occasionally a String.
+    /// `nil` when unset.
     private func readGdprApplies() -> Bool? {
-        guard defaults.object(forKey: IABKey.gdprApplies) != nil else { return nil }
-        return defaults.integer(forKey: IABKey.gdprApplies) == 1
+        guard let s = coercedString(IABKey.gdprApplies) else { return nil }
+        return s == "1"
     }
 
-    /// `IABGPP_GppSID` is stored as an underscore-separated string of section IDs
-    /// (e.g. `"2_6"`). Normalize to comma-separated to match the wire contract.
+    /// `IABGPP_GppSID` is an underscore-separated string of section IDs (e.g.
+    /// `"2_6"`), or a bare Number for a single section. Normalize to comma-separated.
     private func readGppSid() -> String? {
-        guard let s = nonEmpty(defaults.string(forKey: IABKey.gppSid)) else { return nil }
+        guard let s = coercedString(IABKey.gppSid) else { return nil }
         return s.replacingOccurrences(of: "_", with: ",")
     }
 
     /// TCF Purpose 1 consent = first character of `IABTCF_PurposeConsents` (a
     /// binary string indexed from Purpose 1); `'1'` means consented.
     private func readPurpose1Consent() -> Bool? {
-        guard let s = nonEmpty(defaults.string(forKey: IABKey.purposeConsents)) else { return nil }
+        guard let s = coercedString(IABKey.purposeConsents) else { return nil }
         return s.first == "1"
     }
 }
