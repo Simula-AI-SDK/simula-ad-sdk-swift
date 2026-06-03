@@ -121,6 +121,9 @@ private struct CreativeInterstitialView: View {
     @State private var closeRemaining: Int
     /// 0→1 fill for the non-rewarded close-delay countdown (ring / bar UI).
     @State private var closeProgress: Double = 0
+    /// Monotonic anchor (`systemUptime`) for whichever gate is active, so a re-`onAppear`
+    /// resumes the countdown from where it was instead of restarting it. `nil` until first set.
+    @State private var gateStartedAt: TimeInterval?
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -328,11 +331,18 @@ private struct CreativeInterstitialView: View {
             if isRewarded { rewardEarned = true }
             return
         }
+        // Resume from the monotonic anchor so a re-`onAppear` doesn't restart the dwell.
+        let remaining = remainingGateTime(total: minPlayThreshold)
+        if remaining <= 0 {
+            rewardEarned = true
+            closeEnabled = true
+            return
+        }
         // Cancellable min-view gate: a fire-and-forget asyncAfter would still fire
         // after dismiss and mutate dead @State. The Task is cancelled in
         // `.onDisappear`.
         gateTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(minPlayThreshold * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
             if Task.isCancelled { return }
             rewardEarned = true
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -347,16 +357,24 @@ private struct CreativeInterstitialView: View {
     private func startCloseDelayGate() {
         guard !isRewarded, let close = response.adBehavior?.close,
               close.delaySeconds > 0, !closeEnabled else { return }
-        let delay = close.delaySeconds
+        let total = TimeInterval(close.delaySeconds)
+        let remaining = remainingGateTime(total: total)
+        if remaining <= 0 {
+            closeEnabled = true
+            return
+        }
 
-        // Ring / bar treatments fill linearly over the delay.
+        // Ring / bar treatments fill linearly over the remaining delay (resuming from the
+        // fraction already elapsed, so a re-`onAppear` doesn't snap the fill back to 0).
         if close.countdownUI == .circularProgress || close.countdownUI == .bar {
-            withAnimation(.linear(duration: Double(delay))) { closeProgress = 1 }
+            closeProgress = (total - remaining) / total
+            withAnimation(.linear(duration: remaining)) { closeProgress = 1 }
         }
 
         gateTask = Task { @MainActor in
             if close.countdownUI == .numericAlways {
-                var left = delay
+                var left = Int(ceil(remaining))
+                closeRemaining = left
                 while left > 0 {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                     if Task.isCancelled { return }
@@ -364,11 +382,20 @@ private struct CreativeInterstitialView: View {
                     closeRemaining = left
                 }
             } else {
-                try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
             }
             if Task.isCancelled { return }
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
+    }
+
+    /// Seconds left on the active gate, anchored to a monotonic clock the first time it's asked.
+    /// Reusing one anchor across `onAppear` calls means the countdown resumes instead of resetting.
+    private func remainingGateTime(total: TimeInterval) -> TimeInterval {
+        let now = ProcessInfo.processInfo.systemUptime
+        let startedAt = gateStartedAt ?? now
+        if gateStartedAt == nil { gateStartedAt = startedAt }
+        return total - (now - startedAt)
     }
 }
 
@@ -432,12 +459,23 @@ private struct CloseButtonView: View {
         .padding(.bottom, isBottom ? 96 : 0)
     }
 
+    /// Apple HIG minimum tappable size. The visual circle may be smaller (the `small` arm), but
+    /// the hit area is never below this so a tiny close button can't inflate accidental CTA taps.
+    private let minTouchTarget: CGFloat = 44
+
     @ViewBuilder
     private var buttonOrIndicator: some View {
         if enabled {
-            Button(action: onClose) { closeGlyph }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close")
+            Button(action: onClose) {
+                closeGlyph
+                    .frame(
+                        width: max(minTouchTarget, behavior.size.circleSize),
+                        height: max(minTouchTarget, behavior.size.circleSize)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close")
         } else {
             switch countdown {
             case .appearsAtNs, .bar:

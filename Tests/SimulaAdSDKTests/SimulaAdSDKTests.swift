@@ -385,6 +385,18 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds, 0)
     }
 
+    func testAdBehaviorOversizedDelayClampsToMax() throws {
+        // A bad/oversized delay must clamp so it can't trap the user behind a blocked close.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":600}}}
+        """
+        XCTAssertEqual(
+            try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds,
+            maxCloseDelaySeconds
+        )
+    }
+
     func testCloseSizeGlyphMapping() {
         XCTAssertEqual(CloseSize.small.glyphSize, 16)
         XCTAssertEqual(CloseSize.standard.glyphSize, 24)

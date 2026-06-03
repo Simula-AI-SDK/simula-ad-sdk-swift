@@ -353,6 +353,11 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
     (raw ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
 }
 
+/// Hard cap on the server-driven close delay. The close button (and, on Android, the system
+/// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
+/// trap the user with no exit. PRD arms are 0/3/5s; 15s leaves headroom without the footgun.
+let maxCloseDelaySeconds = 15
+
 /// How the close button's pre-tap delay is communicated. Non-rewarded creatives only.
 /// Unknown/missing → `.none`.
 public enum CloseCountdownUI: Sendable, Equatable {
@@ -476,7 +481,8 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.delaySeconds = max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        // Clamp to [0, maxCloseDelaySeconds] so a bad/oversized value can't trap the user.
+        self.delaySeconds = min(maxCloseDelaySeconds, max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0))
         self.countdownUI = .from(try? c.decode(String.self, forKey: .countdownUI))
         self.position = .from(try? c.decode(String.self, forKey: .position))
         self.size = .from(try? c.decode(String.self, forKey: .size))
