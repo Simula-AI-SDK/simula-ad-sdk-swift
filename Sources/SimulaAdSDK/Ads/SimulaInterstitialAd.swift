@@ -128,8 +128,9 @@ public final class SimulaInterstitialAd {
 
     /// Minimum viewing time (seconds) before a rewarded ad earns its reward. Only
     /// applies when `rewarded` is `true`: the close button stays hidden until this
-    /// elapses, then `EARNED_REWARD` fires on dismiss.
-    public let minPlayThreshold: TimeInterval
+    /// elapses, then `EARNED_REWARD` fires on dismiss. Mutable (like `rewarded` /
+    /// `ctaText`) — settable directly or via the `init` convenience parameter.
+    public var minPlayThreshold: TimeInterval = 0
 
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?

@@ -175,7 +175,13 @@ enum CreativeCTARouter {
             return
         }
 
-        var resolverRef: RedirectResolver?
+        // `weak` so the completion closure (stored on `resolver.completion`) doesn't
+        // strongly capture the resolver — that would be a retain cycle
+        // (resolver → completion → resolver) that outlives removal from
+        // `activeResolvers` and leaks one resolver per resolve. The Set + the
+        // delegate-retaining URLSession keep it alive through the request, so the
+        // weak ref is still valid when the completion fires.
+        weak var resolverRef: RedirectResolver?
         let resolver = RedirectResolver { finalURL in
             DispatchQueue.main.async {
                 if let appID = appStoreID(from: finalURL) {
