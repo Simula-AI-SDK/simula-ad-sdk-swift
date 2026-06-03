@@ -447,13 +447,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// `sessionId` is passed through as the `session_id` query param when available (the backend
     /// ties the catalog to the session); omitted when nil/empty.
     public func fetchCatalog(sessionId: String? = nil) async throws -> CatalogResponse {
-        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalogv2") else {
-            throw SimulaAPIError.invalidURL
-        }
-        if let sessionId, !sessionId.isEmpty {
-            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
-        }
-        guard let url = components.url else {
+        guard let url = Self.catalogURL(sessionId: sessionId) else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -472,6 +466,17 @@ public final class SimulaAPI: @unchecked Sendable {
 
         // Decode flexibly into the SDK's CatalogResponse (see parseCatalog).
         return try parseCatalog(data)
+    }
+
+    /// Builds the catalogv2 request URL, adding `session_id` when available. Pure/testable.
+    static func catalogURL(sessionId: String? = nil) -> URL? {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+            return nil
+        }
+        if let sessionId, !sessionId.isEmpty {
+            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
+        }
+        return components.url
     }
 
     // MARK: - Load Ad (imperative prefetch)
