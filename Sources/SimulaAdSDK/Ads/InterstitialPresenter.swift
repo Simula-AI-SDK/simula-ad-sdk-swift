@@ -114,9 +114,13 @@ private struct CreativeInterstitialView: View {
     /// Whether the close button may be shown/tapped. For rewarded creatives it
     /// starts `false` and unlocks once the min-view threshold elapses.
     @State private var closeEnabled: Bool
-    /// Cancellable min-view gate timer (rewarded). Cancelled in `.onDisappear` so
-    /// it can't fire after the surface is gone.
+    /// Cancellable min-view gate timer (rewarded) / close-delay gate (non-rewarded).
+    /// Cancelled in `.onDisappear` so it can't fire after the surface is gone.
     @State private var gateTask: Task<Void, Never>?
+    /// Remaining whole seconds for the non-rewarded close-delay countdown (numeric UI).
+    @State private var closeRemaining: Int
+    /// 0→1 fill for the non-rewarded close-delay countdown (ring / bar UI).
+    @State private var closeProgress: Double = 0
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -135,9 +139,12 @@ private struct CreativeInterstitialView: View {
         self.onClick = onClick
         self.onEarnReward = onEarnReward
         self.onRequestDismiss = onRequestDismiss
-        // Non-rewarded: close always available. Rewarded with no threshold: also
-        // immediately available; otherwise gated by the timer below.
-        _closeEnabled = State(initialValue: !(response.rewarded || response.renderedFormat == "rewarded_video") || minPlayThreshold <= 0)
+        // Close starts enabled unless a gate applies: rewarded gates on `minPlayThreshold`
+        // (unchanged); non-rewarded gates on the server-driven `close.delay_seconds`.
+        let rewarded = response.rewarded || response.renderedFormat == "rewarded_video"
+        let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
+        _closeEnabled = State(initialValue: rewarded ? (minPlayThreshold <= 0) : (closeDelay <= 0))
+        _closeRemaining = State(initialValue: max(0, closeDelay))
     }
 
     private var isRewarded: Bool {
@@ -152,25 +159,19 @@ private struct CreativeInterstitialView: View {
 
             carousel
 
-            // Close button — top right (hidden until enabled for rewarded ads).
-            if closeEnabled {
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button(action: { handleClose() }) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundColor(Color(hex: "#1F2937"))
-                                .frame(width: 44, height: 44)
-                                .background(Circle().fill(Color.white.opacity(0.9)))
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.top, 16)
-                        .padding(.trailing, 16)
-                        .accessibilityLabel("Close")
-                    }
-                    Spacer()
-                }
+            // Close button — driven by `ad_behavior` when present; otherwise today's literal
+            // top-right button (an absent ad_behavior renders exactly as before).
+            if let close = response.adBehavior?.close {
+                CloseButtonView(
+                    behavior: close,
+                    isRewarded: isRewarded,
+                    enabled: closeEnabled,
+                    remaining: closeRemaining,
+                    progress: closeProgress,
+                    onClose: { handleClose() }
+                )
+            } else if closeEnabled {
+                legacyCloseButton
             }
 
             // CTA button — always visible, bottom.
@@ -204,10 +205,37 @@ private struct CreativeInterstitialView: View {
         // and close (top-right) overlays stay inside the safe-area insets so they
         // clear the home indicator / notch / Dynamic Island.
         .hideStatusBar(true)
-        .onAppear { startRewardGateIfNeeded() }
+        .onAppear {
+            startRewardGateIfNeeded()
+            startCloseDelayGate()
+        }
         .onDisappear {
             gateTask?.cancel()
             gateTask = nil
+        }
+    }
+
+    // MARK: Close button (legacy / no ad_behavior)
+
+    /// Today's literal top-right close button, rendered only when the payload omits
+    /// `ad_behavior`. Kept byte-for-byte so non-experiment traffic is unchanged.
+    private var legacyCloseButton: some View {
+        VStack {
+            HStack {
+                Spacer()
+                Button(action: { handleClose() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(Color(hex: "#1F2937"))
+                        .frame(width: 44, height: 44)
+                        .background(Circle().fill(Color.white.opacity(0.9)))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 16)
+                .padding(.trailing, 16)
+                .accessibilityLabel("Close")
+            }
+            Spacer()
         }
     }
 
@@ -255,15 +283,17 @@ private struct CreativeInterstitialView: View {
         onClick() // CLICKED
 
         // Capture the destination before any teardown so the async resolve path
-        // can't read freed state.
+        // can't read freed state. `storeOpen` defaults to today's in-app store sheet
+        // when the payload omits `ad_behavior`.
         let trackingUrl = response.trackingUrl
         let destination = response.destinationKind
+        let storeOpen = response.adBehavior?.storeOpen ?? .skstoreproduct
 
         if isRewarded {
             // Rewarded creatives stay up (the min-view gate governs close/reward),
             // so the store/Safari sheet presents over the still-live interstitial
             // window — fine.
-            CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination)
+            CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen)
             return
         }
 
@@ -277,7 +307,7 @@ private struct CreativeInterstitialView: View {
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
             onRequestDismiss()
-            CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination)
+            CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen)
         }
     }
 
@@ -309,6 +339,142 @@ private struct CreativeInterstitialView: View {
                 closeEnabled = true
             }
         }
+    }
+
+    /// Non-rewarded close-delay gate driven by `ad_behavior.close.delay_seconds`. Drives the
+    /// countdown affordance (numeric tick / ring + bar fill) and unlocks the close button once
+    /// the delay elapses. Rewarded creatives ignore this (they gate on `minPlayThreshold`).
+    private func startCloseDelayGate() {
+        guard !isRewarded, let close = response.adBehavior?.close,
+              close.delaySeconds > 0, !closeEnabled else { return }
+        let delay = close.delaySeconds
+
+        // Ring / bar treatments fill linearly over the delay.
+        if close.countdownUI == .circularProgress || close.countdownUI == .bar {
+            withAnimation(.linear(duration: Double(delay))) { closeProgress = 1 }
+        }
+
+        gateTask = Task { @MainActor in
+            if close.countdownUI == .numericAlways {
+                var left = delay
+                while left > 0 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if Task.isCancelled { return }
+                    left -= 1
+                    closeRemaining = left
+                }
+            } else {
+                try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+            }
+            if Task.isCancelled { return }
+            withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
+        }
+    }
+}
+
+// MARK: - CloseButtonView
+
+/// The `ad_behavior`-driven close button: applies size (glyph/circle), corner position, and the
+/// countdown_ui treatment. Rewarded creatives ignore the countdown (they gate on `minPlayThreshold`
+/// and use "appears" semantics), but still honor position/size.
+private struct CloseButtonView: View {
+    let behavior: CloseBehavior
+    let isRewarded: Bool
+    let enabled: Bool
+    let remaining: Int
+    let progress: Double
+    let onClose: () -> Void
+
+    /// Effective countdown affordance: rewarded creatives always use "appears" (hidden→shown).
+    private var countdown: CloseCountdownUI { isRewarded ? .appearsAtNs : behavior.countdownUI }
+
+    private var isBottom: Bool {
+        behavior.position == .bottomLeft || behavior.position == .bottomRight
+    }
+
+    private var isTrailing: Bool {
+        behavior.position == .topRight || behavior.position == .bottomRight
+    }
+
+    var body: some View {
+        ZStack {
+            // `bar` treatment: a slim top-edge progress bar shown during the delay.
+            if !enabled && countdown == .bar {
+                VStack {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.white.opacity(0.25))
+                            Capsule().fill(Color.white)
+                                .frame(width: max(0, geo.size.width * progress))
+                        }
+                    }
+                    .frame(height: 4)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    Spacer()
+                }
+            }
+
+            // The button (or its in-delay indicator), pinned to the configured corner.
+            VStack {
+                if !isBottom { cornerRow; Spacer() } else { Spacer(); cornerRow }
+            }
+        }
+    }
+
+    private var cornerRow: some View {
+        HStack {
+            if isTrailing { Spacer(); buttonOrIndicator } else { buttonOrIndicator; Spacer() }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, isBottom ? 0 : 16)
+        // Bottom-corner buttons sit above the full-width CTA so they can't overlap it.
+        .padding(.bottom, isBottom ? 96 : 0)
+    }
+
+    @ViewBuilder
+    private var buttonOrIndicator: some View {
+        if enabled {
+            Button(action: onClose) { closeGlyph }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+        } else {
+            switch countdown {
+            case .appearsAtNs, .bar:
+                EmptyView() // hidden during the delay (the bar shows progress separately)
+            case .none:
+                closeGlyph.opacity(0.4)
+            case .numericAlways:
+                numericGlyph
+            case .circularProgress:
+                ZStack {
+                    closeGlyph.opacity(0.5)
+                    Circle()
+                        .trim(from: 0, to: progress)
+                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
+                }
+            }
+        }
+    }
+
+    /// The circular "X" glyph at the configured size.
+    private var closeGlyph: some View {
+        Image(systemName: "xmark")
+            .font(.system(size: behavior.size.glyphSize, weight: .bold))
+            .foregroundColor(Color(hex: "#1F2937"))
+            .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
+            .background(Circle().fill(Color.white.opacity(0.9)))
+    }
+
+    /// The remaining-seconds glyph used by the `numeric_always` treatment.
+    private var numericGlyph: some View {
+        Text("\(remaining)")
+            .font(.system(size: behavior.size.glyphSize, weight: .bold))
+            .foregroundColor(Color(hex: "#1F2937"))
+            .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
+            .background(Circle().fill(Color.white.opacity(0.9)))
     }
 }
 

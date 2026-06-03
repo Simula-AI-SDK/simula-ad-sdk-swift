@@ -280,6 +280,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let renderedFormat: String?
     public let renderedAssets: [String]
     public let trackingUrl: String?
+    /// Server-driven render config for this impression (A/B test). `nil` when the payload
+    /// omits `ad_behavior` — the renderer falls back to today's literal close button / store path.
+    public let adBehavior: AdBehavior?
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
@@ -295,6 +298,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case renderedFormat = "rendered_format"
         case renderedAssets = "rendered_assets"
         case trackingUrl = "tracking_url"
+        case adBehavior = "ad_behavior"
     }
 
     public init(from decoder: Decoder) throws {
@@ -307,6 +311,9 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.renderedAssets = (try? c.decode([String].self, forKey: .renderedAssets)) ?? []
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
+        // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
+        self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
     }
 
     /// Member-wise init for internal construction and tests.
@@ -318,7 +325,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         destination: String = "appstore",
         renderedFormat: String? = nil,
         renderedAssets: [String] = [],
-        trackingUrl: String? = nil
+        trackingUrl: String? = nil,
+        adBehavior: AdBehavior? = nil
     ) {
         self.adId = adId
         self.adInserted = adInserted
@@ -328,6 +336,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = renderedFormat
         self.renderedAssets = renderedAssets
         self.trackingUrl = trackingUrl
+        self.adBehavior = adBehavior
     }
 
     /// Returns a copy with `renderedAssets` replaced (used after filtering out
@@ -341,7 +350,8 @@ public struct AdLoadResponse: Decodable, Sendable {
             destination: destination,
             renderedFormat: renderedFormat,
             renderedAssets: assets,
-            trackingUrl: trackingUrl
+            trackingUrl: trackingUrl,
+            adBehavior: adBehavior
         )
     }
 }

@@ -344,3 +344,166 @@ public enum MaxGamesToShow: Int, Sendable, Equatable {
     case six = 6
     case nine = 9
 }
+
+// MARK: - Ad Behavior (server-driven A/B config)
+
+/// Lowercases and normalizes hyphens to underscores so the tolerant enum factories
+/// accept either wire spelling (`circular-progress` ≡ `circular_progress`).
+private func normalizeBehaviorToken(_ raw: String?) -> String {
+    (raw ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+}
+
+/// How the close button's pre-tap delay is communicated. Non-rewarded creatives only.
+/// Unknown/missing → `.none`.
+public enum CloseCountdownUI: Sendable, Equatable {
+    /// Glyph shows the remaining whole seconds, counting down to the X.
+    case numericAlways
+    /// A ring around the button fills over the delay.
+    case circularProgress
+    /// No indicator; the X simply materializes once the delay elapses.
+    case appearsAtNs
+    /// A slim top-edge progress bar fills over the delay (Unity-style).
+    case bar
+    /// No countdown affordance.
+    case none
+
+    static func from(_ raw: String?) -> CloseCountdownUI {
+        switch normalizeBehaviorToken(raw) {
+        case "numeric_always": return .numericAlways
+        case "circular_progress": return .circularProgress
+        case "appears_at_ns": return .appearsAtNs
+        case "bar": return .bar
+        default: return .none
+        }
+    }
+}
+
+/// Where the close button sits. Unknown/missing → `.topRight`. Legacy `bottom_corner` → `.bottomRight`.
+public enum ClosePosition: Sendable, Equatable {
+    case topRight, topLeft, bottomLeft, bottomRight
+
+    static func from(_ raw: String?) -> ClosePosition {
+        switch normalizeBehaviorToken(raw) {
+        case "top_left": return .topLeft
+        case "bottom_left": return .bottomLeft
+        case "bottom_right", "bottom_corner": return .bottomRight
+        default: return .topRight
+        }
+    }
+}
+
+/// Close button size. Unknown/missing → `.standard`. Point sizes per PRD.
+public enum CloseSize: Sendable, Equatable {
+    case small, standard, large
+
+    static func from(_ raw: String?) -> CloseSize {
+        switch normalizeBehaviorToken(raw) {
+        case "small": return .small
+        case "large": return .large
+        default: return .standard
+        }
+    }
+
+    /// Close glyph point size (PRD: small 16 / standard 24 / large 32).
+    public var glyphSize: CGFloat {
+        switch self {
+        case .small: return 16
+        case .standard: return 24
+        case .large: return 32
+        }
+    }
+
+    /// Tappable circular control diameter (glyph + 20pt of padding).
+    public var circleSize: CGFloat { glyphSize + 20 }
+}
+
+/// Close button motion. Only `.static` is rendered this release (non-static not shipping).
+public enum CloseMotion: Sendable, Equatable {
+    case `static`, repositionOnTap, drift
+
+    static func from(_ raw: String?) -> CloseMotion {
+        switch normalizeBehaviorToken(raw) {
+        case "reposition_on_tap": return .repositionOnTap
+        case "drift": return .drift
+        default: return .static
+        }
+    }
+}
+
+/// How a CTA tap opens the advertiser's store (PRD Section 6). Unknown/missing → `.external`.
+/// `sk_overlay` (not shipped) and `inline_install` (Android-only) are accepted and routed to
+/// each platform's native store at the router. Legacy `external_browser`/`sk_store_product` aliased.
+public enum StoreOpen: Sendable, Equatable {
+    case external, skstoreproduct, inlineInstall
+
+    static func from(_ raw: String?) -> StoreOpen {
+        switch normalizeBehaviorToken(raw) {
+        case "skstoreproduct", "sk_store_product", "sk_overlay": return .skstoreproduct
+        case "inline_install": return .inlineInstall
+        default: return .external
+        }
+    }
+}
+
+/// Close-button behavior for one impression. Decoding is tolerant: every field falls back to
+/// its default and unknown enum strings never fail the parse.
+public struct CloseBehavior: Sendable, Equatable, Decodable {
+    public let delaySeconds: Int
+    public let countdownUI: CloseCountdownUI
+    public let position: ClosePosition
+    public let size: CloseSize
+    public let motion: CloseMotion
+
+    public init(
+        delaySeconds: Int = 0,
+        countdownUI: CloseCountdownUI = .none,
+        position: ClosePosition = .topRight,
+        size: CloseSize = .standard,
+        motion: CloseMotion = .static
+    ) {
+        self.delaySeconds = delaySeconds
+        self.countdownUI = countdownUI
+        self.position = position
+        self.size = size
+        self.motion = motion
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case delaySeconds = "delay_seconds"
+        case countdownUI = "countdown_ui"
+        case position, size, motion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.delaySeconds = max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        self.countdownUI = .from(try? c.decode(String.self, forKey: .countdownUI))
+        self.position = .from(try? c.decode(String.self, forKey: .position))
+        self.size = .from(try? c.decode(String.self, forKey: .size))
+        self.motion = .from(try? c.decode(String.self, forKey: .motion))
+    }
+}
+
+/// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
+/// response: an absent object means "render today's defaults". A present-but-partial object
+/// fills each missing field with its default.
+public struct AdBehavior: Sendable, Equatable, Decodable {
+    public let close: CloseBehavior
+    public let storeOpen: StoreOpen
+
+    public init(close: CloseBehavior = CloseBehavior(), storeOpen: StoreOpen = .external) {
+        self.close = close
+        self.storeOpen = storeOpen
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case close
+        case storeOpen = "store_open"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.close = (try? c.decode(CloseBehavior.self, forKey: .close)) ?? CloseBehavior()
+        self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
+    }
+}

@@ -270,6 +270,128 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(AdDestination(rawValue: "carousel"))
     }
 
+    // MARK: - Ad behavior (ad_behavior decode)
+
+    func testAdBehaviorAbsentDecodesToNil() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        // Absent ad_behavior → nil so the renderer falls back to today's literal behavior.
+        XCTAssertNil(r.adBehavior)
+    }
+
+    func testAdBehaviorHappyPath() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":5,"countdown_ui":"circular_progress",
+           "position":"bottom_left","size":"large","motion":"reposition_on_tap"},
+           "store_open":"skstoreproduct"}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 5)
+        XCTAssertEqual(b.close.countdownUI, .circularProgress)
+        XCTAssertEqual(b.close.position, .bottomLeft)
+        XCTAssertEqual(b.close.size, .large)
+        XCTAssertEqual(b.close.motion, .repositionOnTap)
+        XCTAssertEqual(b.storeOpen, .skstoreproduct)
+    }
+
+    func testAdBehaviorEmptyObjectUsesDefaults() throws {
+        // Present-but-empty ad_behavior is non-nil and fully defaulted.
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 0)
+        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.size, .standard)
+        XCTAssertEqual(b.close.motion, .static)
+        XCTAssertEqual(b.storeOpen, .external)
+    }
+
+    func testAdBehaviorPartialCloseFillsDefaults() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":3}}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 3)
+        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.size, .standard)
+        XCTAssertEqual(b.storeOpen, .external)
+    }
+
+    func testAdBehaviorHyphenNormalization() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"countdown_ui":"numeric-always","position":"top-left",
+           "motion":"reposition-on-tap"},"store_open":"external-browser"}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.countdownUI, .numericAlways)
+        XCTAssertEqual(b.close.position, .topLeft)
+        XCTAssertEqual(b.close.motion, .repositionOnTap)
+        XCTAssertEqual(b.storeOpen, .external)
+    }
+
+    func testAdBehaviorLegacyAliases() throws {
+        // bottom_corner → bottomRight; sk_overlay/sk_store_product → skstoreproduct; bar accepted.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"countdown_ui":"bar","position":"bottom_corner","size":"small"},
+           "store_open":"sk_overlay"}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.countdownUI, .bar)
+        XCTAssertEqual(b.close.position, .bottomRight)
+        XCTAssertEqual(b.close.size, .small)
+        XCTAssertEqual(b.storeOpen, .skstoreproduct)
+    }
+
+    func testAdBehaviorInlineInstallAndStoreProductAlias() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"store_open":"inline_install"}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).storeOpen, .inlineInstall)
+
+        let json2 = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"store_open":"sk_store_product"}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json2).adBehavior).storeOpen, .skstoreproduct)
+    }
+
+    func testAdBehaviorResilientToUnknownEnums() throws {
+        // Unknown enum strings fall back per-field; delay_seconds is still parsed.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":12,"countdown_ui":"spinner","position":"middle",
+           "size":"huge","motion":"teleport"},"store_open":"warp"}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 12)
+        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.size, .standard)
+        XCTAssertEqual(b.close.motion, .static)
+        XCTAssertEqual(b.storeOpen, .external)
+    }
+
+    func testAdBehaviorNegativeDelayClampsToZero() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":-5}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds, 0)
+    }
+
+    func testCloseSizeGlyphMapping() {
+        XCTAssertEqual(CloseSize.small.glyphSize, 16)
+        XCTAssertEqual(CloseSize.standard.glyphSize, 24)
+        XCTAssertEqual(CloseSize.large.glyphSize, 32)
+        XCTAssertEqual(CloseSize.standard.circleSize, 44)
+    }
+
     // MARK: - Interstitial configuration defaults / mutability
 
     @MainActor
