@@ -443,8 +443,17 @@ public final class SimulaAPI: @unchecked Sendable {
 
     /// Fetches the game catalog.
     /// Translates `fetchCatalog()` from api.ts
-    public func fetchCatalog() async throws -> CatalogResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+    ///
+    /// `sessionId` is passed through as the `session_id` query param when available (the backend
+    /// ties the catalog to the session); omitted when nil/empty.
+    public func fetchCatalog(sessionId: String? = nil) async throws -> CatalogResponse {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+            throw SimulaAPIError.invalidURL
+        }
+        if let sessionId, !sessionId.isEmpty {
+            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
+        }
+        guard let url = components.url else {
             throw SimulaAPIError.invalidURL
         }
 
