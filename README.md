@@ -99,9 +99,10 @@ MiniGameInvitation(
 
 The interstitial is a preloadable full-screen ad with a standard load/show
 lifecycle. Initialize the SDK once, preload with `load()`, then present with
-`show(...)`. Showing presents an invite teaser
-(`DISPLAYED`); tapping its CTA (`CLICKED`) opens the game menu → game →
-post-game ad. The teaser + menu + game + ad together are the ad unit.
+`show()` — no arguments. Showing presents a native full-screen creative
+(`DISPLAYED`): a swipeable, paged carousel of the prefetched portrait assets with
+an always-visible CTA. Tapping the CTA (`CLICKED`) opens the advertiser's
+destination — the App Store (in-app store sheet) or a web page (in-app Safari).
 
 ```swift
 import SimulaAdSDK
@@ -115,16 +116,12 @@ final class GameAds: SimulaInterstitialAdDelegate {
 
     init() {
         interstitial.delegate = self
+        interstitial.ctaText = "Learn More"   // optional, defaults to "Learn More"
         interstitial.load()
     }
 
-    func showGame() {
-        interstitial.show(
-            charID: "char_123",
-            charName: "Luna",
-            charImage: "https://example.com/avatar.png",
-            charDesc: "A playful companion"
-        )
+    func showAd() {
+        interstitial.show()
     }
 
     // 3. Lifecycle events (all optional):
@@ -132,23 +129,40 @@ final class GameAds: SimulaInterstitialAdDelegate {
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
-    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* CTA tapped → menu opens */ }
+    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* CTA tapped → opens advertiser destination */ }
     func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
 }
+```
+
+**Rewarded ads**
+
+Set `rewarded = true` and a `minPlayThreshold` (seconds) to request a rewarded
+creative. The close button stays hidden until the threshold elapses; once the user
+dismisses the ad after that point, `EARNED_REWARD` fires. A click-through on a
+rewarded ad does **not** auto-dismiss — the view gate governs close and reward.
+
+```swift
+let rewarded = SimulaInterstitialAd(adUnitId: "your_placement_id", minPlayThreshold: 5)
+rewarded.delegate = self
+rewarded.rewarded = true
+rewarded.load()
+// later, once LOADED:
+rewarded.show()
+
+func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward */ }
 ```
 
 **Lifecycle notes**
 
 - A single load is in flight per instance; the next ad is preloaded automatically
   after `CLOSED`.
-- `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called.
-- The teaser is configurable via `invitationText`, `ctaText`, `backgroundImage`,
-  and `inviteTheme` (`MiniGameInterstitialTheme`). The menu is themed via `theme`
-  (`MiniGameTheme`); `messages`, `maxGamesToShow`, and `delegateChar` are also
-  configurable on the instance.
-- `EARNED_REWARD` / `REWARD_VERIFICATION_FAILED` and `minPlayThreshold` are reserved
-  for an upcoming reward feature and are not active yet.
-- Imperative presentation is iOS-only; on other platforms `show(...)` reports
+- `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
+  or `.noFill` when no creative is available.
+- The CTA label is configurable via `ctaText` (defaults to `"Learn More"`). A single
+  asset renders without paging dots; multiple assets render as a paged carousel.
+- A non-rewarded ad auto-dismisses (firing `CLOSED`) after a CTA tap. `CLICKED` fires
+  on tap regardless of whether the store/web open succeeds.
+- Imperative presentation is iOS-only; on other platforms `show()` reports
   `DISPLAY_FAILED(.unsupportedPlatform)`.
 
 | Event | Delegate method |
@@ -158,8 +172,8 @@ final class GameAds: SimulaInterstitialAdDelegate {
 | DISPLAYED | `interstitialDidDisplay(_:)` |
 | DISPLAY_FAILED | `interstitialDidFailToDisplay(_:error:)` |
 | CLICKED | `interstitialDidClick(_:)` |
+| EARNED_REWARD | `interstitialDidEarnReward(_:)` |
 | CLOSED | `interstitialDidClose(_:)` |
-| EARNED_REWARD\* | `interstitialDidEarnReward(_:)` |
 | REWARD_VERIFICATION_FAILED\* | `interstitialRewardVerificationDidFail(_:)` |
 
 \* Reserved — not emitted yet.
@@ -197,7 +211,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` themes its invite teaser via `MiniGameInterstitialTheme` (the `inviteTheme` property) and its game menu via `MiniGameTheme` (the `theme` property).
+See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's native creative assets directly; its only customization is the CTA label (`ctaText`).
 
 ## Privacy & App Store Compliance
 

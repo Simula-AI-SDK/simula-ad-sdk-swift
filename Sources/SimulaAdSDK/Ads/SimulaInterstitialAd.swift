@@ -23,10 +23,11 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `DISPLAY_FAILED` — `show()` could not present the ad.
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError)
 
-    /// `CLICKED` — the user tapped the teaser CTA (which opens the game menu).
+    /// `CLICKED` — the user tapped the CTA, which opens the advertiser destination.
     func interstitialDidClick(_ ad: SimulaInterstitialAd)
 
-    /// `EARNED_REWARD` — reserved for a future reward feature. Not emitted yet.
+    /// `EARNED_REWARD` — a rewarded ad was viewed for at least `minPlayThreshold`
+    /// before being dismissed.
     func interstitialDidEarnReward(_ ad: SimulaInterstitialAd)
 
     /// `REWARD_VERIFICATION_FAILED` — reserved for a future reward feature. Not emitted yet.
@@ -55,7 +56,7 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case notInitialized
     /// A server session could not be created.
     case noSession
-    /// The catalog returned no playable games (no-fill).
+    /// No creative was returned to show (no-fill).
     case noFill
     /// `show()` was called before an ad was loaded.
     case notReady
@@ -75,7 +76,7 @@ public enum SimulaAdError: LocalizedError, Sendable {
         case .noSession:
             return "Could not create a session. Check the API key and network connection."
         case .noFill:
-            return "No games available to show right now (no fill)."
+            return "No ad available to show right now (no fill)."
         case .notReady:
             return "No ad is ready. Call load() and wait for LOADED before show()."
         case .alreadyShowing:
@@ -104,11 +105,11 @@ public enum SimulaAdError: LocalizedError, Sendable {
 /// - `load()` fails fast with `.notInitialized` when `SimulaAds.initialize` has
 ///   not been called.
 ///
-/// `show(...)` presents an invite teaser first (`DISPLAYED`); tapping its CTA
-/// (`CLICKED`) opens the game catalog menu → game → post-game-ad. The teaser +
-/// menu + game + ad together are the ad unit. Reward events (`EARNED_REWARD` /
-/// `REWARD_VERIFICATION_FAILED`) and `minPlayThreshold` are reserved for a future
-/// reward feature and are not active yet.
+/// `show()` presents a native full-screen creative (`DISPLAYED`): a swipeable
+/// carousel of the prefetched ad assets with an always-visible CTA. Tapping the
+/// CTA (`CLICKED`) opens the advertiser's App Store or web destination. When
+/// `rewarded` is set, the close button is gated behind `minPlayThreshold` seconds
+/// of viewing, after which `EARNED_REWARD` fires on dismiss.
 ///
 /// Usage:
 /// ```swift
@@ -116,7 +117,7 @@ public enum SimulaAdError: LocalizedError, Sendable {
 /// ad.delegate = self
 /// ad.load()
 /// // later, once LOADED:
-/// ad.show(charID: "char_123", charName: "Luna", charImage: "https://.../a.png")
+/// ad.show()
 /// ```
 @MainActor
 public final class SimulaInterstitialAd {
@@ -125,45 +126,28 @@ public final class SimulaInterstitialAd {
     /// The placement identifier for this ad instance.
     public let adUnitId: String
 
-    /// Minimum play time (seconds) before a reward is earned. Reserved for a
-    /// future reward feature; currently stored but unused.
+    /// Minimum viewing time (seconds) before a rewarded ad earns its reward. Only
+    /// applies when `rewarded` is `true`: the close button stays hidden until this
+    /// elapses, then `EARNED_REWARD` fires on dismiss.
     public let minPlayThreshold: TimeInterval
 
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
-    // MARK: - Optional menu configuration
-    //
-    // `show(...)` keeps the spec's four-argument shape, so menu-level options are
-    // configured on the instance instead.
+    /// Whether this placement requests a rewarded creative. When `true`, close is
+    /// gated by `minPlayThreshold` and `EARNED_REWARD` fires on a qualifying dismiss.
+    public var rewarded: Bool = false
 
-    /// Theme applied to the presented game menu.
-    public var theme: MiniGameTheme = MiniGameTheme()
-    /// Conversation context forwarded for contextual targeting.
-    public var messages: [Message] = []
-    /// Maximum number of games shown in the menu grid.
-    public var maxGamesToShow: MaxGamesToShow = .six
-    /// Whether the character delegates play to the game.
-    public var delegateChar: Bool = true
-
-    // Invite teaser — the first screen `show()` presents, before the menu.
-
-    /// Headline shown on the invite teaser.
-    public var invitationText: String = "Want to play a game?"
-    /// CTA button label on the invite teaser.
-    public var ctaText: String = "Play a Game"
-    /// Optional background image URL for the teaser. `nil` uses the bundled default.
-    public var backgroundImage: String?
-    /// Theme applied to the invite teaser.
-    public var inviteTheme: MiniGameInterstitialTheme = MiniGameInterstitialTheme()
+    /// Label for the always-visible creative CTA button.
+    public var ctaText: String = "Learn More"
 
     // MARK: - State
 
     private enum State {
         case idle
         case loading
-        case ready(CatalogResponse)
-        case showing
+        case ready(AdLoadResponse)
+        case showing(AdLoadResponse)
     }
 
     private var state: State = .idle
@@ -213,16 +197,29 @@ public final class SimulaInterstitialAd {
             }
 
             do {
-                let catalog = try await self.api.fetchCatalog()
+                let response = try await self.api.loadAd(
+                    adUnitId: self.adUnitId,
+                    rewarded: self.rewarded,
+                    sessionId: sessionId
+                )
                 if Task.isCancelled { return }
-                guard !catalog.games.isEmpty else {
+                // Drop blank/whitespace-only asset URLs: a payload of ["", " "]
+                // would otherwise pass the `isEmpty` check and render a fully black
+                // "ad" that still fires DISPLAYED + an impression.
+                let assets = response.renderedAssets.filter {
+                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                guard response.adInserted, !assets.isEmpty else {
                     self.failLoad(.noFill)
                     return
                 }
+                // Render/preload the filtered assets, not the raw (possibly blank) ones.
+                let sanitized = response.withRenderedAssets(assets)
                 #if os(iOS)
-                WebViewPool.shared.prewarm()
+                await CoverImageCache.shared.preload(urls: assets)
+                if Task.isCancelled { return }
                 #endif
-                self.state = .ready(catalog)
+                self.state = .ready(sanitized)
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 self.failLoad(.network(apiError))
@@ -234,27 +231,17 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Show
 
-    /// Presents the loaded ad's invite teaser. Fires `DISPLAYED` on success or
+    /// Presents the loaded creative full-screen. Fires `DISPLAYED` on success or
     /// `DISPLAY_FAILED` when no ad is ready / one is already showing / the platform
-    /// is unsupported. Tapping the teaser CTA fires `CLICKED` and opens the menu.
+    /// is unsupported. Tapping the CTA fires `CLICKED` and opens the advertiser
+    /// destination. For rewarded ads, `EARNED_REWARD` fires on a qualifying dismiss.
     ///
     /// On close, fires `CLOSED` and automatically preloads the next ad.
-    ///
-    /// - Parameters:
-    ///   - charID: Character identifier used to contextualize the games.
-    ///   - charName: Character display name shown in the menu header.
-    ///   - charImage: Character avatar URL.
-    ///   - charDesc: Optional character description forwarded for targeting.
-    public func show(
-        charID: String,
-        charName: String,
-        charImage: String,
-        charDesc: String? = nil
-    ) {
-        let catalog: CatalogResponse
+    public func show() {
+        let response: AdLoadResponse
         switch state {
         case .ready(let loaded):
-            catalog = loaded
+            response = loaded
         case .showing:
             failDisplay(.alreadyShowing)
             return
@@ -270,26 +257,19 @@ public final class SimulaInterstitialAd {
         }
 
         let presenter = InterstitialPresenter()
-        state = .showing
 
         let didPresent = presenter.present(
-            provider: provider,
-            preloadedCatalog: catalog,
-            charID: charID,
-            charName: charName,
-            charImage: charImage,
-            charDesc: charDesc,
-            invitationText: invitationText,
+            apiKey: provider.apiKey,
+            response: response,
             ctaText: ctaText,
-            backgroundImage: backgroundImage,
-            inviteTheme: inviteTheme,
-            menuTheme: theme,
-            messages: messages,
-            maxGamesToShow: maxGamesToShow,
-            delegateChar: delegateChar,
+            minPlayThreshold: minPlayThreshold,
             onClick: { [weak self] in
                 guard let self else { return }
                 self.delegate?.interstitialDidClick(self)
+            },
+            onEarnReward: { [weak self] in
+                guard let self else { return }
+                self.delegate?.interstitialDidEarnReward(self)
             },
             onClose: { [weak self] in
                 guard let self else { return }
@@ -304,13 +284,20 @@ public final class SimulaInterstitialAd {
         guard didPresent else {
             // Couldn't present (no window scene). Keep the loaded ad so the host
             // can retry; report DISPLAY_FAILED without a bogus DISPLAYED/CLOSED.
-            state = .ready(catalog)
+            // `state` was never moved off `.ready`, so the ad stays showable.
             failDisplay(.noPresentationContext)
             return
         }
 
+        // Only now is the ad actually on screen.
+        state = .showing(response)
         self.presenter = presenter
         delegate?.interstitialDidDisplay(self)
+        // Fire the impression once, only after the present succeeded.
+        let api = self.api
+        let apiKey = provider.apiKey
+        let adId = response.adId
+        Task { await api.trackImpression(adId: adId, apiKey: apiKey) }
         #else
         failDisplay(.unsupportedPlatform)
         #endif

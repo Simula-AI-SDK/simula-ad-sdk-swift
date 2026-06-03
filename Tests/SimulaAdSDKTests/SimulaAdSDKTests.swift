@@ -45,7 +45,7 @@ final class SimulaAdSDKTests: XCTestCase {
         let ad = SimulaInterstitialAd(adUnitId: "test_unit")
         ad.delegate = delegate
 
-        ad.show(charID: "c1", charName: "Char", charImage: "https://example.com/i.png")
+        ad.show()
 
         guard case .notReady? = delegate.displayFailedError else {
             return XCTFail("Expected .notReady, got \(String(describing: delegate.displayFailedError))")
@@ -131,6 +131,118 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testParseCatalogInvalidJSONThrows() {
         XCTAssertThrowsError(try parseCatalog(data("not json")))
+    }
+
+    // MARK: - Ad load parsing (AdLoadResponse decode)
+
+    private func decodeAdLoad(_ json: String) throws -> AdLoadResponse {
+        try JSONDecoder().decode(AdLoadResponse.self, from: data(json))
+    }
+
+    func testAdLoadHappyPath() throws {
+        let json = """
+        {"ad_id":"ad_1","ad_inserted":true,"ad_unit_id":"unit_1","rewarded":true,
+         "destination":"web","rendered_format":"rewarded_video",
+         "rendered_assets":["https://x/a.png","https://x/b.png"],
+         "tracking_url":"https://x/click"}
+        """
+        let r = try decodeAdLoad(json)
+        XCTAssertEqual(r.adId, "ad_1")
+        XCTAssertTrue(r.adInserted)
+        XCTAssertEqual(r.adUnitId, "unit_1")
+        XCTAssertTrue(r.rewarded)
+        XCTAssertEqual(r.destination, "web")
+        XCTAssertEqual(r.destinationKind, .web)
+        XCTAssertEqual(r.renderedFormat, "rewarded_video")
+        XCTAssertEqual(r.renderedAssets, ["https://x/a.png", "https://x/b.png"])
+        XCTAssertEqual(r.trackingUrl, "https://x/click")
+    }
+
+    func testAdLoadDestinationDefaultsToAppstoreWhenAbsent() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertEqual(r.destination, "appstore")
+        XCTAssertEqual(r.destinationKind, .appstore)
+    }
+
+    func testAdLoadDestinationUnknownFallsBackToAppstore() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"destination":"carousel"}"#
+        let r = try decodeAdLoad(json)
+        // The raw string is preserved, but destinationKind maps unknown → .appstore.
+        XCTAssertEqual(r.destination, "carousel")
+        XCTAssertEqual(r.destinationKind, .appstore)
+    }
+
+    func testAdLoadMissingRenderedFormatIsNil() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertNil(r.renderedFormat)
+    }
+
+    func testAdLoadMissingRenderedAssetsIsEmpty() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertEqual(r.renderedAssets, [])
+    }
+
+    func testAdLoadAdInsertedFalseDecodes() throws {
+        let json = #"{"ad_id":"a","ad_inserted":false,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertFalse(r.adInserted)
+    }
+
+    func testAdLoadMalformedJSONThrows() {
+        XCTAssertThrowsError(try JSONDecoder().decode(AdLoadResponse.self, from: Data("not json".utf8)))
+    }
+
+    // MARK: - No-fill: blank/whitespace-only rendered assets
+
+    /// The no-fill guard filters blank/whitespace asset URLs before the emptiness
+    /// check (M2). A payload whose only assets are "" / " " must be treated as
+    /// no-fill, not rendered as a black "ad" that fires a junk impression.
+    private func nonBlankAssets(_ assets: [String]) -> [String] {
+        assets.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    func testAdLoadBlankOnlyAssetsAreNoFill() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "rendered_assets":["", "   ", "\\t"]}
+        """
+        let r = try decodeAdLoad(json)
+        // Decoder keeps the raw strings...
+        XCTAssertEqual(r.renderedAssets.count, 3)
+        // ...but after filtering there is nothing renderable → no-fill.
+        XCTAssertTrue(nonBlankAssets(r.renderedAssets).isEmpty,
+                      "Blank/whitespace-only assets must filter to empty (no-fill)")
+    }
+
+    func testAdLoadMixedBlankAndValidAssetsKeepsValid() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "rendered_assets":["", "https://x/a.png", "  ", "https://x/b.png"]}
+        """
+        let r = try decodeAdLoad(json)
+        let kept = nonBlankAssets(r.renderedAssets)
+        XCTAssertEqual(kept, ["https://x/a.png", "https://x/b.png"])
+    }
+
+    func testWithRenderedAssetsReplacesOnlyAssets() {
+        let original = AdLoadResponse(
+            adId: "ad_1", adInserted: true, adUnitId: "u", rewarded: true,
+            destination: "web", renderedFormat: "rewarded_video",
+            renderedAssets: ["", " ", "https://x/a.png"], trackingUrl: "https://x/click"
+        )
+        let sanitized = original.withRenderedAssets(nonBlankAssets(original.renderedAssets))
+        XCTAssertEqual(sanitized.renderedAssets, ["https://x/a.png"])
+        // Every other field is carried over unchanged.
+        XCTAssertEqual(sanitized.adId, "ad_1")
+        XCTAssertTrue(sanitized.adInserted)
+        XCTAssertEqual(sanitized.adUnitId, "u")
+        XCTAssertTrue(sanitized.rewarded)
+        XCTAssertEqual(sanitized.destination, "web")
+        XCTAssertEqual(sanitized.renderedFormat, "rewarded_video")
+        XCTAssertEqual(sanitized.trackingUrl, "https://x/click")
     }
 }
 

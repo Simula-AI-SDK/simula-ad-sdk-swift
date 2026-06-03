@@ -88,7 +88,8 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     // MARK: - Coordinator
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, SKStoreProductViewControllerDelegate {
+    @preconcurrency
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
@@ -101,112 +102,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
-        /// Extracts App Store ID from URLs like:
-        /// - https://apps.apple.com/app/id123456789
-        /// - https://itunes.apple.com/app/id123456789
-        /// - itms-apps://apps.apple.com/app/id123456789
-        /// - itms-apps://itunes.apple.com/app/id123456789
-        // Precompiled once — `range(of:options:.regularExpression)` would compile
-        // the pattern on every navigation. Group 1 captures the numeric ID.
-        private static let appStoreIDRegex = try! NSRegularExpression(pattern: #"id(\d+)"#)
-        private static let appStorePathIDRegex = try! NSRegularExpression(pattern: #"/id(\d+)"#)
-
-        private func capturedID(_ regex: NSRegularExpression, in string: String) -> String? {
-            let range = NSRange(string.startIndex..., in: string)
-            guard let match = regex.firstMatch(in: string, range: range),
-                  match.numberOfRanges >= 2,
-                  let idRange = Range(match.range(at: 1), in: string) else {
-                return nil
-            }
-            return String(string[idRange])
+        /// App Store id extraction lives in the shared `CreativeCTARouter` so the
+        /// game-iframe CTA and the native creative CTA resolve ids identically.
+        /// `CreativeCTARouter.appStoreID` is `nonisolated` (pure regex), so this is
+        /// a plain direct call — no `MainActor.assumeIsolated` trap on the hot path.
+        nonisolated private func appStoreID(from url: URL) -> String? {
+            CreativeCTARouter.appStoreID(from: url)
         }
-
-        private func appStoreID(from url: URL) -> String? {
-            let scheme = url.scheme?.lowercased() ?? ""
-            let host = url.host?.lowercased() ?? ""
-
-            // For itms-apps:// and itms:// schemes, search the path for /id\d+
-            // regardless of host (these are always App Store URLs)
-            if scheme == "itms-apps" || scheme == "itms" {
-                return capturedID(Self.appStoreIDRegex, in: url.absoluteString)
-            }
-
-            // For http/https, require known App Store hosts
-            guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
-                return nil
-            }
-            return capturedID(Self.appStorePathIDRegex, in: url.path)
-        }
-
-        private static var coordinatorKey: UInt8 = 0
-        private var isShowingStoreProduct = false
-
-        /// Presents SKStoreProductViewController in-app for the given App Store ID
-        private func presentStoreProduct(appID: String) {
-            guard !isShowingStoreProduct else { return }
-            isShowingStoreProduct = true
-            let storeVC = SKStoreProductViewController()
-            storeVC.delegate = self
-            objc_setAssociatedObject(storeVC, &Self.coordinatorKey, self, .OBJC_ASSOCIATION_RETAIN)
-            storeVC.loadProduct(withParameters: [
-                SKStoreProductParameterITunesItemIdentifier: NSNumber(value: Int(appID) ?? 0)
-            ])
-            presentViewController(storeVC)
-        }
-
-        // MARK: - SKStoreProductViewControllerDelegate
-
-        func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
-            isShowingStoreProduct = false
-            viewController.dismiss(animated: true)
-        }
-
-        /// Presents SFSafariViewController for external links
-        private func presentSafari(url: URL) {
-            let safariVC = SFSafariViewController(url: url)
-            presentViewController(safariVC)
-        }
-
-        private func presentViewController(_ vc: UIViewController) {
-            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                  let rootVC = scene.windows.first(where: \.isKeyWindow)?.rootViewController else { return }
-            var topVC = rootVC
-            while let presented = topVC.presentedViewController {
-                topVC = presented
-            }
-            topVC.present(vc, animated: true)
-        }
-
-        /// Follows HTTP redirect chain to determine the final destination.
-        /// If it resolves to an App Store URL → SKStoreProductViewController.
-        /// Otherwise → SFSafariViewController with the final URL.
-        private func resolveAndRoute(url: URL) {
-            // Quick check — already an App Store URL?
-            if let appID = appStoreID(from: url) {
-                presentStoreProduct(appID: appID)
-                return
-            }
-
-            let resolver = RedirectResolver { [weak self] finalURL in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    if let appID = self.appStoreID(from: finalURL) {
-                        self.presentStoreProduct(appID: appID)
-                    } else {
-                        self.presentSafari(url: finalURL)
-                    }
-                    // Release the resolver and its (now-invalidated) session.
-                    self.activeResolver = nil
-                }
-            }
-            // Keep a strong reference so it isn't deallocated during the request
-            self.activeResolver = resolver
-            let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
-            resolver.session = session
-            session.dataTask(with: URLRequest(url: url)).resume()
-        }
-
-        private var activeResolver: RedirectResolver?
 
         init(
             onNavigationFinished: (() -> Void)?,
@@ -266,9 +168,12 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // Intercept App Store URLs → show in-app store sheet
+            // Intercept App Store URLs → show in-app store sheet. The router's
+            // presentation entry points are `@MainActor`; WebKit delivers this
+            // delegate callback on the main thread, so hop there explicitly (no
+            // `assumeIsolated`, which would trap if ever called off-main).
             if let appID = appStoreID(from: url) {
-                presentStoreProduct(appID: appID)
+                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 decisionHandler(.cancel)
                 return
             }
@@ -276,10 +181,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
                 if let appID = appStoreID(from: url) {
-                    presentStoreProduct(appID: appID)
+                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 } else {
                     // Couldn't extract app ID — let the system handle it
-                    UIApplication.shared.open(url)
+                    Task { @MainActor in UIApplication.shared.open(url) }
                 }
                 decisionHandler(.cancel)
                 return
@@ -292,7 +197,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let currentHost = currentURL?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
-                    resolveAndRoute(url: url)
+                    Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
                     decisionHandler(.cancel)
                     return
                 }
@@ -317,8 +222,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                     let currentHost = currentURL?.host?.lowercased() ?? ""
                     let targetHost = url.host?.lowercased() ?? ""
                     if !targetHost.isEmpty && currentHost != targetHost {
-                        // Cross-domain → resolve redirects then route
-                        resolveAndRoute(url: url)
+                        // Cross-domain → resolve redirects then route. Router entry
+                        // point is `@MainActor`; this delegate runs on main, so hop
+                        // explicitly rather than asserting isolation.
+                        Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))
@@ -342,70 +249,6 @@ struct WebViewRepresentable: UIViewRepresentable {
                 onMessageReceived?(str)
             }
         }
-    }
-}
-
-// MARK: - RedirectResolver
-
-/// URLSession delegate that follows HTTP redirect chains and stops when it
-/// encounters an App Store URL or non-HTTP scheme. Used to pre-resolve
-/// AppsFlyer/onelink redirects before deciding whether to show
-/// SKStoreProductViewController or SFSafariViewController.
-private class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
-    let completion: (URL) -> Void
-    /// The session driving this resolution. Held so it can be invalidated on
-    /// completion: a delegate-based URLSession otherwise retains its delegate
-    /// (and an operation-queue thread) indefinitely until `invalidate` is called.
-    var session: URLSession?
-    private var completed = false
-
-    init(completion: @escaping (URL) -> Void) {
-        self.completion = completion
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        guard let redirectURL = request.url else {
-            // request.url is nil here; never force-unwrap it.
-            finish(with: task.currentRequest?.url)
-            completionHandler(nil)
-            return
-        }
-
-        let scheme = redirectURL.scheme?.lowercased() ?? ""
-        let host = redirectURL.host?.lowercased() ?? ""
-
-        // Stop at App Store URLs or non-HTTP schemes
-        if host.contains("apps.apple.com") || host.contains("itunes.apple.com")
-            || scheme == "itms-apps" || scheme == "itms" {
-            finish(with: redirectURL)
-            completionHandler(nil)
-            return
-        }
-
-        // Continue following redirect chain
-        completionHandler(request)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // Terminal callback on every path (success or error). Always finish so
-        // the session is invalidated even when there's no final URL to route to.
-        finish(with: task.currentRequest?.url)
-    }
-
-    /// Terminates the resolution. Always invalidates the session — so its
-    /// delegate (self) and backing thread are released on every path — and
-    /// routes to `url` only when one is available.
-    private func finish(with url: URL?) {
-        guard !completed else { return }
-        completed = true
-        session?.finishTasksAndInvalidate()
-        if let url { completion(url) }
     }
 }
 

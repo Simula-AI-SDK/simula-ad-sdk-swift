@@ -190,12 +190,22 @@ public struct SimulaProviderView<Content: View>: View {
         hasPrivacyConsent: Bool = true,
         @ViewBuilder content: @escaping () -> Content
     ) {
-        self._provider = StateObject(wrappedValue: SimulaProvider(
-            apiKey: apiKey,
-            devMode: devMode,
-            primaryUserID: primaryUserID,
-            hasPrivacyConsent: hasPrivacyConsent
-        ))
+        let provider: SimulaProvider
+        if let shared = SimulaAds.shared,
+           shared.apiKey == apiKey,
+           shared.devMode == devMode,
+           shared.primaryUserID == primaryUserID,
+           shared.hasPrivacyConsent == hasPrivacyConsent {
+            provider = shared
+        } else {
+            provider = SimulaProvider(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: primaryUserID,
+                hasPrivacyConsent: hasPrivacyConsent
+            )
+        }
+        self._provider = StateObject(wrappedValue: provider)
         self.content = content
     }
 
