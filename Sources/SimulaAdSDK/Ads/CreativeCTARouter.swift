@@ -95,22 +95,25 @@ enum CreativeCTARouter {
 
     // MARK: - Presentation
 
-    /// Associated-object key under which the presented `SKStoreProductViewController`
-    /// retains its delegate, so each in-flight store sheet owns its own delegate
-    /// (no single global slot that a second present would clobber).
+    /// Associated-object keys under which a presented store / Safari sheet retains
+    /// its own delegate, so each in-flight sheet owns its delegate (no single global
+    /// slot that a second present would clobber).
     private static var storeDelegateAssocKey: UInt8 = 0
+    private static var safariDelegateAssocKey: UInt8 = 0
 
-    /// Guards against stacking duplicate store sheets. Set to `true` only after a
-    /// confirmed present (and reset if presentation fails), so a failed present can
-    /// never wedge all future store sheets shut process-wide.
-    private static var isShowingStoreProduct = false
+    /// Guards against stacking a second in-app sheet (store OR Safari) on top of one
+    /// already showing — only one external surface should be up at a time. Set `true`
+    /// only after a confirmed present (and never set on a failed present), so a
+    /// no-window early-return can't wedge all future CTAs shut. Each sheet's delegate
+    /// resets it on dismiss.
+    private static var isPresentingExternal = false
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID.
     static func presentStoreProduct(appID: String) {
-        guard !isShowingStoreProduct else { return }
+        guard !isPresentingExternal else { return }
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
-            isShowingStoreProduct = false
+            isPresentingExternal = false
         }
         storeVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
@@ -124,14 +127,26 @@ enum CreativeCTARouter {
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick true forever on a no-window early-return.
         if presentViewController(storeVC) {
-            isShowingStoreProduct = true
+            isPresentingExternal = true
         }
     }
 
     /// Presents `SFSafariViewController` for external links.
     static func presentSafari(url: URL) {
+        guard !isPresentingExternal else { return }
         let safariVC = SFSafariViewController(url: url)
-        _ = presentViewController(safariVC)
+        let delegate = SafariDelegate {
+            isPresentingExternal = false
+        }
+        safariVC.delegate = delegate
+        // Retain the delegate on the presented VC itself (per-sheet).
+        objc_setAssociatedObject(
+            safariVC, &safariDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+        )
+        // Only mark "presenting" once the present actually succeeds.
+        if presentViewController(safariVC) {
+            isPresentingExternal = true
+        }
     }
 
     /// Presents `vc` on top of the active window. Returns `true` if a host
@@ -217,6 +232,24 @@ private final class StoreProductDelegate: NSObject, SKStoreProductViewController
 
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
         viewController.dismiss(animated: true)
+        let onFinish = self.onFinish
+        Task { @MainActor in onFinish() }
+    }
+}
+
+// MARK: - SafariDelegate
+
+/// Clears the "presenting" guard when the user dismisses the Safari sheet. Retained
+/// per-sheet via an associated object (like `StoreProductDelegate`). `SFSafariViewController`
+/// dismisses itself, so this only resets the guard. Delivered on the main thread.
+private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate {
+    private let onFinish: @MainActor () -> Void
+
+    init(onFinish: @escaping @MainActor () -> Void) {
+        self.onFinish = onFinish
+    }
+
+    func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
         let onFinish = self.onFinish
         Task { @MainActor in onFinish() }
     }

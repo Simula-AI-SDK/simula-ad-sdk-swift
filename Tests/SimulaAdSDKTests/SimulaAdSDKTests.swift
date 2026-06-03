@@ -244,6 +244,53 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(sanitized.renderedFormat, "rewarded_video")
         XCTAssertEqual(sanitized.trackingUrl, "https://x/click")
     }
+
+    // MARK: - Ad load request (AdLoadRequest encode)
+
+    func testAdLoadRequestEncodesSnakeCaseKeys() throws {
+        let body = AdLoadRequest(adUnitId: "unit_1", rewarded: true, sessionId: "sess_9")
+        let encoded = try JSONEncoder().encode(body)
+        let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        XCTAssertEqual(obj?["ad_unit_id"] as? String, "unit_1")
+        XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
+        XCTAssertEqual(obj?["rewarded"] as? Bool, true)
+    }
+
+    func testAdLoadRequestDefaults() {
+        let body = AdLoadRequest(adUnitId: "unit_1")
+        XCTAssertFalse(body.rewarded)
+        XCTAssertEqual(body.sessionId, "")
+    }
+
+    // MARK: - AdDestination raw values
+
+    func testAdDestinationRawValues() {
+        XCTAssertEqual(AdDestination(rawValue: "appstore"), .appstore)
+        XCTAssertEqual(AdDestination(rawValue: "web"), .web)
+        XCTAssertNil(AdDestination(rawValue: "carousel"))
+    }
+
+    // MARK: - Interstitial configuration defaults / mutability
+
+    @MainActor
+    func testInterstitialDefaultConfiguration() {
+        let ad = SimulaInterstitialAd(adUnitId: "u")
+        XCTAssertEqual(ad.adUnitId, "u")
+        XCTAssertFalse(ad.rewarded)
+        XCTAssertEqual(ad.minPlayThreshold, 0)
+        XCTAssertEqual(ad.ctaText, "Learn More")
+    }
+
+    @MainActor
+    func testInterstitialConfigurationIsMutable() {
+        let ad = SimulaInterstitialAd(adUnitId: "u")
+        ad.rewarded = true
+        ad.minPlayThreshold = 7
+        ad.ctaText = "Play Now"
+        XCTAssertTrue(ad.rewarded)
+        XCTAssertEqual(ad.minPlayThreshold, 7)
+        XCTAssertEqual(ad.ctaText, "Play Now")
+    }
 }
 
 // MARK: - Test doubles
