@@ -100,9 +100,9 @@ MiniGameInvitation(
 The interstitial is a preloadable full-screen ad with a standard load/show
 lifecycle. Initialize the SDK once, preload with `load()`, then present with
 `show()` — no arguments. Showing presents a native full-screen creative
-(`DISPLAYED`): a swipeable, paged carousel of the prefetched portrait assets with
-an always-visible CTA. Tapping the CTA (`CLICKED`) opens the advertiser's
-destination — the App Store (in-app store sheet) or a web page (in-app Safari).
+(`DISPLAYED`): the server-rendered HTML creative in a web view, which owns its own
+CTA. A user-initiated link tap inside the creative (`CLICKED`) opens the
+advertiser's destination — the App Store (in-app store sheet) or a web page (in-app Safari).
 
 ```swift
 import SimulaAdSDK
@@ -116,7 +116,6 @@ final class GameAds: SimulaInterstitialAdDelegate {
 
     init() {
         interstitial.delegate = self
-        interstitial.ctaText = "Learn More"   // optional, defaults to "Learn More"
         interstitial.load()
     }
 
@@ -129,7 +128,7 @@ final class GameAds: SimulaInterstitialAdDelegate {
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
-    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* CTA tapped → opens advertiser destination */ }
+    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* creative link tapped → opens advertiser destination */ }
     func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
 }
 ```
@@ -157,11 +156,11 @@ func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward
 - A single load is in flight per instance; the next ad is preloaded automatically
   after `CLOSED`.
 - `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
-  or `.noFill` when no creative is available.
-- The CTA label is configurable via `ctaText` (defaults to `"Learn More"`). A single
-  asset renders without paging dots; multiple assets render as a paged carousel.
-- A non-rewarded ad auto-dismisses (firing `CLOSED`) after a CTA tap. `CLICKED` fires
-  on tap regardless of whether the store/web open succeeds.
+  or `.noFill` when the payload carries no `rendered_html` creative.
+- The creative is the server-rendered HTML; it owns its own CTA, so there is no
+  SDK-drawn button to configure. The interstitial is dismissed via the close button
+  (gated for rewarded ads), not by the click-through. `CLICKED` fires on a
+  user-initiated link tap regardless of whether the store/web open succeeds.
 - Imperative presentation is iOS-only; on other platforms `show()` reports
   `DISPLAY_FAILED(.unsupportedPlatform)`.
 
@@ -211,7 +210,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's native creative assets directly; its only customization is the CTA label (`ctaText`).
+See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
 
 ## Privacy & App Store Compliance
 

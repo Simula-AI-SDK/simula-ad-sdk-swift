@@ -294,10 +294,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let rewarded: Bool
     public let destination: String
     public let renderedFormat: String?
-    public let renderedAssets: [String]
     public let trackingUrl: String?
-    /// Server-rendered HTML creative. When present (non-blank), this is rendered
-    /// full-screen in a web view and **takes precedence** over `renderedAssets`.
+    /// Server-rendered HTML creative. When present (non-blank) it is rendered
+    /// full-screen in a web view — the imperative interstitial's sole creative.
     public let renderedHtml: String?
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
@@ -305,8 +304,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
-    /// The HTML creative to render — trimmed and non-blank — or `nil`. When non-nil
-    /// it takes precedence over `renderedAssets` (the carousel path).
+    /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
+    /// value means the payload carries no renderable creative (no-fill).
     public var htmlCreative: String? {
         guard let html = renderedHtml,
               !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -320,7 +319,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         case rewarded
         case destination
         case renderedFormat = "rendered_format"
-        case renderedAssets = "rendered_assets"
         case trackingUrl = "tracking_url"
         case renderedHtml = "rendered_html"
     }
@@ -333,7 +331,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.rewarded = (try? c.decode(Bool.self, forKey: .rewarded)) ?? false
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
-        self.renderedAssets = (try? c.decode([String].self, forKey: .renderedAssets)) ?? []
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
     }
@@ -346,7 +343,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         rewarded: Bool,
         destination: String = "appstore",
         renderedFormat: String? = nil,
-        renderedAssets: [String] = [],
         trackingUrl: String? = nil,
         renderedHtml: String? = nil
     ) {
@@ -356,25 +352,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.rewarded = rewarded
         self.destination = destination
         self.renderedFormat = renderedFormat
-        self.renderedAssets = renderedAssets
         self.trackingUrl = trackingUrl
         self.renderedHtml = renderedHtml
-    }
-
-    /// Returns a copy with `renderedAssets` replaced (used after filtering out
-    /// blank/whitespace asset URLs so presentation renders only valid assets).
-    public func withRenderedAssets(_ assets: [String]) -> AdLoadResponse {
-        AdLoadResponse(
-            adId: adId,
-            adInserted: adInserted,
-            adUnitId: adUnitId,
-            rewarded: rewarded,
-            destination: destination,
-            renderedFormat: renderedFormat,
-            renderedAssets: assets,
-            trackingUrl: trackingUrl,
-            renderedHtml: renderedHtml
-        )
     }
 }
 
