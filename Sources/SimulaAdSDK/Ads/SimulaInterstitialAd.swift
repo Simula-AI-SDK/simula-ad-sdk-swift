@@ -105,11 +105,12 @@ public enum SimulaAdError: LocalizedError, Sendable {
 /// - `load()` fails fast with `.notInitialized` when `SimulaAds.initialize` has
 ///   not been called.
 ///
-/// `show()` presents a native full-screen creative (`DISPLAYED`): a swipeable
-/// carousel of the prefetched ad assets with an always-visible CTA. Tapping the
-/// CTA (`CLICKED`) opens the advertiser's App Store or web destination. When
-/// `rewarded` is set, the close button is gated behind `minPlayThreshold` seconds
-/// of viewing, after which `EARNED_REWARD` fires on dismiss.
+/// `show()` presents a native full-screen creative (`DISPLAYED`): the
+/// server-rendered HTML creative (`rendered_html`) in a web view, which owns its
+/// own CTA. A user-initiated link tap inside it fires `CLICKED` and opens the
+/// advertiser's App Store or web destination. When `rewarded` is set, the close
+/// button is gated behind `minPlayThreshold` seconds of viewing, after which
+/// `EARNED_REWARD` fires on dismiss.
 ///
 /// Usage:
 /// ```swift
@@ -128,8 +129,8 @@ public final class SimulaInterstitialAd {
 
     /// Minimum viewing time (seconds) before a rewarded ad earns its reward. Only
     /// applies when `rewarded` is `true`: the close button stays hidden until this
-    /// elapses, then `EARNED_REWARD` fires on dismiss. Mutable (like `rewarded` /
-    /// `ctaText`) — settable directly or via the `init` convenience parameter.
+    /// elapses, then `EARNED_REWARD` fires on dismiss. Mutable (like `rewarded`) —
+    /// settable directly or via the `init` convenience parameter.
     public var minPlayThreshold: TimeInterval = 0
 
     /// Receives lifecycle events.
@@ -139,8 +140,14 @@ public final class SimulaInterstitialAd {
     /// gated by `minPlayThreshold` and `EARNED_REWARD` fires on a qualifying dismiss.
     public var rewarded: Bool = false
 
-    /// Label for the always-visible creative CTA button.
-    public var ctaText: String = "Learn More"
+    /// Optional character context sent on the `/ads/load` request so the backend
+    /// can target the creative. Omitted from the request body when `nil`.
+    public var charId: String?
+    /// Character name displayed in the creative header.
+    public var charName: String?
+    /// Character avatar URL.
+    public var charImage: String?
+    public var charDesc: String?
 
     // MARK: - State
 
@@ -201,26 +208,24 @@ public final class SimulaInterstitialAd {
                 let response = try await self.api.loadAd(
                     adUnitId: self.adUnitId,
                     rewarded: self.rewarded,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    charId: self.charId,
+                    charName: self.charName,
+                    charImage: self.charImage,
+                    charDesc: self.charDesc
                 )
                 if Task.isCancelled { return }
-                // Drop blank/whitespace-only asset URLs: a payload of ["", " "]
-                // would otherwise pass the `isEmpty` check and render a fully black
-                // "ad" that still fires DISPLAYED + an impression.
-                let assets = response.renderedAssets.filter {
-                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                }
-                guard response.adInserted, !assets.isEmpty else {
+                // Fillable only when the payload carries a non-blank `rendered_html`
+                // creative (whitespace-only HTML trims to nil → no-fill).
+                guard response.adInserted, response.htmlCreative != nil else {
                     self.failLoad(.noFill)
                     return
                 }
-                // Render/preload the filtered assets, not the raw (possibly blank) ones.
-                let sanitized = response.withRenderedAssets(assets)
                 #if os(iOS)
-                await CoverImageCache.shared.preload(urls: assets)
-                if Task.isCancelled { return }
+                // Warm a WKWebView so the first spin-up is off the present() critical path.
+                WebViewPool.shared.prewarm()
                 #endif
-                self.state = .ready(sanitized)
+                self.state = .ready(response)
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 self.failLoad(.network(apiError))
@@ -262,7 +267,6 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
-            ctaText: ctaText,
             minPlayThreshold: minPlayThreshold,
             onClick: { [weak self] in
                 guard let self else { return }

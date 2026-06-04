@@ -49,14 +49,19 @@ public enum SimulaAds {
     ///   - apiKey: The API key for authenticating with Simula services.
     ///   - devMode: Whether the SDK runs in development mode.
     ///   - primaryUserID: Optional primary user identifier (suppressed when
-    ///     `hasPrivacyConsent` is `false`).
-    ///   - hasPrivacyConsent: Privacy consent flag. When `false`, suppresses
-    ///     collection of PII.
+    ///     `hasPrivacyConsent` is `false` or COPPA applies).
+    ///   - hasPrivacyConsent: Legacy coarse consent flag. When `false`, suppresses
+    ///     collection of PII. Seeds `privacy` when no explicit config is given.
+    ///   - privacy: Granular privacy / consent configuration (GDPR/TCF/CCPA/GPP/COPPA
+    ///     + IDFA opt-in). When provided it takes precedence over `hasPrivacyConsent`;
+    ///     when `nil` the SDK seeds a config from `hasPrivacyConsent` and still
+    ///     auto-reads IAB-standard CMP keys. Mirrors `SimulaProviderView`'s `privacy`.
     public static func initialize(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
-        hasPrivacyConsent: Bool = true
+        hasPrivacyConsent: Bool = true,
+        privacy: SimulaPrivacyConfig? = nil
     ) {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
@@ -74,7 +79,8 @@ public enum SimulaAds {
             apiKey: apiKey,
             devMode: devMode,
             primaryUserID: primaryUserID,
-            hasPrivacyConsent: hasPrivacyConsent
+            hasPrivacyConsent: hasPrivacyConsent,
+            privacy: privacy
         )
         shared = provider
 

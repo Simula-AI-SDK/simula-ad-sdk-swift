@@ -6,7 +6,7 @@ A native Swift SDK for integrating sponsored mini-games into iOS and macOS appli
 
 - Sponsored mini-games that users can play with AI characters
 - Native SwiftUI components with smooth animations
-- Privacy-first design — no IDFA collection, contextual targeting only
+- Privacy-first — contextual by default, with opt-in IDFA attribution and IAB consent (GDPR / CCPA / GPP / COPPA) support
 - iOS App Store compliant with bundled Privacy Manifest
 - SKAdNetwork support for privacy-preserving ad attribution
 
@@ -100,9 +100,9 @@ MiniGameInvitation(
 The interstitial is a preloadable full-screen ad with a standard load/show
 lifecycle. Initialize the SDK once, preload with `load()`, then present with
 `show()` — no arguments. Showing presents a native full-screen creative
-(`DISPLAYED`): a swipeable, paged carousel of the prefetched portrait assets with
-an always-visible CTA. Tapping the CTA (`CLICKED`) opens the advertiser's
-destination — the App Store (in-app store sheet) or a web page (in-app Safari).
+(`DISPLAYED`): the server-rendered HTML creative in a web view, which owns its own
+CTA. A user-initiated link tap inside the creative (`CLICKED`) opens the
+advertiser's destination — the App Store (in-app store sheet) or a web page (in-app Safari).
 
 ```swift
 import SimulaAdSDK
@@ -116,7 +116,6 @@ final class GameAds: SimulaInterstitialAdDelegate {
 
     init() {
         interstitial.delegate = self
-        interstitial.ctaText = "Learn More"   // optional, defaults to "Learn More"
         interstitial.load()
     }
 
@@ -129,7 +128,7 @@ final class GameAds: SimulaInterstitialAdDelegate {
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
-    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* CTA tapped → opens advertiser destination */ }
+    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* creative link tapped → opens advertiser destination */ }
     func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
 }
 ```
@@ -157,11 +156,11 @@ func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward
 - A single load is in flight per instance; the next ad is preloaded automatically
   after `CLOSED`.
 - `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
-  or `.noFill` when no creative is available.
-- The CTA label is configurable via `ctaText` (defaults to `"Learn More"`). A single
-  asset renders without paging dots; multiple assets render as a paged carousel.
-- A non-rewarded ad auto-dismisses (firing `CLOSED`) after a CTA tap. `CLICKED` fires
-  on tap regardless of whether the store/web open succeeds.
+  or `.noFill` when the payload carries no `rendered_html` creative.
+- The creative is the server-rendered HTML; it owns its own CTA, so there is no
+  SDK-drawn button to configure. The interstitial is dismissed via the close button
+  (gated for rewarded ads), not by the click-through. `CLICKED` fires on a
+  user-initiated link tap regardless of whether the store/web open succeeds.
 - Imperative presentation is iOS-only; on other platforms `show()` reports
   `DISPLAY_FAILED(.unsupportedPlatform)`.
 
@@ -211,7 +210,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's native creative assets directly; its only customization is the CTA label (`ctaText`).
+See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
 
 ## Privacy & App Store Compliance
 
@@ -233,12 +232,33 @@ The `PrivacyInfo.xcprivacy` is bundled as a package resource and automatically i
 
 Copy the SKAdNetwork identifiers from `docs/SKAdNetworkItems.plist` into your app's `Info.plist` to enable privacy-preserving ad attribution. See [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) for detailed instructions.
 
+### Consent & Attribution
+
+The SDK is **contextual by default** and *consumes* IAB consent — it does not gather it. Either pass signals via `SimulaPrivacyConfig`, or let the SDK auto-read the standard `IABTCF_*` / `IABUSPrivacy_String` / `IABGPP_*` keys your CMP writes:
+
+```swift
+SimulaProviderView(
+    apiKey: "YOUR_API_KEY",
+    privacy: SimulaPrivacyConfig(
+        tcString: tc, uspString: usp, gppString: gpp, coppaApplies: false
+    )
+) { ContentView() }
+```
+
+Refresh at runtime when your CMP updates (from a child view via `@EnvironmentObject var simula: SimulaProvider`):
+
+```swift
+simula.updateConsent(tcString: newTC, gppString: newGPP)
+```
+
+**Opt-in IDFA attribution** (off by default): set `enableAdvertisingId: true`, call `await simula.requestTrackingAuthorization()`, add `NSUserTrackingUsageDescription` to your `Info.plist`, and declare tracking in your **app-level** privacy manifest. Full steps: [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) §4.
+
 ### Data Practices Summary
 
 | Practice | Status |
 |----------|--------|
-| Cross-app tracking | **No** |
-| IDFA collection | **No** |
+| Cross-app tracking | **No** by default (only if you opt in to IDFA) |
+| IDFA collection | **Opt-in** (off by default) |
 | User-linked data | **No** |
 | Privacy Manifest | **Included** |
 | Contextual targeting | **Yes** (content-based, not user-based) |
@@ -252,7 +272,7 @@ Copy the SKAdNetwork identifiers from `docs/SKAdNetworkItems.plist` into your ap
 
 ### Data NOT Collected
 
-- Apple Advertising Identifier (IDFA)
+- Apple Advertising Identifier (IDFA) — *unless you opt in; see Consent & Attribution*
 - Location data
 - Personal information (name, email, phone)
 - Contacts, photos, or browsing history
