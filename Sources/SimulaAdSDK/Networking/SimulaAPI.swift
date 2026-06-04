@@ -249,6 +249,8 @@ public struct AdLoadRequest: Encodable, Sendable {
     /// Optional character context the backend can use to target the creative.
     /// Encoded only when non-nil (synthesized `encodeIfPresent`).
     public let charId: String?
+    public let charName: String?
+    public let charImage: String?
     public let charDesc: String?
 
     enum CodingKeys: String, CodingKey {
@@ -256,6 +258,8 @@ public struct AdLoadRequest: Encodable, Sendable {
         case rewarded
         case sessionId = "session_id"
         case charId = "char_id"
+        case charName = "char_name"
+        case charImage = "char_image"
         case charDesc = "char_desc"
     }
 
@@ -264,12 +268,16 @@ public struct AdLoadRequest: Encodable, Sendable {
         rewarded: Bool = false,
         sessionId: String = "",
         charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
         charDesc: String? = nil
     ) {
         self.adUnitId = adUnitId
         self.rewarded = rewarded
         self.sessionId = sessionId
         self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
         self.charDesc = charDesc
     }
 }
@@ -501,6 +509,8 @@ public final class SimulaAPI: @unchecked Sendable {
         rewarded: Bool = false,
         sessionId: String = "",
         charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
         charDesc: String? = nil
     ) async throws -> AdLoadResponse {
         guard let url = URL(string: "\(API_BASE_URL)/ads/load") else {
@@ -516,6 +526,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 rewarded: rewarded,
                 sessionId: sessionId,
                 charId: charId,
+                charName: charName,
+                charImage: charImage,
                 charDesc: charDesc
             )
         )

@@ -315,13 +315,23 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertFalse(body.rewarded)
         XCTAssertEqual(body.sessionId, "")
         XCTAssertNil(body.charId)
+        XCTAssertNil(body.charName)
+        XCTAssertNil(body.charImage)
         XCTAssertNil(body.charDesc)
     }
 
     func testAdLoadRequestEncodesCharFieldsWhenSet() throws {
-        let body = AdLoadRequest(adUnitId: "u", charId: "char_7", charDesc: "a wise mentor")
+        let body = AdLoadRequest(
+            adUnitId: "u",
+            charId: "char_7",
+            charName: "Mentor",
+            charImage: "https://cdn.example.com/avatar.png",
+            charDesc: "a wise mentor"
+        )
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
         XCTAssertEqual(obj?["char_id"] as? String, "char_7")
+        XCTAssertEqual(obj?["char_name"] as? String, "Mentor")
+        XCTAssertEqual(obj?["char_image"] as? String, "https://cdn.example.com/avatar.png")
         XCTAssertEqual(obj?["char_desc"] as? String, "a wise mentor")
     }
 
@@ -330,6 +340,8 @@ final class SimulaAdSDKTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
         // Synthesized `encodeIfPresent` drops nil optionals → keys absent on the wire.
         XCTAssertNil(obj?["char_id"])
+        XCTAssertNil(obj?["char_name"])
+        XCTAssertNil(obj?["char_image"])
         XCTAssertNil(obj?["char_desc"])
     }
 

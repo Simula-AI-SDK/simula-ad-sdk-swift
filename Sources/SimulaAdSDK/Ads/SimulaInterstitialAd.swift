@@ -145,6 +145,10 @@ public final class SimulaInterstitialAd {
     /// Optional character context sent on the `/ads/load` request so the backend
     /// can target the creative. Omitted from the request body when `nil`.
     public var charId: String?
+    /// Character name displayed in the creative header.
+    public var charName: String?
+    /// Character avatar URL.
+    public var charImage: String?
     public var charDesc: String?
 
     // MARK: - State
@@ -208,6 +212,8 @@ public final class SimulaInterstitialAd {
                     rewarded: self.rewarded,
                     sessionId: sessionId,
                     charId: self.charId,
+                    charName: self.charName,
+                    charImage: self.charImage,
                     charDesc: self.charDesc
                 )
                 if Task.isCancelled { return }
