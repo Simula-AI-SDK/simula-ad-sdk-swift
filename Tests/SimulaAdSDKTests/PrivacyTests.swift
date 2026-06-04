@@ -185,4 +185,30 @@ final class PrivacyTests: XCTestCase {
         store.apply(SimulaPrivacyConfig(coppaApplies: true, enableAdvertisingId: true))
         XCTAssertNil(store.currentSnapshot.advertisingId)
     }
+
+    // MARK: - Privacy resolution (shared by SimulaAds.initialize via SimulaProvider)
+
+    @MainActor
+    func testProviderExplicitPrivacyConfigWins() {
+        // An explicit `privacy` config is stored verbatim (the imperative
+        // `SimulaAds.initialize(privacy:)` forwards straight into this init).
+        let cfg = SimulaPrivacyConfig(hasPrivacyConsent: true, gdprApplies: true, coppaApplies: true)
+        let provider = SimulaProvider(apiKey: "test-key", privacy: cfg)
+        XCTAssertEqual(provider.privacyConfig, cfg)
+    }
+
+    @MainActor
+    func testProviderSeedsConfigFromLegacyFlagWhenNoPrivacy() {
+        // No `privacy` given → the legacy `hasPrivacyConsent` flag seeds the config.
+        let provider = SimulaProvider(apiKey: "test-key", hasPrivacyConsent: false)
+        XCTAssertFalse(provider.privacyConfig.hasPrivacyConsent)
+    }
+
+    @MainActor
+    func testProviderExplicitPrivacyOverridesLegacyFlag() {
+        // Explicit `privacy` (consent granted) wins even when the legacy flag says false.
+        let cfg = SimulaPrivacyConfig(hasPrivacyConsent: true)
+        let provider = SimulaProvider(apiKey: "test-key", hasPrivacyConsent: false, privacy: cfg)
+        XCTAssertTrue(provider.privacyConfig.hasPrivacyConsent)
+    }
 }
