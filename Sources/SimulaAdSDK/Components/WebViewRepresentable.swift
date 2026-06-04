@@ -30,18 +30,25 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// Called when the web view receives a postMessage from JavaScript
     var onMessageReceived: ((String) -> Void)?
 
+    /// Called when a user-initiated link inside the content is intercepted for
+    /// routing (App Store / cross-domain click-through). Lets the imperative HTML
+    /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
+    var onAdClick: (() -> Void)?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
-        onMessageReceived: ((String) -> Void)? = nil
+        onMessageReceived: ((String) -> Void)? = nil,
+        onAdClick: (() -> Void)? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
+        self.onAdClick = onAdClick
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -82,7 +89,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         Coordinator(
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
-            onMessageReceived: onMessageReceived
+            onMessageReceived: onMessageReceived,
+            onAdClick: onAdClick
         )
     }
 
@@ -93,6 +101,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
+        var onAdClick: (() -> Void)?
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -113,11 +122,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         init(
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
-            onMessageReceived: ((String) -> Void)?
+            onMessageReceived: ((String) -> Void)?,
+            onAdClick: (() -> Void)? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
+            self.onAdClick = onAdClick
         }
 
         // MARK: - WKNavigationDelegate
@@ -173,6 +184,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // delegate callback on the main thread, so hop there explicitly (no
             // `assumeIsolated`, which would trap if ever called off-main).
             if let appID = appStoreID(from: url) {
+                onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
                 Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 decisionHandler(.cancel)
                 return
@@ -180,6 +192,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
+                onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
                 if let appID = appStoreID(from: url) {
                     Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 } else {
@@ -197,6 +210,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let currentHost = currentURL?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
+                    onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
                     Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
                     decisionHandler(.cancel)
                     return
@@ -264,19 +278,24 @@ struct WebViewRepresentable: NSViewRepresentable {
     var onNavigationFinished: (() -> Void)?
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
+    /// Accepted for signature parity with the iOS variant (the imperative HTML
+    /// creative is iOS-only, so this is unused on macOS).
+    var onAdClick: (() -> Void)?
 
     init(
         url: URL? = nil,
         htmlString: String? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
-        onMessageReceived: ((String) -> Void)? = nil
+        onMessageReceived: ((String) -> Void)? = nil,
+        onAdClick: (() -> Void)? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
+        self.onAdClick = onAdClick
     }
 
     func makeNSView(context: Context) -> WKWebView {

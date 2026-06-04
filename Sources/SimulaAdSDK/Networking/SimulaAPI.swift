@@ -274,10 +274,21 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let renderedFormat: String?
     public let renderedAssets: [String]
     public let trackingUrl: String?
+    /// Server-rendered HTML creative. When present (non-blank), this is rendered
+    /// full-screen in a web view and **takes precedence** over `renderedAssets`.
+    public let renderedHtml: String?
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
         AdDestination(rawValue: destination) ?? .appstore
+    }
+
+    /// The HTML creative to render — trimmed and non-blank — or `nil`. When non-nil
+    /// it takes precedence over `renderedAssets` (the carousel path).
+    public var htmlCreative: String? {
+        guard let html = renderedHtml,
+              !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return html
     }
 
     enum CodingKeys: String, CodingKey {
@@ -289,6 +300,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case renderedFormat = "rendered_format"
         case renderedAssets = "rendered_assets"
         case trackingUrl = "tracking_url"
+        case renderedHtml = "rendered_html"
     }
 
     public init(from decoder: Decoder) throws {
@@ -301,6 +313,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.renderedAssets = (try? c.decode([String].self, forKey: .renderedAssets)) ?? []
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
     }
 
     /// Member-wise init for internal construction and tests.
@@ -312,7 +325,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         destination: String = "appstore",
         renderedFormat: String? = nil,
         renderedAssets: [String] = [],
-        trackingUrl: String? = nil
+        trackingUrl: String? = nil,
+        renderedHtml: String? = nil
     ) {
         self.adId = adId
         self.adInserted = adInserted
@@ -322,6 +336,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = renderedFormat
         self.renderedAssets = renderedAssets
         self.trackingUrl = trackingUrl
+        self.renderedHtml = renderedHtml
     }
 
     /// Returns a copy with `renderedAssets` replaced (used after filtering out
@@ -335,7 +350,8 @@ public struct AdLoadResponse: Decodable, Sendable {
             destination: destination,
             renderedFormat: renderedFormat,
             renderedAssets: assets,
-            trackingUrl: trackingUrl
+            trackingUrl: trackingUrl,
+            renderedHtml: renderedHtml
         )
     }
 }

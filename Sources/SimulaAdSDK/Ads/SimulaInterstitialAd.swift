@@ -204,21 +204,31 @@ public final class SimulaInterstitialAd {
                     sessionId: sessionId
                 )
                 if Task.isCancelled { return }
+                // A non-blank `rendered_html` takes precedence over the image assets.
+                let html = response.htmlCreative
                 // Drop blank/whitespace-only asset URLs: a payload of ["", " "]
                 // would otherwise pass the `isEmpty` check and render a fully black
                 // "ad" that still fires DISPLAYED + an impression.
                 let assets = response.renderedAssets.filter {
                     !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-                guard response.adInserted, !assets.isEmpty else {
+                // Fillable when we have an HTML creative OR at least one valid asset.
+                guard response.adInserted, html != nil || !assets.isEmpty else {
                     self.failLoad(.noFill)
                     return
                 }
                 // Render/preload the filtered assets, not the raw (possibly blank) ones.
                 let sanitized = response.withRenderedAssets(assets)
                 #if os(iOS)
-                await CoverImageCache.shared.preload(urls: assets)
-                if Task.isCancelled { return }
+                if html == nil {
+                    // Image carousel path: warm the image cache so page 1 is instant.
+                    await CoverImageCache.shared.preload(urls: assets)
+                    if Task.isCancelled { return }
+                } else {
+                    // HTML path: nothing to image-preload; warm a WKWebView so the
+                    // first spin-up is off the present() critical path.
+                    WebViewPool.shared.prewarm()
+                }
                 #endif
                 self.state = .ready(sanitized)
                 self.delegate?.interstitialDidLoad(self)

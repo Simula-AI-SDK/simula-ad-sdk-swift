@@ -195,6 +195,60 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(AdLoadResponse.self, from: Data("not json".utf8)))
     }
 
+    // MARK: - Ad load: rendered_html (HTML creative precedence)
+
+    func testAdLoadDecodesRenderedHtml() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "rendered_assets":["https://x/a.png"],
+         "rendered_html":"<html><body>hi</body></html>"}
+        """
+        let r = try decodeAdLoad(json)
+        XCTAssertEqual(r.renderedHtml, "<html><body>hi</body></html>")
+        // Present & non-blank → htmlCreative is the precedence signal.
+        XCTAssertEqual(r.htmlCreative, "<html><body>hi</body></html>")
+    }
+
+    func testAdLoadRenderedHtmlAbsentIsNil() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_assets":["https://x/a.png"]}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertNil(r.renderedHtml)
+        XCTAssertNil(r.htmlCreative)
+    }
+
+    func testAdLoadRenderedHtmlBlankYieldsNilCreative() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"   \n\t  "}"#
+        let r = try decodeAdLoad(json)
+        // The raw whitespace string is preserved by the decoder...
+        XCTAssertFalse(r.renderedHtml?.isEmpty ?? true)
+        // ...but htmlCreative trims it away → no HTML precedence (falls back to assets).
+        XCTAssertNil(r.htmlCreative)
+    }
+
+    /// HTML creative takes precedence: a payload with `rendered_html` but no assets
+    /// is still fillable (mirrors the `load()` no-fill rule).
+    func testAdLoadHtmlOnlyPayloadIsFillable() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"<b>x</b>"}"#
+        let r = try decodeAdLoad(json)
+        let html = r.htmlCreative
+        let assets = nonBlankAssets(r.renderedAssets)
+        XCTAssertNotNil(html)
+        XCTAssertTrue(assets.isEmpty)
+        // Fillable = adInserted && (html != nil || !assets.isEmpty)
+        XCTAssertTrue(r.adInserted && (html != nil || !assets.isEmpty))
+    }
+
+    func testWithRenderedAssetsPreservesRenderedHtml() {
+        let original = AdLoadResponse(
+            adId: "a", adInserted: true, adUnitId: "u", rewarded: false,
+            renderedAssets: ["", "https://x/a.png"], renderedHtml: "<b>x</b>"
+        )
+        let sanitized = original.withRenderedAssets(nonBlankAssets(original.renderedAssets))
+        XCTAssertEqual(sanitized.renderedAssets, ["https://x/a.png"])
+        XCTAssertEqual(sanitized.renderedHtml, "<b>x</b>")
+        XCTAssertEqual(sanitized.htmlCreative, "<b>x</b>")
+    }
+
     // MARK: - No-fill: blank/whitespace-only rendered assets
 
     /// The no-fill guard filters blank/whitespace asset URLs before the emptiness

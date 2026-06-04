@@ -150,7 +150,13 @@ private struct CreativeInterstitialView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            carousel
+            // A non-blank `rendered_html` renders full-screen and takes precedence
+            // over the image carousel.
+            if let html = response.htmlCreative {
+                htmlCreativeView(html)
+            } else {
+                carousel
+            }
 
             // Close button — top right (hidden until enabled for rewarded ads).
             if closeEnabled {
@@ -173,23 +179,27 @@ private struct CreativeInterstitialView: View {
                 }
             }
 
-            // CTA button — always visible, bottom.
-            VStack {
-                Spacer()
-                Button(action: { handleCtaClick() }) {
-                    Text(ctaText)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14)
-                                .fill(Color(hex: "#3B82F6"))
-                        )
+            // CTA button — always visible, bottom. Shown only for the carousel
+            // (asset) path: an HTML creative owns its own CTA, so the SDK button is
+            // suppressed and the in-creative link drives CLICKED instead.
+            if response.htmlCreative == nil {
+                VStack {
+                    Spacer()
+                    Button(action: { handleCtaClick() }) {
+                        Text(ctaText)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .background(
+                                RoundedRectangle(cornerRadius: 14)
+                                    .fill(Color(hex: "#3B82F6"))
+                            )
+                    }
+                    .buttonStyle(CreativeCtaButtonStyle())
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 32)
                 }
-                .buttonStyle(CreativeCtaButtonStyle())
-                .padding(.horizontal, 24)
-                .padding(.bottom, 32)
             }
         }
         .opacity(visible ? 1 : 0)
@@ -228,6 +238,16 @@ private struct CreativeInterstitialView: View {
         } else {
             Color.black.ignoresSafeArea()
         }
+    }
+
+    // MARK: HTML creative
+
+    @ViewBuilder
+    private func htmlCreativeView(_ html: String) -> some View {
+        WebViewRepresentable(htmlString: html, onAdClick: { handleHtmlClick() })
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
+            .ignoresSafeArea()
     }
 
     @ViewBuilder
@@ -279,6 +299,16 @@ private struct CreativeInterstitialView: View {
             onRequestDismiss()
             CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination)
         }
+    }
+
+    /// Fired when a user-initiated link inside the HTML creative is intercepted by
+    /// the web view. The web view's coordinator routes the tapped link to the
+    /// store/Safari sheet (which presents over this still-live interstitial window),
+    /// so here we only emit CLICKED. We intentionally do NOT auto-dismiss: tearing
+    /// the window down would destroy the just-presented sheet. Dismissal is driven by
+    /// the close button (gated for rewarded creatives).
+    private func handleHtmlClick() {
+        onClick() // CLICKED
     }
 
     private func handleClose() {
