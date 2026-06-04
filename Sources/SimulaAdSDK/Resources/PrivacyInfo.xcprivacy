@@ -54,6 +54,25 @@
     <key>NSPrivacyCollectedDataTypes</key>
     <array>
         <!--
+          Device ID - Temporary session identifiers (NOT IDFA)
+          NOT linked to identity, NOT used for tracking.
+          IDFA is opt-in and, when enabled, must be declared at the APP level
+          (see docs/IOS_APP_PRIVACY.md "Enabling IDFA attribution").
+        -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeDeviceID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
+            </array>
+        </dict>
+
+        <!--
           Other Usage Data - Ad impressions and clicks
           NOT linked to identity, NOT used for tracking
         -->

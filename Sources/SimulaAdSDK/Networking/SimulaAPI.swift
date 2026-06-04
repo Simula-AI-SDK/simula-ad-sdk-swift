@@ -40,12 +40,6 @@ struct CreateSessionResponse: Decodable {
     let sessionId: String?
 }
 
-/// Request body for POST /session/create
-struct CreateSessionRequest: Encodable {
-    let devMode: Bool
-    let ppid: String?
-}
-
 /// Wraps a decode so failure yields `nil` instead of throwing. Because its own
 /// `init` never throws, decoding it from an unkeyed container always advances
 /// the container — the basis for lossy array decoding below.
@@ -374,13 +368,19 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Common Headers
 
-    private func makeHeaders(apiKey: String? = nil) -> [String: String] {
+    private func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
         var headers: [String: String] = [
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "1",
         ]
         if let apiKey = apiKey {
             headers["Authorization"] = "Bearer \(apiKey)"
+        }
+        // Attach consent signals to every request from the single header chokepoint.
+        // Reads the process-wide store unless an explicit snapshot is supplied.
+        let snapshot = consent ?? SimulaPrivacy.shared.currentSnapshot
+        for (key, value) in snapshot.consentHeaders() {
+            headers[key] = value
         }
         return headers
     }
@@ -398,15 +398,20 @@ public final class SimulaAPI: @unchecked Sendable {
     public func createSession(
         apiKey: String,
         devMode: Bool = false,
-        primaryUserID: String? = nil
+        primaryUserID: String? = nil,
+        privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
         guard let url = URL(string: "\(API_BASE_URL)/session/create") else { throw SimulaAPIError.invalidURL }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        let body = CreateSessionRequest(devMode: devMode, ppid: primaryUserID?.isEmpty == false ? primaryUserID : nil)
-        request.httpBody = try? JSONEncoder().encode(body)
+        applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
+        // Body carries dev/user identity plus, when present, the consent block the
+        // backend ties to the session and inherits on subsequent calls.
+        var body: [String: Any] = ["devMode": devMode]
+        if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        if let privacy { body["privacy"] = privacy.privacyBody() }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
 
