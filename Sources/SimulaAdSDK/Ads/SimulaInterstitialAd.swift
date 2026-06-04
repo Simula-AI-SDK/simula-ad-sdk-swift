@@ -142,6 +142,11 @@ public final class SimulaInterstitialAd {
     /// Label for the always-visible creative CTA button.
     public var ctaText: String = "Learn More"
 
+    /// Optional character context sent on the `/ads/load` request so the backend
+    /// can target the creative. Omitted from the request body when `nil`.
+    public var charId: String?
+    public var charDesc: String?
+
     // MARK: - State
 
     private enum State {
@@ -201,7 +206,9 @@ public final class SimulaInterstitialAd {
                 let response = try await self.api.loadAd(
                     adUnitId: self.adUnitId,
                     rewarded: self.rewarded,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    charId: self.charId,
+                    charDesc: self.charDesc
                 )
                 if Task.isCancelled { return }
                 // A non-blank `rendered_html` takes precedence over the image assets.

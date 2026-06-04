@@ -246,17 +246,31 @@ public struct AdLoadRequest: Encodable, Sendable {
     public let adUnitId: String
     public let rewarded: Bool
     public let sessionId: String
+    /// Optional character context the backend can use to target the creative.
+    /// Encoded only when non-nil (synthesized `encodeIfPresent`).
+    public let charId: String?
+    public let charDesc: String?
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
         case rewarded
         case sessionId = "session_id"
+        case charId = "char_id"
+        case charDesc = "char_desc"
     }
 
-    public init(adUnitId: String, rewarded: Bool = false, sessionId: String = "") {
+    public init(
+        adUnitId: String,
+        rewarded: Bool = false,
+        sessionId: String = "",
+        charId: String? = nil,
+        charDesc: String? = nil
+    ) {
         self.adUnitId = adUnitId
         self.rewarded = rewarded
         self.sessionId = sessionId
+        self.charId = charId
+        self.charDesc = charDesc
     }
 }
 
@@ -485,7 +499,9 @@ public final class SimulaAPI: @unchecked Sendable {
     public func loadAd(
         adUnitId: String,
         rewarded: Bool = false,
-        sessionId: String = ""
+        sessionId: String = "",
+        charId: String? = nil,
+        charDesc: String? = nil
     ) async throws -> AdLoadResponse {
         guard let url = URL(string: "\(API_BASE_URL)/ads/load") else {
             throw SimulaAPIError.invalidURL
@@ -495,7 +511,13 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            AdLoadRequest(adUnitId: adUnitId, rewarded: rewarded, sessionId: sessionId)
+            AdLoadRequest(
+                adUnitId: adUnitId,
+                rewarded: rewarded,
+                sessionId: sessionId,
+                charId: charId,
+                charDesc: charDesc
+            )
         )
 
         let (data, response) = try await session.data(for: request)

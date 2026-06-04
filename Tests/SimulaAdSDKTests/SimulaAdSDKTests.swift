@@ -314,6 +314,23 @@ final class SimulaAdSDKTests: XCTestCase {
         let body = AdLoadRequest(adUnitId: "unit_1")
         XCTAssertFalse(body.rewarded)
         XCTAssertEqual(body.sessionId, "")
+        XCTAssertNil(body.charId)
+        XCTAssertNil(body.charDesc)
+    }
+
+    func testAdLoadRequestEncodesCharFieldsWhenSet() throws {
+        let body = AdLoadRequest(adUnitId: "u", charId: "char_7", charDesc: "a wise mentor")
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["char_id"] as? String, "char_7")
+        XCTAssertEqual(obj?["char_desc"] as? String, "a wise mentor")
+    }
+
+    func testAdLoadRequestOmitsCharFieldsWhenNil() throws {
+        let body = AdLoadRequest(adUnitId: "u")
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        // Synthesized `encodeIfPresent` drops nil optionals → keys absent on the wire.
+        XCTAssertNil(obj?["char_id"])
+        XCTAssertNil(obj?["char_desc"])
     }
 
     // MARK: - AdDestination raw values
