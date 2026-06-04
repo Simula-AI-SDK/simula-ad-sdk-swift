@@ -1,5 +1,9 @@
 import Foundation
 import SwiftUI
+import Combine
+#if os(iOS)
+import AppTrackingTransparency
+#endif
 
 // MARK: - SimulaProvider
 
@@ -29,8 +33,13 @@ public final class SimulaProvider: ObservableObject {
     /// Optional primary user identifier
     public let primaryUserID: String?
 
-    /// Privacy consent flag. When false, suppresses collection of PII.
+    /// Legacy coarse consent flag. When false, suppresses collection of PII.
+    /// Retained as a convenience alias for `privacyConfig.hasPrivacyConsent`.
     public let hasPrivacyConsent: Bool
+
+    /// Resolved privacy / consent configuration. Pushed into the process-wide
+    /// `SimulaPrivacy` store, which also auto-reads IAB-standard CMP keys.
+    public let privacyConfig: SimulaPrivacyConfig
 
     // MARK: - Session State
 
@@ -57,13 +66,17 @@ public final class SimulaProvider: ObservableObject {
 
     private let api: SimulaAPI
 
+    /// Subscriptions to the consent store (re-sync session on CMP refresh).
+    private var cancellables: Set<AnyCancellable> = []
+
     // MARK: - Init
 
     public init(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
-        hasPrivacyConsent: Bool = true
+        hasPrivacyConsent: Bool = true,
+        privacy: SimulaPrivacyConfig? = nil
     ) {
         // Validate at init (matches React's validateSimulaProviderProps call)
         do {
@@ -77,7 +90,37 @@ public final class SimulaProvider: ObservableObject {
         self.devMode = devMode
         self.primaryUserID = primaryUserID
         self.hasPrivacyConsent = hasPrivacyConsent
+
+        // When an explicit `privacy` config is given it wins; otherwise the legacy
+        // `hasPrivacyConsent` flag seeds the config so existing call sites behave
+        // exactly as before.
+        var resolved = privacy ?? SimulaPrivacyConfig()
+        if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
+        self.privacyConfig = resolved
         self.api = SimulaAPI()
+
+        // Feed the process-wide store, then re-sync the session whenever consent
+        // changes (host CMP refresh or ATT result) so the backend sees current signals.
+        SimulaPrivacy.shared.apply(resolved)
+        SimulaPrivacy.shared.$snapshot
+            .dropFirst()
+            .removeDuplicates()
+            // CMPs write the IAB keys in a burst; coalesce so a settled consent
+            // state triggers exactly one /session/create instead of a race.
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    #if os(iOS)
+                    // The storage policy may have flipped (TCF Purpose 1 / GDPR);
+                    // drop prewarmed web views so the next game/ad is built with a
+                    // data store matching the new consent. (`acquire` also guards
+                    // this lazily; this just frees stale views proactively.)
+                    WebViewPool.shared.clear()
+                    #endif
+                    await self?.resyncSession()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Session Management
@@ -104,13 +147,16 @@ public final class SimulaProvider: ObservableObject {
         if let sessionId, !sessionId.isEmpty { return sessionId }
         if let sessionTask { return await sessionTask.value }
 
-        let effectiveUserID = hasPrivacyConsent ? primaryUserID : nil
+        // `ppid` is suppressed without consent and additionally under COPPA.
+        let snapshot = SimulaPrivacy.shared.currentSnapshot
+        let effectiveUserID = snapshot.allowsPrimaryUserID ? primaryUserID : nil
         let task = Task<String?, Never> { [api, apiKey, devMode] in
             do {
                 let id = try await api.createSession(
                     apiKey: apiKey,
                     devMode: devMode,
-                    primaryUserID: effectiveUserID
+                    primaryUserID: effectiveUserID,
+                    privacy: snapshot
                 )
                 return (id?.isEmpty == false) ? id : nil
             } catch {
@@ -127,6 +173,82 @@ public final class SimulaProvider: ObservableObject {
         }
         return sessionId
     }
+
+    /// Invalidates the current session and recreates it so the backend sees the
+    /// latest consent signals. Triggered when the consent store changes.
+    @MainActor
+    private func resyncSession() async {
+        sessionId = nil
+        sessionTask = nil
+        await ensureSession()
+    }
+
+    // MARK: - Consent Updates
+
+    /// Replace the privacy configuration at runtime (e.g. after the host CMP
+    /// gathers or refreshes consent). Forwarded to the process-wide store; the
+    /// session re-syncs automatically.
+    public func updateConsent(_ config: SimulaPrivacyConfig) {
+        SimulaPrivacy.shared.apply(config)
+    }
+
+    /// Merge a partial consent update at runtime. Only the supplied fields change.
+    public func updateConsent(
+        hasPrivacyConsent: Bool? = nil,
+        tcString: String? = nil,
+        uspString: String? = nil,
+        gppString: String? = nil,
+        gppSid: String? = nil,
+        gdprApplies: Bool? = nil,
+        tcfPurpose1Consent: Bool? = nil,
+        coppaApplies: Bool? = nil,
+        enableAdvertisingId: Bool? = nil
+    ) {
+        SimulaPrivacy.shared.update(
+            hasPrivacyConsent: hasPrivacyConsent,
+            tcString: tcString,
+            uspString: uspString,
+            gppString: gppString,
+            gppSid: gppSid,
+            gdprApplies: gdprApplies,
+            tcfPurpose1Consent: tcfPurpose1Consent,
+            coppaApplies: coppaApplies,
+            enableAdvertisingId: enableAdvertisingId
+        )
+    }
+
+    /// Clears the named explicit consent overrides (the store then falls back to any
+    /// auto-read IAB value). Use to *remove* a signal you previously set — `update`
+    /// can only change or leave fields, not clear them.
+    public func clearConsent(
+        tcString: Bool = false,
+        uspString: Bool = false,
+        gppString: Bool = false,
+        gppSid: Bool = false,
+        gdprApplies: Bool = false,
+        tcfPurpose1Consent: Bool = false
+    ) {
+        SimulaPrivacy.shared.clearConsent(
+            tcString: tcString,
+            uspString: uspString,
+            gppString: gppString,
+            gppSid: gppSid,
+            gdprApplies: gdprApplies,
+            tcfPurpose1Consent: tcfPurpose1Consent
+        )
+    }
+
+    #if os(iOS)
+    /// Presents the App Tracking Transparency prompt and, when advertising-id
+    /// collection is enabled (and COPPA does not apply), begins forwarding the
+    /// IDFA on authorization. Call from the host's launch flow or a post-CMP
+    /// callback. Requires `NSUserTrackingUsageDescription` in the app's Info.plist.
+    @MainActor
+    @discardableResult
+    public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {
+        await SimulaPrivacy.shared.requestTrackingAuthorization()
+    }
+    #endif
 
     // MARK: - Cache Key Helper
 
@@ -182,19 +304,27 @@ public final class SimulaProvider: ObservableObject {
 public struct SimulaProviderView<Content: View>: View {
     @StateObject private var provider: SimulaProvider
     private let content: () -> Content
+    /// The resolved config, kept so prop changes can be pushed to the store —
+    /// `@StateObject` is initialized only once and ignores later init args.
+    private let resolvedConfig: SimulaPrivacyConfig
 
     public init(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
+        privacy: SimulaPrivacyConfig? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) {
+        var resolved = privacy ?? SimulaPrivacyConfig()
+        if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
+        self.resolvedConfig = resolved
         self._provider = StateObject(wrappedValue: SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,
             primaryUserID: primaryUserID,
-            hasPrivacyConsent: hasPrivacyConsent
+            hasPrivacyConsent: hasPrivacyConsent,
+            privacy: privacy
         ))
         self.content = content
     }
@@ -204,6 +334,12 @@ public struct SimulaProviderView<Content: View>: View {
             .environmentObject(provider)
             .task {
                 await provider.createSession()
+            }
+            // Push privacy-prop changes into the store. SwiftUI does not re-init
+            // the @StateObject when the `privacy`/`hasPrivacyConsent` props change,
+            // so without this a host updating them at render time would be ignored.
+            .task(id: resolvedConfig) {
+                provider.updateConsent(resolvedConfig)
             }
     }
 }

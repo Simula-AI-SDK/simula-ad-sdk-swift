@@ -261,13 +261,19 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Common Headers
 
-    private func makeHeaders(apiKey: String? = nil) -> [String: String] {
+    private func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
         var headers: [String: String] = [
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "1",
         ]
         if let apiKey = apiKey {
             headers["Authorization"] = "Bearer \(apiKey)"
+        }
+        // Attach consent signals to every request from the single header chokepoint.
+        // Reads the process-wide store unless an explicit snapshot is supplied.
+        let snapshot = consent ?? SimulaPrivacy.shared.currentSnapshot
+        for (key, value) in snapshot.consentHeaders() {
+            headers[key] = value
         }
         return headers
     }
@@ -285,7 +291,8 @@ public final class SimulaAPI: @unchecked Sendable {
     public func createSession(
         apiKey: String,
         devMode: Bool = false,
-        primaryUserID: String? = nil
+        primaryUserID: String? = nil,
+        privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
         var components = URLComponents(string: "\(API_BASE_URL)/session/create")!
         var queryItems: [URLQueryItem] = []
@@ -299,8 +306,15 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        request.httpBody = "{}".data(using: .utf8)
+        applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
+        // Establish consent at session creation: the backend ties the `privacy`
+        // block to the session and inherits it on subsequent calls.
+        if let privacy {
+            let body: [String: Any] = ["privacy": privacy.privacyBody()]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        } else {
+            request.httpBody = "{}".data(using: .utf8)
+        }
 
         let (data, response) = try await session.data(for: request)
 

@@ -6,7 +6,7 @@ A native Swift SDK for integrating sponsored mini-games into iOS and macOS appli
 
 - Sponsored mini-games that users can play with AI characters
 - Native SwiftUI components with smooth animations
-- Privacy-first design — no IDFA collection, contextual targeting only
+- Privacy-first — contextual by default, with opt-in IDFA attribution and IAB consent (GDPR / CCPA / GPP / COPPA) support
 - iOS App Store compliant with bundled Privacy Manifest
 - SKAdNetwork support for privacy-preserving ad attribution
 
@@ -157,12 +157,33 @@ The `PrivacyInfo.xcprivacy` is bundled as a package resource and automatically i
 
 Copy the SKAdNetwork identifiers from `docs/SKAdNetworkItems.plist` into your app's `Info.plist` to enable privacy-preserving ad attribution. See [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) for detailed instructions.
 
+### Consent & Attribution
+
+The SDK is **contextual by default** and *consumes* IAB consent — it does not gather it. Either pass signals via `SimulaPrivacyConfig`, or let the SDK auto-read the standard `IABTCF_*` / `IABUSPrivacy_String` / `IABGPP_*` keys your CMP writes:
+
+```swift
+SimulaProviderView(
+    apiKey: "YOUR_API_KEY",
+    privacy: SimulaPrivacyConfig(
+        tcString: tc, uspString: usp, gppString: gpp, coppaApplies: false
+    )
+) { ContentView() }
+```
+
+Refresh at runtime when your CMP updates (from a child view via `@EnvironmentObject var simula: SimulaProvider`):
+
+```swift
+simula.updateConsent(tcString: newTC, gppString: newGPP)
+```
+
+**Opt-in IDFA attribution** (off by default): set `enableAdvertisingId: true`, call `await simula.requestTrackingAuthorization()`, add `NSUserTrackingUsageDescription` to your `Info.plist`, and declare tracking in your **app-level** privacy manifest. Full steps: [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) §4.
+
 ### Data Practices Summary
 
 | Practice | Status |
 |----------|--------|
-| Cross-app tracking | **No** |
-| IDFA collection | **No** |
+| Cross-app tracking | **No** by default (only if you opt in to IDFA) |
+| IDFA collection | **Opt-in** (off by default) |
 | User-linked data | **No** |
 | Privacy Manifest | **Included** |
 | Contextual targeting | **Yes** (content-based, not user-based) |
@@ -176,7 +197,7 @@ Copy the SKAdNetwork identifiers from `docs/SKAdNetworkItems.plist` into your ap
 
 ### Data NOT Collected
 
-- Apple Advertising Identifier (IDFA)
+- Apple Advertising Identifier (IDFA) — *unless you opt in; see Consent & Attribution*
 - Location data
 - Personal information (name, email, phone)
 - Contacts, photos, or browsing history
