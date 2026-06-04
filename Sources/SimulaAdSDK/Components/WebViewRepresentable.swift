@@ -85,6 +85,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
     }
 
+    /// Return the web view to the pool when SwiftUI tears this representable down,
+    /// so the (expensive) WKWebView + its Web Content process is recycled for the
+    /// next acquire instead of being deallocated.
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        WebViewPool.shared.release(uiView)
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             onNavigationFinished: onNavigationFinished,
@@ -184,7 +191,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             // delegate callback on the main thread, so hop there explicitly (no
             // `assumeIsolated`, which would trap if ever called off-main).
             if let appID = appStoreID(from: url) {
-                onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                // Fire CLICKED only for a user-activated link — consistent with the
+                // cross-domain branch below and Android's `hasGesture()` guard — so a
+                // programmatic redirect to the store can't fake a click. Routing is
+                // unconditional (the game iframe's post-game auto-redirect still opens).
+                if navigationAction.navigationType == .linkActivated { onAdClick?() }
                 Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 decisionHandler(.cancel)
                 return
@@ -192,7 +203,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
-                onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                if navigationAction.navigationType == .linkActivated { onAdClick?() } // CLICKED, user-activated only
                 if let appID = appStoreID(from: url) {
                     Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
                 } else {
@@ -238,7 +249,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                     if !targetHost.isEmpty && currentHost != targetHost {
                         // Cross-domain → resolve redirects then route. Router entry
                         // point is `@MainActor`; this delegate runs on main, so hop
-                        // explicitly rather than asserting isolation.
+                        // explicitly rather than asserting isolation. `createWebViewWith`
+                        // is only invoked for user-initiated new-window requests
+                        // (target="_blank" / window.open), so this is a real click.
+                        onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
                         Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
                     } else {
                         // Same-origin → load in webview
