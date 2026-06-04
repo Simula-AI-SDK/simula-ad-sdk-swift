@@ -108,6 +108,48 @@ enum CreativeCTARouter {
         return capturedID(appStorePathIDRegex, in: url.path)
     }
 
+    // MARK: - App Store id resolution (for SKOverlay)
+
+    /// Resolves the advertised app's numeric App Store id (adamId) for `SKOverlay.AppConfiguration`.
+    /// Tries the tracking URL directly; if it's an http(s) attribution tracker for a store CTA,
+    /// follows the redirect chain (the same `RedirectResolver` the CTA uses) to the final App Store
+    /// URL. Calls back with `nil` when none can be resolved (the overlay then safely no-ops).
+    /// The completion is always delivered on the main thread.
+    static func resolveAppStoreID(
+        trackingUrl: String?,
+        destination: AdDestination,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
+            completion(nil)
+            return
+        }
+        // Already a store URL — no network needed.
+        if let appID = appStoreID(from: url) {
+            completion(appID)
+            return
+        }
+        // Only http(s) trackers for an appstore destination are worth resolving.
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard destination == .appstore, scheme == "http" || scheme == "https" else {
+            completion(nil)
+            return
+        }
+
+        weak var resolverRef: RedirectResolver?
+        let resolver = RedirectResolver { finalURL in
+            DispatchQueue.main.async {
+                completion(appStoreID(from: finalURL))
+                if let r = resolverRef { activeResolvers.remove(r) }
+            }
+        }
+        resolverRef = resolver
+        activeResolvers.insert(resolver)
+        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        resolver.session = session
+        session.dataTask(with: URLRequest(url: url)).resume()
+    }
+
     // MARK: - Presentation
 
     /// Associated-object keys under which a presented store / Safari sheet retains

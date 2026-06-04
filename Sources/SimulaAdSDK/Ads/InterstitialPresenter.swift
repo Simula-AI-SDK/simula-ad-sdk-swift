@@ -117,16 +117,29 @@ private struct CreativeInterstitialView: View {
     /// Cancellable min-view gate timer (rewarded) / close-delay gate (non-rewarded).
     /// Cancelled in `.onDisappear` so it can't fire after the surface is gone.
     @State private var gateTask: Task<Void, Never>?
-    /// Remaining whole seconds for the non-rewarded close-delay countdown (numeric UI).
+    /// Remaining whole seconds for the close-delay countdown (drives the `reward_or_close_label` copy).
     @State private var closeRemaining: Int
-    /// 0→1 fill for the non-rewarded close-delay countdown (ring / bar UI).
+    /// 0→1 fill for the close-delay countdown (`countdown_circle` ring / `progress_bar`).
     @State private var closeProgress: Double = 0
     /// Monotonic anchor (`systemUptime`) for whichever gate is active, so a re-`onAppear`
     /// resumes the countdown from where it was instead of restarting it. `nil` until first set.
     @State private var gateStartedAt: TimeInterval?
 
+    // Mid-ad store prompt (`store_prompt`) — a tappable badge revealed at the 50% playable mark.
+    @State private var storePromptVisible = false
+    @State private var storePromptScheduled = false
+    @State private var storePromptTask: Task<Void, Never>?
+
+    // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
+    @State private var resolvedAppID: String?
+    @State private var skOverlayPresented = false
+    @State private var skOverlayTask: Task<Void, Never>?
+
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
+    /// Fallback playable length used to time the store prompt's 50% trigger when no playable
+    /// `midpoint` JS-bridge event is available (the image-carousel creative emits none).
+    private let nominalPlayableDuration: TimeInterval = 30
 
     init(
         response: AdLoadResponse,
@@ -146,13 +159,19 @@ private struct CreativeInterstitialView: View {
         // (unchanged); non-rewarded gates on the server-driven `close.delay_seconds`.
         let rewarded = response.rewarded || response.renderedFormat == "rewarded_video"
         let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
-        _closeEnabled = State(initialValue: rewarded ? (minPlayThreshold <= 0) : (closeDelay <= 0))
-        _closeRemaining = State(initialValue: max(0, closeDelay))
+        let gateTotal = rewarded ? minPlayThreshold : TimeInterval(closeDelay)
+        _closeEnabled = State(initialValue: gateTotal <= 0)
+        // Initial label count (`reward_or_close_label`): whole seconds of the active gate.
+        _closeRemaining = State(initialValue: max(0, Int(ceil(gateTotal))))
     }
 
     private var isRewarded: Bool {
         response.rewarded || response.renderedFormat == "rewarded_video"
     }
+
+    /// Whether the `reward_or_close_label` should read "Reward in X" (vs "Close in X"), inferred
+    /// from the creative's declared ad-unit type.
+    private var isRewardCopy: Bool { response.adUnitType == .rewarded }
 
     private var assets: [String] { response.renderedAssets }
 
@@ -166,8 +185,10 @@ private struct CreativeInterstitialView: View {
             // top-right button (an absent ad_behavior renders exactly as before).
             if let close = response.adBehavior?.close {
                 CloseButtonView(
-                    behavior: close,
-                    isRewarded: isRewarded,
+                    treatment: close.treatment,
+                    position: close.position,
+                    progressBarColor: close.progressBarColor,
+                    isRewardCopy: isRewardCopy,
                     enabled: closeEnabled,
                     remaining: closeRemaining,
                     progress: closeProgress,
@@ -175,6 +196,12 @@ private struct CreativeInterstitialView: View {
                 )
             } else if closeEnabled {
                 legacyCloseButton
+            }
+
+            // Mid-ad store prompt — independent of the close button and SKOverlay. Rendered at the
+            // server-resolved position (never recomputed) once the 50% playable mark is reached.
+            if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible {
+                StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
             }
 
             // CTA button — always visible, bottom.
@@ -209,12 +236,21 @@ private struct CreativeInterstitialView: View {
         // clear the home indicator / notch / Dynamic Island.
         .hideStatusBar(true)
         .onAppear {
-            startRewardGateIfNeeded()
-            startCloseDelayGate()
+            startGate()
+            startStorePromptTrigger()
+            startSKOverlay()
         }
         .onDisappear {
             gateTask?.cancel()
             gateTask = nil
+            storePromptTask?.cancel()
+            storePromptTask = nil
+            skOverlayTask?.cancel()
+            skOverlayTask = nil
+            // Tear the install banner down with the ad so it doesn't leak into the host app.
+            if skOverlayPresented, #available(iOS 14.0, *) {
+                SKOverlayPresenter.dismiss()
+            }
         }
     }
 
@@ -285,6 +321,9 @@ private struct CreativeInterstitialView: View {
     private func handleCtaClick() {
         onClick() // CLICKED
 
+        // SKOverlay timed to the click (independent of the store sheet the CTA opens).
+        presentSKOverlayOnClickIfNeeded()
+
         // Capture the destination before any teardown so the async resolve path
         // can't read freed state. `storeOpen` defaults to today's in-app store sheet
         // when the payload omits `ad_behavior`.
@@ -325,54 +364,41 @@ private struct CreativeInterstitialView: View {
         }
     }
 
-    private func startRewardGateIfNeeded() {
-        guard isRewarded, minPlayThreshold > 0, !closeEnabled else {
-            // Non-gated rewarded (threshold 0) still earns its reward.
+    /// Unified close gate. Rewarded creatives gate on `minPlayThreshold` (and earn the reward when
+    /// it elapses); non-rewarded gate on the server-driven `close.delay_seconds`. The active
+    /// `treatment` drives the affordance: `countdown_circle`/`progress_bar` fill `closeProgress`,
+    /// `reward_or_close_label` ticks `closeRemaining`, `hidden` shows nothing until it unlocks.
+    private func startGate() {
+        let treatment = response.adBehavior?.close.treatment ?? .hidden
+        let total: TimeInterval = isRewarded
+            ? minPlayThreshold
+            : TimeInterval(response.adBehavior?.close.delaySeconds ?? 0)
+
+        guard total > 0, !closeEnabled else {
+            // No gate applies. A non-gated rewarded creative still earns its reward.
             if isRewarded { rewardEarned = true }
             return
         }
-        // Resume from the monotonic anchor so a re-`onAppear` doesn't restart the dwell.
-        let remaining = remainingGateTime(total: minPlayThreshold)
-        if remaining <= 0 {
-            rewardEarned = true
-            closeEnabled = true
-            return
-        }
-        // Cancellable min-view gate: a fire-and-forget asyncAfter would still fire
-        // after dismiss and mutate dead @State. The Task is cancelled in
-        // `.onDisappear`.
-        gateTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-            if Task.isCancelled { return }
-            rewardEarned = true
-            withAnimation(.easeInOut(duration: 0.2)) {
-                closeEnabled = true
-            }
-        }
-    }
 
-    /// Non-rewarded close-delay gate driven by `ad_behavior.close.delay_seconds`. Drives the
-    /// countdown affordance (numeric tick / ring + bar fill) and unlocks the close button once
-    /// the delay elapses. Rewarded creatives ignore this (they gate on `minPlayThreshold`).
-    private func startCloseDelayGate() {
-        guard !isRewarded, let close = response.adBehavior?.close,
-              close.delaySeconds > 0, !closeEnabled else { return }
-        let total = TimeInterval(close.delaySeconds)
+        // Resume from the monotonic anchor so a re-`onAppear` doesn't restart the countdown.
         let remaining = remainingGateTime(total: total)
         if remaining <= 0 {
+            if isRewarded { rewardEarned = true }
             closeEnabled = true
             return
         }
 
-        // Ring / bar treatments fill linearly over the remaining delay (resuming from the
-        // fraction already elapsed, so a re-`onAppear` doesn't snap the fill back to 0).
-        if close.countdownUI == .circularProgress || close.countdownUI == .bar {
+        // Ring / bar treatments fill linearly over the remaining delay (resuming from the fraction
+        // already elapsed, so a re-`onAppear` doesn't snap the fill back to 0).
+        if treatment == .countdownCircle || treatment == .progressBar {
             closeProgress = (total - remaining) / total
             withAnimation(.linear(duration: remaining)) { closeProgress = 1 }
         }
 
+        // Cancellable gate: a fire-and-forget asyncAfter would still fire after dismiss and mutate
+        // dead @State. The Task is cancelled in `.onDisappear`.
         gateTask = Task { @MainActor in
-            if close.countdownUI == .numericAlways {
+            if treatment == .rewardOrCloseLabel {
                 var left = Int(ceil(remaining))
                 closeRemaining = left
                 while left > 0 {
@@ -385,8 +411,93 @@ private struct CreativeInterstitialView: View {
                 try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
             }
             if Task.isCancelled { return }
+            if isRewarded { rewardEarned = true }
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
+    }
+
+    // MARK: Store prompt (mid-ad)
+
+    /// Schedules the mid-ad store prompt's 50% trigger. A true playable would post a `midpoint`
+    /// JS-bridge event and call `showStorePrompt()` directly; the image-carousel creative emits no
+    /// such signal, so we fall back to a wall-clock timer at 50% of the nominal playable duration.
+    private func startStorePromptTrigger() {
+        guard let prompt = response.adBehavior?.storePrompt, prompt.enabled,
+              !storePromptScheduled, !storePromptVisible else { return }
+        storePromptScheduled = true
+        storePromptTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(nominalPlayableDuration / 2 * 1_000_000_000))
+            if Task.isCancelled { return }
+            showStorePrompt()
+        }
+    }
+
+    /// Reveals the store prompt. Idempotent — safe to call from a JS-bridge `midpoint` event
+    /// (true playables) or from the timer fallback.
+    private func showStorePrompt() {
+        guard !storePromptVisible else { return }
+        withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+    }
+
+    /// Routes a store-prompt tap to the same destination as the CTA (shared router).
+    private func handleStorePromptTap() {
+        let storeOpen = response.adBehavior?.storeOpen ?? .skstoreproduct
+        CreativeCTARouter.open(
+            trackingUrl: response.trackingUrl,
+            destination: response.destinationKind,
+            storeOpen: storeOpen
+        )
+    }
+
+    // MARK: SKOverlay (install banner)
+
+    /// Resolves the advertised app id once, then presents the SKOverlay per its timing. `duringPlay`
+    /// / `delayed` present automatically (after the optional `delay_seconds`); `onClick` waits for
+    /// the CTA tap. iOS 14+ only — below that the config is simply ignored.
+    private func startSKOverlay() {
+        guard let config = response.adBehavior?.skoverlay, config.enabled, resolvedAppID == nil else { return }
+        guard #available(iOS 14.0, *) else { return }
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: response.trackingUrl,
+            destination: response.destinationKind
+        ) { id in
+            resolvedAppID = id
+            if config.timing == .duringPlay || config.timing == .delayed {
+                scheduleSKOverlayPresent(config: config)
+            }
+        }
+    }
+
+    private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
+        guard !skOverlayPresented, resolvedAppID != nil else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = Task { @MainActor in
+            if config.delaySeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000)
+            }
+            if Task.isCancelled { return }
+            presentSKOverlay(config: config)
+        }
+    }
+
+    /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
+    /// link) safely no-ops with a console warning.
+    private func presentSKOverlay(config: SKOverlayConfig) {
+        guard !skOverlayPresented, let appID = resolvedAppID, !appID.isEmpty else {
+            if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
+                print("[Simula] SKOverlay skipped: could not resolve an App Store id for this creative.")
+            }
+            return
+        }
+        guard #available(iOS 14.0, *) else { return }
+        skOverlayPresented = true
+        SKOverlayPresenter.present(appID: appID, config: config)
+    }
+
+    /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).
+    private func presentSKOverlayOnClickIfNeeded() {
+        guard let config = response.adBehavior?.skoverlay, config.enabled, config.timing == .onClick else { return }
+        presentSKOverlay(config: config)
     }
 
     /// Seconds left on the active gate, anchored to a monotonic clock the first time it's asked.
@@ -401,37 +512,42 @@ private struct CreativeInterstitialView: View {
 
 // MARK: - CloseButtonView
 
-/// The `ad_behavior`-driven close button: applies size (glyph/circle), corner position, and the
-/// countdown_ui treatment. Rewarded creatives ignore the countdown (they gate on `minPlayThreshold`
-/// and use "appears" semantics), but still honor position/size.
+/// The `ad_behavior`-driven close button. Renders the assigned `treatment` at the configured
+/// corner: `hidden` shows nothing until the gate unlocks, `countdownCircle` draws a ring,
+/// `progressBar` a top-edge bar, `rewardOrCloseLabel` a counting-down text pill. `progressBarColor`
+/// tints the ring/bar fill. The `rewardOrCloseLabel` copy is reward- vs interstitial-aware.
 private struct CloseButtonView: View {
-    let behavior: CloseBehavior
-    let isRewarded: Bool
+    let treatment: CloseTreatment
+    let position: ClosePosition
+    let progressBarColor: String
+    /// `true` → "Reward in X"; `false` → "Close in X" (only used by `rewardOrCloseLabel`).
+    let isRewardCopy: Bool
     let enabled: Bool
     let remaining: Int
     let progress: Double
     let onClose: () -> Void
 
-    /// Effective countdown affordance: rewarded creatives always use "appears" (hidden→shown).
-    private var countdown: CloseCountdownUI { isRewarded ? .appearsAtNs : behavior.countdownUI }
+    // v2 dropped the per-size config; the close glyph renders at the former `.standard` size, with
+    // the circle pinned to the HIG-minimum tappable target.
+    private let glyphSize: CGFloat = 24
+    private let circleSize: CGFloat = 44
+    private let minTouchTarget: CGFloat = 44
 
-    private var isBottom: Bool {
-        behavior.position == .bottomLeft || behavior.position == .bottomRight
-    }
+    private var isBottom: Bool { position == .bottomLeft }
+    private var isTrailing: Bool { position == .topRight }
 
-    private var isTrailing: Bool {
-        behavior.position == .topRight || behavior.position == .bottomRight
-    }
+    /// Fill tint for the ring / bar. Validated upstream, so `Color(hex:)` always gets clean input.
+    private var tint: Color { Color(hex: progressBarColor) }
 
     var body: some View {
         ZStack {
-            // `bar` treatment: a slim top-edge progress bar shown during the delay.
-            if !enabled && countdown == .bar {
+            // `progress_bar` treatment: a slim top-edge bar shown during the delay, tinted by color.
+            if !enabled && treatment == .progressBar {
                 VStack {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
                             Capsule().fill(Color.white.opacity(0.25))
-                            Capsule().fill(Color.white)
+                            Capsule().fill(tint)
                                 .frame(width: max(0, geo.size.width * progress))
                         }
                     }
@@ -455,64 +571,107 @@ private struct CloseButtonView: View {
         }
         .padding(.horizontal, 16)
         .padding(.top, isBottom ? 0 : 16)
-        // Bottom-corner buttons sit above the full-width CTA so they can't overlap it.
+        // Bottom-corner targets sit above the full-width CTA so they can't overlap it.
         .padding(.bottom, isBottom ? 96 : 0)
     }
-
-    /// Apple HIG minimum tappable size. The visual circle may be smaller (the `small` arm), but
-    /// the hit area is never below this so a tiny close button can't inflate accidental CTA taps.
-    private let minTouchTarget: CGFloat = 44
 
     @ViewBuilder
     private var buttonOrIndicator: some View {
         if enabled {
+            // The resolved tap target: a labelled pill for `rewardOrCloseLabel`, the circular X
+            // for every other treatment.
             Button(action: onClose) {
-                closeGlyph
-                    .frame(
-                        width: max(minTouchTarget, behavior.size.circleSize),
-                        height: max(minTouchTarget, behavior.size.circleSize)
-                    )
-                    .contentShape(Rectangle())
+                if treatment == .rewardOrCloseLabel {
+                    labelPill(text: "Close")
+                } else {
+                    closeGlyph
+                        .frame(width: max(minTouchTarget, circleSize), height: max(minTouchTarget, circleSize))
+                        .contentShape(Rectangle())
+                }
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close")
         } else {
-            switch countdown {
-            case .appearsAtNs, .bar:
-                EmptyView() // hidden during the delay (the bar shows progress separately)
-            case .none:
-                closeGlyph.opacity(0.4)
-            case .numericAlways:
-                numericGlyph
-            case .circularProgress:
+            switch treatment {
+            case .hidden, .progressBar:
+                EmptyView() // nothing in the corner during the delay (the bar shows separately)
+            case .countdownCircle:
                 ZStack {
                     closeGlyph.opacity(0.5)
                     Circle()
                         .trim(from: 0, to: progress)
-                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                        .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
+                        .frame(width: circleSize, height: circleSize)
                 }
+            case .rewardOrCloseLabel:
+                labelPill(text: "\(isRewardCopy ? "Reward" : "Close") in \(remaining)")
             }
         }
     }
 
-    /// The circular "X" glyph at the configured size.
+    /// The circular "X" glyph.
     private var closeGlyph: some View {
         Image(systemName: "xmark")
-            .font(.system(size: behavior.size.glyphSize, weight: .bold))
+            .font(.system(size: glyphSize, weight: .bold))
             .foregroundColor(Color(hex: "#1F2937"))
-            .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
+            .frame(width: circleSize, height: circleSize)
             .background(Circle().fill(Color.white.opacity(0.9)))
     }
 
-    /// The remaining-seconds glyph used by the `numeric_always` treatment.
-    private var numericGlyph: some View {
-        Text("\(remaining)")
-            .font(.system(size: behavior.size.glyphSize, weight: .bold))
+    /// The text pill used by the `rewardOrCloseLabel` treatment (counting down, then "Close").
+    private func labelPill(text: String) -> some View {
+        Text(text)
+            .font(.system(size: 15, weight: .semibold))
             .foregroundColor(Color(hex: "#1F2937"))
-            .frame(width: behavior.size.circleSize, height: behavior.size.circleSize)
-            .background(Circle().fill(Color.white.opacity(0.9)))
+            .padding(.horizontal, 14)
+            .frame(height: minTouchTarget)
+            .background(Capsule().fill(Color.white.opacity(0.9)))
+    }
+}
+
+// MARK: - StorePromptBadge
+
+/// The mid-ad store prompt (`store_prompt`): a tappable "▶| App Store" / "▶| Google Play" badge
+/// rendered at the server-resolved corner. The SDK never recomputes the position — it trusts the
+/// backend's collision resolution (opposite the close button).
+private struct StorePromptBadge: View {
+    let prompt: StorePrompt
+    let onTap: () -> Void
+
+    private var label: String {
+        prompt.platform == .android ? "▶| Google Play" : "▶| App Store"
+    }
+    private var isBottom: Bool { prompt.position == .bottomLeft }
+    private var isTrailing: Bool { prompt.position == .topRight }
+
+    var body: some View {
+        VStack {
+            if !isBottom { row; Spacer() } else { Spacer(); row }
+        }
+    }
+
+    private var row: some View {
+        HStack {
+            if isTrailing { Spacer(); badge } else { badge; Spacer() }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, isBottom ? 0 : 16)
+        .padding(.bottom, isBottom ? 96 : 0)
+    }
+
+    private var badge: some View {
+        Button(action: onTap) {
+            Text(label)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 14)
+                .frame(height: 40)
+                .background(Capsule().fill(Color.black.opacity(0.65)))
+                .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Install")
     }
 }
 

@@ -298,7 +298,8 @@ public final class SimulaInterstitialAd {
         let api = self.api
         let apiKey = provider.apiKey
         let adId = response.adId
-        Task { await api.trackImpression(adId: adId, apiKey: apiKey) }
+        let experiment = response.experiment
+        Task { await api.trackImpression(adId: adId, apiKey: apiKey, experiment: experiment) }
         #else
         failDisplay(.unsupportedPlatform)
         #endif

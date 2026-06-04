@@ -292,41 +292,63 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(AdDestination(rawValue: "carousel"))
     }
 
-    // MARK: - Ad behavior (ad_behavior decode)
+    // MARK: - Ad behavior (ad_behavior decode, v2 schema)
 
     func testAdBehaviorAbsentDecodesToNil() throws {
         let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         // Absent ad_behavior → nil so the renderer falls back to today's literal behavior.
         XCTAssertNil(r.adBehavior)
+        XCTAssertNil(r.creative)
+        XCTAssertNil(r.experiment)
     }
 
     func testAdBehaviorHappyPath() throws {
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"close":{"delay_seconds":5,"countdown_ui":"circular_progress",
-           "position":"bottom_left","size":"large","motion":"reposition_on_tap"},
-           "store_open":"skstoreproduct"}}
+         "creative":{"type":"playable","bundle_url":"https://b","ad_unit_type":"rewarded"},
+         "experiment":{"experiment_id":"playable_close_q3","variant_id":"countdown_circle_top_right_3s","layer":"close_chrome"},
+         "ad_behavior":{"close":{"delay_seconds":3,"treatment":"countdown_circle",
+           "position":"top_right","progress_bar_color":"#00FF00"},
+           "store_prompt":{"enabled":true,"trigger":"midpoint","position":"top_left","platform":"ios"},
+           "skoverlay":{"enabled":true,"timing":"on_click","delay_seconds":0,"position":"bottom","dismissible":true}}}
         """
-        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
-        XCTAssertEqual(b.close.delaySeconds, 5)
-        XCTAssertEqual(b.close.countdownUI, .circularProgress)
-        XCTAssertEqual(b.close.position, .bottomLeft)
-        XCTAssertEqual(b.close.size, .large)
-        XCTAssertEqual(b.close.motion, .repositionOnTap)
-        XCTAssertEqual(b.storeOpen, .skstoreproduct)
+        let r = try decodeAdLoad(json)
+        let b = try XCTUnwrap(r.adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 3)
+        XCTAssertEqual(b.close.treatment, .countdownCircle)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.progressBarColor, "#00FF00")
+
+        let prompt = try XCTUnwrap(b.storePrompt)
+        XCTAssertTrue(prompt.enabled)
+        XCTAssertEqual(prompt.position, .topLeft)
+        XCTAssertEqual(prompt.platform, .ios)
+
+        let overlay = try XCTUnwrap(b.skoverlay)
+        XCTAssertTrue(overlay.enabled)
+        XCTAssertEqual(overlay.timing, .onClick)
+        XCTAssertEqual(overlay.position, .bottom)
+        XCTAssertTrue(overlay.dismissible)
+
+        XCTAssertEqual(r.creative?.adUnitType, .rewarded)
+        XCTAssertEqual(r.creative?.bundleUrl, "https://b")
+        XCTAssertEqual(r.adUnitType, .rewarded)
+        XCTAssertEqual(r.experiment?.experimentId, "playable_close_q3")
+        XCTAssertEqual(r.experiment?.variantId, "countdown_circle_top_right_3s")
+        XCTAssertEqual(r.experiment?.layer, "close_chrome")
     }
 
     func testAdBehaviorEmptyObjectUsesDefaults() throws {
-        // Present-but-empty ad_behavior is non-nil and fully defaulted.
+        // Present-but-empty ad_behavior is non-nil and fully defaulted; the new nodes stay nil.
         let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
         XCTAssertEqual(b.close.delaySeconds, 0)
-        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.treatment, .hidden)
         XCTAssertEqual(b.close.position, .topRight)
-        XCTAssertEqual(b.close.size, .standard)
-        XCTAssertEqual(b.close.motion, .static)
-        XCTAssertEqual(b.storeOpen, .external)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
+        XCTAssertNil(b.storePrompt)
+        XCTAssertNil(b.skoverlay)
     }
 
     func testAdBehaviorPartialCloseFillsDefaults() throws {
@@ -336,66 +358,152 @@ final class SimulaAdSDKTests: XCTestCase {
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
         XCTAssertEqual(b.close.delaySeconds, 3)
-        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.treatment, .hidden)
         XCTAssertEqual(b.close.position, .topRight)
-        XCTAssertEqual(b.close.size, .standard)
-        XCTAssertEqual(b.storeOpen, .external)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
     }
 
     func testAdBehaviorHyphenNormalization() throws {
+        // Hyphenated wire spellings normalize to the same tolerant enums as underscores.
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"close":{"countdown_ui":"numeric-always","position":"top-left",
-           "motion":"reposition-on-tap"},"store_open":"external-browser"}}
+         "ad_behavior":{"close":{"treatment":"reward-or-close-label","position":"top-left"},
+           "skoverlay":{"enabled":true,"timing":"during-play","position":"bottom-raised"}}}
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
-        XCTAssertEqual(b.close.countdownUI, .numericAlways)
+        XCTAssertEqual(b.close.treatment, .rewardOrCloseLabel)
         XCTAssertEqual(b.close.position, .topLeft)
-        XCTAssertEqual(b.close.motion, .repositionOnTap)
-        XCTAssertEqual(b.storeOpen, .external)
+        XCTAssertEqual(b.skoverlay?.timing, .duringPlay)
+        XCTAssertEqual(b.skoverlay?.position, .bottomRaised)
     }
 
-    func testAdBehaviorLegacyAliases() throws {
-        // bottom_corner → bottomRight; sk_overlay/sk_store_product → skstoreproduct; bar accepted.
+    func testClosePositionExcludesBottomRight() throws {
+        // v2 excludes bottom_right (and legacy bottom_corner) → snaps to the safe top_right default.
+        for raw in ["bottom_right", "bottom_corner"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"hidden","position":"\(raw)"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
+        }
+    }
+
+    func testClosePositionSnapsForEdgeAnchoredTreatments() throws {
+        // countdown_circle / progress_bar can't render bottom_left → snap to top_right.
+        for treatment in ["countdown_circle", "progress_bar"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
+        }
+        // hidden / reward_or_close_label keep bottom_left.
+        for treatment in ["hidden", "reward_or_close_label"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .bottomLeft)
+        }
+    }
+
+    func testCloseTreatmentUnknownFallsBackToHidden() throws {
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"close":{"countdown_ui":"bar","position":"bottom_corner","size":"small"},
-           "store_open":"sk_overlay"}}
+         "ad_behavior":{"close":{"treatment":"sparkles","position":"galaxy"}}}
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
-        XCTAssertEqual(b.close.countdownUI, .bar)
-        XCTAssertEqual(b.close.position, .bottomRight)
-        XCTAssertEqual(b.close.size, .small)
-        XCTAssertEqual(b.storeOpen, .skstoreproduct)
+        XCTAssertEqual(b.close.treatment, .hidden)
+        XCTAssertEqual(b.close.position, .topRight)
     }
 
-    func testAdBehaviorInlineInstallAndStoreProductAlias() throws {
+    func testProgressBarColorValidation() {
+        // Valid 6-digit hex (with/without #) is accepted and normalized to upper-case with a #.
+        XCTAssertEqual(validatedHexColor("#3b82f6"), "#3B82F6")
+        XCTAssertEqual(validatedHexColor("00FF00"), "#00FF00")
+        // Malformed → white fallback.
+        XCTAssertEqual(validatedHexColor("#FFF"), "#FFFFFF")        // too short
+        XCTAssertEqual(validatedHexColor("#GGGGGG"), "#FFFFFF")     // non-hex
+        XCTAssertEqual(validatedHexColor("rgba(0,0,0,1)"), "#FFFFFF")
+        XCTAssertEqual(validatedHexColor(nil), "#FFFFFF")
+    }
+
+    func testProgressBarColorDecodesAndFallsBack() throws {
+        let good = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"progress_bar_color":"#abcdef"}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(good).adBehavior).close.progressBarColor, "#ABCDEF")
+
+        let bad = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"progress_bar_color":"not-a-color"}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(bad).adBehavior).close.progressBarColor, "#FFFFFF")
+    }
+
+    func testStorePromptVerbatimPositionAndPlatform() throws {
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"store_open":"inline_install"}}
+         "ad_behavior":{"store_prompt":{"enabled":true,"position":"bottom_left","platform":"android"}}}
         """
-        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).storeOpen, .inlineInstall)
+        let prompt = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).storePrompt)
+        XCTAssertTrue(prompt.enabled)
+        XCTAssertEqual(prompt.position, .bottomLeft)   // rendered verbatim — never recomputed
+        XCTAssertEqual(prompt.platform, .android)
+        XCTAssertEqual(prompt.trigger, "midpoint")
+    }
 
-        let json2 = """
+    func testSKOverlayDefaultsAndValues() throws {
+        // Empty skoverlay object → defaults (disabled, on_click, bottom, dismissible).
+        let empty = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"store_open":"sk_store_product"}}
+         "ad_behavior":{"skoverlay":{}}}
         """
-        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json2).adBehavior).storeOpen, .skstoreproduct)
+        let d = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(empty).adBehavior).skoverlay)
+        XCTAssertFalse(d.enabled)
+        XCTAssertEqual(d.timing, .onClick)
+        XCTAssertEqual(d.position, .bottom)
+        XCTAssertTrue(d.dismissible)
+
+        // Explicit values, including a clamped negative delay.
+        let full = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"skoverlay":{"enabled":true,"timing":"delayed","delay_seconds":-3,
+           "position":"bottom_raised","dismissible":false}}}
+        """
+        let o = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(full).adBehavior).skoverlay)
+        XCTAssertTrue(o.enabled)
+        XCTAssertEqual(o.timing, .delayed)
+        XCTAssertEqual(o.delaySeconds, 0)             // negative clamps to 0
+        XCTAssertEqual(o.position, .bottomRaised)
+        XCTAssertFalse(o.dismissible)
+    }
+
+    func testAdUnitTypeFallsBackToLegacyFlags() throws {
+        // No creative node: adUnitType derives from the legacy rewarded flag / rendered_format.
+        let rewardedFlag = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
+        XCTAssertEqual(try decodeAdLoad(rewardedFlag).adUnitType, .rewarded)
+
+        let renderedFormat = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_format":"rewarded_video"}"#
+        XCTAssertEqual(try decodeAdLoad(renderedFormat).adUnitType, .rewarded)
+
+        let plain = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        XCTAssertEqual(try decodeAdLoad(plain).adUnitType, .interstitial)
     }
 
     func testAdBehaviorResilientToUnknownEnums() throws {
         // Unknown enum strings fall back per-field; delay_seconds is still parsed.
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"close":{"delay_seconds":12,"countdown_ui":"spinner","position":"middle",
-           "size":"huge","motion":"teleport"},"store_open":"warp"}}
+         "ad_behavior":{"close":{"delay_seconds":12,"treatment":"spinner","position":"middle",
+           "progress_bar_color":"warp"},"store_open":"warp"}}
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
         XCTAssertEqual(b.close.delaySeconds, 12)
-        XCTAssertEqual(b.close.countdownUI, .none)
+        XCTAssertEqual(b.close.treatment, .hidden)
         XCTAssertEqual(b.close.position, .topRight)
-        XCTAssertEqual(b.close.size, .standard)
-        XCTAssertEqual(b.close.motion, .static)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
         XCTAssertEqual(b.storeOpen, .external)
     }
 
@@ -419,11 +527,14 @@ final class SimulaAdSDKTests: XCTestCase {
         )
     }
 
-    func testCloseSizeGlyphMapping() {
-        XCTAssertEqual(CloseSize.small.glyphSize, 16)
-        XCTAssertEqual(CloseSize.standard.glyphSize, 24)
-        XCTAssertEqual(CloseSize.large.glyphSize, 32)
-        XCTAssertEqual(CloseSize.standard.circleSize, 44)
+    func testDeviceCapabilitiesEncodesHandshakeKeys() throws {
+        // The capability handshake must serialize the snake_case keys the backend expects.
+        let data = try JSONEncoder().encode(DeviceCapabilities.current)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNotNil(obj["os_version"])
+        XCTAssertNotNil(obj["storekit_available"])
+        XCTAssertNotNil(obj["skan_version"])
+        XCTAssertNotNil(obj["adattributionkit_available"])
     }
 
     // MARK: - Interstitial configuration defaults / mutability
