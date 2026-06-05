@@ -116,6 +116,10 @@ public enum SimulaAds {
         // Inherits the main actor from the enclosing `@MainActor` context.
         Task {
             await provider.createSession()
+            // Recover any reward verifications a prior launch left pending (e.g. a
+            // crash/kill before a verify could land) so their server-side SSV postbacks
+            // still fire without waiting for the next rewarded play.
+            RewardVerificationManager.shared.triggerProcessQueue()
         }
     }
 

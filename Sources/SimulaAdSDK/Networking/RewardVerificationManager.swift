@@ -35,6 +35,12 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private let lock = NSLock()
     private var isProcessing = false
 
+    /// Per-`serveId` result callbacks, so a verification's outcome reaches the caller
+    /// that enqueued it — not whoever happens to be draining the queue. One-shot:
+    /// removed the first time the task is attempted, so it can't be misrouted to
+    /// another play. Guarded by `lock`.
+    private var activeCallbacks: [String: @Sendable (Result<String?, Error>) -> Void] = [:]
+
     private init() {}
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
@@ -48,6 +54,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
         completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
     ) {
         lock.lock()
+        // Register before enqueueing so a drain already in flight (which reloads the
+        // queue each iteration and can pick this task up) still routes the result here.
+        if let completion = completion {
+            activeCallbacks[serveId] = completion
+        }
         var list = loadQueue()
         if !list.contains(where: { $0.serveId == serveId }) {
             list.append(
@@ -63,12 +74,12 @@ public final class RewardVerificationManager: @unchecked Sendable {
         }
         lock.unlock()
 
-        triggerProcessQueue(completion: completion)
+        triggerProcessQueue()
     }
 
     /// Drains any persisted verifications that are eligible under their backoff.
     /// Call at app launch to recover work left over from a previous session.
-    public func triggerProcessQueue(completion: (@Sendable (Result<String?, Error>) -> Void)? = nil) {
+    public func triggerProcessQueue() {
         lock.lock()
         if isProcessing {
             lock.unlock()
@@ -77,13 +88,15 @@ public final class RewardVerificationManager: @unchecked Sendable {
         isProcessing = true
         lock.unlock()
 
-        Task { await self.processQueue(completion: completion) }
+        Task { await self.processQueue() }
     }
 
     // MARK: - Processing
 
-    private func processQueue(completion: (@Sendable (Result<String?, Error>) -> Void)?) async {
-        defer { markProcessed() }
+    private func processQueue() async {
+        // True when we stop because a task hit a retryable error: its peers (if any)
+        // are intentionally left for a later trigger, so we must NOT immediately re-drain.
+        var bailedForBackoff = false
 
         while let task = nextEligibleTask() {
             do {
@@ -93,7 +106,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                     elapsedPlayTime: task.elapsedPlayTime
                 )
                 removeTask(serveId: task.serveId)
-                completion?(.success(res.token))
+                invokeCallback(serveId: task.serveId, .success(res.token))
             } catch {
                 // 4xx (except 408 Request Timeout / 429 Too Many Requests) is a
                 // permanent client error: retrying won't help, so drop it.
@@ -104,16 +117,46 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 }
 
                 if retryable {
+                    // Keep the task for a later trigger; deliver this attempt's failure
+                    // to its caller once (the server-side SSV postback still lands on a
+                    // successful retry — the client signal is one-shot).
                     recordAttempt(serveId: task.serveId)
-                    completion?(.failure(error))
-                    // Stop here; the remaining backoff is awaited by a later trigger.
+                    invokeCallback(serveId: task.serveId, .failure(error))
+                    bailedForBackoff = true
                     break
                 } else {
                     removeTask(serveId: task.serveId)
-                    completion?(.failure(error))
+                    invokeCallback(serveId: task.serveId, .failure(error))
                 }
             }
         }
+
+        finishProcessing(reDrainIfEligible: !bailedForBackoff)
+    }
+
+    /// Delivers a task's outcome to its registered caller exactly once, off the lock.
+    private func invokeCallback(serveId: String, _ result: Result<String?, Error>) {
+        lock.lock()
+        let callback = activeCallbacks.removeValue(forKey: serveId)
+        lock.unlock()
+        callback?(result)
+    }
+
+    /// Releases the processing claim and, under the SAME lock that observes the queue,
+    /// decides whether to re-drain. This closes the race where a verification enqueued
+    /// just as the drain finished would otherwise sit idle until some later trigger: a
+    /// task persisted concurrently is either seen here (→ re-trigger) or seen by the
+    /// enqueuer's own `triggerProcessQueue` once `isProcessing` is false.
+    private func finishProcessing(reDrainIfEligible: Bool) {
+        lock.lock()
+        isProcessing = false
+        var reDrain = false
+        if reDrainIfEligible {
+            let now = Date().timeIntervalSince1970
+            reDrain = loadQueue().contains { now - $0.lastAttemptTimestamp >= calculateBackoff(retryCount: $0.retryCount) }
+        }
+        lock.unlock()
+        if reDrain { triggerProcessQueue() }
     }
 
     /// Exponential backoff: first attempt immediate, then 5s, 10s, 20s, 40s, 60s cap.
@@ -148,12 +191,6 @@ public final class RewardVerificationManager: @unchecked Sendable {
             queue[idx].lastAttemptTimestamp = Date().timeIntervalSince1970
         }
         saveQueue(queue)
-    }
-
-    private func markProcessed() {
-        lock.lock()
-        isProcessing = false
-        lock.unlock()
     }
 
     // MARK: - Persistence
