@@ -116,11 +116,14 @@ public enum SimulaAds {
         // Inherits the main actor from the enclosing `@MainActor` context.
         Task {
             await provider.createSession()
-            // Recover any reward verifications a prior launch left pending (e.g. a
-            // crash/kill before a verify could land) so their server-side SSV postbacks
-            // still fire without waiting for the next rewarded play.
-            RewardVerificationManager.shared.triggerProcessQueue()
         }
+
+        // Independently of session warm-up (each queued verification carries its own
+        // session), recover any reward verifications a prior launch left pending (e.g. a
+        // crash/kill before a verify could land) so their server-side SSV postbacks fire
+        // without waiting for the next rewarded play. This kicks off its own Task, so a
+        // slow/failed session create can't delay or skip recovery.
+        RewardVerificationManager.shared.triggerProcessQueue()
     }
 
     /// Replaces the character context used for subsequent interstitial loads. Call

@@ -13,6 +13,32 @@ struct PendingVerification: Codable, Equatable {
     var lastAttemptTimestamp: Double
 }
 
+// MARK: - Seams (injected so the queue is unit-testable without the network/clock)
+
+/// Performs one `verify-reward` call. `SimulaAPI` is the production implementation;
+/// tests substitute a fake. Mirrors the Kotlin `RewardVerifier`.
+protocol RewardVerifying: Sendable {
+    func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double) async throws -> VerifyRewardResponse
+}
+
+extension SimulaAPI: RewardVerifying {}
+
+/// Exponential backoff for verification retries: 0, then 5s, 10s, 20s, 40s, capped 60s.
+func rewardVerificationBackoff(retryCount: Int) -> TimeInterval {
+    guard retryCount > 0 else { return 0 }
+    return min(pow(2.0, Double(retryCount - 1)) * 5.0, 60.0)
+}
+
+/// True if [error] is a permanent client error — a 4xx other than 408 (Request Timeout)
+/// or 429 (Too Many Requests) — for which retrying won't help.
+func isPermanentVerificationError(_ error: Error) -> Bool {
+    if case let SimulaAPIError.httpError(statusCode) = error,
+       (400...499).contains(statusCode), statusCode != 408, statusCode != 429 {
+        return true
+    }
+    return false
+}
+
 // MARK: - RewardVerificationManager
 
 /// Thread-safe, persistent queue that delivers `verify-reward` calls reliably and
@@ -31,7 +57,9 @@ public final class RewardVerificationManager: @unchecked Sendable {
     public static let shared = RewardVerificationManager()
 
     private let userDefaultsKey = "simula_pending_reward_verifications"
-    private let api = SimulaAPI()
+    private let verifier: RewardVerifying
+    private let defaults: UserDefaults
+    private let now: @Sendable () -> TimeInterval
     private let lock = NSLock()
     private var isProcessing = false
 
@@ -41,7 +69,23 @@ public final class RewardVerificationManager: @unchecked Sendable {
     /// another play. Guarded by `lock`.
     private var activeCallbacks: [String: @Sendable (Result<String?, Error>) -> Void] = [:]
 
-    private init() {}
+    private init() {
+        self.verifier = SimulaAPI()
+        self.defaults = .standard
+        self.now = { Date().timeIntervalSince1970 }
+    }
+
+    /// Test seam: inject a fake verifier, an isolated `UserDefaults`, and a controllable
+    /// clock so the draining logic can be exercised deterministically.
+    init(
+        verifier: RewardVerifying,
+        defaults: UserDefaults,
+        now: @escaping @Sendable () -> TimeInterval
+    ) {
+        self.verifier = verifier
+        self.defaults = defaults
+        self.now = now
+    }
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
     /// `completion` is invoked per attempt: `.success(token)` once verified (or
@@ -100,7 +144,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
         while let task = nextEligibleTask() {
             do {
-                let res = try await api.verifyReward(
+                let res = try await verifier.verifyReward(
                     serveId: task.serveId,
                     sessionId: task.sessionId,
                     elapsedPlayTime: task.elapsedPlayTime
@@ -108,15 +152,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 removeTask(serveId: task.serveId)
                 invokeCallback(serveId: task.serveId, .success(res.token))
             } catch {
-                // 4xx (except 408 Request Timeout / 429 Too Many Requests) is a
-                // permanent client error: retrying won't help, so drop it.
-                var retryable = true
-                if case let SimulaAPIError.httpError(statusCode) = error,
-                   (400...499).contains(statusCode), statusCode != 408, statusCode != 429 {
-                    retryable = false
-                }
-
-                if retryable {
+                // A 4xx (except 408/429) is permanent: retrying won't help, so drop it.
+                if !isPermanentVerificationError(error) {
                     // Keep the task for a later trigger; deliver this attempt's failure
                     // to its caller once (the server-side SSV postback still lands on a
                     // successful retry — the client signal is one-shot).
@@ -152,17 +189,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
         isProcessing = false
         var reDrain = false
         if reDrainIfEligible {
-            let now = Date().timeIntervalSince1970
-            reDrain = loadQueue().contains { now - $0.lastAttemptTimestamp >= calculateBackoff(retryCount: $0.retryCount) }
+            let nowTs = now()
+            reDrain = loadQueue().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
         }
         lock.unlock()
         if reDrain { triggerProcessQueue() }
-    }
-
-    /// Exponential backoff: first attempt immediate, then 5s, 10s, 20s, 40s, 60s cap.
-    private func calculateBackoff(retryCount: Int) -> Double {
-        guard retryCount > 0 else { return 0 }
-        return min(pow(2.0, Double(retryCount - 1)) * 5.0, 60.0)
     }
 
     // MARK: - Queue state (lock-guarded)
@@ -170,8 +201,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private func nextEligibleTask() -> PendingVerification? {
         lock.lock()
         defer { lock.unlock() }
-        let now = Date().timeIntervalSince1970
-        return loadQueue().first { now - $0.lastAttemptTimestamp >= calculateBackoff(retryCount: $0.retryCount) }
+        let nowTs = now()
+        return loadQueue().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
     }
 
     private func removeTask(serveId: String) {
@@ -188,7 +219,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         var queue = loadQueue()
         if let idx = queue.firstIndex(where: { $0.serveId == serveId }) {
             queue[idx].retryCount += 1
-            queue[idx].lastAttemptTimestamp = Date().timeIntervalSince1970
+            queue[idx].lastAttemptTimestamp = now()
         }
         saveQueue(queue)
     }
@@ -196,13 +227,13 @@ public final class RewardVerificationManager: @unchecked Sendable {
     // MARK: - Persistence
 
     private func loadQueue() -> [PendingVerification] {
-        guard let data = UserDefaults.standard.data(forKey: userDefaultsKey) else { return [] }
+        guard let data = defaults.data(forKey: userDefaultsKey) else { return [] }
         return (try? JSONDecoder().decode([PendingVerification].self, from: data)) ?? []
     }
 
     private func saveQueue(_ queue: [PendingVerification]) {
         if let data = try? JSONEncoder().encode(queue) {
-            UserDefaults.standard.set(data, forKey: userDefaultsKey)
+            defaults.set(data, forKey: userDefaultsKey)
         }
     }
 }
