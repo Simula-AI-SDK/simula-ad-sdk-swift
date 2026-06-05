@@ -133,22 +133,29 @@ final class GameAds: SimulaInterstitialAdDelegate {
 }
 ```
 
-**Rewarded ads**
+**Character context**
 
-Set `rewarded = true` and a `minPlayThreshold` (seconds) to request a rewarded
-creative. The close button stays hidden until the threshold elapses; once the user
-dismisses the ad after that point, `EARNED_REWARD` fires. A click-through on a
-rewarded ad does **not** auto-dismiss — the view gate governs close and reward.
+The interstitial sends optional character context (`charId`, `charName`, `charImage`,
+`charDesc`) on the `/ads/load/interstitial` request so the backend can target the
+creative. It lives globally on `SimulaAds` — seed it at `initialize`, then update it
+whenever the active character changes. The next `load()` uses the current values, so
+there is nothing to set per ad instance.
 
 ```swift
-let rewarded = SimulaInterstitialAd(adUnitId: "your_placement_id", minPlayThreshold: 5)
-rewarded.delegate = self
-rewarded.rewarded = true
-rewarded.load()
-// later, once LOADED:
-rewarded.show()
+SimulaAds.initialize(
+    apiKey: "YOUR_API_KEY",
+    devMode: true,
+    charId: "char_123",
+    charName: "Luna",
+    charImage: "https://example.com/avatar.png",
+    charDesc: "a witty companion"
+)
 
-func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward */ }
+// Later, when the active character changes (replaces all fields):
+SimulaAds.setCharacter(charId: "char_456", charName: "Sage")
+
+// …or tweak a single field on the fly:
+SimulaAds.charName = "Sage"
 ```
 
 **Lifecycle notes**
@@ -158,9 +165,9 @@ func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward
 - `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
   or `.noFill` when the payload carries no `rendered_html` creative.
 - The creative is the server-rendered HTML; it owns its own CTA, so there is no
-  SDK-drawn button to configure. The interstitial is dismissed via the close button
-  (gated for rewarded ads), not by the click-through. `CLICKED` fires on a
-  user-initiated link tap regardless of whether the store/web open succeeds.
+  SDK-drawn button to configure. The interstitial is dismissed via the close button,
+  not by the click-through. `CLICKED` fires on a user-initiated link tap regardless
+  of whether the store/web open succeeds.
 - Imperative presentation is iOS-only; on other platforms `show()` reports
   `DISPLAY_FAILED(.unsupportedPlatform)`.
 
@@ -171,11 +178,7 @@ func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) { /* grant the reward
 | DISPLAYED | `interstitialDidDisplay(_:)` |
 | DISPLAY_FAILED | `interstitialDidFailToDisplay(_:error:)` |
 | CLICKED | `interstitialDidClick(_:)` |
-| EARNED_REWARD | `interstitialDidEarnReward(_:)` |
 | CLOSED | `interstitialDidClose(_:)` |
-| REWARD_VERIFICATION_FAILED\* | `interstitialRewardVerificationDidFail(_:)` |
-
-\* Reserved — not emitted yet.
 
 ## Components
 

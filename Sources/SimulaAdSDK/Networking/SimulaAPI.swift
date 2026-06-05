@@ -241,10 +241,9 @@ public enum AdDestination: String, Sendable {
     case web
 }
 
-/// Request body for POST /ads/load — the imperative `.load()` prefetch call.
+/// Request body for POST /ads/load/interstitial — the imperative `.load()` prefetch call.
 public struct AdLoadRequest: Encodable, Sendable {
     public let adUnitId: String
-    public let rewarded: Bool
     public let sessionId: String
     /// Optional character context the backend can use to target the creative.
     /// Encoded only when non-nil (synthesized `encodeIfPresent`).
@@ -255,7 +254,6 @@ public struct AdLoadRequest: Encodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
-        case rewarded
         case sessionId = "session_id"
         case charId = "char_id"
         case charName = "char_name"
@@ -265,7 +263,6 @@ public struct AdLoadRequest: Encodable, Sendable {
 
     public init(
         adUnitId: String,
-        rewarded: Bool = false,
         sessionId: String = "",
         charId: String? = nil,
         charName: String? = nil,
@@ -273,7 +270,6 @@ public struct AdLoadRequest: Encodable, Sendable {
         charDesc: String? = nil
     ) {
         self.adUnitId = adUnitId
-        self.rewarded = rewarded
         self.sessionId = sessionId
         self.charId = charId
         self.charName = charName
@@ -282,16 +278,15 @@ public struct AdLoadRequest: Encodable, Sendable {
     }
 }
 
-/// Prefetch payload from POST /ads/load. The SDK caches this and renders the raw
-/// creative assets itself — there is no iframe. `destination` says whether a CTA
-/// tap opens the App Store or a web URL; `trackingUrl` is the click-attribution
+/// Prefetch payload from POST /ads/load/interstitial. The SDK caches this and renders
+/// the server-rendered `rendered_html` itself in a web view. `destination` says whether
+/// a CTA tap opens the App Store or a web URL; `trackingUrl` is the click-attribution
 /// redirect to open. Decoding is tolerant: missing fields fall back to defaults so
 /// a partial payload can't fail the whole decode (malformed JSON still throws).
 public struct AdLoadResponse: Decodable, Sendable {
     public let adId: String
     public let adInserted: Bool
     public let adUnitId: String
-    public let rewarded: Bool
     public let destination: String
     public let renderedFormat: String?
     public let trackingUrl: String?
@@ -316,7 +311,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         case adId = "ad_id"
         case adInserted = "ad_inserted"
         case adUnitId = "ad_unit_id"
-        case rewarded
         case destination
         case renderedFormat = "rendered_format"
         case trackingUrl = "tracking_url"
@@ -328,7 +322,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
         self.adInserted = (try? c.decode(Bool.self, forKey: .adInserted)) ?? false
         self.adUnitId = (try? c.decode(String.self, forKey: .adUnitId)) ?? ""
-        self.rewarded = (try? c.decode(Bool.self, forKey: .rewarded)) ?? false
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
@@ -340,7 +333,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         adId: String,
         adInserted: Bool,
         adUnitId: String,
-        rewarded: Bool,
         destination: String = "appstore",
         renderedFormat: String? = nil,
         trackingUrl: String? = nil,
@@ -349,7 +341,6 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adId = adId
         self.adInserted = adInserted
         self.adUnitId = adUnitId
-        self.rewarded = rewarded
         self.destination = destination
         self.renderedFormat = renderedFormat
         self.trackingUrl = trackingUrl
@@ -479,20 +470,19 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Load Ad (imperative prefetch)
 
-    /// Prefetches one interstitial creative via POST /ads/load. Pure transport:
-    /// returns the response as-is — including `ad_inserted == false`, which the
-    /// caller maps to a no-fill. No impression is fired here; `.load()` is prefetch
+    /// Prefetches one interstitial creative via POST /ads/load/interstitial. Pure
+    /// transport: returns the response as-is — including `ad_inserted == false`, which
+    /// the caller maps to a no-fill. No impression is fired here; `.load()` is prefetch
     /// only.
     public func loadAd(
         adUnitId: String,
-        rewarded: Bool = false,
         sessionId: String = "",
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
         charDesc: String? = nil
     ) async throws -> AdLoadResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/ads/load") else {
+        guard let url = URL(string: "\(API_BASE_URL)/ads/load/interstitial") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -502,7 +492,6 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpBody = try JSONEncoder().encode(
             AdLoadRequest(
                 adUnitId: adUnitId,
-                rewarded: rewarded,
                 sessionId: sessionId,
                 charId: charId,
                 charName: charName,
