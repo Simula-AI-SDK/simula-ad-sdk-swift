@@ -1,8 +1,11 @@
 // SimulaAdSDK — Public API Surface
 //
-// The mini-game invite components (Invitation, Button) are exported from their
-// respective files. The interstitial is an imperative ad (`SimulaInterstitialAd`),
-// initialized via `SimulaAds.initialize(apiKey:)` — see those types.
+// Two distinct full-screen surfaces coexist:
+//  • Declarative `MiniGameInterstitial` — a SwiftUI overlay that invites the user to
+//    play a mini-game (also grouped under `MiniGameInviteKit.Interstitial`).
+//  • Imperative `SimulaInterstitialAd` — a preloadable native ad, initialized via
+//    `SimulaAds.initialize(apiKey:)`.
+// The mini-game invite components are exported from their respective files.
 
 import SwiftUI
 
@@ -14,11 +17,14 @@ import SwiftUI
 /// ```swift
 /// MiniGameInviteKit.Invitation(...)
 /// MiniGameInviteKit.Button(...)
+/// MiniGameInviteKit.Interstitial(...)
 /// ```
 ///
-/// The interstitial is no longer a declarative view. Use the imperative
-/// `SimulaInterstitialAd` (configured with `SimulaAds.initialize(apiKey:)`) instead.
+/// Note: `MiniGameInviteKit.Interstitial` is the *declarative* mini-game invite
+/// overlay. For the *imperative* native interstitial ad, use `SimulaInterstitialAd`
+/// (configured with `SimulaAds.initialize(apiKey:)`).
 public enum MiniGameInviteKit {
     public typealias Invitation = MiniGameInvitation
     public typealias Button = MiniGameButton
+    public typealias Interstitial = MiniGameInterstitial
 }

@@ -80,7 +80,7 @@ struct ChatView: View {
 
 ### 3. Invitation Components
 
-The SDK provides two declarative invite components for triggering the game menu:
+The SDK provides three declarative invite components for triggering the game menu:
 
 ```swift
 // CTA Button with pulsating animation
@@ -93,7 +93,21 @@ MiniGameInvitation(
     onClick: { showGames = true },
     onClose: { showInvitation = false }
 )
+
+// Full-screen invitation overlay (character image + CTA over a background)
+MiniGameInterstitial(
+    charImage: "https://example.com/avatar.png",
+    invitationText: "Want to play a game?",
+    isOpen: showInterstitial,
+    onClick: { showGames = true },
+    onClose: { showInterstitial = false }
+)
 ```
+
+These are also grouped under `MiniGameInviteKit` (`.Button`, `.Invitation`,
+`.Interstitial`). Note that the declarative `MiniGameInterstitial` (a mini-game
+*invite* overlay) is distinct from the imperative native interstitial **ad**,
+`SimulaInterstitialAd` (see §4).
 
 ### 4. Interstitial Ad (Imperative)
 
@@ -188,6 +202,7 @@ SimulaAds.charName = "Sage"
 | `MiniGameMenu` | Modal game catalog with search, pagination, and ad display. Requires `onClose` callback. |
 | `MiniGameButton` | Animated CTA button to launch the game menu |
 | `MiniGameInvitation` | Slide-in banner card with character image |
+| `MiniGameInterstitial` | Declarative full-screen mini-game invite overlay (distinct from the imperative ad) |
 | `SimulaAds` | Global entry point — `initialize(apiKey:)` for the imperative API |
 | `SimulaInterstitialAd` | Imperative preloadable full-screen interstitial ad |
 
@@ -213,7 +228,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, and `MiniGameButtonTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
+See `MiniGameTheme`, `MiniGameInvitationTheme`, `MiniGameButtonTheme`, and `MiniGameInterstitialTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
 
 ## Privacy & App Store Compliance
 

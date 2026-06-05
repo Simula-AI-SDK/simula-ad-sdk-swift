@@ -13,11 +13,12 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testMiniGameInviteKitTypes() {
-        // Verify that the MiniGameInviteKit namespace correctly aliases types.
-        // The interstitial is no longer part of the namespace — it is the
-        // imperative `SimulaInterstitialAd` (see interstitial tests below).
+        // Verify that the MiniGameInviteKit namespace correctly aliases the
+        // declarative invite components. (The interstitial here is the declarative
+        // `MiniGameInterstitial`; the imperative ad is `SimulaInterstitialAd`.)
         XCTAssertTrue(MiniGameInviteKit.Invitation.self == MiniGameInvitation.self)
         XCTAssertTrue(MiniGameInviteKit.Button.self == MiniGameButton.self)
+        XCTAssertTrue(MiniGameInviteKit.Interstitial.self == MiniGameInterstitial.self)
     }
 
     // MARK: - Imperative interstitial (SimulaInterstitialAd) state guards
