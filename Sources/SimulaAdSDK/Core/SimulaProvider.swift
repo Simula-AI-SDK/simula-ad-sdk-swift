@@ -316,16 +316,34 @@ public struct SimulaProviderView<Content: View>: View {
         privacy: SimulaPrivacyConfig? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) {
+        // Resolve the privacy config: an explicit `privacy` wins; otherwise the
+        // legacy `hasPrivacyConsent` flag seeds it. Kept so prop changes can be
+        // pushed into the store via `.task(id: resolvedConfig)` below.
         var resolved = privacy ?? SimulaPrivacyConfig()
         if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
         self.resolvedConfig = resolved
-        self._provider = StateObject(wrappedValue: SimulaProvider(
-            apiKey: apiKey,
-            devMode: devMode,
-            primaryUserID: primaryUserID,
-            hasPrivacyConsent: hasPrivacyConsent,
-            privacy: privacy
-        ))
+
+        // Reuse the process-wide provider when its core config matches, to avoid
+        // recreating the session/store. A divergent privacy config on the shared
+        // instance is reconciled by `updateConsent(resolvedConfig)` in the
+        // `.task(id:)` below, so reuse stays safe.
+        let provider: SimulaProvider
+        if let shared = SimulaAds.shared,
+           shared.apiKey == apiKey,
+           shared.devMode == devMode,
+           shared.primaryUserID == primaryUserID,
+           shared.hasPrivacyConsent == hasPrivacyConsent {
+            provider = shared
+        } else {
+            provider = SimulaProvider(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: primaryUserID,
+                hasPrivacyConsent: hasPrivacyConsent,
+                privacy: privacy
+            )
+        }
+        self._provider = StateObject(wrappedValue: provider)
         self.content = content
     }
 

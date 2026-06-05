@@ -19,6 +19,10 @@ public struct MiniGameMenu: View {
     var maxGamesToShow: MaxGamesToShow = .six
     var theme: MiniGameTheme = MiniGameTheme()
     var delegateChar: Bool = true
+    /// Optional preloaded catalog. When set, the menu seeds its grid from it and
+    /// skips the network fetch on open (used by the imperative interstitial's
+    /// `load()` so the menu opens instantly without re-fetching).
+    var preloadedCatalog: CatalogResponse?
 
     public init(
         isOpen: Binding<Bool>,
@@ -30,7 +34,8 @@ public struct MiniGameMenu: View {
         charDesc: String? = nil,
         maxGamesToShow: MaxGamesToShow = .six,
         theme: MiniGameTheme = MiniGameTheme(),
-        delegateChar: Bool = true
+        delegateChar: Bool = true,
+        preloadedCatalog: CatalogResponse? = nil
     ) {
         self._isOpen = isOpen
         self.onClose = onClose
@@ -42,6 +47,7 @@ public struct MiniGameMenu: View {
         self.maxGamesToShow = maxGamesToShow
         self.theme = theme
         self.delegateChar = delegateChar
+        self.preloadedCatalog = preloadedCatalog
     }
 
     // MARK: - State
@@ -519,6 +525,23 @@ public struct MiniGameMenu: View {
     private func loadCatalog() async {
         catalogLoading = true
         catalogError = false
+
+        // When a preloaded catalog is supplied (imperative interstitial load()),
+        // seed the grid from it and skip the network fetch.
+        if let preloaded = preloadedCatalog {
+            await MainActor.run {
+                self.games = preloaded.games
+                self.menuId = preloaded.menuId.isEmpty ? nil : preloaded.menuId
+                self.catalogLoading = false
+            }
+            let coverUrls = preloaded.games.compactMap { game -> String? in
+                let url = game.gifCover ?? game.iconUrl
+                return url.isEmpty ? nil : url
+            }
+            await CoverImageCache.shared.preload(urls: coverUrls)
+            return
+        }
+
         do {
             let response = try await api.fetchCatalog()
 

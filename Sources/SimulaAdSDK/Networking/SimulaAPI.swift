@@ -233,6 +233,121 @@ private struct MinigameAdResponse: Decodable {
     }
 }
 
+// MARK: - Ad Load (imperative prefetch)
+
+/// Where a creative's CTA leads. Unknown/absent values fall back to `.appstore`.
+public enum AdDestination: String, Sendable {
+    case appstore
+    case web
+}
+
+/// Request body for POST /ads/load/interstitial — the imperative `.load()` prefetch call.
+public struct AdLoadRequest: Encodable, Sendable {
+    public let adUnitId: String
+    public let sessionId: String
+    /// Optional character context the backend can use to target the creative.
+    /// Encoded only when non-nil (synthesized `encodeIfPresent`).
+    public let charId: String?
+    public let charName: String?
+    public let charImage: String?
+    public let charDesc: String?
+
+    enum CodingKeys: String, CodingKey {
+        case adUnitId = "ad_unit_id"
+        case sessionId = "session_id"
+        case charId = "char_id"
+        case charName = "char_name"
+        case charImage = "char_image"
+        case charDesc = "char_desc"
+    }
+
+    public init(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
+        self.adUnitId = adUnitId
+        self.sessionId = sessionId
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
+    }
+}
+
+/// Prefetch payload from POST /ads/load/interstitial. The SDK caches this and renders
+/// the server-rendered `rendered_html` itself in a web view. `destination` says whether
+/// a CTA tap opens the App Store or a web URL; `trackingUrl` is the click-attribution
+/// redirect to open. Decoding is tolerant: missing fields fall back to defaults so
+/// a partial payload can't fail the whole decode (malformed JSON still throws).
+public struct AdLoadResponse: Decodable, Sendable {
+    public let adId: String
+    public let adInserted: Bool
+    public let adUnitId: String
+    public let destination: String
+    public let renderedFormat: String?
+    public let trackingUrl: String?
+    /// Server-rendered HTML creative. When present (non-blank) it is rendered
+    /// full-screen in a web view — the imperative interstitial's sole creative.
+    public let renderedHtml: String?
+
+    /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
+    public var destinationKind: AdDestination {
+        AdDestination(rawValue: destination) ?? .appstore
+    }
+
+    /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
+    /// value means the payload carries no renderable creative (no-fill).
+    public var htmlCreative: String? {
+        guard let html = renderedHtml,
+              !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return html
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case adId = "ad_id"
+        case adInserted = "ad_inserted"
+        case adUnitId = "ad_unit_id"
+        case destination
+        case renderedFormat = "rendered_format"
+        case trackingUrl = "tracking_url"
+        case renderedHtml = "rendered_html"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
+        self.adInserted = (try? c.decode(Bool.self, forKey: .adInserted)) ?? false
+        self.adUnitId = (try? c.decode(String.self, forKey: .adUnitId)) ?? ""
+        self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
+        self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
+        self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
+    }
+
+    /// Member-wise init for internal construction and tests.
+    public init(
+        adId: String,
+        adInserted: Bool,
+        adUnitId: String,
+        destination: String = "appstore",
+        renderedFormat: String? = nil,
+        trackingUrl: String? = nil,
+        renderedHtml: String? = nil
+    ) {
+        self.adId = adId
+        self.adInserted = adInserted
+        self.adUnitId = adUnitId
+        self.destination = destination
+        self.renderedFormat = renderedFormat
+        self.trackingUrl = trackingUrl
+        self.renderedHtml = renderedHtml
+    }
+}
+
 // MARK: - SimulaAPI
 
 /// Centralized API client for all Simula endpoints (translates api.ts)
@@ -294,27 +409,17 @@ public final class SimulaAPI: @unchecked Sendable {
         primaryUserID: String? = nil,
         privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
-        var components = URLComponents(string: "\(API_BASE_URL)/session/create")!
-        var queryItems: [URLQueryItem] = []
-        queryItems.append(URLQueryItem(name: "devMode", value: String(devMode)))
-        if let ppid = primaryUserID, !ppid.isEmpty {
-            queryItems.append(URLQueryItem(name: "ppid", value: ppid))
-        }
-        components.queryItems = queryItems.isEmpty ? nil : queryItems
-
-        guard let url = components.url else { throw SimulaAPIError.invalidURL }
+        guard let url = URL(string: "\(API_BASE_URL)/session/create") else { throw SimulaAPIError.invalidURL }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
-        // Establish consent at session creation: the backend ties the `privacy`
-        // block to the session and inherits it on subsequent calls.
-        if let privacy {
-            let body: [String: Any] = ["privacy": privacy.privacyBody()]
-            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        } else {
-            request.httpBody = "{}".data(using: .utf8)
-        }
+        // Body carries dev/user identity plus, when present, the consent block the
+        // backend ties to the session and inherits on subsequent calls.
+        var body: [String: Any] = ["devMode": devMode]
+        if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        if let privacy { body["privacy"] = privacy.privacyBody() }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
 
@@ -361,6 +466,50 @@ public final class SimulaAPI: @unchecked Sendable {
 
         // Decode flexibly into the SDK's CatalogResponse (see parseCatalog).
         return try parseCatalog(data)
+    }
+
+    // MARK: - Load Ad (imperative prefetch)
+
+    /// Prefetches one interstitial creative via POST /ads/load/interstitial. Pure
+    /// transport: returns the response as-is — including `ad_inserted == false`, which
+    /// the caller maps to a no-fill. No impression is fired here; `.load()` is prefetch
+    /// only.
+    public func loadAd(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) async throws -> AdLoadResponse {
+        guard let url = URL(string: "\(API_BASE_URL)/ads/load/interstitial") else {
+            throw SimulaAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(), to: &request)
+        request.httpBody = try JSONEncoder().encode(
+            AdLoadRequest(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc
+            )
+        )
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw SimulaAPIError.httpError(
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
+            )
+        }
+
+        return try JSONDecoder().decode(AdLoadResponse.self, from: data)
     }
 
     // MARK: - Init Minigame
@@ -483,6 +632,8 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Tracks an ad impression.
     /// Translates `trackImpression()` from api.ts
     public func trackImpression(adId: String, apiKey: String) async {
+        // An empty `adId` would POST to `.../impression/` (no id) — skip it.
+        guard !adId.isEmpty else { return }
         guard let url = URL(string: "\(API_BASE_URL)/track/engagement/impression/\(adId)") else { return }
 
         var request = URLRequest(url: url)

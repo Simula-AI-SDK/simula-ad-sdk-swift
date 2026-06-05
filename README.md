@@ -80,7 +80,7 @@ struct ChatView: View {
 
 ### 3. Invitation Components
 
-The SDK provides three invite components for triggering the game menu:
+The SDK provides three declarative invite components for triggering the game menu:
 
 ```swift
 // CTA Button with pulsating animation
@@ -94,14 +94,105 @@ MiniGameInvitation(
     onClose: { showInvitation = false }
 )
 
-// Full-screen interstitial overlay
+// Full-screen invitation overlay (character image + CTA over a background)
 MiniGameInterstitial(
     charImage: "https://example.com/avatar.png",
+    invitationText: "Want to play a game?",
     isOpen: showInterstitial,
     onClick: { showGames = true },
     onClose: { showInterstitial = false }
 )
 ```
+
+These are also grouped under `MiniGameInviteKit` (`.Button`, `.Invitation`,
+`.Interstitial`). Note that the declarative `MiniGameInterstitial` (a mini-game
+*invite* overlay) is distinct from the imperative native interstitial **ad**,
+`SimulaInterstitialAd` (see §4).
+
+### 4. Interstitial Ad (Imperative)
+
+The interstitial is a preloadable full-screen ad with a standard load/show
+lifecycle. Initialize the SDK once, preload with `load()`, then present with
+`show()` — no arguments. Showing presents a native full-screen creative
+(`DISPLAYED`): the server-rendered HTML creative in a web view, which owns its own
+CTA. A user-initiated link tap inside the creative (`CLICKED`) opens the
+advertiser's destination — the App Store (in-app store sheet) or a web page (in-app Safari).
+
+```swift
+import SimulaAdSDK
+
+// 1. Initialize once at launch (does not require SimulaProviderView).
+SimulaAds.initialize(apiKey: "YOUR_API_KEY", devMode: true)
+
+// 2. Create, configure, and preload.
+final class GameAds: SimulaInterstitialAdDelegate {
+    let interstitial = SimulaInterstitialAd(adUnitId: "your_placement_id")
+
+    init() {
+        interstitial.delegate = self
+        interstitial.load()
+    }
+
+    func showAd() {
+        interstitial.show()
+    }
+
+    // 3. Lifecycle events (all optional):
+    func interstitialDidLoad(_ ad: SimulaInterstitialAd) { /* ready to show */ }
+    func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
+    func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
+    func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
+    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* creative link tapped → opens advertiser destination */ }
+    func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
+}
+```
+
+**Character context**
+
+The interstitial sends optional character context (`charId`, `charName`, `charImage`,
+`charDesc`) on the `/ads/load/interstitial` request so the backend can target the
+creative. It lives globally on `SimulaAds` — seed it at `initialize`, then update it
+whenever the active character changes. The next `load()` uses the current values, so
+there is nothing to set per ad instance.
+
+```swift
+SimulaAds.initialize(
+    apiKey: "YOUR_API_KEY",
+    devMode: true,
+    charId: "char_123",
+    charName: "Luna",
+    charImage: "https://example.com/avatar.png",
+    charDesc: "a witty companion"
+)
+
+// Later, when the active character changes (replaces all fields):
+SimulaAds.setCharacter(charId: "char_456", charName: "Sage")
+
+// …or tweak a single field on the fly:
+SimulaAds.charName = "Sage"
+```
+
+**Lifecycle notes**
+
+- A single load is in flight per instance; the next ad is preloaded automatically
+  after `CLOSED`.
+- `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
+  or `.noFill` when the payload carries no `rendered_html` creative.
+- The creative is the server-rendered HTML; it owns its own CTA, so there is no
+  SDK-drawn button to configure. The interstitial is dismissed via the close button,
+  not by the click-through. `CLICKED` fires on a user-initiated link tap regardless
+  of whether the store/web open succeeds.
+- Imperative presentation is iOS-only; on other platforms `show()` reports
+  `DISPLAY_FAILED(.unsupportedPlatform)`.
+
+| Event | Delegate method |
+|-------|-----------------|
+| LOADED | `interstitialDidLoad(_:)` |
+| LOAD_FAILED | `interstitialDidFailToLoad(_:error:)` |
+| DISPLAYED | `interstitialDidDisplay(_:)` |
+| DISPLAY_FAILED | `interstitialDidFailToDisplay(_:error:)` |
+| CLICKED | `interstitialDidClick(_:)` |
+| CLOSED | `interstitialDidClose(_:)` |
 
 ## Components
 
@@ -111,7 +202,9 @@ MiniGameInterstitial(
 | `MiniGameMenu` | Modal game catalog with search, pagination, and ad display. Requires `onClose` callback. |
 | `MiniGameButton` | Animated CTA button to launch the game menu |
 | `MiniGameInvitation` | Slide-in banner card with character image |
-| `MiniGameInterstitial` | Full-screen overlay invitation |
+| `MiniGameInterstitial` | Declarative full-screen mini-game invite overlay (distinct from the imperative ad) |
+| `SimulaAds` | Global entry point — `initialize(apiKey:)` for the imperative API |
+| `SimulaInterstitialAd` | Imperative preloadable full-screen interstitial ad |
 
 ## Theming
 
@@ -135,7 +228,7 @@ MiniGameMenu(
 )
 ```
 
-See `MiniGameTheme`, `MiniGameInvitationTheme`, `MiniGameButtonTheme`, and `MiniGameInterstitialTheme` for all available properties.
+See `MiniGameTheme`, `MiniGameInvitationTheme`, `MiniGameButtonTheme`, and `MiniGameInterstitialTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
 
 ## Privacy & App Store Compliance
 

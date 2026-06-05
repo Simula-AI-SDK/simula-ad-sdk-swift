@@ -57,6 +57,10 @@ final class WebViewPool {
         let persistent: Bool
     }
     private var idle: [Pooled] = []
+    /// Views currently handed out to a representable, retained so `release` can
+    /// reset and re-pool them on `dismantleUIView` (recycling) instead of letting
+    /// them deallocate and tear down their Web Content process.
+    private var active: [ObjectIdentifier: Pooled] = [:]
 
     /// How many warm web views to keep on hand. The game and post-game ad are
     /// shown sequentially, so a small buffer is enough; `acquire` refills.
@@ -142,11 +146,38 @@ final class WebViewPool {
         pooled.webView.navigationDelegate = delegate
         pooled.webView.uiDelegate = delegate
 
+        active[ObjectIdentifier(pooled.webView)] = pooled
+
         // Refill on the next runloop turn so this acquire returns immediately and
         // the following one (e.g. the post-game ad) is also warm.
         Task { @MainActor [weak self] in self?.prewarm() }
 
         return pooled.webView
+    }
+
+    /// Reset a finished web view and return it to the pool (or discard if full /
+    /// privacy mismatch). Idempotent: a second call for the same view no-ops
+    /// because `active` no longer holds it.
+    func release(_ webView: WKWebView) {
+        guard let pooled = active.removeValue(forKey: ObjectIdentifier(webView)) else {
+            return
+        }
+        pooled.webView.stopLoading()
+        pooled.webView.navigationDelegate = nil
+        pooled.webView.uiDelegate = nil
+        pooled.forwarder.onMessage = nil
+
+        // Tear down the DOM so a recycled view never flashes the prior creative.
+        if let blank = URL(string: "about:blank") {
+            pooled.webView.load(URLRequest(url: blank))
+        }
+
+        // Only re-pool when the storage policy still matches current consent; a
+        // mismatched view is dropped so the next acquire builds a fresh one.
+        let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
+        if pooled.persistent == wantPersistent && idle.count < maxIdle {
+            idle.append(pooled)
+        }
     }
 
     /// Flushes prewarmed idle web views. Called on a consent change so the next
