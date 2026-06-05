@@ -591,6 +591,113 @@ final class SimulaAdSDKTests: XCTestCase {
         // Reset global state so other tests aren't affected.
         SimulaAds.setCharacter()
     }
+
+    // MARK: - Rewarded init parsing (RewardedInitResponse decode)
+
+    private func decodeRewardedInit(_ json: String) throws -> RewardedInitResponse {
+        try JSONDecoder().decode(RewardedInitResponse.self, from: data(json))
+    }
+
+    func testRewardedInitHappyPath() throws {
+        let json = #"{"serve_id":"srv_1","iframe_url":"https://x/play","ad_id":"ad_9","duration_seconds":30}"#
+        let r = try decodeRewardedInit(json)
+        XCTAssertEqual(r.serveId, "srv_1")
+        XCTAssertEqual(r.iframeUrl, "https://x/play")
+        XCTAssertEqual(r.adId, "ad_9")
+        XCTAssertEqual(r.durationSeconds, 30)
+    }
+
+    func testRewardedInitMissingFieldsFallBackToDefaults() throws {
+        // Tolerant decode: a partial payload must not fail the whole decode.
+        let r = try decodeRewardedInit(#"{"serve_id":"srv_2","iframe_url":"https://x/p"}"#)
+        XCTAssertEqual(r.serveId, "srv_2")
+        XCTAssertEqual(r.adId, "")           // missing → ""
+        XCTAssertEqual(r.durationSeconds, 0) // missing → 0
+    }
+
+    func testRewardedInitMalformedJSONThrows() {
+        XCTAssertThrowsError(try decodeRewardedInit("not json"))
+    }
+
+    // MARK: - Verify reward parsing (VerifyRewardResponse decode)
+
+    func testVerifyRewardResponseDecodes() throws {
+        let r = try JSONDecoder().decode(VerifyRewardResponse.self, from: data(#"{"verified":true,"token":"tok_1"}"#))
+        XCTAssertTrue(r.verified)
+        XCTAssertEqual(r.token, "tok_1")
+    }
+
+    func testVerifyRewardResponseMissingTokenIsNil() throws {
+        let r = try JSONDecoder().decode(VerifyRewardResponse.self, from: data(#"{"verified":true}"#))
+        XCTAssertTrue(r.verified)
+        XCTAssertNil(r.token)
+    }
+
+    // MARK: - Rewarded request encoding (snake_case)
+
+    func testRewardedInitRequestEncodesSnakeCaseKeys() throws {
+        let body = RewardedInitRequest(adUnitId: "unit_1", sessionId: "sess_9", minPlayThreshold: 15)
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["ad_unit_id"] as? String, "unit_1")
+        XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
+        XCTAssertEqual(obj?["min_play_threshold"] as? Int, 15)
+    }
+
+    func testRewardedInitRequestOmitsThresholdWhenNil() throws {
+        let body = RewardedInitRequest(adUnitId: "unit_1", sessionId: "s")
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertNil(obj?["min_play_threshold"], "nil threshold must be omitted, not sent as null")
+    }
+
+    func testVerifyRewardRequestEncodesSnakeCaseKeys() throws {
+        let body = VerifyRewardRequest(serveId: "srv_1", sessionId: "sess_9", elapsedPlayTime: 31.5)
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["serve_id"] as? String, "srv_1")
+        XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
+        XCTAssertEqual(obj?["elapsed_play_time"] as? Double, 31.5)
+    }
+
+    // MARK: - Idempotent verify response
+
+    func testVerifyRewardResponse409IdempotentShape() {
+        // The API layer maps HTTP 409 (already claimed) to a verified response with a
+        // nil token; assert that shape directly (no network).
+        let r = VerifyRewardResponse(verified: true, token: nil)
+        XCTAssertTrue(r.verified)
+        XCTAssertNil(r.token)
+    }
+
+    // MARK: - Rewarded configuration + state guards
+
+    @MainActor
+    func testRewardedDefaultConfiguration() {
+        let ad = SimulaRewardedAd(adUnitId: "u")
+        XCTAssertEqual(ad.adUnitId, "u")
+        XCTAssertEqual(ad.minPlayThreshold, 0)
+    }
+
+    @MainActor
+    func testRewardedLoadBeforeInitFiresLoadFailedNotInitialized() {
+        XCTAssertFalse(SimulaAds.isInitialized, "Test assumes SimulaAds is not initialized")
+        let delegate = RewardedMockDelegate()
+        let ad = SimulaRewardedAd(adUnitId: "u")
+        ad.delegate = delegate
+        ad.load()
+        guard case .notInitialized? = delegate.loadFailedError else {
+            return XCTFail("Expected .notInitialized, got \(String(describing: delegate.loadFailedError))")
+        }
+    }
+
+    @MainActor
+    func testRewardedShowBeforeLoadFiresDisplayFailedNotReady() {
+        let delegate = RewardedMockDelegate()
+        let ad = SimulaRewardedAd(adUnitId: "u")
+        ad.delegate = delegate
+        ad.show()
+        guard case .notReady? = delegate.displayFailedError else {
+            return XCTFail("Expected .notReady, got \(String(describing: delegate.displayFailedError))")
+        }
+    }
 }
 
 // MARK: - Test doubles
@@ -605,6 +712,20 @@ final class InterstitialMockDelegate: SimulaInterstitialAdDelegate {
     }
 
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {
+        displayFailedError = error
+    }
+}
+
+/// Captures the most recent failure events from a `SimulaRewardedAd`.
+final class RewardedMockDelegate: SimulaRewardedAdDelegate {
+    var loadFailedError: SimulaAdError?
+    var displayFailedError: SimulaAdError?
+
+    func rewardedDidFailToLoad(_ ad: SimulaRewardedAd, error: SimulaAdError) {
+        loadFailedError = error
+    }
+
+    func rewardedDidFailToDisplay(_ ad: SimulaRewardedAd, error: SimulaAdError) {
         displayFailedError = error
     }
 }
