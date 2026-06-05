@@ -26,13 +26,6 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `CLICKED` — the user tapped the CTA, which opens the advertiser destination.
     func interstitialDidClick(_ ad: SimulaInterstitialAd)
 
-    /// `EARNED_REWARD` — a rewarded ad was viewed for at least `minPlayThreshold`
-    /// before being dismissed.
-    func interstitialDidEarnReward(_ ad: SimulaInterstitialAd)
-
-    /// `REWARD_VERIFICATION_FAILED` — reserved for a future reward feature. Not emitted yet.
-    func interstitialRewardVerificationDidFail(_ ad: SimulaInterstitialAd)
-
     /// `CLOSED` — the ad surface was fully dismissed.
     func interstitialDidClose(_ ad: SimulaInterstitialAd)
 }
@@ -43,8 +36,6 @@ public extension SimulaInterstitialAdDelegate {
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidClick(_ ad: SimulaInterstitialAd) {}
-    func interstitialDidEarnReward(_ ad: SimulaInterstitialAd) {}
-    func interstitialRewardVerificationDidFail(_ ad: SimulaInterstitialAd) {}
     func interstitialDidClose(_ ad: SimulaInterstitialAd) {}
 }
 
@@ -108,9 +99,7 @@ public enum SimulaAdError: LocalizedError, Sendable {
 /// `show()` presents a native full-screen creative (`DISPLAYED`): the
 /// server-rendered HTML creative (`rendered_html`) in a web view, which owns its
 /// own CTA. A user-initiated link tap inside it fires `CLICKED` and opens the
-/// advertiser's App Store or web destination. When `rewarded` is set, the close
-/// button is gated behind `minPlayThreshold` seconds of viewing, after which
-/// `EARNED_REWARD` fires on dismiss.
+/// advertiser's App Store or web destination. A close button dismisses the ad.
 ///
 /// Usage:
 /// ```swift
@@ -127,27 +116,11 @@ public final class SimulaInterstitialAd {
     /// The placement identifier for this ad instance.
     public let adUnitId: String
 
-    /// Minimum viewing time (seconds) before a rewarded ad earns its reward. Only
-    /// applies when `rewarded` is `true`: the close button stays hidden until this
-    /// elapses, then `EARNED_REWARD` fires on dismiss. Mutable (like `rewarded`) —
-    /// settable directly or via the `init` convenience parameter.
-    public var minPlayThreshold: TimeInterval = 0
-
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
-    /// Whether this placement requests a rewarded creative. When `true`, close is
-    /// gated by `minPlayThreshold` and `EARNED_REWARD` fires on a qualifying dismiss.
-    public var rewarded: Bool = false
-
-    /// Optional character context sent on the `/ads/load` request so the backend
-    /// can target the creative. Omitted from the request body when `nil`.
-    public var charId: String?
-    /// Character name displayed in the creative header.
-    public var charName: String?
-    /// Character avatar URL.
-    public var charImage: String?
-    public var charDesc: String?
+    // Character context is global: set it on `SimulaAds` (via `initialize` or
+    // `setCharacter`), and every `load()` reads the current values from there.
 
     // MARK: - State
 
@@ -168,9 +141,8 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Init
 
-    public init(adUnitId: String, minPlayThreshold: TimeInterval = 0) {
+    public init(adUnitId: String) {
         self.adUnitId = adUnitId
-        self.minPlayThreshold = minPlayThreshold
     }
 
     // MARK: - Load
@@ -207,12 +179,11 @@ public final class SimulaInterstitialAd {
             do {
                 let response = try await self.api.loadAd(
                     adUnitId: self.adUnitId,
-                    rewarded: self.rewarded,
                     sessionId: sessionId,
-                    charId: self.charId,
-                    charName: self.charName,
-                    charImage: self.charImage,
-                    charDesc: self.charDesc
+                    charId: SimulaAds.charId,
+                    charName: SimulaAds.charName,
+                    charImage: SimulaAds.charImage,
+                    charDesc: SimulaAds.charDesc
                 )
                 if Task.isCancelled { return }
                 // Fillable only when the payload carries a non-blank `rendered_html`
@@ -240,7 +211,7 @@ public final class SimulaInterstitialAd {
     /// Presents the loaded creative full-screen. Fires `DISPLAYED` on success or
     /// `DISPLAY_FAILED` when no ad is ready / one is already showing / the platform
     /// is unsupported. Tapping the CTA fires `CLICKED` and opens the advertiser
-    /// destination. For rewarded ads, `EARNED_REWARD` fires on a qualifying dismiss.
+    /// destination.
     ///
     /// On close, fires `CLOSED` and automatically preloads the next ad.
     public func show() {
@@ -267,14 +238,9 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
-            minPlayThreshold: minPlayThreshold,
             onClick: { [weak self] in
                 guard let self else { return }
                 self.delegate?.interstitialDidClick(self)
-            },
-            onEarnReward: { [weak self] in
-                guard let self else { return }
-                self.delegate?.interstitialDidEarnReward(self)
             },
             onClose: { [weak self] in
                 guard let self else { return }

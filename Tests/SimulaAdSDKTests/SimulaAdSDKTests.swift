@@ -13,11 +13,12 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testMiniGameInviteKitTypes() {
-        // Verify that the MiniGameInviteKit namespace correctly aliases types.
-        // The interstitial is no longer part of the namespace — it is the
-        // imperative `SimulaInterstitialAd` (see interstitial tests below).
+        // Verify that the MiniGameInviteKit namespace correctly aliases the
+        // declarative invite components. (The interstitial here is the declarative
+        // `MiniGameInterstitial`; the imperative ad is `SimulaInterstitialAd`.)
         XCTAssertTrue(MiniGameInviteKit.Invitation.self == MiniGameInvitation.self)
         XCTAssertTrue(MiniGameInviteKit.Button.self == MiniGameButton.self)
+        XCTAssertTrue(MiniGameInviteKit.Interstitial.self == MiniGameInterstitial.self)
     }
 
     // MARK: - Imperative interstitial (SimulaInterstitialAd) state guards
@@ -54,9 +55,8 @@ final class SimulaAdSDKTests: XCTestCase {
 
     @MainActor
     func testInterstitialStoresConfiguration() {
-        let ad = SimulaInterstitialAd(adUnitId: "unit_42", minPlayThreshold: 5)
+        let ad = SimulaInterstitialAd(adUnitId: "unit_42")
         XCTAssertEqual(ad.adUnitId, "unit_42")
-        XCTAssertEqual(ad.minPlayThreshold, 5)
     }
 
     func testMaxGamesToShowValues() {
@@ -150,7 +150,6 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(r.adId, "ad_1")
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.adUnitId, "unit_1")
-        XCTAssertTrue(r.rewarded)
         XCTAssertEqual(r.destination, "web")
         XCTAssertEqual(r.destinationKind, .web)
         XCTAssertEqual(r.renderedFormat, "rewarded_video")
@@ -239,17 +238,17 @@ final class SimulaAdSDKTests: XCTestCase {
     // MARK: - Ad load request (AdLoadRequest encode)
 
     func testAdLoadRequestEncodesSnakeCaseKeys() throws {
-        let body = AdLoadRequest(adUnitId: "unit_1", rewarded: true, sessionId: "sess_9")
+        let body = AdLoadRequest(adUnitId: "unit_1", sessionId: "sess_9")
         let encoded = try JSONEncoder().encode(body)
         let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         XCTAssertEqual(obj?["ad_unit_id"] as? String, "unit_1")
         XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
-        XCTAssertEqual(obj?["rewarded"] as? Bool, true)
+        // `rewarded` is no longer part of the request body.
+        XCTAssertNil(obj?["rewarded"])
     }
 
     func testAdLoadRequestDefaults() {
         let body = AdLoadRequest(adUnitId: "unit_1")
-        XCTAssertFalse(body.rewarded)
         XCTAssertEqual(body.sessionId, "")
         XCTAssertNil(body.charId)
         XCTAssertNil(body.charName)
@@ -296,17 +295,36 @@ final class SimulaAdSDKTests: XCTestCase {
     func testInterstitialDefaultConfiguration() {
         let ad = SimulaInterstitialAd(adUnitId: "u")
         XCTAssertEqual(ad.adUnitId, "u")
-        XCTAssertFalse(ad.rewarded)
-        XCTAssertEqual(ad.minPlayThreshold, 0)
     }
 
+    // MARK: - Global character context (SimulaAds)
+
     @MainActor
-    func testInterstitialConfigurationIsMutable() {
-        let ad = SimulaInterstitialAd(adUnitId: "u")
-        ad.rewarded = true
-        ad.minPlayThreshold = 7
-        XCTAssertTrue(ad.rewarded)
-        XCTAssertEqual(ad.minPlayThreshold, 7)
+    func testSimulaAdsSetCharacterUpdatesGlobalContext() {
+        SimulaAds.setCharacter(
+            charId: "char_7",
+            charName: "Mentor",
+            charImage: "https://x/a.png",
+            charDesc: "a wise mentor"
+        )
+        XCTAssertEqual(SimulaAds.charId, "char_7")
+        XCTAssertEqual(SimulaAds.charName, "Mentor")
+        XCTAssertEqual(SimulaAds.charImage, "https://x/a.png")
+        XCTAssertEqual(SimulaAds.charDesc, "a wise mentor")
+
+        // Direct property assignment updates a single field on the fly.
+        SimulaAds.charName = "Sage"
+        XCTAssertEqual(SimulaAds.charName, "Sage")
+
+        // setCharacter replaces wholesale: omitted fields are cleared (no stale carry-over).
+        SimulaAds.setCharacter(charId: "char_8")
+        XCTAssertEqual(SimulaAds.charId, "char_8")
+        XCTAssertNil(SimulaAds.charName)
+        XCTAssertNil(SimulaAds.charImage)
+        XCTAssertNil(SimulaAds.charDesc)
+
+        // Reset global state so other tests aren't affected.
+        SimulaAds.setCharacter()
     }
 
     // MARK: - Rewarded init parsing (RewardedInitResponse decode)
