@@ -357,17 +357,39 @@ public struct RewardedInitRequest: Encodable, Sendable {
     public let adUnitId: String
     public let sessionId: String
     public let minPlayThreshold: Int?
+    /// Optional character context the backend can use to target the minigame.
+    /// Encoded only when non-nil (synthesized `encodeIfPresent`).
+    public let charId: String?
+    public let charName: String?
+    public let charImage: String?
+    public let charDesc: String?
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
         case sessionId = "session_id"
         case minPlayThreshold = "min_play_threshold"
+        case charId = "char_id"
+        case charName = "char_name"
+        case charImage = "char_image"
+        case charDesc = "char_desc"
     }
 
-    public init(adUnitId: String, sessionId: String = "", minPlayThreshold: Int? = nil) {
+    public init(
+        adUnitId: String,
+        sessionId: String = "",
+        minPlayThreshold: Int? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
         self.adUnitId = adUnitId
         self.sessionId = sessionId
         self.minPlayThreshold = minPlayThreshold
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
     }
 }
 
@@ -618,7 +640,11 @@ public final class SimulaAPI: @unchecked Sendable {
     public func initRewarded(
         adUnitId: String,
         sessionId: String = "",
-        minPlayThreshold: Int? = nil
+        minPlayThreshold: Int? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
     ) async throws -> RewardedInitResponse {
         guard let url = URL(string: "\(API_BASE_URL)/minigames/init/rewarded") else {
             throw SimulaAPIError.invalidURL
@@ -628,7 +654,15 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            RewardedInitRequest(adUnitId: adUnitId, sessionId: sessionId, minPlayThreshold: minPlayThreshold)
+            RewardedInitRequest(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                minPlayThreshold: minPlayThreshold,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc
+            )
         )
 
         let (data, response) = try await session.data(for: request)

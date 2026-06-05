@@ -147,7 +147,11 @@ public final class SimulaRewardedAd {
                 let response = try await self.api.initRewarded(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
-                    minPlayThreshold: threshold
+                    minPlayThreshold: threshold,
+                    charId: SimulaAds.charId,
+                    charName: SimulaAds.charName,
+                    charImage: SimulaAds.charImage,
+                    charDesc: SimulaAds.charDesc
                 )
                 if Task.isCancelled { return }
                 // A rewarded ad with no iframe to render is a no-fill.
