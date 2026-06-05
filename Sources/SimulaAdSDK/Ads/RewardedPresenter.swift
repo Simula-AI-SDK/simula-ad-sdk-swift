@@ -82,8 +82,8 @@ final class RewardedPresenter {
 // MARK: - RewardedGameView
 
 /// Full-screen playable minigame: the creative iframe in a pooled `WKWebView`, a
-/// top-left close button (always available) and a top-right status pill counting
-/// down the remaining play time. The reward is earned once `durationSeconds` of play
+/// bottom-left close button (always available) and a bottom-right status pill
+/// counting down the remaining play time. The reward is earned once `durationSeconds` of play
 /// elapse; closing earlier prompts an exit confirmation so the user doesn't lose the
 /// reward by accident. On a qualifying close, `onFinish(earned, elapsedPlayTime)`
 /// fires after the dismiss fade.
@@ -114,9 +114,12 @@ private struct RewardedGameView: View {
                     .ignoresSafeArea()
             }
 
-            // Top bar: close (left) + reward status pill (right).
+            // Bottom bar: close (bottom-left, hugging the edge) + reward status pill
+            // (bottom-right).
             VStack {
-                HStack(alignment: .top) {
+                Spacer()
+
+                HStack(alignment: .bottom) {
                     Button(action: handleCloseAttempt) {
                         Image(systemName: "xmark")
                             .font(.system(size: 16, weight: .bold))
@@ -126,15 +129,15 @@ private struct RewardedGameView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Close")
+                    .padding(.leading, 8)
+                    .padding(.bottom, 8)
 
                     Spacer()
 
                     statusPill
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 16)
                 }
-                .padding(.top, 16)
-                .padding(.horizontal, 16)
-
-                Spacer()
             }
         }
         .opacity(visible ? 1 : 0)
