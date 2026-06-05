@@ -408,16 +408,16 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testClosePositionSnapsForEdgeAnchoredTreatments() throws {
-        // countdown_circle / progress_bar can't render bottom_left → snap to top_right.
-        for treatment in ["countdown_circle", "progress_bar"] {
+        // progress_bar is a full-width top-edge bar → can't render bottom_left → snap to top_right.
+        for treatment in ["progress_bar"] {
             let json = """
             {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
              "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
             """
             XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
         }
-        // hidden / reward_or_close_label keep bottom_left.
-        for treatment in ["hidden", "reward_or_close_label"] {
+        // hidden / reward_or_close_label / countdown_circle keep bottom_left.
+        for treatment in ["hidden", "reward_or_close_label", "countdown_circle"] {
             let json = """
             {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
              "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}

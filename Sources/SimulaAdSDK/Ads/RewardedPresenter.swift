@@ -95,7 +95,6 @@ private struct RewardedGameView: View {
     @State private var elapsedPlayTime: Double = 0
     @State private var rewardEarned = false
     @State private var visible = true
-    @State private var showExitConfirmation = false
     @State private var timerTask: Task<Void, Never>?
 
     /// Matches the dismiss fade before the window is removed.
@@ -114,31 +113,13 @@ private struct RewardedGameView: View {
                     .ignoresSafeArea()
             }
 
-            // Bottom bar: close (bottom-left, hugging the edge) + reward status pill
-            // (bottom-right).
-            VStack {
-                Spacer()
-
-                HStack(alignment: .bottom) {
-                    Button(action: handleCloseAttempt) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(.white)
-                            .frame(width: 36, height: 36)
-                            .background(Circle().fill(Color.black.opacity(0.6)))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close")
-                    .padding(.leading, 8)
-                    .padding(.bottom, 8)
-
-                    Spacer()
-
-                    statusPill
-                        .padding(.trailing, 16)
-                        .padding(.bottom, 16)
-                }
-            }
+            // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
+            // earned (display-only — there is no early exit), which becomes the close button
+            // ("✕ Reward unlocked") the moment the reward is earned. The whole pill then dismisses.
+            rewardClosePill
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .animation(.default, value: rewardEarned)
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a
@@ -146,14 +127,6 @@ private struct RewardedGameView: View {
         .allowsHitTesting(visible)
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
-        .alert(isPresented: $showExitConfirmation) {
-            Alert(
-                title: Text("Exit game?"),
-                message: Text("You haven't played long enough to earn your reward. If you exit now, you'll lose it."),
-                primaryButton: .destructive(Text("Exit anyway")) { finish(earned: false) },
-                secondaryButton: .cancel(Text("Keep playing"))
-            )
-        }
         .onAppear { startTimer() }
         .onDisappear {
             timerTask?.cancel()
@@ -162,31 +135,41 @@ private struct RewardedGameView: View {
     }
 
     @ViewBuilder
-    private var statusPill: some View {
-        Group {
-            if rewardEarned {
-                Text("🎁 Reward unlocked!")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.green)
-            } else {
-                Text("🎮 Play to earn: \(secondsLeft)s")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.white)
+    private var rewardClosePill: some View {
+        if rewardEarned {
+            // Earned: the entire pill is the close button.
+            Button(action: { finish(earned: true) }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
+                    Text("Reward unlocked").font(.system(size: 14, weight: .bold))
+                }
+                .foregroundColor(.white)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .background(pillBackground(earned: true))
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Reward unlocked, close")
+        } else {
+            // Still earning: a display-only status — no close affordance yet.
+            Text("🎮 Play to earn: \(secondsLeft)s")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(.white)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .background(pillBackground(earned: false))
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 16)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.75))
-                .overlay(
-                    Capsule().stroke(
-                        rewardEarned ? Color.green.opacity(0.6) : Color.white.opacity(0.2),
-                        lineWidth: 1
-                    )
+    }
+
+    private func pillBackground(earned: Bool) -> some View {
+        Capsule()
+            .fill(Color.black.opacity(0.75))
+            .overlay(
+                Capsule().stroke(
+                    earned ? Color.green.opacity(0.6) : Color.white.opacity(0.2),
+                    lineWidth: 1
                 )
-        )
-        .animation(.default, value: rewardEarned)
+            )
     }
 
     // MARK: Timer
@@ -211,14 +194,6 @@ private struct RewardedGameView: View {
     }
 
     // MARK: Close
-
-    private func handleCloseAttempt() {
-        if rewardEarned {
-            finish(earned: true)
-        } else {
-            showExitConfirmation = true
-        }
-    }
 
     private func finish(earned: Bool) {
         let elapsed = elapsedPlayTime

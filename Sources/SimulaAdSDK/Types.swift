@@ -391,13 +391,10 @@ public enum CloseTreatment: Sendable, Equatable {
         }
     }
 
-    /// `countdown_circle` / `progress_bar` are edge-anchored (top only) and cannot render at
-    /// `bottom_left`; `hidden` / `reward_or_close_label` allow all three corners.
+    /// `progress_bar` is a full-width top-edge bar, so it's the only treatment that can't render at
+    /// `bottom_left`; `hidden` / `reward_or_close_label` / `countdown_circle` allow all three corners.
     var allowsBottomLeft: Bool {
-        switch self {
-        case .hidden, .rewardOrCloseLabel: return true
-        case .countdownCircle, .progressBar: return false
-        }
+        self != .progressBar
     }
 }
 

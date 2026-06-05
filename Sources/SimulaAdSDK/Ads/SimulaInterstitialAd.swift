@@ -275,6 +275,112 @@ public final class SimulaInterstitialAd {
         #endif
     }
 
+    // MARK: - Preview (debug / QA)
+
+    /// A self-contained placeholder creative so `showPreview` can render the close-button A/B
+    /// chrome over a visible surface without fetching a network creative.
+    private static let previewCreativeHTML = """
+    <!doctype html><html><head><meta name="viewport" \
+    content="width=device-width, initial-scale=1, viewport-fit=cover"></head>\
+    <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;\
+    background:linear-gradient(160deg,#1e3a8a,#7c3aed);\
+    font-family:-apple-system,system-ui,sans-serif;color:#fff;text-align:center">\
+    <div><div style="font-size:22px;font-weight:700">A/B Close Button Preview</div>\
+    <div style="opacity:.8;margin-top:8px;font-size:15px">Hardcoded ad_behavior — no network</div></div>\
+    </body></html>
+    """
+
+    /// A real App Store URL used only by `showPreview` so the SKOverlay path can resolve a numeric
+    /// adamId (`SKOverlay.AppConfiguration(appIdentifier:)` requires one) without a network round-trip,
+    /// and so a store-prompt-badge tap routes somewhere. Without this the preview's SKOverlay no-ops.
+    private static let previewTrackingURL = "https://apps.apple.com/app/id375380948"
+
+    /// Presents the interstitial with a **hardcoded** `ad_behavior` and a placeholder creative —
+    /// no network call and no impression tracked. Lets a host/sample app preview the A/B
+    /// close-button treatments without the backend assigning the variant.
+    ///
+    /// Parameters take the same wire strings the server would send; unknown values fall back
+    /// exactly as a real payload would (e.g. an unknown treatment → `hidden`). iOS only.
+    ///
+    /// - Parameters:
+    ///   - closeTreatment: `hidden` / `countdown_circle` / `progress_bar` / `reward_or_close_label`.
+    ///   - closePosition: `top_right` / `top_left` / `bottom_left`.
+    ///   - delaySeconds: the pre-tap close delay the treatment animates over.
+    ///   - progressBarColor: 6-digit hex (optional leading `#`) tinting the ring / bar fill.
+    ///   - adUnitType: `interstitial` / `rewarded` — drives the `reward_or_close_label` copy.
+    ///   - storePrompt: also show the mid-ad store-prompt badge.
+    ///   - skOverlay: also present the SKOverlay install banner (needs a resolvable store id).
+    public func showPreview(
+        closeTreatment: String,
+        closePosition: String = "top_right",
+        delaySeconds: Int = 5,
+        progressBarColor: String = "#FFFFFF",
+        adUnitType: String = "interstitial",
+        storePrompt: Bool = false,
+        skOverlay: Bool = false
+    ) {
+        #if os(iOS)
+        if case .showing = state {
+            failDisplay(.alreadyShowing)
+            return
+        }
+        guard let provider = SimulaAds.shared else {
+            failDisplay(.notInitialized)
+            return
+        }
+
+        let close = CloseBehavior(
+            delaySeconds: delaySeconds,
+            treatment: CloseTreatment.from(closeTreatment),
+            position: ClosePosition.from(closePosition),
+            progressBarColor: validatedHexColor(progressBarColor)
+        )
+        // Mirror the server's collision rule: render the store-prompt badge opposite the close button.
+        let storePromptPosition: ClosePosition = close.position == .topRight ? .topLeft : .topRight
+        let behavior = AdBehavior(
+            close: close,
+            storePrompt: storePrompt ? StorePrompt(enabled: true, position: storePromptPosition, platform: .ios) : nil,
+            skoverlay: skOverlay ? SKOverlayConfig(enabled: true, timing: .duringPlay) : nil
+        )
+        let response = AdLoadResponse(
+            adId: "",                     // empty → no impression is ever tracked for a preview
+            adInserted: true,
+            adUnitId: adUnitId,
+            trackingUrl: Self.previewTrackingURL,  // lets SKOverlay resolve an adamId + store taps route
+            renderedHtml: Self.previewCreativeHTML,
+            adBehavior: behavior,
+            creative: Creative(type: "preview", adUnitType: AdUnitType.from(adUnitType))
+        )
+
+        let presenter = InterstitialPresenter()
+        let didPresent = presenter.present(
+            apiKey: provider.apiKey,
+            response: response,
+            onClick: { [weak self] in
+                guard let self else { return }
+                self.delegate?.interstitialDidClick(self)
+            },
+            onClose: { [weak self] in
+                guard let self else { return }
+                self.presenter = nil
+                self.state = .idle
+                self.delegate?.interstitialDidClose(self)
+            }
+        )
+
+        guard didPresent else {
+            failDisplay(.noPresentationContext)
+            return
+        }
+        state = .showing(response)
+        self.presenter = presenter
+        delegate?.interstitialDidDisplay(self)
+        // Preview is local-only: deliberately no `trackImpression`.
+        #else
+        failDisplay(.unsupportedPlatform)
+        #endif
+    }
+
     // MARK: - Failure helpers
 
     private func failLoad(_ error: SimulaAdError) {

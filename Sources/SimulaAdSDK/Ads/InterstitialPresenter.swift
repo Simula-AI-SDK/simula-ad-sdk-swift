@@ -432,52 +432,61 @@ private struct CloseButtonView: View {
     let progress: Double
     let onClose: () -> Void
 
-    // v2 dropped the per-size config; the close glyph renders at the former `.standard` size, with
-    // the circle pinned to the HIG-minimum tappable target.
-    private let glyphSize: CGFloat = 24
-    private let circleSize: CGFloat = 44
+    // Visible close affordance sized to match AdMob / AppLovin (a compact ~28–30pt circle), while
+    // the tappable frame stays at the 44pt HIG minimum (see `minTouchTarget`). The 44pt circle used
+    // before was the touch-target minimum mistakenly used as the visual size.
+    private let glyphSize: CGFloat = 16
+    private let circleSize: CGFloat = 30
     private let minTouchTarget: CGFloat = 44
 
-    private var isBottom: Bool { position == .bottomLeft }
-    private var isTrailing: Bool { position == .topRight }
+    /// Tappable footprint, used identically by the in-delay indicator and the unlocked button so the
+    /// glyph keeps the same size/position and doesn't jump when the close button activates.
+    private var touchSize: CGFloat { max(minTouchTarget, circleSize) }
 
     /// Fill tint for the ring / bar. Validated upstream, so `Color(hex:)` always gets clean input.
     private var tint: Color { Color(hex: progressBarColor) }
 
-    var body: some View {
-        ZStack {
-            // `progress_bar` treatment: a slim top-edge bar shown during the delay, tinted by color.
-            if !enabled && treatment == .progressBar {
-                VStack {
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.white.opacity(0.25))
-                            Capsule().fill(tint)
-                                .frame(width: max(0, geo.size.width * progress))
-                        }
-                    }
-                    .frame(height: 4)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-                    Spacer()
-                }
-            }
-
-            // The button (or its in-delay indicator), pinned to the configured corner.
-            VStack {
-                if !isBottom { cornerRow; Spacer() } else { Spacer(); cornerRow }
-            }
+    /// SwiftUI alignment for the configured corner.
+    private var cornerAlignment: Alignment {
+        switch position {
+        case .topRight: return .topTrailing
+        case .topLeft: return .topLeading
+        case .bottomLeft: return .bottomLeading
         }
     }
 
-    private var cornerRow: some View {
-        HStack {
-            if isTrailing { Spacer(); buttonOrIndicator } else { buttonOrIndicator; Spacer() }
+    var body: some View {
+        ZStack {
+            // `progress_bar` treatment: a full-width bar pinned to the very top edge of the screen
+            // (inside the status-bar region), shown during the delay and tinted by color.
+            if !enabled && treatment == .progressBar {
+                progressBar
+            }
+
+            // The button (or its in-delay indicator), pinned to the configured corner. An explicit
+            // fill-and-align frame is used (NOT VStack/HStack + Spacer): the Spacer approach can
+            // collapse to center when this view sits beside the `.ignoresSafeArea()` web view and
+            // isn't proposed a full-size container, which made every position render at the same spot.
+            // A tight 8pt inset keeps the button close to the corner (AdMob / AppLovin-style).
+            buttonOrIndicator
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, isBottom ? 0 : 16)
-        // Bottom-corner targets sit above the full-width CTA so they can't overlap it.
-        .padding(.bottom, isBottom ? 96 : 0)
+    }
+
+    /// The full-width progress bar pinned to the very top edge of the screen for the `progress_bar`
+    /// treatment — spans edge-to-edge inside the top nav / status-bar region.
+    private var progressBar: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Color.white.opacity(0.25))
+                Rectangle().fill(tint)
+                    .frame(width: max(0, geo.size.width * progress))
+            }
+        }
+        .frame(height: 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .ignoresSafeArea(edges: .top)
     }
 
     @ViewBuilder
@@ -490,7 +499,7 @@ private struct CloseButtonView: View {
                     labelPill(text: "Close")
                 } else {
                     closeGlyph
-                        .frame(width: max(minTouchTarget, circleSize), height: max(minTouchTarget, circleSize))
+                        .frame(width: touchSize, height: touchSize)
                         .contentShape(Rectangle())
                 }
             }
@@ -509,19 +518,22 @@ private struct CloseButtonView: View {
                         .rotationEffect(.degrees(-90))
                         .frame(width: circleSize, height: circleSize)
                 }
+                // Same footprint as the unlocked button so the glyph doesn't jump when it activates.
+                .frame(width: touchSize, height: touchSize)
             case .rewardOrCloseLabel:
                 labelPill(text: "\(isRewardCopy ? "Reward" : "Close") in \(remaining)")
             }
         }
     }
 
-    /// The circular "X" glyph.
+    /// The circular "X" glyph — a gray / translucent dark circle with a white X (AdMob / AppLovin
+    /// style), rather than an opaque white circle.
     private var closeGlyph: some View {
         Image(systemName: "xmark")
             .font(.system(size: glyphSize, weight: .bold))
-            .foregroundColor(Color(hex: "#1F2937"))
+            .foregroundColor(.white)
             .frame(width: circleSize, height: circleSize)
-            .background(Circle().fill(Color.white.opacity(0.9)))
+            .background(Circle().fill(Color.black.opacity(0.5)))
     }
 
     /// The text pill used by the `rewardOrCloseLabel` treatment (counting down, then "Close").
@@ -547,22 +559,18 @@ private struct StorePromptBadge: View {
     private var label: String {
         prompt.platform == .android ? "▶| Google Play" : "▶| App Store"
     }
-    private var isBottom: Bool { prompt.position == .bottomLeft }
-    private var isTrailing: Bool { prompt.position == .topRight }
-
-    var body: some View {
-        VStack {
-            if !isBottom { row; Spacer() } else { Spacer(); row }
+    private var cornerAlignment: Alignment {
+        switch prompt.position {
+        case .topRight: return .topTrailing
+        case .topLeft: return .topLeading
+        case .bottomLeft: return .bottomLeading
         }
     }
 
-    private var row: some View {
-        HStack {
-            if isTrailing { Spacer(); badge } else { badge; Spacer() }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, isBottom ? 0 : 16)
-        .padding(.bottom, isBottom ? 96 : 0)
+    var body: some View {
+        badge
+            .padding(16)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
 
     private var badge: some View {
