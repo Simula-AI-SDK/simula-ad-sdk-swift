@@ -13,11 +13,12 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testMiniGameInviteKitTypes() {
-        // Verify that the MiniGameInviteKit namespace correctly aliases types.
-        // The interstitial is no longer part of the namespace — it is the
-        // imperative `SimulaInterstitialAd` (see interstitial tests below).
+        // Verify that the MiniGameInviteKit namespace correctly aliases the
+        // declarative invite components. (The interstitial here is the declarative
+        // `MiniGameInterstitial`; the imperative ad is `SimulaInterstitialAd`.)
         XCTAssertTrue(MiniGameInviteKit.Invitation.self == MiniGameInvitation.self)
         XCTAssertTrue(MiniGameInviteKit.Button.self == MiniGameButton.self)
+        XCTAssertTrue(MiniGameInviteKit.Interstitial.self == MiniGameInterstitial.self)
     }
 
     // MARK: - Imperative interstitial (SimulaInterstitialAd) state guards
@@ -54,9 +55,8 @@ final class SimulaAdSDKTests: XCTestCase {
 
     @MainActor
     func testInterstitialStoresConfiguration() {
-        let ad = SimulaInterstitialAd(adUnitId: "unit_42", minPlayThreshold: 5)
+        let ad = SimulaInterstitialAd(adUnitId: "unit_42")
         XCTAssertEqual(ad.adUnitId, "unit_42")
-        XCTAssertEqual(ad.minPlayThreshold, 5)
     }
 
     func testMaxGamesToShowValues() {
@@ -165,18 +165,17 @@ final class SimulaAdSDKTests: XCTestCase {
         let json = """
         {"ad_id":"ad_1","ad_inserted":true,"ad_unit_id":"unit_1","rewarded":true,
          "destination":"web","rendered_format":"rewarded_video",
-         "rendered_assets":["https://x/a.png","https://x/b.png"],
+         "rendered_html":"<b>hi</b>",
          "tracking_url":"https://x/click"}
         """
         let r = try decodeAdLoad(json)
         XCTAssertEqual(r.adId, "ad_1")
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.adUnitId, "unit_1")
-        XCTAssertTrue(r.rewarded)
         XCTAssertEqual(r.destination, "web")
         XCTAssertEqual(r.destinationKind, .web)
         XCTAssertEqual(r.renderedFormat, "rewarded_video")
-        XCTAssertEqual(r.renderedAssets, ["https://x/a.png", "https://x/b.png"])
+        XCTAssertEqual(r.renderedHtml, "<b>hi</b>")
         XCTAssertEqual(r.trackingUrl, "https://x/click")
     }
 
@@ -201,12 +200,6 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(r.renderedFormat)
     }
 
-    func testAdLoadMissingRenderedAssetsIsEmpty() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
-        let r = try decodeAdLoad(json)
-        XCTAssertEqual(r.renderedAssets, [])
-    }
-
     func testAdLoadAdInsertedFalseDecodes() throws {
         let json = #"{"ad_id":"a","ad_inserted":false,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
@@ -217,71 +210,97 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(AdLoadResponse.self, from: Data("not json".utf8)))
     }
 
-    // MARK: - No-fill: blank/whitespace-only rendered assets
+    // MARK: - Ad load: rendered_html (HTML creative precedence)
 
-    /// The no-fill guard filters blank/whitespace asset URLs before the emptiness
-    /// check (M2). A payload whose only assets are "" / " " must be treated as
-    /// no-fill, not rendered as a black "ad" that fires a junk impression.
-    private func nonBlankAssets(_ assets: [String]) -> [String] {
-        assets.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-
-    func testAdLoadBlankOnlyAssetsAreNoFill() throws {
+    func testAdLoadDecodesRenderedHtml() throws {
         let json = """
         {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "rendered_assets":["", "   ", "\\t"]}
+         "rendered_html":"<html><body>hi</body></html>"}
         """
         let r = try decodeAdLoad(json)
-        // Decoder keeps the raw strings...
-        XCTAssertEqual(r.renderedAssets.count, 3)
-        // ...but after filtering there is nothing renderable → no-fill.
-        XCTAssertTrue(nonBlankAssets(r.renderedAssets).isEmpty,
-                      "Blank/whitespace-only assets must filter to empty (no-fill)")
+        XCTAssertEqual(r.renderedHtml, "<html><body>hi</body></html>")
+        // Present & non-blank → htmlCreative is the renderable creative.
+        XCTAssertEqual(r.htmlCreative, "<html><body>hi</body></html>")
     }
 
-    func testAdLoadMixedBlankAndValidAssetsKeepsValid() throws {
-        let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "rendered_assets":["", "https://x/a.png", "  ", "https://x/b.png"]}
-        """
+    func testAdLoadRenderedHtmlAbsentIsNil() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
-        let kept = nonBlankAssets(r.renderedAssets)
-        XCTAssertEqual(kept, ["https://x/a.png", "https://x/b.png"])
+        XCTAssertNil(r.renderedHtml)
+        XCTAssertNil(r.htmlCreative)
     }
 
-    func testWithRenderedAssetsReplacesOnlyAssets() {
-        let original = AdLoadResponse(
-            adId: "ad_1", adInserted: true, adUnitId: "u", rewarded: true,
-            destination: "web", renderedFormat: "rewarded_video",
-            renderedAssets: ["", " ", "https://x/a.png"], trackingUrl: "https://x/click"
-        )
-        let sanitized = original.withRenderedAssets(nonBlankAssets(original.renderedAssets))
-        XCTAssertEqual(sanitized.renderedAssets, ["https://x/a.png"])
-        // Every other field is carried over unchanged.
-        XCTAssertEqual(sanitized.adId, "ad_1")
-        XCTAssertTrue(sanitized.adInserted)
-        XCTAssertEqual(sanitized.adUnitId, "u")
-        XCTAssertTrue(sanitized.rewarded)
-        XCTAssertEqual(sanitized.destination, "web")
-        XCTAssertEqual(sanitized.renderedFormat, "rewarded_video")
-        XCTAssertEqual(sanitized.trackingUrl, "https://x/click")
+    func testAdLoadRenderedHtmlBlankYieldsNilCreative() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"   \n\t  "}"#
+        let r = try decodeAdLoad(json)
+        // The raw whitespace string is preserved by the decoder...
+        XCTAssertFalse(r.renderedHtml?.isEmpty ?? true)
+        // ...but htmlCreative trims it away → no renderable creative (no-fill).
+        XCTAssertNil(r.htmlCreative)
+    }
+
+    /// A payload with a non-blank `rendered_html` is fillable (mirrors the `load()`
+    /// no-fill rule: fill = adInserted && htmlCreative != nil).
+    func testAdLoadHtmlOnlyPayloadIsFillable() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"<b>x</b>"}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertNotNil(r.htmlCreative)
+        XCTAssertTrue(r.adInserted && r.htmlCreative != nil)
+    }
+
+    /// No `rendered_html` (even with `ad_inserted == true`) is a no-fill: there is
+    /// no other creative to render now that the carousel/asset path is gone.
+    func testAdLoadNoHtmlIsNoFill() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        XCTAssertNil(r.htmlCreative)
+        XCTAssertFalse(r.adInserted && r.htmlCreative != nil)
     }
 
     // MARK: - Ad load request (AdLoadRequest encode)
 
     func testAdLoadRequestEncodesSnakeCaseKeys() throws {
-        let body = AdLoadRequest(adUnitId: "unit_1", rewarded: true, sessionId: "sess_9")
+        let body = AdLoadRequest(adUnitId: "unit_1", sessionId: "sess_9")
         let encoded = try JSONEncoder().encode(body)
         let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         XCTAssertEqual(obj?["ad_unit_id"] as? String, "unit_1")
         XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
-        XCTAssertEqual(obj?["rewarded"] as? Bool, true)
+        // `rewarded` is no longer part of the request body.
+        XCTAssertNil(obj?["rewarded"])
     }
 
     func testAdLoadRequestDefaults() {
         let body = AdLoadRequest(adUnitId: "unit_1")
-        XCTAssertFalse(body.rewarded)
         XCTAssertEqual(body.sessionId, "")
+        XCTAssertNil(body.charId)
+        XCTAssertNil(body.charName)
+        XCTAssertNil(body.charImage)
+        XCTAssertNil(body.charDesc)
+    }
+
+    func testAdLoadRequestEncodesCharFieldsWhenSet() throws {
+        let body = AdLoadRequest(
+            adUnitId: "u",
+            charId: "char_7",
+            charName: "Mentor",
+            charImage: "https://cdn.example.com/avatar.png",
+            charDesc: "a wise mentor"
+        )
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["char_id"] as? String, "char_7")
+        XCTAssertEqual(obj?["char_name"] as? String, "Mentor")
+        XCTAssertEqual(obj?["char_image"] as? String, "https://cdn.example.com/avatar.png")
+        XCTAssertEqual(obj?["char_desc"] as? String, "a wise mentor")
+    }
+
+    func testAdLoadRequestOmitsCharFieldsWhenNil() throws {
+        let body = AdLoadRequest(adUnitId: "u")
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        // Synthesized `encodeIfPresent` drops nil optionals → keys absent on the wire.
+        XCTAssertNil(obj?["char_id"])
+        XCTAssertNil(obj?["char_name"])
+        XCTAssertNil(obj?["char_image"])
+        XCTAssertNil(obj?["char_desc"])
     }
 
     // MARK: - AdDestination raw values
@@ -481,14 +500,12 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testAdUnitTypeFallsBackToLegacyFlags() throws {
-        // No creative node: adUnitType derives from the legacy rewarded flag / rendered_format.
-        let rewardedFlag = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
-        XCTAssertEqual(try decodeAdLoad(rewardedFlag).adUnitType, .rewarded)
-
-        let renderedFormat = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_format":"rewarded_video"}"#
+        // No creative node: adUnitType derives from the legacy `rendered_format` (the imperative
+        // HTML model dropped the flat `rewarded` flag, so a stray `rewarded` key is ignored).
+        let renderedFormat = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rendered_format":"rewarded_video"}"#
         XCTAssertEqual(try decodeAdLoad(renderedFormat).adUnitType, .rewarded)
 
-        let plain = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let plain = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
         XCTAssertEqual(try decodeAdLoad(plain).adUnitType, .interstitial)
     }
 
@@ -543,20 +560,36 @@ final class SimulaAdSDKTests: XCTestCase {
     func testInterstitialDefaultConfiguration() {
         let ad = SimulaInterstitialAd(adUnitId: "u")
         XCTAssertEqual(ad.adUnitId, "u")
-        XCTAssertFalse(ad.rewarded)
-        XCTAssertEqual(ad.minPlayThreshold, 0)
-        XCTAssertEqual(ad.ctaText, "Learn More")
     }
 
+    // MARK: - Global character context (SimulaAds)
+
     @MainActor
-    func testInterstitialConfigurationIsMutable() {
-        let ad = SimulaInterstitialAd(adUnitId: "u")
-        ad.rewarded = true
-        ad.minPlayThreshold = 7
-        ad.ctaText = "Play Now"
-        XCTAssertTrue(ad.rewarded)
-        XCTAssertEqual(ad.minPlayThreshold, 7)
-        XCTAssertEqual(ad.ctaText, "Play Now")
+    func testSimulaAdsSetCharacterUpdatesGlobalContext() {
+        SimulaAds.setCharacter(
+            charId: "char_7",
+            charName: "Mentor",
+            charImage: "https://x/a.png",
+            charDesc: "a wise mentor"
+        )
+        XCTAssertEqual(SimulaAds.charId, "char_7")
+        XCTAssertEqual(SimulaAds.charName, "Mentor")
+        XCTAssertEqual(SimulaAds.charImage, "https://x/a.png")
+        XCTAssertEqual(SimulaAds.charDesc, "a wise mentor")
+
+        // Direct property assignment updates a single field on the fly.
+        SimulaAds.charName = "Sage"
+        XCTAssertEqual(SimulaAds.charName, "Sage")
+
+        // setCharacter replaces wholesale: omitted fields are cleared (no stale carry-over).
+        SimulaAds.setCharacter(charId: "char_8")
+        XCTAssertEqual(SimulaAds.charId, "char_8")
+        XCTAssertNil(SimulaAds.charName)
+        XCTAssertNil(SimulaAds.charImage)
+        XCTAssertNil(SimulaAds.charDesc)
+
+        // Reset global state so other tests aren't affected.
+        SimulaAds.setCharacter()
     }
 }
 

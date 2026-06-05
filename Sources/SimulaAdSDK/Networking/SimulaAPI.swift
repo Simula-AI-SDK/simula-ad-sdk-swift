@@ -40,14 +40,6 @@ struct CreateSessionResponse: Decodable {
     let sessionId: String?
 }
 
-/// Request body for POST /session/create
-struct CreateSessionRequest: Encodable {
-    let devMode: Bool
-    let ppid: String?
-    /// Device capability snapshot so the backend never assigns an unsupported variant.
-    let capabilities: DeviceCapabilities
-}
-
 /// Device capability snapshot reported on ad requests (the "capability handshake"). The backend
 /// uses it to withhold variants the OS can't support — e.g. SKOverlay requires iOS 14+,
 /// AdAttributionKit requires iOS 17.4+. Computed once per process (`current`) since it never
@@ -94,6 +86,17 @@ public struct DeviceCapabilities: Encodable, Sendable {
             adAttributionKitAvailable: adAttributionKitAvailable
         )
     }()
+
+    /// JSON-object form for the dictionary-built `/session/create` body (which also carries the
+    /// consent block). Keys match `CodingKeys` so the wire shape is identical to `Encodable` output.
+    var dictionary: [String: Any] {
+        [
+            "os_version": osVersion,
+            "storekit_available": storekitAvailable,
+            "skan_version": skanVersion,
+            "adattributionkit_available": adAttributionKitAvailable,
+        ]
+    }
 }
 
 /// Wraps a decode so failure yields `nil` instead of throwing. Because its own
@@ -297,48 +300,63 @@ public enum AdDestination: String, Sendable {
     case web
 }
 
-/// Request body for POST /ads/load — the imperative `.load()` prefetch call.
+/// Request body for POST /ads/load/interstitial — the imperative `.load()` prefetch call.
 public struct AdLoadRequest: Encodable, Sendable {
     public let adUnitId: String
-    public let rewarded: Bool
     public let sessionId: String
+    /// Optional character context the backend can use to target the creative.
+    /// Encoded only when non-nil (synthesized `encodeIfPresent`).
+    public let charId: String?
+    public let charName: String?
+    public let charImage: String?
+    public let charDesc: String?
     /// Device capability snapshot so the backend never assigns an unsupported variant.
     public let capabilities: DeviceCapabilities
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
-        case rewarded
         case sessionId = "session_id"
+        case charId = "char_id"
+        case charName = "char_name"
+        case charImage = "char_image"
+        case charDesc = "char_desc"
         case capabilities
     }
 
     public init(
         adUnitId: String,
-        rewarded: Bool = false,
         sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil,
         capabilities: DeviceCapabilities = .current
     ) {
         self.adUnitId = adUnitId
-        self.rewarded = rewarded
         self.sessionId = sessionId
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
         self.capabilities = capabilities
     }
 }
 
-/// Prefetch payload from POST /ads/load. The SDK caches this and renders the raw
-/// creative assets itself — there is no iframe. `destination` says whether a CTA
-/// tap opens the App Store or a web URL; `trackingUrl` is the click-attribution
+/// Prefetch payload from POST /ads/load/interstitial. The SDK caches this and renders
+/// the server-rendered `rendered_html` itself in a web view. `destination` says whether
+/// a CTA tap opens the App Store or a web URL; `trackingUrl` is the click-attribution
 /// redirect to open. Decoding is tolerant: missing fields fall back to defaults so
 /// a partial payload can't fail the whole decode (malformed JSON still throws).
 public struct AdLoadResponse: Decodable, Sendable {
     public let adId: String
     public let adInserted: Bool
     public let adUnitId: String
-    public let rewarded: Bool
     public let destination: String
     public let renderedFormat: String?
-    public let renderedAssets: [String]
     public let trackingUrl: String?
+    /// Server-rendered HTML creative. When present (non-blank) it is rendered
+    /// full-screen in a web view — the imperative interstitial's sole creative.
+    public let renderedHtml: String?
     /// Server-driven render config for this impression (A/B test). `nil` when the payload
     /// omits `ad_behavior` — the renderer falls back to today's literal close button / store path.
     public let adBehavior: AdBehavior?
@@ -352,22 +370,29 @@ public struct AdLoadResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
+    /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
+    /// value means the payload carries no renderable creative (no-fill).
+    public var htmlCreative: String? {
+        guard let html = renderedHtml,
+              !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return html
+    }
+
     /// The ad format for this impression. Prefers the nested `creative.ad_unit_type`; falls back
-    /// to the legacy flat `rewarded` flag / `rendered_format` so older payloads keep working.
+    /// to the legacy `rendered_format` so older payloads (`rewarded_video`) keep working.
     public var adUnitType: AdUnitType {
         if let creative { return creative.adUnitType }
-        return (rewarded || renderedFormat == "rewarded_video") ? .rewarded : .interstitial
+        return renderedFormat == "rewarded_video" ? .rewarded : .interstitial
     }
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case adInserted = "ad_inserted"
         case adUnitId = "ad_unit_id"
-        case rewarded
         case destination
         case renderedFormat = "rendered_format"
-        case renderedAssets = "rendered_assets"
         case trackingUrl = "tracking_url"
+        case renderedHtml = "rendered_html"
         case adBehavior = "ad_behavior"
         case creative
         case experiment
@@ -378,11 +403,10 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
         self.adInserted = (try? c.decode(Bool.self, forKey: .adInserted)) ?? false
         self.adUnitId = (try? c.decode(String.self, forKey: .adUnitId)) ?? ""
-        self.rewarded = (try? c.decode(Bool.self, forKey: .rewarded)) ?? false
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
-        self.renderedAssets = (try? c.decode([String].self, forKey: .renderedAssets)) ?? []
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
         // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
         // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
@@ -395,11 +419,10 @@ public struct AdLoadResponse: Decodable, Sendable {
         adId: String,
         adInserted: Bool,
         adUnitId: String,
-        rewarded: Bool,
         destination: String = "appstore",
         renderedFormat: String? = nil,
-        renderedAssets: [String] = [],
         trackingUrl: String? = nil,
+        renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
         creative: Creative? = nil,
         experiment: Experiment? = nil
@@ -407,32 +430,13 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adId = adId
         self.adInserted = adInserted
         self.adUnitId = adUnitId
-        self.rewarded = rewarded
         self.destination = destination
         self.renderedFormat = renderedFormat
-        self.renderedAssets = renderedAssets
         self.trackingUrl = trackingUrl
+        self.renderedHtml = renderedHtml
         self.adBehavior = adBehavior
         self.creative = creative
         self.experiment = experiment
-    }
-
-    /// Returns a copy with `renderedAssets` replaced (used after filtering out
-    /// blank/whitespace asset URLs so presentation renders only valid assets).
-    public func withRenderedAssets(_ assets: [String]) -> AdLoadResponse {
-        AdLoadResponse(
-            adId: adId,
-            adInserted: adInserted,
-            adUnitId: adUnitId,
-            rewarded: rewarded,
-            destination: destination,
-            renderedFormat: renderedFormat,
-            renderedAssets: assets,
-            trackingUrl: trackingUrl,
-            adBehavior: adBehavior,
-            creative: creative,
-            experiment: experiment
-        )
     }
 }
 
@@ -464,13 +468,19 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Common Headers
 
-    private func makeHeaders(apiKey: String? = nil) -> [String: String] {
+    private func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
         var headers: [String: String] = [
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "1",
         ]
         if let apiKey = apiKey {
             headers["Authorization"] = "Bearer \(apiKey)"
+        }
+        // Attach consent signals to every request from the single header chokepoint.
+        // Reads the process-wide store unless an explicit snapshot is supplied.
+        let snapshot = consent ?? SimulaPrivacy.shared.currentSnapshot
+        for (key, value) in snapshot.consentHeaders() {
+            headers[key] = value
         }
         return headers
     }
@@ -488,19 +498,22 @@ public final class SimulaAPI: @unchecked Sendable {
     public func createSession(
         apiKey: String,
         devMode: Bool = false,
-        primaryUserID: String? = nil
+        primaryUserID: String? = nil,
+        privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
         guard let url = URL(string: "\(API_BASE_URL)/session/create") else { throw SimulaAPIError.invalidURL }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        let body = CreateSessionRequest(
-            devMode: devMode,
-            ppid: primaryUserID?.isEmpty == false ? primaryUserID : nil,
-            capabilities: .current
-        )
-        request.httpBody = try? JSONEncoder().encode(body)
+        applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
+        // Body carries dev/user identity, the device-capability handshake (so the backend never
+        // assigns an unsupported variant), plus, when present, the consent block the backend ties
+        // to the session and inherits on subsequent calls.
+        var body: [String: Any] = ["devMode": devMode]
+        if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        body["capabilities"] = DeviceCapabilities.current.dictionary
+        if let privacy { body["privacy"] = privacy.privacyBody() }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
 
@@ -565,16 +578,19 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Load Ad (imperative prefetch)
 
-    /// Prefetches one interstitial creative via POST /ads/load. Pure transport:
-    /// returns the response as-is — including `ad_inserted == false`, which the
-    /// caller maps to a no-fill. No impression is fired here; `.load()` is prefetch
+    /// Prefetches one interstitial creative via POST /ads/load/interstitial. Pure
+    /// transport: returns the response as-is — including `ad_inserted == false`, which
+    /// the caller maps to a no-fill. No impression is fired here; `.load()` is prefetch
     /// only.
     public func loadAd(
         adUnitId: String,
-        rewarded: Bool = false,
-        sessionId: String = ""
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
     ) async throws -> AdLoadResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/ads/load") else {
+        guard let url = URL(string: "\(API_BASE_URL)/ads/load/interstitial") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -582,7 +598,14 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            AdLoadRequest(adUnitId: adUnitId, rewarded: rewarded, sessionId: sessionId)
+            AdLoadRequest(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc
+            )
         )
 
         let (data, response) = try await session.data(for: request)

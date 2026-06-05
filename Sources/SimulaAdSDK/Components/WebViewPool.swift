@@ -51,8 +51,16 @@ final class WebViewPool {
     private struct Pooled {
         let webView: WKWebView
         let forwarder: WebViewMessageForwarder
+        /// Whether this view was built with a persistent data store. Tracked so a
+        /// consent change (which flips the storage policy) doesn't hand back a view
+        /// with a stale policy.
+        let persistent: Bool
     }
     private var idle: [Pooled] = []
+    /// Views currently handed out to a representable, retained so `release` can
+    /// reset and re-pool them on `dismantleUIView` (recycling) instead of letting
+    /// them deallocate and tear down their Web Content process.
+    private var active: [ObjectIdentifier: Pooled] = [:]
 
     /// How many warm web views to keep on hand. The game and post-game ad are
     /// shown sequentially, so a small buffer is enough; `acquire` refills.
@@ -88,6 +96,14 @@ final class WebViewPool {
         config.mediaTypesRequiringUserActionForPlayback = []
         config.userContentController = controller
 
+        // Honor TCF Purpose 1 / GDPR: when on-device storage is not permitted, use a
+        // non-persistent data store so cookies & localStorage stay in memory for the
+        // session and nothing is written to disk. In-session functionality is intact.
+        let persistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
+        if !persistent {
+            config.websiteDataStore = .nonPersistent()
+        }
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.scrollView.isScrollEnabled = true
         webView.scrollView.contentInsetAdjustmentBehavior = .never
@@ -95,7 +111,7 @@ final class WebViewPool {
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
 
-        return Pooled(webView: webView, forwarder: forwarder)
+        return Pooled(webView: webView, forwarder: forwarder, persistent: persistent)
     }
 
     /// Create a warm web view ahead of time, if the pool has room. Loads
@@ -118,17 +134,57 @@ final class WebViewPool {
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (String) -> Void
     ) -> WKWebView {
+        // Drop any prewarmed views whose storage policy no longer matches the
+        // current consent, then reuse a matching one (or build fresh).
+        let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
+        while let last = idle.last, last.persistent != wantPersistent {
+            idle.removeLast()
+        }
         let pooled = idle.popLast() ?? makePooled()
 
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate
         pooled.webView.uiDelegate = delegate
 
+        active[ObjectIdentifier(pooled.webView)] = pooled
+
         // Refill on the next runloop turn so this acquire returns immediately and
         // the following one (e.g. the post-game ad) is also warm.
         Task { @MainActor [weak self] in self?.prewarm() }
 
         return pooled.webView
+    }
+
+    /// Reset a finished web view and return it to the pool (or discard if full /
+    /// privacy mismatch). Idempotent: a second call for the same view no-ops
+    /// because `active` no longer holds it.
+    func release(_ webView: WKWebView) {
+        guard let pooled = active.removeValue(forKey: ObjectIdentifier(webView)) else {
+            return
+        }
+        pooled.webView.stopLoading()
+        pooled.webView.navigationDelegate = nil
+        pooled.webView.uiDelegate = nil
+        pooled.forwarder.onMessage = nil
+
+        // Tear down the DOM so a recycled view never flashes the prior creative.
+        if let blank = URL(string: "about:blank") {
+            pooled.webView.load(URLRequest(url: blank))
+        }
+
+        // Only re-pool when the storage policy still matches current consent; a
+        // mismatched view is dropped so the next acquire builds a fresh one.
+        let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
+        if pooled.persistent == wantPersistent && idle.count < maxIdle {
+            idle.append(pooled)
+        }
+    }
+
+    /// Flushes prewarmed idle web views. Called on a consent change so the next
+    /// view is built with a data store matching the new storage policy (a
+    /// prewarmed view bakes its policy in at creation time).
+    func clear() {
+        idle.removeAll()
     }
 }
 #endif
