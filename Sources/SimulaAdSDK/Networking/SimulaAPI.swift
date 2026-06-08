@@ -348,6 +348,126 @@ public struct AdLoadResponse: Decodable, Sendable {
     }
 }
 
+// MARK: - Rewarded Minigame Models
+
+/// Request body for POST /minigames/init/rewarded — the rewarded `.load()` call.
+/// `minPlayThreshold` (seconds) is optional; when omitted the server decides the
+/// required play duration and returns it as `duration_seconds`.
+public struct RewardedInitRequest: Encodable, Sendable {
+    public let adUnitId: String
+    public let sessionId: String
+    public let minPlayThreshold: Int?
+    /// Optional character context the backend can use to target the minigame.
+    /// Encoded only when non-nil (synthesized `encodeIfPresent`).
+    public let charId: String?
+    public let charName: String?
+    public let charImage: String?
+    public let charDesc: String?
+
+    enum CodingKeys: String, CodingKey {
+        case adUnitId = "ad_unit_id"
+        case sessionId = "session_id"
+        case minPlayThreshold = "min_play_threshold"
+        case charId = "char_id"
+        case charName = "char_name"
+        case charImage = "char_image"
+        case charDesc = "char_desc"
+    }
+
+    public init(
+        adUnitId: String,
+        sessionId: String = "",
+        minPlayThreshold: Int? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
+        self.adUnitId = adUnitId
+        self.sessionId = sessionId
+        self.minPlayThreshold = minPlayThreshold
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
+    }
+}
+
+/// Payload from POST /minigames/init/rewarded. The SDK renders `iframeUrl` in a
+/// WebView and enforces `durationSeconds` before the reward can be earned. Decoding
+/// is tolerant: missing fields fall back to defaults so a partial payload can't fail
+/// the whole decode (malformed JSON still throws).
+public struct RewardedInitResponse: Decodable, Sendable {
+    public let serveId: String
+    public let iframeUrl: String
+    public let adId: String
+    public let durationSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case serveId = "serve_id"
+        case iframeUrl = "iframe_url"
+        case adId = "ad_id"
+        case durationSeconds = "duration_seconds"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.serveId = (try? c.decode(String.self, forKey: .serveId)) ?? ""
+        self.iframeUrl = (try? c.decode(String.self, forKey: .iframeUrl)) ?? ""
+        self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
+        self.durationSeconds = (try? c.decode(Int.self, forKey: .durationSeconds)) ?? 0
+    }
+
+    /// Member-wise init for internal construction and tests.
+    public init(serveId: String, iframeUrl: String, adId: String = "", durationSeconds: Int) {
+        self.serveId = serveId
+        self.iframeUrl = iframeUrl
+        self.adId = adId
+        self.durationSeconds = durationSeconds
+    }
+}
+
+/// Request body for POST /minigames/verify-reward.
+public struct VerifyRewardRequest: Encodable, Sendable {
+    public let serveId: String
+    public let sessionId: String
+    public let elapsedPlayTime: Double
+
+    enum CodingKeys: String, CodingKey {
+        case serveId = "serve_id"
+        case sessionId = "session_id"
+        case elapsedPlayTime = "elapsed_play_time"
+    }
+
+    public init(serveId: String, sessionId: String, elapsedPlayTime: Double) {
+        self.serveId = serveId
+        self.sessionId = sessionId
+        self.elapsedPlayTime = elapsedPlayTime
+    }
+}
+
+/// Response from POST /minigames/verify-reward. `token` is the publisher-facing
+/// reward token; the backend fires the SSV postback server-side on a verified call.
+public struct VerifyRewardResponse: Decodable, Sendable {
+    public let verified: Bool
+    public let token: String?
+
+    public init(verified: Bool, token: String?) {
+        self.verified = verified
+        self.token = token
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case verified, token
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.verified = (try? c.decode(Bool.self, forKey: .verified)) ?? false
+        self.token = try? c.decode(String.self, forKey: .token)
+    }
+}
+
 // MARK: - SimulaAPI
 
 /// Centralized API client for all Simula endpoints (translates api.ts)
@@ -510,6 +630,90 @@ public final class SimulaAPI: @unchecked Sendable {
         }
 
         return try JSONDecoder().decode(AdLoadResponse.self, from: data)
+    }
+
+    // MARK: - Rewarded Minigame
+
+    /// Initializes a rewarded minigame via POST /minigames/init/rewarded. Returns the
+    /// iframe URL, the `serve_id` that ties the play to its later verification, and the
+    /// `duration_seconds` the SDK must enforce before a reward can be earned.
+    public func initRewarded(
+        adUnitId: String,
+        sessionId: String = "",
+        minPlayThreshold: Int? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) async throws -> RewardedInitResponse {
+        guard let url = URL(string: "\(API_BASE_URL)/minigames/init/rewarded") else {
+            throw SimulaAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(), to: &request)
+        request.httpBody = try JSONEncoder().encode(
+            RewardedInitRequest(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                minPlayThreshold: minPlayThreshold,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc
+            )
+        )
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw SimulaAPIError.httpError(
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
+            )
+        }
+
+        return try JSONDecoder().decode(RewardedInitResponse.self, from: data)
+    }
+
+    /// Verifies a rewarded play via POST /minigames/verify-reward. On a verified call
+    /// the backend fires the publisher's SSV postback server-side and returns the
+    /// reward `token`. Idempotent: a repeated call for the same `serve_id` returns 409,
+    /// which is treated here as a successful (already-claimed) verification so retries
+    /// converge without double-rewarding.
+    public func verifyReward(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double
+    ) async throws -> VerifyRewardResponse {
+        guard let url = URL(string: "\(API_BASE_URL)/minigames/verify-reward") else {
+            throw SimulaAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(), to: &request)
+        request.httpBody = try JSONEncoder().encode(
+            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime)
+        )
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SimulaAPIError.invalidResponse
+        }
+
+        // Already claimed — treat as a successful idempotent verification.
+        if httpResponse.statusCode == 409 {
+            return VerifyRewardResponse(verified: true, token: nil)
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw SimulaAPIError.httpError(statusCode: httpResponse.statusCode)
+        }
+
+        return try JSONDecoder().decode(VerifyRewardResponse.self, from: data)
     }
 
     // MARK: - Init Minigame
