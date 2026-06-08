@@ -133,6 +133,28 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertThrowsError(try parseCatalog(data("not json")))
     }
 
+    // MARK: - Catalog request URL (session_id query)
+
+    func testCatalogURLAppendsSessionId() throws {
+        let url = try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "sess_9"))
+        XCTAssertTrue(url.absoluteString.hasSuffix("/minigames/catalogv2?session_id=sess_9"),
+                      "Unexpected URL: \(url.absoluteString)")
+    }
+
+    func testCatalogURLOmitsSessionWhenNilOrEmpty() throws {
+        XCTAssertNil(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: nil)).query)
+        XCTAssertNil(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "")).query)
+    }
+
+    func testCatalogURLEncodesSpecialCharacters() throws {
+        let url = try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "a b&c"))
+        // Round-trips back to the original value (decoded)...
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        XCTAssertEqual(items?.first(where: { $0.name == "session_id" })?.value, "a b&c")
+        // ...and the raw string is percent-encoded (no literal space/&).
+        XCTAssertFalse(url.absoluteString.contains("a b&c"))
+    }
+
     // MARK: - Ad load parsing (AdLoadResponse decode)
 
     private func decodeAdLoad(_ json: String) throws -> AdLoadResponse {
@@ -287,6 +309,249 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(AdDestination(rawValue: "appstore"), .appstore)
         XCTAssertEqual(AdDestination(rawValue: "web"), .web)
         XCTAssertNil(AdDestination(rawValue: "carousel"))
+    }
+
+    // MARK: - Ad behavior (ad_behavior decode, v2 schema)
+
+    func testAdBehaviorAbsentDecodesToNil() throws {
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let r = try decodeAdLoad(json)
+        // Absent ad_behavior → nil so the renderer falls back to today's literal behavior.
+        XCTAssertNil(r.adBehavior)
+        XCTAssertNil(r.creative)
+        XCTAssertNil(r.experiment)
+    }
+
+    func testAdBehaviorHappyPath() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "creative":{"type":"playable","bundle_url":"https://b","ad_unit_type":"rewarded"},
+         "experiment":{"experiment_id":"playable_close_q3","variant_id":"countdown_circle_top_right_3s","layer":"close_chrome"},
+         "ad_behavior":{"close":{"delay_seconds":3,"treatment":"countdown_circle",
+           "position":"top_right","progress_bar_color":"#00FF00"},
+           "store_prompt":{"enabled":true,"trigger":"midpoint","position":"top_left","platform":"ios"},
+           "skoverlay":{"enabled":true,"timing":"on_click","delay_seconds":0,"position":"bottom","dismissible":true}}}
+        """
+        let r = try decodeAdLoad(json)
+        let b = try XCTUnwrap(r.adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 3)
+        XCTAssertEqual(b.close.treatment, .countdownCircle)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.progressBarColor, "#00FF00")
+
+        let prompt = try XCTUnwrap(b.storePrompt)
+        XCTAssertTrue(prompt.enabled)
+        XCTAssertEqual(prompt.position, .topLeft)
+        XCTAssertEqual(prompt.platform, .ios)
+
+        let overlay = try XCTUnwrap(b.skoverlay)
+        XCTAssertTrue(overlay.enabled)
+        XCTAssertEqual(overlay.timing, .onClick)
+        XCTAssertEqual(overlay.position, .bottom)
+        XCTAssertTrue(overlay.dismissible)
+
+        XCTAssertEqual(r.creative?.adUnitType, .rewarded)
+        XCTAssertEqual(r.creative?.bundleUrl, "https://b")
+        XCTAssertEqual(r.adUnitType, .rewarded)
+        XCTAssertEqual(r.experiment?.experimentId, "playable_close_q3")
+        XCTAssertEqual(r.experiment?.variantId, "countdown_circle_top_right_3s")
+        XCTAssertEqual(r.experiment?.layer, "close_chrome")
+    }
+
+    func testAdBehaviorEmptyObjectUsesDefaults() throws {
+        // Present-but-empty ad_behavior is non-nil and fully defaulted; the new nodes stay nil.
+        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 0)
+        XCTAssertEqual(b.close.treatment, .hidden)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
+        XCTAssertNil(b.storePrompt)
+        XCTAssertNil(b.skoverlay)
+    }
+
+    func testAdBehaviorPartialCloseFillsDefaults() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":3}}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 3)
+        XCTAssertEqual(b.close.treatment, .hidden)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
+    }
+
+    func testAdBehaviorHyphenNormalization() throws {
+        // Hyphenated wire spellings normalize to the same tolerant enums as underscores.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"treatment":"reward-or-close-label","position":"top-left"},
+           "skoverlay":{"enabled":true,"timing":"during-play","position":"bottom-raised"}}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.treatment, .rewardOrCloseLabel)
+        XCTAssertEqual(b.close.position, .topLeft)
+        XCTAssertEqual(b.skoverlay?.timing, .duringPlay)
+        XCTAssertEqual(b.skoverlay?.position, .bottomRaised)
+    }
+
+    func testClosePositionExcludesBottomRight() throws {
+        // v2 excludes bottom_right (and legacy bottom_corner) → snaps to the safe top_right default.
+        for raw in ["bottom_right", "bottom_corner"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"hidden","position":"\(raw)"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
+        }
+    }
+
+    func testClosePositionSnapsForEdgeAnchoredTreatments() throws {
+        // progress_bar is a full-width top-edge bar → can't render bottom_left → snap to top_right.
+        for treatment in ["progress_bar"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
+        }
+        // hidden / reward_or_close_label / countdown_circle keep bottom_left.
+        for treatment in ["hidden", "reward_or_close_label", "countdown_circle"] {
+            let json = """
+            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+             "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
+            """
+            XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .bottomLeft)
+        }
+    }
+
+    func testCloseTreatmentUnknownFallsBackToHidden() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"treatment":"sparkles","position":"galaxy"}}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.treatment, .hidden)
+        XCTAssertEqual(b.close.position, .topRight)
+    }
+
+    func testProgressBarColorValidation() {
+        // Valid 6-digit hex (with/without #) is accepted and normalized to upper-case with a #.
+        XCTAssertEqual(validatedHexColor("#3b82f6"), "#3B82F6")
+        XCTAssertEqual(validatedHexColor("00FF00"), "#00FF00")
+        // Malformed → white fallback.
+        XCTAssertEqual(validatedHexColor("#FFF"), "#FFFFFF")        // too short
+        XCTAssertEqual(validatedHexColor("#GGGGGG"), "#FFFFFF")     // non-hex
+        XCTAssertEqual(validatedHexColor("rgba(0,0,0,1)"), "#FFFFFF")
+        XCTAssertEqual(validatedHexColor(nil), "#FFFFFF")
+    }
+
+    func testProgressBarColorDecodesAndFallsBack() throws {
+        let good = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"progress_bar_color":"#abcdef"}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(good).adBehavior).close.progressBarColor, "#ABCDEF")
+
+        let bad = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"progress_bar_color":"not-a-color"}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(bad).adBehavior).close.progressBarColor, "#FFFFFF")
+    }
+
+    func testStorePromptVerbatimPositionAndPlatform() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"store_prompt":{"enabled":true,"position":"bottom_left","platform":"android"}}}
+        """
+        let prompt = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).storePrompt)
+        XCTAssertTrue(prompt.enabled)
+        XCTAssertEqual(prompt.position, .bottomLeft)   // rendered verbatim — never recomputed
+        XCTAssertEqual(prompt.platform, .android)
+        XCTAssertEqual(prompt.trigger, "midpoint")
+    }
+
+    func testSKOverlayDefaultsAndValues() throws {
+        // Empty skoverlay object → defaults (disabled, on_click, bottom, dismissible).
+        let empty = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"skoverlay":{}}}
+        """
+        let d = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(empty).adBehavior).skoverlay)
+        XCTAssertFalse(d.enabled)
+        XCTAssertEqual(d.timing, .onClick)
+        XCTAssertEqual(d.position, .bottom)
+        XCTAssertTrue(d.dismissible)
+
+        // Explicit values, including a clamped negative delay.
+        let full = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"skoverlay":{"enabled":true,"timing":"delayed","delay_seconds":-3,
+           "position":"bottom_raised","dismissible":false}}}
+        """
+        let o = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(full).adBehavior).skoverlay)
+        XCTAssertTrue(o.enabled)
+        XCTAssertEqual(o.timing, .delayed)
+        XCTAssertEqual(o.delaySeconds, 0)             // negative clamps to 0
+        XCTAssertEqual(o.position, .bottomRaised)
+        XCTAssertFalse(o.dismissible)
+    }
+
+    func testAdUnitTypeFallsBackToLegacyFlags() throws {
+        // No creative node: adUnitType derives from the legacy `rendered_format` (the imperative
+        // HTML model dropped the flat `rewarded` flag, so a stray `rewarded` key is ignored).
+        let renderedFormat = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rendered_format":"rewarded_video"}"#
+        XCTAssertEqual(try decodeAdLoad(renderedFormat).adUnitType, .rewarded)
+
+        let plain = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
+        XCTAssertEqual(try decodeAdLoad(plain).adUnitType, .interstitial)
+    }
+
+    func testAdBehaviorResilientToUnknownEnums() throws {
+        // Unknown enum strings fall back per-field; delay_seconds is still parsed.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":12,"treatment":"spinner","position":"middle",
+           "progress_bar_color":"warp"},"store_open":"warp"}}
+        """
+        let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
+        XCTAssertEqual(b.close.delaySeconds, 12)
+        XCTAssertEqual(b.close.treatment, .hidden)
+        XCTAssertEqual(b.close.position, .topRight)
+        XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
+        XCTAssertEqual(b.storeOpen, .external)
+    }
+
+    func testAdBehaviorNegativeDelayClampsToZero() throws {
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":-5}}}
+        """
+        XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds, 0)
+    }
+
+    func testAdBehaviorOversizedDelayClampsToMax() throws {
+        // A bad/oversized delay must clamp so it can't trap the user behind a blocked close.
+        let json = """
+        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"close":{"delay_seconds":600}}}
+        """
+        XCTAssertEqual(
+            try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds,
+            maxCloseDelaySeconds
+        )
+    }
+
+    func testDeviceCapabilitiesEncodesHandshakeKeys() throws {
+        // The capability handshake must serialize the snake_case keys the backend expects.
+        let data = try JSONEncoder().encode(DeviceCapabilities.current)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNotNil(obj["os_version"])
+        XCTAssertNotNil(obj["storekit_available"])
+        XCTAssertNotNil(obj["skan_version"])
+        XCTAssertNotNil(obj["adattributionkit_available"])
     }
 
     // MARK: - Interstitial configuration defaults / mutability

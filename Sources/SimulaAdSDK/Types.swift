@@ -344,3 +344,344 @@ public enum MaxGamesToShow: Int, Sendable, Equatable {
     case six = 6
     case nine = 9
 }
+
+// MARK: - Ad Behavior (server-driven A/B config)
+
+/// Lowercases and normalizes hyphens to underscores so the tolerant enum factories
+/// accept either wire spelling (`circular-progress` ≡ `circular_progress`).
+private func normalizeBehaviorToken(_ raw: String?) -> String {
+    (raw ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+}
+
+/// Hard cap on the server-driven close delay. The close button (and, on Android, the system
+/// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
+/// trap the user with no exit. PRD arms are 0/3/5s; 15s leaves headroom without the footgun.
+let maxCloseDelaySeconds = 15
+
+/// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
+/// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
+/// spec. Returned WITH a leading `#` so it drops straight into `Color(hex:)`.
+func validatedHexColor(_ raw: String?, fallback: String = "#FFFFFF") -> String {
+    guard let raw else { return fallback }
+    let body = raw.hasPrefix("#") ? String(raw.dropFirst()) : raw
+    guard body.count == 6, body.allSatisfy({ $0.isHexDigit }) else { return fallback }
+    return "#" + body.uppercased()
+}
+
+/// The close-button visual treatment while the pre-tap delay runs and after it resolves
+/// (v2 replaces the prior `countdown_ui`). Unknown/missing → `.hidden` (safest: shows no
+/// affordance, so a malformed value can never present a false tap target).
+public enum CloseTreatment: Sendable, Equatable {
+    /// No close affordance during the delay; the X materializes once the delay elapses.
+    case hidden
+    /// An animated circular progress ring counts down around the close target.
+    case countdownCircle
+    /// A horizontal progress bar (Unity-style) fills over the delay, pinned to its edge.
+    case progressBar
+    /// A text label — "Reward in X" (rewarded) / "Close in X" (interstitial) — resolving to a
+    /// tap target when complete. Copy is inferred from `creative.ad_unit_type`.
+    case rewardOrCloseLabel
+
+    static func from(_ raw: String?) -> CloseTreatment {
+        switch normalizeBehaviorToken(raw) {
+        case "countdown_circle": return .countdownCircle
+        case "progress_bar": return .progressBar
+        case "reward_or_close_label": return .rewardOrCloseLabel
+        default: return .hidden
+        }
+    }
+
+    /// `progress_bar` is a full-width top-edge bar, so it's the only treatment that can't render at
+    /// `bottom_left`; `hidden` / `reward_or_close_label` / `countdown_circle` allow all three corners.
+    var allowsBottomLeft: Bool {
+        self != .progressBar
+    }
+}
+
+/// Where the close button sits. v2 narrows this to three corners — `bottom_right` is excluded
+/// (it collides with SKOverlay and common OS nav gestures). Unknown/missing/excluded → `.topRight`.
+/// Reused verbatim for the server-resolved store-prompt position.
+public enum ClosePosition: Sendable, Equatable {
+    case topRight, topLeft, bottomLeft
+
+    static func from(_ raw: String?) -> ClosePosition {
+        switch normalizeBehaviorToken(raw) {
+        case "top_left": return .topLeft
+        case "bottom_left": return .bottomLeft
+        // top_right, plus excluded bottom_right / legacy bottom_corner, plus unknown → safe default.
+        default: return .topRight
+        }
+    }
+}
+
+/// How a CTA tap opens the advertiser's store. Unknown/missing → `.external`. `inline_install`
+/// (Android-only) is accepted and routed to each platform's native store at the router. Legacy
+/// `external_browser`/`sk_store_product`/`sk_overlay` aliased. Retained from v1; the v2 payload
+/// omits `store_open`, so it simply defaults (CTA store path unchanged — SKStoreProductVC stays on).
+public enum StoreOpen: Sendable, Equatable {
+    case external, skstoreproduct, inlineInstall
+
+    static func from(_ raw: String?) -> StoreOpen {
+        switch normalizeBehaviorToken(raw) {
+        case "skstoreproduct", "sk_store_product", "sk_overlay": return .skstoreproduct
+        case "inline_install": return .inlineInstall
+        default: return .external
+        }
+    }
+}
+
+/// The ad format, used to pick `reward_or_close_label` copy. Unknown/missing → `.interstitial`.
+public enum AdUnitType: Sendable, Equatable {
+    case rewarded, interstitial
+
+    static func from(_ raw: String?) -> AdUnitType {
+        switch normalizeBehaviorToken(raw) {
+        case "rewarded": return .rewarded
+        default: return .interstitial
+        }
+    }
+}
+
+/// The creative descriptor (`creative` node). `adUnitType` drives format-aware close copy; the
+/// playable `bundleUrl`/`type` carry render metadata. Decoding is tolerant.
+public struct Creative: Sendable, Equatable, Decodable {
+    public let type: String
+    public let bundleUrl: String?
+    public let adUnitType: AdUnitType
+
+    public init(type: String = "", bundleUrl: String? = nil, adUnitType: AdUnitType = .interstitial) {
+        self.type = type
+        self.bundleUrl = bundleUrl
+        self.adUnitType = adUnitType
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case bundleUrl = "bundle_url"
+        case adUnitType = "ad_unit_type"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = (try? c.decode(String.self, forKey: .type)) ?? ""
+        self.bundleUrl = try? c.decode(String.self, forKey: .bundleUrl)
+        self.adUnitType = .from(try? c.decode(String.self, forKey: .adUnitType))
+    }
+}
+
+/// Experiment-assignment metadata (`experiment` node), carried for telemetry only (it does not
+/// drive rendering — the resolved `ad_behavior` does). All fields optional.
+public struct Experiment: Sendable, Equatable, Decodable {
+    public let experimentId: String?
+    public let variantId: String?
+    public let layer: String?
+
+    public init(experimentId: String? = nil, variantId: String? = nil, layer: String? = nil) {
+        self.experimentId = experimentId
+        self.variantId = variantId
+        self.layer = layer
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case experimentId = "experiment_id"
+        case variantId = "variant_id"
+        case layer
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.experimentId = try? c.decode(String.self, forKey: .experimentId)
+        self.variantId = try? c.decode(String.self, forKey: .variantId)
+        self.layer = try? c.decode(String.self, forKey: .layer)
+    }
+}
+
+/// Close-button behavior for one impression (`close` node). Decoding is tolerant: every field
+/// falls back to its default and unknown enum strings never fail the parse.
+public struct CloseBehavior: Sendable, Equatable, Decodable {
+    public let delaySeconds: Int
+    public let treatment: CloseTreatment
+    public let position: ClosePosition
+    /// Validated 6-digit hex (with leading `#`); tints the fill of `countdownCircle` and
+    /// `progressBar`. White when omitted/invalid. No-op for `hidden` / `rewardOrCloseLabel`.
+    public let progressBarColor: String
+
+    public init(
+        delaySeconds: Int = 0,
+        treatment: CloseTreatment = .hidden,
+        position: ClosePosition = .topRight,
+        progressBarColor: String = "#FFFFFF"
+    ) {
+        self.delaySeconds = delaySeconds
+        self.treatment = treatment
+        // Snap an out-of-spec position (bottom_left under an edge-anchored treatment) to a safe
+        // default so the SDK renders the field exactly as constrained, per "snap to safe default".
+        self.position = (position == .bottomLeft && !treatment.allowsBottomLeft) ? .topRight : position
+        self.progressBarColor = progressBarColor
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case delaySeconds = "delay_seconds"
+        case treatment, position
+        case progressBarColor = "progress_bar_color"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Clamp to [0, maxCloseDelaySeconds] so a bad/oversized value can't trap the user.
+        let delay = min(maxCloseDelaySeconds, max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0))
+        let treatment = CloseTreatment.from(try? c.decode(String.self, forKey: .treatment))
+        let position = ClosePosition.from(try? c.decode(String.self, forKey: .position))
+        let color = validatedHexColor(try? c.decode(String.self, forKey: .progressBarColor))
+        // Route through the memberwise init so the position-vs-treatment snap applies on decode too.
+        self.init(delaySeconds: delay, treatment: treatment, position: position, progressBarColor: color)
+    }
+}
+
+/// Which store the mid-ad prompt badge advertises. Unknown/missing → `.ios`.
+public enum StorePromptPlatform: Sendable, Equatable {
+    case ios, android
+
+    static func from(_ raw: String?) -> StorePromptPlatform {
+        switch normalizeBehaviorToken(raw) {
+        case "android": return .android
+        default: return .ios
+        }
+    }
+}
+
+/// Mid-ad store prompt (`store_prompt` node): a tappable store badge shown at the 50% playable
+/// mark, independent of the close button and SKOverlay. `position` is resolved server-side
+/// (opposite the close button) — the SDK renders it verbatim and never recomputes collisions.
+public struct StorePrompt: Sendable, Equatable, Decodable {
+    public let enabled: Bool
+    public let trigger: String
+    public let position: ClosePosition
+    public let platform: StorePromptPlatform
+
+    public init(
+        enabled: Bool = false,
+        trigger: String = "midpoint",
+        position: ClosePosition = .topLeft,
+        platform: StorePromptPlatform = .ios
+    ) {
+        self.enabled = enabled
+        self.trigger = trigger
+        self.position = position
+        self.platform = platform
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, trigger, position, platform
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        self.trigger = (try? c.decode(String.self, forKey: .trigger)) ?? "midpoint"
+        self.position = .from(try? c.decode(String.self, forKey: .position))
+        self.platform = .from(try? c.decode(String.self, forKey: .platform))
+    }
+}
+
+/// When the install overlay is presented. Unknown/missing → `.onClick`.
+public enum OverlayTiming: Sendable, Equatable {
+    case duringPlay, onClick, delayed
+
+    static func from(_ raw: String?) -> OverlayTiming {
+        switch normalizeBehaviorToken(raw) {
+        case "during_play": return .duringPlay
+        case "delayed": return .delayed
+        default: return .onClick
+        }
+    }
+}
+
+/// Where the install overlay is pinned. Unknown/missing → `.bottom`.
+public enum OverlayPosition: Sendable, Equatable {
+    case bottom, bottomRaised
+
+    static func from(_ raw: String?) -> OverlayPosition {
+        switch normalizeBehaviorToken(raw) {
+        case "bottom_raised": return .bottomRaised
+        default: return .bottom
+        }
+    }
+}
+
+/// SKOverlay (iOS) / Play Install Prompt (Android) config (`skoverlay` node): a native,
+/// SDK-presented install banner, independent of the creative click handler. Gated by the OS
+/// capability handshake — the backend won't assign it below iOS 14 / Android API 21.
+public struct SKOverlayConfig: Sendable, Equatable, Decodable {
+    public let enabled: Bool
+    public let timing: OverlayTiming
+    public let delaySeconds: Int
+    public let position: OverlayPosition
+    public let dismissible: Bool
+
+    public init(
+        enabled: Bool = false,
+        timing: OverlayTiming = .onClick,
+        delaySeconds: Int = 0,
+        position: OverlayPosition = .bottom,
+        dismissible: Bool = true
+    ) {
+        self.enabled = enabled
+        self.timing = timing
+        self.delaySeconds = max(0, delaySeconds)
+        self.position = position
+        self.dismissible = dismissible
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, timing
+        case delaySeconds = "delay_seconds"
+        case position, dismissible
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        self.timing = .from(try? c.decode(String.self, forKey: .timing))
+        self.delaySeconds = max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        self.position = .from(try? c.decode(String.self, forKey: .position))
+        self.dismissible = (try? c.decode(Bool.self, forKey: .dismissible)) ?? true
+    }
+}
+
+/// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
+/// response: an absent object means "render today's defaults". A present-but-partial object
+/// fills each missing field with its default; `store_prompt` / `skoverlay` are nil when omitted.
+public struct AdBehavior: Sendable, Equatable, Decodable {
+    public let close: CloseBehavior
+    public let storeOpen: StoreOpen
+    public let storePrompt: StorePrompt?
+    public let skoverlay: SKOverlayConfig?
+
+    public init(
+        close: CloseBehavior = CloseBehavior(),
+        storeOpen: StoreOpen = .external,
+        storePrompt: StorePrompt? = nil,
+        skoverlay: SKOverlayConfig? = nil
+    ) {
+        self.close = close
+        self.storeOpen = storeOpen
+        self.storePrompt = storePrompt
+        self.skoverlay = skoverlay
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case close
+        case storeOpen = "store_open"
+        case storePrompt = "store_prompt"
+        case skoverlay
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.close = (try? c.decode(CloseBehavior.self, forKey: .close)) ?? CloseBehavior()
+        self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
+        self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
+        self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
+    }
+}

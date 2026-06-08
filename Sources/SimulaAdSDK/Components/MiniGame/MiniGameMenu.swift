@@ -543,7 +543,8 @@ public struct MiniGameMenu: View {
         }
 
         do {
-            let response = try await api.fetchCatalog()
+            let sessionId = await provider.ensureSession()
+            let response = try await api.fetchCatalog(sessionId: sessionId)
 
             // Show the grid immediately. Each card lazy-loads its own cover via
             // CachedCoverImage, so we no longer block the menu on downloading and

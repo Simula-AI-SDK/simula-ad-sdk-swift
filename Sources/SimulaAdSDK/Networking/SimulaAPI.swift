@@ -40,6 +40,65 @@ struct CreateSessionResponse: Decodable {
     let sessionId: String?
 }
 
+/// Device capability snapshot reported on ad requests (the "capability handshake"). The backend
+/// uses it to withhold variants the OS can't support — e.g. SKOverlay requires iOS 14+,
+/// AdAttributionKit requires iOS 17.4+. Computed once per process (`current`) since it never
+/// changes during a run; recomputing per request would be wasted work on the ad path.
+public struct DeviceCapabilities: Encodable, Sendable {
+    public let osVersion: String
+    public let storekitAvailable: Bool
+    public let skanVersion: String
+    public let adAttributionKitAvailable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case osVersion = "os_version"
+        case storekitAvailable = "storekit_available"
+        case skanVersion = "skan_version"
+        case adAttributionKitAvailable = "adattributionkit_available"
+    }
+
+    public init(osVersion: String, storekitAvailable: Bool, skanVersion: String, adAttributionKitAvailable: Bool) {
+        self.osVersion = osVersion
+        self.storekitAvailable = storekitAvailable
+        self.skanVersion = skanVersion
+        self.adAttributionKitAvailable = adAttributionKitAvailable
+    }
+
+    /// The running device's capabilities, evaluated once. `storekit_available` mirrors SKOverlay
+    /// availability (iOS 14+); `skan_version` reports the max SKAdNetwork version the SDK supports.
+    public static let current: DeviceCapabilities = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        let osVersion = "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+        var storekitAvailable = false
+        var skanVersion = "0"
+        var adAttributionKitAvailable = false
+        if #available(iOS 14.0, *) {
+            storekitAvailable = true
+            skanVersion = "4.0"
+        }
+        if #available(iOS 17.4, *) {
+            adAttributionKitAvailable = true
+        }
+        return DeviceCapabilities(
+            osVersion: osVersion,
+            storekitAvailable: storekitAvailable,
+            skanVersion: skanVersion,
+            adAttributionKitAvailable: adAttributionKitAvailable
+        )
+    }()
+
+    /// JSON-object form for the dictionary-built `/session/create` body (which also carries the
+    /// consent block). Keys match `CodingKeys` so the wire shape is identical to `Encodable` output.
+    var dictionary: [String: Any] {
+        [
+            "os_version": osVersion,
+            "storekit_available": storekitAvailable,
+            "skan_version": skanVersion,
+            "adattributionkit_available": adAttributionKitAvailable,
+        ]
+    }
+}
+
 /// Wraps a decode so failure yields `nil` instead of throwing. Because its own
 /// `init` never throws, decoding it from an unkeyed container always advances
 /// the container — the basis for lossy array decoding below.
@@ -251,6 +310,8 @@ public struct AdLoadRequest: Encodable, Sendable {
     public let charName: String?
     public let charImage: String?
     public let charDesc: String?
+    /// Device capability snapshot so the backend never assigns an unsupported variant.
+    public let capabilities: DeviceCapabilities
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -259,6 +320,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         case charName = "char_name"
         case charImage = "char_image"
         case charDesc = "char_desc"
+        case capabilities
     }
 
     public init(
@@ -267,7 +329,8 @@ public struct AdLoadRequest: Encodable, Sendable {
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
-        charDesc: String? = nil
+        charDesc: String? = nil,
+        capabilities: DeviceCapabilities = .current
     ) {
         self.adUnitId = adUnitId
         self.sessionId = sessionId
@@ -275,6 +338,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         self.charName = charName
         self.charImage = charImage
         self.charDesc = charDesc
+        self.capabilities = capabilities
     }
 }
 
@@ -293,6 +357,13 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Server-rendered HTML creative. When present (non-blank) it is rendered
     /// full-screen in a web view — the imperative interstitial's sole creative.
     public let renderedHtml: String?
+    /// Server-driven render config for this impression (A/B test). `nil` when the payload
+    /// omits `ad_behavior` — the renderer falls back to today's literal close button / store path.
+    public let adBehavior: AdBehavior?
+    /// Creative descriptor (`creative` node). `nil` when omitted; `adUnitType` drives close copy.
+    public let creative: Creative?
+    /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
+    public let experiment: Experiment?
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
@@ -307,6 +378,13 @@ public struct AdLoadResponse: Decodable, Sendable {
         return html
     }
 
+    /// The ad format for this impression. Prefers the nested `creative.ad_unit_type`; falls back
+    /// to the legacy `rendered_format` so older payloads (`rewarded_video`) keep working.
+    public var adUnitType: AdUnitType {
+        if let creative { return creative.adUnitType }
+        return renderedFormat == "rewarded_video" ? .rewarded : .interstitial
+    }
+
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case adInserted = "ad_inserted"
@@ -315,6 +393,9 @@ public struct AdLoadResponse: Decodable, Sendable {
         case renderedFormat = "rendered_format"
         case trackingUrl = "tracking_url"
         case renderedHtml = "rendered_html"
+        case adBehavior = "ad_behavior"
+        case creative
+        case experiment
     }
 
     public init(from decoder: Decoder) throws {
@@ -326,6 +407,11 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
+        // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
+        // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
+        self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.creative = try? c.decode(Creative.self, forKey: .creative)
+        self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
     }
 
     /// Member-wise init for internal construction and tests.
@@ -336,7 +422,10 @@ public struct AdLoadResponse: Decodable, Sendable {
         destination: String = "appstore",
         renderedFormat: String? = nil,
         trackingUrl: String? = nil,
-        renderedHtml: String? = nil
+        renderedHtml: String? = nil,
+        adBehavior: AdBehavior? = nil,
+        creative: Creative? = nil,
+        experiment: Experiment? = nil
     ) {
         self.adId = adId
         self.adInserted = adInserted
@@ -345,6 +434,9 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = renderedFormat
         self.trackingUrl = trackingUrl
         self.renderedHtml = renderedHtml
+        self.adBehavior = adBehavior
+        self.creative = creative
+        self.experiment = experiment
     }
 }
 
@@ -534,10 +626,12 @@ public final class SimulaAPI: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
-        // Body carries dev/user identity plus, when present, the consent block the
-        // backend ties to the session and inherits on subsequent calls.
+        // Body carries dev/user identity, the device-capability handshake (so the backend never
+        // assigns an unsupported variant), plus, when present, the consent block the backend ties
+        // to the session and inherits on subsequent calls.
         var body: [String: Any] = ["devMode": devMode]
         if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        body["capabilities"] = DeviceCapabilities.current.dictionary
         if let privacy { body["privacy"] = privacy.privacyBody() }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
@@ -566,8 +660,11 @@ public final class SimulaAPI: @unchecked Sendable {
 
     /// Fetches the game catalog.
     /// Translates `fetchCatalog()` from api.ts
-    public func fetchCatalog() async throws -> CatalogResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+    ///
+    /// `sessionId` is passed through as the `session_id` query param when available (the backend
+    /// ties the catalog to the session); omitted when nil/empty.
+    public func fetchCatalog(sessionId: String? = nil) async throws -> CatalogResponse {
+        guard let url = Self.catalogURL(sessionId: sessionId) else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -586,6 +683,17 @@ public final class SimulaAPI: @unchecked Sendable {
 
         // Decode flexibly into the SDK's CatalogResponse (see parseCatalog).
         return try parseCatalog(data)
+    }
+
+    /// Builds the catalogv2 request URL, adding `session_id` when available. Pure/testable.
+    static func catalogURL(sessionId: String? = nil) -> URL? {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+            return nil
+        }
+        if let sessionId, !sessionId.isEmpty {
+            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
+        }
+        return components.url
     }
 
     // MARK: - Load Ad (imperative prefetch)
@@ -833,9 +941,10 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Track Impression
 
-    /// Tracks an ad impression.
+    /// Tracks an ad impression. When the load response carried an `experiment` node, its
+    /// assignment metadata rides along so impressions can be attributed to the A/B variant.
     /// Translates `trackImpression()` from api.ts
-    public func trackImpression(adId: String, apiKey: String) async {
+    public func trackImpression(adId: String, apiKey: String, experiment: Experiment? = nil) async {
         // An empty `adId` would POST to `.../impression/` (no id) — skip it.
         guard !adId.isEmpty else { return }
         guard let url = URL(string: "\(API_BASE_URL)/track/engagement/impression/\(adId)") else { return }
@@ -843,7 +952,13 @@ public final class SimulaAPI: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        request.httpBody = "{}".data(using: .utf8)
+        var body: [String: Any] = [:]
+        if let experiment {
+            if let id = experiment.experimentId { body["experiment_id"] = id }
+            if let variant = experiment.variantId { body["variant_id"] = variant }
+            if let layer = experiment.layer { body["layer"] = layer }
+        }
+        request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
 
         _ = try? await session.data(for: request)
     }

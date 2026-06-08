@@ -27,8 +27,23 @@ import ObjectiveC.runtime
 enum CreativeCTARouter {
     /// Opens the advertiser destination for a creative CTA. Best-effort: a bad id
     /// or unopenable URL silently no-ops (the CLICKED event has already fired).
-    static func open(trackingUrl: String?, destination: AdDestination) {
+    ///
+    /// `storeOpen` selects the presentation surface (server-driven A/B config):
+    /// - `.skstoreproduct` (default; also the iOS mapping of the Android-only
+    ///   `.inlineInstall`) → in-app `SKStoreProductViewController` / `SFSafariViewController`.
+    /// - `.external` → leave the app: the App Store app for store links, the default
+    ///   browser otherwise (resolving the attribution redirect first for store CTAs).
+    static func open(
+        trackingUrl: String?,
+        destination: AdDestination,
+        storeOpen: StoreOpen = .skstoreproduct
+    ) {
         guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
+            return
+        }
+
+        if storeOpen == .external {
+            openExternally(initialURL: url, destination: destination)
             return
         }
 
@@ -91,6 +106,48 @@ enum CreativeCTARouter {
             return nil
         }
         return capturedID(appStorePathIDRegex, in: url.path)
+    }
+
+    // MARK: - App Store id resolution (for SKOverlay)
+
+    /// Resolves the advertised app's numeric App Store id (adamId) for `SKOverlay.AppConfiguration`.
+    /// Tries the tracking URL directly; if it's an http(s) attribution tracker for a store CTA,
+    /// follows the redirect chain (the same `RedirectResolver` the CTA uses) to the final App Store
+    /// URL. Calls back with `nil` when none can be resolved (the overlay then safely no-ops).
+    /// The completion is always delivered on the main thread.
+    static func resolveAppStoreID(
+        trackingUrl: String?,
+        destination: AdDestination,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
+            completion(nil)
+            return
+        }
+        // Already a store URL — no network needed.
+        if let appID = appStoreID(from: url) {
+            completion(appID)
+            return
+        }
+        // Only http(s) trackers for an appstore destination are worth resolving.
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard destination == .appstore, scheme == "http" || scheme == "https" else {
+            completion(nil)
+            return
+        }
+
+        weak var resolverRef: RedirectResolver?
+        let resolver = RedirectResolver { finalURL in
+            DispatchQueue.main.async {
+                completion(appStoreID(from: finalURL))
+                if let r = resolverRef { activeResolvers.remove(r) }
+            }
+        }
+        resolverRef = resolver
+        activeResolvers.insert(resolver)
+        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        resolver.session = session
+        session.dataTask(with: URLRequest(url: url)).resume()
     }
 
     // MARK: - Presentation
@@ -179,6 +236,35 @@ enum CreativeCTARouter {
     /// multiple CTAs resolve concurrently without dropping/leaking each other; each
     /// removes itself on completion.
     private static var activeResolvers: Set<RedirectResolver> = []
+
+    /// Opens the destination externally (leaving the app) for `store_open == .external`.
+    /// Direct App Store / non-http links and web destinations open immediately; an
+    /// http(s) attribution tracker for a store CTA is resolved through its redirect chain
+    /// first so we land on the real App Store page rather than bouncing through the tracker.
+    static func openExternally(initialURL: URL, destination: AdDestination) {
+        let scheme = initialURL.scheme?.lowercased() ?? ""
+        let isHTTP = scheme == "http" || scheme == "https"
+
+        // Already a store / custom-scheme link, or a plain web destination — open as-is.
+        if appStoreID(from: initialURL) != nil || !isHTTP || destination == .web {
+            UIApplication.shared.open(initialURL)
+            return
+        }
+
+        // appstore destination behind an http(s) tracker: resolve, then open the final URL.
+        weak var resolverRef: RedirectResolver?
+        let resolver = RedirectResolver { finalURL in
+            DispatchQueue.main.async {
+                UIApplication.shared.open(finalURL)
+                if let r = resolverRef { activeResolvers.remove(r) }
+            }
+        }
+        resolverRef = resolver
+        activeResolvers.insert(resolver)
+        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        resolver.session = session
+        session.dataTask(with: URLRequest(url: initialURL)).resume()
+    }
 
     /// Follows the HTTP redirect chain to determine the final destination.
     /// If it resolves to an App Store URL → `SKStoreProductViewController`.
