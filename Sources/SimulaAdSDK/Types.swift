@@ -679,3 +679,27 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
     }
 }
+
+/// User-selectable reasons for the in-ad report flow (the "i" → report sheet). `rawValue` is the wire
+/// `flag` sent to `POST /impressions/{adId}/report`; `label` is the user-facing copy.
+public enum AdReportReason: String, CaseIterable, Sendable {
+    case adNotShowing = "ad_not_showing"
+    case adInappropriate = "ad_inappropriate"
+    case adLooksWrong = "ad_looks_wrong"
+    case dislike
+    case other
+
+    /// The wire value posted as `flag`.
+    public var flag: String { rawValue }
+
+    /// User-facing menu copy.
+    public var label: String {
+        switch self {
+        case .adNotShowing: return "Ad isn't showing properly"
+        case .adInappropriate: return "Inappropriate or offensive"
+        case .adLooksWrong: return "Ad looks wrong or misleading"
+        case .dislike: return "I don't want to see this"
+        case .other: return "Other"
+        }
+    }
+}

@@ -204,6 +204,8 @@ public final class SimulaRewardedAd {
 
         let presenter = RewardedPresenter()
         let didPresent = presenter.present(
+            adId: response.adId,
+            apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
             onClose: { [weak self] earned, elapsedPlayTime in
@@ -293,7 +295,7 @@ public final class SimulaRewardedAd {
             let url = try? await api.fetchAdForMinigame(aid: adId)
             guard let self, let url, !url.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

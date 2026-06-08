@@ -22,11 +22,11 @@ final class FallbackAdPresenter {
     /// Presents the fallback ad iframe. Returns `true` if it was presented; `false` if no window
     /// scene was available (in which case `onClose` is never called).
     @discardableResult
-    func present(iframeUrl: String, onClose: @escaping () -> Void) -> Bool {
+    func present(adId: String, iframeUrl: String, onClose: @escaping () -> Void) -> Bool {
         guard let scene = Self.activeWindowScene() else { return false }
         self.onClose = onClose
 
-        let root = AdOverlayView(iframeUrl: iframeUrl, onClose: { [weak self] in self?.dismiss() })
+        let root = AdOverlayView(iframeUrl: iframeUrl, onClose: { [weak self] in self?.dismiss() }, adId: adId)
         let hosting = UIHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 

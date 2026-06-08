@@ -410,7 +410,7 @@ public final class SimulaInterstitialAd {
             let url = try? await api.fetchAdForMinigame(aid: adId)
             guard let self, let url, !url.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

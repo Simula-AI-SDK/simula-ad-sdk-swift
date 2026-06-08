@@ -19,6 +19,8 @@ public struct AdOverlayView: View {
     var playableHeightDp: CGFloat?
     /// Border color for bottom sheet drag handle area.
     var playableBorderColor: String = "#262626"
+    /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
+    var adId: String = ""
 
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
@@ -140,6 +142,13 @@ public struct AdOverlayView: View {
                 .offset(y: isBottomSheet ? geo.size.height - (playableHeightDp ?? geo.size.height) : 0)
             }
             .ignoresSafeArea()
+
+            // Persistent ad-info "i" + report sheet (required disclosure on the fallback / post-game ad).
+            #if os(iOS)
+            if !adId.isEmpty {
+                AdInfoReportOverlay(adId: adId)
+            }
+            #endif
         }
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)

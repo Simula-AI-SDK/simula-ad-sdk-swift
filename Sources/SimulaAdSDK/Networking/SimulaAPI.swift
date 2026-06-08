@@ -963,6 +963,26 @@ public final class SimulaAPI: @unchecked Sendable {
         _ = try? await session.data(for: request)
     }
 
+    // MARK: - Report Ad
+
+    /// Submits a user-initiated ad report against the impression (`POST /impressions/{adId}/report`).
+    /// `flag` is one of the `AdReportReason` wire values; `note` is an optional free-text detail. The
+    /// backend stores the flag + note against the ad serve (no moderation on receipt). Best-effort and
+    /// silent-fail like the other tracking calls — a report must never disrupt the ad experience.
+    public func reportAd(adId: String, flag: String, note: String? = nil, apiKey: String) async {
+        guard !adId.isEmpty else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/report") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        var body: [String: Any] = ["flag": flag]
+        if let note, !note.isEmpty { body["note"] = note }
+        request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
+
+        _ = try? await session.data(for: request)
+    }
+
     // MARK: - Track Viewport Entry
 
     /// Tracks when an ad enters the viewport.

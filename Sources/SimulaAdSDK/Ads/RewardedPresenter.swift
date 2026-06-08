@@ -26,6 +26,8 @@ final class RewardedPresenter {
     ///   which case `onClose` is never called).
     @discardableResult
     func present(
+        adId: String,
+        apiKey: String,
         iframeUrl: String,
         durationSeconds: Int,
         onClose: @escaping (Bool, Double) -> Void
@@ -36,6 +38,8 @@ final class RewardedPresenter {
         self.onClose = onClose
 
         let root = RewardedGameView(
+            adId: adId,
+            apiKey: apiKey,
             iframeUrl: iframeUrl,
             durationSeconds: durationSeconds,
             onFinish: { [weak self] earned, elapsed in
@@ -88,6 +92,8 @@ final class RewardedPresenter {
 /// reward by accident. On a qualifying close, `onFinish(earned, elapsedPlayTime)`
 /// fires after the dismiss fade.
 private struct RewardedGameView: View {
+    let adId: String
+    let apiKey: String
     let iframeUrl: String
     let durationSeconds: Int
     let onFinish: (Bool, Double) -> Void
@@ -120,6 +126,9 @@ private struct RewardedGameView: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 .animation(.default, value: rewardEarned)
+
+            // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
+            AdInfoReportOverlay(adId: adId, apiKey: apiKey, advertiser: nil)
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a

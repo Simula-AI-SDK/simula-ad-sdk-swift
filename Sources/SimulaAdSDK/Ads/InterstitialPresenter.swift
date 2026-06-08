@@ -39,6 +39,7 @@ final class InterstitialPresenter {
         self.onClose = onClose
 
         let root = CreativeInterstitialView(
+            apiKey: apiKey,
             response: response,
             onClick: onClick,
             onRequestDismiss: { [weak self] in self?.dismiss() }
@@ -95,6 +96,7 @@ final class InterstitialPresenter {
 /// store-prompt badge (`store_prompt`) and an SKOverlay install banner (`skoverlay`) are
 /// layered on per their config.
 private struct CreativeInterstitialView: View {
+    let apiKey: String
     let response: AdLoadResponse
     let onClick: () -> Void
     let onRequestDismiss: () -> Void
@@ -132,10 +134,12 @@ private struct CreativeInterstitialView: View {
     private let nominalPlayableDuration: TimeInterval = 30
 
     init(
+        apiKey: String,
         response: AdLoadResponse,
         onClick: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
+        self.apiKey = apiKey
         self.response = response
         self.onClick = onClick
         self.onRequestDismiss = onRequestDismiss
@@ -182,6 +186,10 @@ private struct CreativeInterstitialView: View {
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible {
                 StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
             }
+
+            // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
+            // report sheet overlays the creative + close button when open.
+            AdInfoReportOverlay(adId: response.adId, apiKey: apiKey, advertiser: response.creative?.bundleUrl)
         }
         .opacity(visible ? 1 : 0)
         // Once a dismiss starts (`visible == false`) the surface is still on screen during the

@@ -171,13 +171,13 @@ public struct GameIframeView: View {
                                 Button(action: {
                                     handleClose()
                                 }) {
-                                    Text("\u{00D7}")
-                                        .font(.system(size: 18, weight: .regular))
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 12, weight: .bold))
                                         .foregroundColor(.white)
-                                        .frame(width: 32, height: 32)
+                                        .frame(width: 22, height: 22)
                                         .background(
                                             Circle()
-                                                .fill(Color.black.opacity(0.6))
+                                                .fill(Color.black.opacity(0.5))
                                         )
                                 }
                                 .buttonStyle(CloseButtonStyle())
