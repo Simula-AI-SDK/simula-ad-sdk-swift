@@ -147,7 +147,7 @@ public final class SimulaRewardedAd {
 
             do {
                 let threshold = self.minPlayThreshold > 0 ? Int(self.minPlayThreshold) : nil
-                let response = try await self.api.initRewarded(
+                let response = try await self.api.loadRewarded(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
                     minPlayThreshold: threshold,

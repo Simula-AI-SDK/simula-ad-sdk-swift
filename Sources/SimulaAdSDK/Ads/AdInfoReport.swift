@@ -15,6 +15,12 @@ struct AdInfoReportOverlay: View {
     var apiKey: String?
     /// Advertiser descriptor (e.g. the creative bundle URL) shown under "About this advertiser".
     var advertiser: String?
+    /// Set when the close button also lives bottom-left: keeps the "i" hit area vertical-only so it
+    /// doesn't swallow taps meant for the close button sitting right beside it.
+    var closeAtBottomLeft: Bool = false
+    /// Inset of the "i" from the corner. Larger on full-screen overlays that ignore the safe area
+    /// (e.g. the post-game / fallback ad), so the glyph clears the screen's rounded corner.
+    var cornerInset: CGFloat = 6
 
     @State private var sheetVisible = false
     private let api = SimulaAPI()
@@ -26,14 +32,17 @@ struct AdInfoReportOverlay: View {
                 ZStack {
                     Circle().fill(Color.black.opacity(0.5))
                     Circle().strokeBorder(Color.white.opacity(0.5), lineWidth: 1)
-                    Text("i").font(.system(size: 13, weight: .bold)).foregroundColor(.white)
+                    Text("i").font(.system(size: 10, weight: .bold)).foregroundColor(.white)
                 }
-                .frame(width: 22, height: 22)
+                .frame(width: 16, height: 16)
+                // Visible glyph stays 16; the hit area is enlarged (up, plus right when there's room)
+                // with the glyph pinned to the corner so it keeps hugging the edge.
+                .frame(width: closeAtBottomLeft ? 16 : 44, height: 44, alignment: .bottomLeading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Ad info and report")
-            .padding(6)
+            .padding(cornerInset)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
 
             if sheetVisible {

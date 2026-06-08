@@ -149,9 +149,9 @@ private struct RewardedGameView: View {
             // Earned: a compact circular X close button (AppLovin-style); tapping it dismisses.
             Button(action: { finish(earned: true) }) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundColor(.white)
-                    .frame(width: 22, height: 22)
+                    .frame(width: 16, height: 16)
                     .background(Circle().fill(Color.black.opacity(0.5)))
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())

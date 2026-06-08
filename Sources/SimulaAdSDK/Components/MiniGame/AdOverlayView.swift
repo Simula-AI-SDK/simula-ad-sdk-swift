@@ -89,27 +89,31 @@ public struct AdOverlayView: View {
                                 Spacer()
                                 if adCountdown <= 0 {
                                     // Compact close button, matching the interstitial/rewarded default
-                                    // (a ~22pt dark-translucent circle with a white X).
+                                    // (a ~16pt dark-translucent circle with a white X). Visible glyph
+                                    // stays small; the hit area is a full 44pt touch target.
                                     Button(action: onClose) {
                                         Image(systemName: "xmark")
-                                            .font(.system(size: 12, weight: .bold))
+                                            .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.white)
-                                            .frame(width: 22, height: 22)
+                                            .frame(width: 16, height: 16)
                                             .background(
                                                 Circle()
                                                     .fill(Color.black.opacity(0.5))
                                             )
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
                                     }
                                     .buttonStyle(CloseButtonStyle())
-                                    .padding(.top, 16)
-                                    .padding(.trailing, 16)
+                                    .padding(.top, 8)
+                                    .padding(.trailing, 8)
                                     .accessibilityLabel("Close ad")
                                 } else {
-                                    // Countdown ring, sized to the same compact footprint.
+                                    // Countdown ring, sized to the same compact footprint (16pt circle
+                                    // centered in the same 44pt frame so nothing jumps when it unlocks).
                                     ZStack {
                                         Circle()
                                             .fill(Color.black.opacity(0.4))
-                                            .frame(width: 22, height: 22)
+                                            .frame(width: 16, height: 16)
 
                                         Circle()
                                             .trim(from: 1 - ringProgress, to: 1)
@@ -117,16 +121,16 @@ public struct AdOverlayView: View {
                                                 Color.white,
                                                 style: StrokeStyle(lineWidth: 2, lineCap: .round)
                                             )
-                                            .frame(width: 18, height: 18)
+                                            .frame(width: 12, height: 12)
                                             .rotationEffect(.degrees(-90))
 
                                         Text("\(adCountdown)")
-                                            .font(.system(size: 11, weight: .bold))
+                                            .font(.system(size: 9, weight: .bold))
                                             .foregroundColor(.white)
                                     }
-                                    .frame(width: 22, height: 22)
-                                    .padding(.top, 16)
-                                    .padding(.trailing, 16)
+                                    .frame(width: 44, height: 44)
+                                    .padding(.top, 8)
+                                    .padding(.trailing, 8)
                                 }
                             }
                             Spacer()
@@ -144,9 +148,11 @@ public struct AdOverlayView: View {
             .ignoresSafeArea()
 
             // Persistent ad-info "i" + report sheet (required disclosure on the fallback / post-game ad).
+            // This overlay ignores the safe area, so use a larger corner inset to keep the "i" clear
+            // of the screen's rounded bottom-left corner (where it would otherwise be clipped).
             #if os(iOS)
             if !adId.isEmpty {
-                AdInfoReportOverlay(adId: adId)
+                AdInfoReportOverlay(adId: adId, cornerInset: 18)
             }
             #endif
         }

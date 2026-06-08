@@ -172,17 +172,21 @@ public struct GameIframeView: View {
                                     handleClose()
                                 }) {
                                     Image(systemName: "xmark")
-                                        .font(.system(size: 12, weight: .bold))
+                                        .font(.system(size: 10, weight: .bold))
                                         .foregroundColor(.white)
-                                        .frame(width: 22, height: 22)
+                                        .frame(width: 16, height: 16)
                                         .background(
                                             Circle()
                                                 .fill(Color.black.opacity(0.5))
                                         )
+                                        // Visible glyph stays compact (16); the hit area is a full
+                                        // 44pt touch target so the small button is easy to tap.
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(CloseButtonStyle())
-                                .padding(.top, 16)
-                                .padding(.trailing, 16)
+                                .padding(.top, 8)
+                                .padding(.trailing, 8)
                                 .accessibilityLabel("Close game")
                             }
                             Spacer()

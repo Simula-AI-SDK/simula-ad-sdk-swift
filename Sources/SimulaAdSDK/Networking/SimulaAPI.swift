@@ -687,7 +687,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
     /// Builds the catalogv2 request URL, adding `session_id` when available. Pure/testable.
     static func catalogURL(sessionId: String? = nil) -> URL? {
-        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalogv2") else {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalog") else {
             return nil
         }
         if let sessionId, !sessionId.isEmpty {
@@ -710,7 +710,7 @@ public final class SimulaAPI: @unchecked Sendable {
         charImage: String? = nil,
         charDesc: String? = nil
     ) async throws -> AdLoadResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/ads/load/interstitial") else {
+        guard let url = URL(string: "\(API_BASE_URL)/load/interstitial") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -745,7 +745,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Initializes a rewarded minigame via POST /minigames/init/rewarded. Returns the
     /// iframe URL, the `serve_id` that ties the play to its later verification, and the
     /// `duration_seconds` the SDK must enforce before a reward can be earned.
-    public func initRewarded(
+    public func loadRewarded(
         adUnitId: String,
         sessionId: String = "",
         minPlayThreshold: Int? = nil,
@@ -754,7 +754,7 @@ public final class SimulaAPI: @unchecked Sendable {
         charImage: String? = nil,
         charDesc: String? = nil
     ) async throws -> RewardedInitResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/init/rewarded") else {
+        guard let url = URL(string: "\(API_BASE_URL)/load/rewarded") else {
             throw SimulaAPIError.invalidURL
         }
 
