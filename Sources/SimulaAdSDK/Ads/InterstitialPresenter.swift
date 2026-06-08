@@ -150,6 +150,10 @@ private struct CreativeInterstitialView: View {
     /// from the creative's declared ad-unit type.
     private var isRewardCopy: Bool { response.adUnitType == .rewarded }
 
+    /// The close config to render: the server's `ad_behavior.close` when present, else a default
+    /// (compact, always-available top-right X) so ads without `ad_behavior` still get a small close.
+    private var closeConfig: CloseBehavior { response.adBehavior?.close ?? CloseBehavior() }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -159,22 +163,19 @@ private struct CreativeInterstitialView: View {
                 htmlCreativeView(html)
             }
 
-            // Close button — driven by `ad_behavior` when present; otherwise today's literal
-            // always-available top-right button (an absent ad_behavior renders exactly as before).
-            if let close = response.adBehavior?.close {
-                CloseButtonView(
-                    treatment: close.treatment,
-                    position: close.position,
-                    progressBarColor: close.progressBarColor,
-                    isRewardCopy: isRewardCopy,
-                    enabled: closeEnabled,
-                    remaining: closeRemaining,
-                    progress: closeProgress,
-                    onClose: { handleClose() }
-                )
-            } else {
-                legacyCloseButton
-            }
+            // Close button — always shown with the compact AppLovin-style chrome. Driven by
+            // `ad_behavior.close` when present; otherwise a default config (top-right, always
+            // available) so ads with no `ad_behavior` still get the small close, not a big one.
+            CloseButtonView(
+                treatment: closeConfig.treatment,
+                position: closeConfig.position,
+                progressBarColor: closeConfig.progressBarColor,
+                isRewardCopy: isRewardCopy,
+                enabled: closeEnabled,
+                remaining: closeRemaining,
+                progress: closeProgress,
+                onClose: { handleClose() }
+            )
 
             // Mid-ad store prompt — independent of the close button and SKOverlay. Rendered at the
             // server-resolved position (never recomputed) once the 50% playable mark is reached.
@@ -205,30 +206,6 @@ private struct CreativeInterstitialView: View {
             if skOverlayPresented, #available(iOS 14.0, *) {
                 SKOverlayPresenter.dismiss()
             }
-        }
-    }
-
-    // MARK: Close button (legacy / no ad_behavior)
-
-    /// Today's literal top-right close button, rendered only when the payload omits
-    /// `ad_behavior`. Always available — kept byte-for-byte so non-experiment traffic is unchanged.
-    private var legacyCloseButton: some View {
-        VStack {
-            HStack {
-                Spacer()
-                Button(action: { handleClose() }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(Color(hex: "#1F2937"))
-                        .frame(width: 44, height: 44)
-                        .background(Circle().fill(Color.white.opacity(0.9)))
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 16)
-                .padding(.trailing, 16)
-                .accessibilityLabel("Close")
-            }
-            Spacer()
         }
     }
 
@@ -432,11 +409,11 @@ private struct CloseButtonView: View {
     let progress: Double
     let onClose: () -> Void
 
-    // Visible close affordance sized to match AdMob / AppLovin (a compact ~28–30pt circle), while
-    // the tappable frame stays at the 44pt HIG minimum (see `minTouchTarget`). The 44pt circle used
-    // before was the touch-target minimum mistakenly used as the visual size.
-    private let glyphSize: CGFloat = 16
-    private let circleSize: CGFloat = 30
+    // Visible close affordance sized to match AppLovin (a compact ~22pt circle); the tappable frame
+    // stays at the 44pt HIG minimum (see `minTouchTarget`), close to IAB MRAID's 50×50dp close
+    // region. The visible graphic and the touch target are deliberately decoupled.
+    private let glyphSize: CGFloat = 12
+    private let circleSize: CGFloat = 22
     private let minTouchTarget: CGFloat = 44
 
     /// Tappable footprint, used identically by the in-delay indicator and the unlocked button so the

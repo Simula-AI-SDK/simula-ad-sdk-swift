@@ -390,12 +390,6 @@ public enum CloseTreatment: Sendable, Equatable {
         default: return .hidden
         }
     }
-
-    /// `progress_bar` is a full-width top-edge bar, so it's the only treatment that can't render at
-    /// `bottom_left`; `hidden` / `reward_or_close_label` / `countdown_circle` allow all three corners.
-    var allowsBottomLeft: Bool {
-        self != .progressBar
-    }
 }
 
 /// Where the close button sits. v2 narrows this to three corners — `bottom_right` is excluded
@@ -514,9 +508,9 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
     ) {
         self.delaySeconds = delaySeconds
         self.treatment = treatment
-        // Snap an out-of-spec position (bottom_left under an edge-anchored treatment) to a safe
-        // default so the SDK renders the field exactly as constrained, per "snap to safe default".
-        self.position = (position == .bottomLeft && !treatment.allowsBottomLeft) ? .topRight : position
+        // Every treatment honors the configured corner. (`progress_bar` renders its bar at the top
+        // edge regardless; only its resolved close ✕ follows `position`.)
+        self.position = position
         self.progressBarColor = progressBarColor
     }
 

@@ -137,39 +137,27 @@ private struct RewardedGameView: View {
     @ViewBuilder
     private var rewardClosePill: some View {
         if rewardEarned {
-            // Earned: the entire pill is the close button.
+            // Earned: a compact circular X close button (AppLovin-style); tapping it dismisses.
             Button(action: { finish(earned: true) }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                    Text("Reward unlocked").font(.system(size: 14, weight: .bold))
-                }
-                .foregroundColor(.white)
-                .padding(.vertical, 8)
-                .padding(.horizontal, 14)
-                .background(pillBackground(earned: true))
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 22, height: 22)
+                    .background(Circle().fill(Color.black.opacity(0.5)))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Reward unlocked, close")
+            .accessibilityLabel("Close")
         } else {
-            // Still earning: a display-only status — no close affordance yet.
+            // Still earning: a small display-only status — no close affordance yet.
             Text("🎮 Play to earn: \(secondsLeft)s")
-                .font(.system(size: 14, weight: .medium))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white)
-                .padding(.vertical, 8)
-                .padding(.horizontal, 14)
-                .background(pillBackground(earned: false))
+                .padding(.vertical, 5)
+                .padding(.horizontal, 10)
+                .background(Capsule().fill(Color.black.opacity(0.6)))
         }
-    }
-
-    private func pillBackground(earned: Bool) -> some View {
-        Capsule()
-            .fill(Color.black.opacity(0.75))
-            .overlay(
-                Capsule().stroke(
-                    earned ? Color.green.opacity(0.6) : Color.white.opacity(0.2),
-                    lineWidth: 1
-                )
-            )
     }
 
     // MARK: Timer

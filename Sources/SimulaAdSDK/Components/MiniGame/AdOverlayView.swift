@@ -86,15 +86,16 @@ public struct AdOverlayView: View {
                             HStack {
                                 Spacer()
                                 if adCountdown <= 0 {
-                                    // Close button (matching React Native's CloseButton style)
+                                    // Compact close button, matching the interstitial/rewarded default
+                                    // (a ~22pt dark-translucent circle with a white X).
                                     Button(action: onClose) {
-                                        Text("\u{00D7}")
-                                            .font(.system(size: 18, weight: .regular))
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 12, weight: .bold))
                                             .foregroundColor(.white)
-                                            .frame(width: 32, height: 32)
+                                            .frame(width: 22, height: 22)
                                             .background(
                                                 Circle()
-                                                    .fill(Color.black.opacity(0.6))
+                                                    .fill(Color.black.opacity(0.5))
                                             )
                                     }
                                     .buttonStyle(CloseButtonStyle())
@@ -102,11 +103,11 @@ public struct AdOverlayView: View {
                                     .padding(.trailing, 16)
                                     .accessibilityLabel("Close ad")
                                 } else {
-                                    // Countdown ring
+                                    // Countdown ring, sized to the same compact footprint.
                                     ZStack {
                                         Circle()
                                             .fill(Color.black.opacity(0.4))
-                                            .frame(width: 32, height: 32)
+                                            .frame(width: 22, height: 22)
 
                                         Circle()
                                             .trim(from: 1 - ringProgress, to: 1)
@@ -114,14 +115,14 @@ public struct AdOverlayView: View {
                                                 Color.white,
                                                 style: StrokeStyle(lineWidth: 2, lineCap: .round)
                                             )
-                                            .frame(width: 26, height: 26)
+                                            .frame(width: 18, height: 18)
                                             .rotationEffect(.degrees(-90))
 
                                         Text("\(adCountdown)")
-                                            .font(.system(size: 14, weight: .bold))
+                                            .font(.system(size: 11, weight: .bold))
                                             .foregroundColor(.white)
                                     }
-                                    .frame(width: 32, height: 32)
+                                    .frame(width: 22, height: 22)
                                     .padding(.top, 16)
                                     .padding(.trailing, 16)
                                 }
