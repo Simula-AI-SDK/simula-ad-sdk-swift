@@ -30,7 +30,6 @@ struct AdInfoReportOverlay: View {
             Button(action: { withAnimation(.easeInOut(duration: 0.2)) { sheetVisible = true } }) {
                 ZStack {
                     Circle().fill(Color.black.opacity(0.5))
-                    Circle().strokeBorder(Color.white.opacity(0.5), lineWidth: 1)
                     Text("i").font(.system(size: 10, weight: .bold)).foregroundColor(.white)
                 }
                 .frame(width: 16, height: 16)
