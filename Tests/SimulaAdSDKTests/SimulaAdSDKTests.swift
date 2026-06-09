@@ -555,34 +555,39 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(ad.adUnitId, "u")
     }
 
-    // MARK: - Global character context (SimulaAds)
+    // MARK: - Character context (per-load)
 
     @MainActor
-    func testSimulaAdsSetCharacterUpdatesGlobalContext() {
-        SimulaAds.setCharacter(
+    func testInterstitialLoadAcceptsPerCallCharacterContext() {
+        // Character context now flows through `load(...)` instead of global SimulaAds
+        // state. Without `initialize` it fails fast with .notInitialized, but the call
+        // must still accept the per-call character arguments (compile + runtime).
+        XCTAssertFalse(SimulaAds.isInitialized, "Test assumes SimulaAds is not initialized")
+
+        let delegate = InterstitialMockDelegate()
+        let ad = SimulaInterstitialAd(adUnitId: "test_unit")
+        ad.delegate = delegate
+
+        ad.load(
             charId: "char_7",
             charName: "Mentor",
             charImage: "https://x/a.png",
             charDesc: "a wise mentor"
         )
-        XCTAssertEqual(SimulaAds.charId, "char_7")
-        XCTAssertEqual(SimulaAds.charName, "Mentor")
-        XCTAssertEqual(SimulaAds.charImage, "https://x/a.png")
-        XCTAssertEqual(SimulaAds.charDesc, "a wise mentor")
 
-        // Direct property assignment updates a single field on the fly.
-        SimulaAds.charName = "Sage"
-        XCTAssertEqual(SimulaAds.charName, "Sage")
+        guard case .notInitialized? = delegate.loadFailedError else {
+            return XCTFail("Expected .notInitialized, got \(String(describing: delegate.loadFailedError))")
+        }
+    }
 
-        // setCharacter replaces wholesale: omitted fields are cleared (no stale carry-over).
-        SimulaAds.setCharacter(charId: "char_8")
-        XCTAssertEqual(SimulaAds.charId, "char_8")
-        XCTAssertNil(SimulaAds.charName)
-        XCTAssertNil(SimulaAds.charImage)
-        XCTAssertNil(SimulaAds.charDesc)
-
-        // Reset global state so other tests aren't affected.
-        SimulaAds.setCharacter()
+    @MainActor
+    func testStaleAndDuplicateRequestErrorMessages() {
+        // The stale message is part of the public contract (shared verbatim with Kotlin).
+        XCTAssertEqual(SimulaAdError.stale.errorDescription, "Ad is stale, please load again")
+        XCTAssertEqual(
+            SimulaAdError.duplicateRequest.errorDescription,
+            "Duplicate ad request — a matching ad is already loaded or loading."
+        )
     }
 
     // MARK: - Rewarded init parsing (RewardedInitResponse decode)

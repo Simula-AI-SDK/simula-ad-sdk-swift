@@ -51,6 +51,12 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case noFill
     /// `show()` was called before an ad was loaded.
     case notReady
+    /// `show()` was called on an ad that loaded more than an hour ago (expired).
+    case stale
+    /// `load()` was blocked because a matching ad is already loaded or in flight
+    /// (same ad unit id, character id, character name, session id) within the
+    /// 5-minute dedup window.
+    case duplicateRequest
     /// `show()` was called while an ad was already showing.
     case alreadyShowing
     /// No active window scene was available to present in.
@@ -70,6 +76,10 @@ public enum SimulaAdError: LocalizedError, Sendable {
             return "No ad available to show right now (no fill)."
         case .notReady:
             return "No ad is ready. Call load() and wait for LOADED before show()."
+        case .stale:
+            return "Ad is stale, please load again"
+        case .duplicateRequest:
+            return "Duplicate ad request — a matching ad is already loaded or loading."
         case .alreadyShowing:
             return "An interstitial is already being shown."
         case .noPresentationContext:
@@ -119,21 +129,39 @@ public final class SimulaInterstitialAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
-    // Character context is global: set it on `SimulaAds` (via `initialize` or
-    // `setCharacter`), and every `load()` reads the current values from there.
+    // Character context is passed per `load()` call (see below); there is no global
+    // character state to keep in sync.
+
+    /// A loaded ad expires this long after it became ready (staleness).
+    private static let staleAfter: TimeInterval = 60 * 60 // 1 hour
+    /// Re-loads of the same dedup key are blocked for this long.
+    private static let dedupWindow: TimeInterval = 5 * 60 // 5 minutes
 
     // MARK: - State
 
     private enum State {
         case idle
         case loading
-        case ready(AdLoadResponse)
+        /// `loadedAt` is when the creative became ready (used for staleness).
+        case ready(AdLoadResponse, loadedAt: Date)
         case showing(AdLoadResponse)
     }
 
     private var state: State = .idle
     private var loadTask: Task<Void, Never>?
     private let api = SimulaAPI()
+
+    // Dedup: the (ad unit, character, session) key of the load currently in flight or
+    // ready, and when that load was initiated. Re-loads of the same key are blocked for
+    // `dedupWindow`. Main-actor isolated.
+    private var currentKey: String?
+    private var currentKeyAt: Date = .distantPast
+
+    // Character context of the last load(), replayed by the post-close auto-preload.
+    private var lastCharId: String?
+    private var lastCharName: String?
+    private var lastCharImage: String?
+    private var lastCharDesc: String?
 
     #if os(iOS)
     private var presenter: InterstitialPresenter?
@@ -150,24 +178,58 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Load
 
-    /// Preloads an ad. Fires `LOADED` on success or `LOAD_FAILED` on failure.
+    /// Preloads an ad for the given character context.
     ///
-    /// No-op while a load is already in flight or an ad is ready (single
-    /// in-flight load per instance). Fails fast with `.notInitialized` when the
-    /// SDK has not been initialized.
-    public func load() {
-        switch state {
-        case .loading, .ready, .showing:
-            return // single in-flight load; don't disturb a ready/showing ad
-        case .idle:
-            break
-        }
-
+    /// The character fields are sent on the `/load/interstitial` request so the
+    /// backend can target the creative; all are optional. Behavior:
+    ///
+    /// - **Single in-flight load.** While a load for the same ad is in flight or
+    ///   ready, calling `load()` again with the **same** key — (ad unit id, `charId`,
+    ///   `charName`, session id) — is blocked for 5 minutes and fires `LOAD_FAILED`
+    ///   with `.duplicateRequest`. A **different** ad unit or character is treated as
+    ///   new and supersedes the pending/ready ad.
+    /// - **Staleness.** A loaded ad expires after 1 hour; `show()` then fires
+    ///   `DISPLAY_FAILED` with `.stale`.
+    /// - **No-op while showing.** Ignored while an ad is on screen; the next ad is
+    ///   preloaded automatically on close.
+    public func load(
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
         guard SimulaAds.isInitialized, let provider = SimulaAds.shared else {
             failLoad(.notInitialized)
             return
         }
 
+        // Replay the same character context on the post-close auto-preload.
+        lastCharId = charId
+        lastCharName = charName
+        lastCharImage = charImage
+        lastCharDesc = charDesc
+
+        let key = Self.dedupKey(adUnitId: adUnitId, charId: charId, charName: charName, sessionId: provider.sessionId)
+        let now = Date()
+
+        switch state {
+        case .showing:
+            return // an ad is on screen; the next one preloads on close
+        case .loading, .ready:
+            // A matching ad is already loading/ready: block a same-key re-load within
+            // the dedup window; a different key falls through and supersedes it.
+            if currentKey == key, now.timeIntervalSince(currentKeyAt) < Self.dedupWindow {
+                reportLoadBlocked()
+                return
+            }
+        case .idle:
+            break // nothing held — proceed
+        }
+
+        // Supersede any in-flight load / discard any ready ad, then start fresh.
+        loadTask?.cancel()
+        currentKey = key
+        currentKeyAt = now
         state = .loading
         loadTask = Task { [weak self] in
             guard let self else { return }
@@ -178,15 +240,20 @@ public final class SimulaInterstitialAd {
                 self.failLoad(.noSession)
                 return
             }
+            // The real session id is now known. Refresh the dedup key — the
+            // synchronous gate at load() time may have keyed on an empty session
+            // during cold-start warm-up — so a subsequent same-key load() still
+            // deduplicates. `currentKeyAt` intentionally stays at the original load time.
+            self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
 
             do {
                 let response = try await self.api.loadAd(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
-                    charId: SimulaAds.charId,
-                    charName: SimulaAds.charName,
-                    charImage: SimulaAds.charImage,
-                    charDesc: SimulaAds.charDesc
+                    charId: charId,
+                    charName: charName,
+                    charImage: charImage,
+                    charDesc: charDesc
                 )
                 if Task.isCancelled { return }
                 // Fillable only when the payload carries a non-blank `rendered_html`
@@ -199,7 +266,7 @@ public final class SimulaInterstitialAd {
                 // Warm a WKWebView so the first spin-up is off the present() critical path.
                 WebViewPool.shared.prewarm()
                 #endif
-                self.state = .ready(response)
+                self.state = .ready(response, loadedAt: Date())
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 self.failLoad(.network(apiError))
@@ -207,6 +274,12 @@ public final class SimulaInterstitialAd {
                 self.failLoad(.network(.invalidResponse))
             }
         }
+    }
+
+    /// Dedup key: (ad unit id, character id, character name, current session id),
+    /// joined with a NUL separator so values containing spaces can't collide.
+    private static func dedupKey(adUnitId: String, charId: String?, charName: String?, sessionId: String?) -> String {
+        [adUnitId, charId ?? "", charName ?? "", sessionId ?? ""].joined(separator: "\u{0}")
     }
 
     // MARK: - Show
@@ -220,7 +293,14 @@ public final class SimulaInterstitialAd {
     public func show() {
         let response: AdLoadResponse
         switch state {
-        case .ready(let loaded):
+        case .ready(let loaded, let loadedAt):
+            // A loaded ad expires after 1 hour. Drop it (back to idle so the host can
+            // load() again — the dedup window is long gone) and report stale.
+            if Date().timeIntervalSince(loadedAt) > Self.staleAfter {
+                state = .idle
+                failDisplay(.stale)
+                return
+            }
             response = loaded
         case .showing:
             failDisplay(.alreadyShowing)
@@ -252,8 +332,13 @@ public final class SimulaInterstitialAd {
                 self.delegate?.interstitialDidClose(self)
                 // Show a fallback ad on close (parity with the minigame post-game flow).
                 self.presentFallbackAd(adId: response.adId)
-                // Preload the next ad after close.
-                self.load()
+                // Preload the next ad after close, reusing the last character context.
+                self.load(
+                    charId: self.lastCharId,
+                    charName: self.lastCharName,
+                    charImage: self.lastCharImage,
+                    charDesc: self.lastCharDesc
+                )
             }
         )
 
@@ -391,6 +476,12 @@ public final class SimulaInterstitialAd {
     private func failLoad(_ error: SimulaAdError) {
         state = .idle
         delegate?.interstitialDidFailToLoad(self, error: error)
+    }
+
+    /// Report a dedup-blocked load without disturbing state — the in-flight or ready
+    /// ad that triggered the block must survive (it stays loadable/showable).
+    private func reportLoadBlocked() {
+        delegate?.interstitialDidFailToLoad(self, error: .duplicateRequest)
     }
 
     private func failDisplay(_ error: SimulaAdError) {

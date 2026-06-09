@@ -150,26 +150,20 @@ final class GameAds: SimulaInterstitialAdDelegate {
 **Character context**
 
 The interstitial sends optional character context (`charId`, `charName`, `charImage`,
-`charDesc`) on the `/ads/load/interstitial` request so the backend can target the
-creative. It lives globally on `SimulaAds` — seed it at `initialize`, then update it
-whenever the active character changes. The next `load()` uses the current values, so
-there is nothing to set per ad instance.
+`charDesc`) on the `/load/interstitial` request so the backend can target the
+creative. Pass it on each `load(...)` call — there is no global character state. To
+switch characters, just `load(...)` with the new values:
 
 ```swift
-SimulaAds.initialize(
-    apiKey: "YOUR_API_KEY",
-    devMode: true,
+ad.load(
     charId: "char_123",
     charName: "Luna",
     charImage: "https://example.com/avatar.png",
     charDesc: "a witty companion"
 )
 
-// Later, when the active character changes (replaces all fields):
-SimulaAds.setCharacter(charId: "char_456", charName: "Sage")
-
-// …or tweak a single field on the fly:
-SimulaAds.charName = "Sage"
+// Later, when the active character changes, load with the new values:
+ad.load(charId: "char_456", charName: "Sage")
 ```
 
 **Lifecycle notes**
@@ -178,6 +172,12 @@ SimulaAds.charName = "Sage"
   after `CLOSED`.
 - `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
   or `.noFill` when the payload carries no `rendered_html` creative.
+- A loaded ad is cached and **expires after 1 hour** — `show()` then fires
+  `DISPLAY_FAILED` with `.stale` (`"Ad is stale, please load again"`); just `load()`
+  again. Loads are **deduplicated** by (ad unit id, character id, character name,
+  session id): while a matching ad is already loaded or in flight, a re-load of the
+  same key within 5 minutes fires `LOAD_FAILED` with `.duplicateRequest`. A different
+  ad unit or character supersedes the pending/ready ad.
 - The creative is the server-rendered HTML; it owns its own CTA, so there is no
   SDK-drawn button to configure. The interstitial is dismissed via the close button,
   not by the click-through. `CLICKED` fires on a user-initiated link tap regardless
