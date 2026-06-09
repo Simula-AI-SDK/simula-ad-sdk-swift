@@ -685,7 +685,7 @@ public final class SimulaAPI: @unchecked Sendable {
         return try parseCatalog(data)
     }
 
-    /// Builds the catalogv2 request URL, adding `session_id` when available. Pure/testable.
+    /// Builds the catalog request URL, adding `session_id` when available. Pure/testable.
     static func catalogURL(sessionId: String? = nil) -> URL? {
         guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalog") else {
             return nil

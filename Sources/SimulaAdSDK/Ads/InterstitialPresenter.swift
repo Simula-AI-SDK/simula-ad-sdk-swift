@@ -233,7 +233,7 @@ private struct CreativeInterstitialView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
-        .ignoresSafeArea()
+        // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
     }
 
     // MARK: Actions

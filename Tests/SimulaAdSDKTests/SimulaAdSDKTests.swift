@@ -137,7 +137,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testCatalogURLAppendsSessionId() throws {
         let url = try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "sess_9"))
-        XCTAssertTrue(url.absoluteString.hasSuffix("/minigames/catalogv2?session_id=sess_9"),
+        XCTAssertTrue(url.absoluteString.hasSuffix("/minigames/catalog?session_id=sess_9"),
                       "Unexpected URL: \(url.absoluteString)")
     }
 

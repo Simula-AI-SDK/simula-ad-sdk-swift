@@ -115,8 +115,8 @@ private struct RewardedGameView: View {
             Color.black.ignoresSafeArea()
 
             if let url = URL(string: iframeUrl) {
+                // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
                 WebViewRepresentable(url: url)
-                    .ignoresSafeArea()
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -160,7 +160,7 @@ private struct RewardedGameView: View {
             .accessibilityLabel("Close")
         } else {
             // Still earning: a small display-only status — no close affordance yet.
-            Text("🎮 Play to earn: \(secondsLeft)s")
+            Text("Play to earn: \(secondsLeft)s")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white)
                 .padding(.vertical, 5)
