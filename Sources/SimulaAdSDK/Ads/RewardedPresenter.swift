@@ -128,7 +128,7 @@ private struct RewardedGameView: View {
                 .animation(.default, value: rewardEarned)
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
-            AdInfoReportOverlay(adId: adId, apiKey: apiKey, advertiser: nil)
+            AdInfoReportOverlay(adId: adId, apiKey: apiKey)
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a

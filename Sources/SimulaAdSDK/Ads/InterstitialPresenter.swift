@@ -192,7 +192,6 @@ private struct CreativeInterstitialView: View {
             AdInfoReportOverlay(
                 adId: response.adId,
                 apiKey: apiKey,
-                advertiser: response.creative?.bundleUrl,
                 closeAtBottomLeft: closeConfig.position == .bottomLeft
             )
         }
