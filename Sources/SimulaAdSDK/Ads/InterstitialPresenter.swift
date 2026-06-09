@@ -117,7 +117,8 @@ private struct CreativeInterstitialView: View {
     /// from where it was instead of restarting it. `nil` until first set.
     @State private var gateStartedAt: TimeInterval?
 
-    // Mid-ad store prompt (`store_prompt`) — a tappable badge revealed at the 50% playable mark.
+    // Mid-ad store prompt (`store_prompt`) — a tappable badge shown from `closeTime / 2` until the
+    // real close button appears.
     @State private var storePromptVisible = false
     @State private var storePromptScheduled = false
     @State private var storePromptTask: Task<Void, Never>?
@@ -129,9 +130,6 @@ private struct CreativeInterstitialView: View {
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
-    /// Fallback playable length used to time the store prompt's 50% trigger when no playable
-    /// `midpoint` JS-bridge event arrives.
-    private let nominalPlayableDuration: TimeInterval = 30
 
     init(
         apiKey: String,
@@ -181,9 +179,10 @@ private struct CreativeInterstitialView: View {
                 onClose: { handleClose() }
             )
 
-            // Mid-ad store prompt — independent of the close button and SKOverlay. Rendered at the
-            // server-resolved position (never recomputed) once the 50% playable mark is reached.
-            if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible {
+            // Mid-ad store prompt — independent of the close button and SKOverlay. Shown at the
+            // server-resolved position (never recomputed) during the [closeTime/2, closeTime)
+            // window; `!closeEnabled` removes it the instant the real close button appears.
+            if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
             }
 
@@ -227,7 +226,6 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onMessageReceived: { handleBridgeMessage($0) },
             onAdClick: { handleHtmlClick() }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -245,16 +243,6 @@ private struct CreativeInterstitialView: View {
     private func handleHtmlClick() {
         onClick() // CLICKED
         presentSKOverlayOnClickIfNeeded()
-    }
-
-    /// Handles `postMessage` traffic from the creative's JS bridge. A true playable posts a
-    /// `midpoint` signal at the 50% mark; we use it to reveal the store prompt directly (the
-    /// wall-clock timer in `startStorePromptTrigger` is the fallback when no such event arrives).
-    private func handleBridgeMessage(_ message: String) {
-        guard response.adBehavior?.storePrompt?.enabled == true else { return }
-        if message.localizedCaseInsensitiveContains("midpoint") {
-            showStorePrompt()
-        }
     }
 
     private func handleClose() {
@@ -312,22 +300,24 @@ private struct CreativeInterstitialView: View {
 
     // MARK: Store prompt (mid-ad)
 
-    /// Schedules the mid-ad store prompt's 50% trigger. A true playable posts a `midpoint`
-    /// JS-bridge event and reveals the prompt via `handleBridgeMessage`; this wall-clock timer at
-    /// 50% of the nominal playable duration is the fallback when no such signal arrives.
+    /// Schedules the mid-ad store prompt at the halfway point to the close button (`closeTime / 2`,
+    /// where closeTime is the server-driven close delay). The badge is removed once the real close
+    /// button appears (the `!closeEnabled` render guard). When the close is immediately available
+    /// (no gate) there is no pre-close window, so it never schedules.
     private func startStorePromptTrigger() {
         guard let prompt = response.adBehavior?.storePrompt, prompt.enabled,
               !storePromptScheduled, !storePromptVisible else { return }
+        let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
+        guard closeDelay > 0 else { return }
         storePromptScheduled = true
         storePromptTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(nominalPlayableDuration / 2 * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(Double(closeDelay) / 2 * 1_000_000_000))
             if Task.isCancelled { return }
             showStorePrompt()
         }
     }
 
-    /// Reveals the store prompt. Idempotent — safe to call from a JS-bridge `midpoint` event
-    /// (true playables) or from the timer fallback.
+    /// Reveals the store prompt. Idempotent — driven by the `closeTime / 2` timer.
     private func showStorePrompt() {
         guard !storePromptVisible else { return }
         withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
@@ -566,15 +556,15 @@ private struct StorePromptBadge: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
 
+    // Sized to match the rewarded minigame's "Play to earn" status pill (RewardedPresenter).
     private var badge: some View {
         Button(action: onTap) {
             Text(label)
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white)
-                .padding(.horizontal, 14)
-                .frame(height: 40)
-                .background(Capsule().fill(Color.black.opacity(0.65)))
-                .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                .padding(.vertical, 5)
+                .padding(.horizontal, 10)
+                .background(Capsule().fill(Color.black.opacity(0.6)))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Install")

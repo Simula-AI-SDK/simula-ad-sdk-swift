@@ -425,8 +425,15 @@ public final class SimulaInterstitialAd {
             position: ClosePosition.from(closePosition),
             progressBarColor: validatedHexColor(progressBarColor)
         )
-        // Mirror the server's collision rule: render the store-prompt badge opposite the close button.
-        let storePromptPosition: ClosePosition = close.position == .topRight ? .topLeft : .topRight
+        // Mirror the server's collision rule: place the store-prompt badge opposite the close button.
+        // top_right → top_left; top_left → top_right; bottom_left → top_left (the default position,
+        // since a bottom-left close doesn't occupy either top corner).
+        let storePromptPosition: ClosePosition
+        switch close.position {
+        case .topRight: storePromptPosition = .topLeft
+        case .topLeft: storePromptPosition = .topRight
+        case .bottomLeft: storePromptPosition = .topLeft
+        }
         let behavior = AdBehavior(
             close: close,
             storePrompt: storePrompt ? StorePrompt(enabled: true, position: storePromptPosition, platform: .ios) : nil,
