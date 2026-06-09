@@ -101,6 +101,12 @@ public final class SimulaRewardedAd {
     private var sessionId: String?
     private let api = SimulaAPI()
 
+    // Monotonic stage markers for telemetry latencies (0 = not yet started).
+    private var loadStartNanos: UInt64 = 0
+    private var showStartNanos: UInt64 = 0
+    // nonisolated so the (off-main, @Sendable) reward-verification callback can read it.
+    private nonisolated static let adFormat = "rewarded"
+
     #if os(iOS)
     private var presenter: RewardedPresenter?
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
@@ -134,6 +140,7 @@ public final class SimulaRewardedAd {
         }
 
         state = .loading
+        loadStartNanos = DispatchTime.now().uptimeNanoseconds
         loadTask = Task { [weak self] in
             guard let self else { return }
 
@@ -167,11 +174,17 @@ public final class SimulaRewardedAd {
                 // critical path.
                 WebViewPool.shared.prewarm()
                 #endif
+                Telemetry.shared.recordLifecycle(
+                    stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.adId, serveId: response.serveId, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
+                )
                 self.state = .ready(response)
                 self.delegate?.rewardedDidLoad(self)
             } catch let apiError as SimulaAPIError {
+                Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
                 self.failLoad(.network(apiError))
             } catch {
+                Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
                 self.failLoad(.network(.invalidResponse))
             }
         }
@@ -203,6 +216,7 @@ public final class SimulaRewardedAd {
         }
 
         let presenter = RewardedPresenter()
+        showStartNanos = DispatchTime.now().uptimeNanoseconds
         let didPresent = presenter.present(
             adId: response.adId,
             apiKey: provider.apiKey,
@@ -213,6 +227,7 @@ public final class SimulaRewardedAd {
                 self.presenter = nil
                 self.state = .idle
                 self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
+                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.adId, serveId: response.serveId)
                 self.delegate?.rewardedDidClose(self)
                 // Show a fallback ad on close (parity with the minigame post-game flow).
                 self.presentFallbackAd(adId: response.adId)
@@ -231,6 +246,10 @@ public final class SimulaRewardedAd {
 
         state = .showing(response)
         self.presenter = presenter
+        Telemetry.shared.recordLifecycle(
+            stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: response.adId, serveId: response.serveId, durationMs: msSince(showStartNanos), errorCode: nil
+        )
         delegate?.rewardedDidDisplay(self)
         // Fire the impression once, only after the present succeeded.
         if !response.adId.isEmpty {
@@ -252,13 +271,31 @@ public final class SimulaRewardedAd {
     private func handleClose(response: RewardedInitResponse, earned: Bool, elapsedPlayTime: Double) {
         guard earned, let sessionId = self.sessionId, !sessionId.isEmpty else { return }
 
+        Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.adId, serveId: response.serveId)
         delegate?.rewardedDidEarnReward(self)
+
+        // Captured as values so the verification callback (off-main, possibly after retries)
+        // records telemetry without touching `self`. End-to-end latency includes queue backoff.
+        let adUnitId = self.adUnitId
+        let adId = response.adId
+        let serveId = response.serveId
+        let verifyStartNanos = DispatchTime.now().uptimeNanoseconds
 
         RewardVerificationManager.shared.queueVerification(
             serveId: response.serveId,
             sessionId: sessionId,
             elapsedPlayTime: elapsedPlayTime
         ) { [weak self] result in
+            let verifyMs = Int((DispatchTime.now().uptimeNanoseconds &- verifyStartNanos) / 1_000_000)
+            switch result {
+            case .success:
+                Telemetry.shared.recordOperation(name: "reward_verification", durationMs: verifyMs, success: true)
+                Telemetry.shared.recordLifecycle(stage: "reward_verified", adFormat: SimulaRewardedAd.adFormat, adUnitId: adUnitId, adId: adId, serveId: serveId, durationMs: verifyMs, errorCode: nil)
+            case .failure(let error):
+                Telemetry.shared.recordOperation(name: "reward_verification", durationMs: verifyMs, success: false)
+                Telemetry.shared.recordLifecycle(stage: "reward_verification_failed", adFormat: SimulaRewardedAd.adFormat, adUnitId: adUnitId, adId: adId, serveId: serveId, durationMs: verifyMs, errorCode: "verify_failed")
+                Telemetry.shared.recordError(signature: "rewarded:verify", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "RewardVerificationManager.queueVerification")
+            }
             Task { @MainActor in
                 guard let self else { return }
                 switch result {
@@ -275,11 +312,22 @@ public final class SimulaRewardedAd {
 
     private func failLoad(_ error: SimulaAdError) {
         state = .idle
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: error.telemetryCode
+        )
         delegate?.rewardedDidFailToLoad(self, error: error)
     }
 
     private func failDisplay(_ error: SimulaAdError) {
+        Telemetry.shared.recordLifecycle(stage: "show_fail", adFormat: Self.adFormat, adUnitId: adUnitId, errorCode: error.telemetryCode)
         delegate?.rewardedDidFailToDisplay(self, error: error)
+    }
+
+    /// Monotonic ms since the given marker (nil if not started).
+    private func msSince(_ startNanos: UInt64) -> Int? {
+        guard startNanos != 0 else { return nil }
+        return Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
     }
 
     // MARK: - Fallback ad (post-close)

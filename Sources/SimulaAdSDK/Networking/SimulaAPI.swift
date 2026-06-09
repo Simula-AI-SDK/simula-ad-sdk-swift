@@ -38,6 +38,16 @@ public enum SimulaAPIError: LocalizedError, Sendable {
 /// Response from POST /session/create
 struct CreateSessionResponse: Decodable {
     let sessionId: String?
+    // Optional server-side telemetry directive: a runtime kill-switch + perf sampling rate,
+    // letting telemetry volume be dialed without an SDK release. Absent → SDK defaults apply.
+    let telemetryEnabled: Bool?
+    let telemetrySampleRate: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId
+        case telemetryEnabled = "telemetry_enabled"
+        case telemetrySampleRate = "telemetry_sample_rate"
+    }
 }
 
 /// Device capability snapshot reported on ad requests (the "capability handshake"). The backend
@@ -574,7 +584,13 @@ public final class SimulaAPI: @unchecked Sendable {
         config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
         config.timeoutIntervalForResource = 20  // overall ceiling for one resource
         config.waitsForConnectivity = false     // fail fast when offline
-        return URLSession(configuration: config)
+        // Session-wide task delegate harvests URLSessionTaskMetrics into telemetry for every
+        // request (skipping the telemetry endpoint itself). Async `data(for:)` still works.
+        return URLSession(
+            configuration: config,
+            delegate: TelemetryURLSessionDelegate.shared,
+            delegateQueue: nil
+        )
     }()
 
     /// Cached ISO-8601 formatter. `ISO8601DateFormatter` construction is costly,
@@ -650,6 +666,13 @@ public final class SimulaAPI: @unchecked Sendable {
         }
 
         let json = try JSONDecoder().decode(CreateSessionResponse.self, from: data)
+        // Honor a server-side telemetry directive (kill-switch / sampling) if present.
+        if json.telemetryEnabled != nil || json.telemetrySampleRate != nil {
+            Telemetry.shared.applyServerConfig(
+                enabled: json.telemetryEnabled ?? true,
+                sampleRate: json.telemetrySampleRate ?? 1.0
+            )
+        }
         if let sid = json.sessionId, !sid.isEmpty {
             return sid
         }
@@ -1019,5 +1042,27 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         _ = try? await session.data(for: request)
+    }
+
+    // MARK: - Telemetry
+
+    /// Delivers a telemetry batch (`POST /v1/telemetry/events`), reusing the auth + consent
+    /// headers so it inherits the same privacy posture as tracking. Returns the HTTP status
+    /// (or -1 on a connectivity failure) for the caller to map to accept/drop/retry. The
+    /// `TelemetryURLSessionDelegate` skips this path, so the request is never self-recorded.
+    public func postTelemetry(apiKey: String, body: Data) async -> Int {
+        guard let url = URL(string: "\(API_BASE_URL)/v1/telemetry/events") else { return -1 }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        request.httpBody = body
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode ?? -1
+        } catch {
+            return -1
+        }
     }
 }
