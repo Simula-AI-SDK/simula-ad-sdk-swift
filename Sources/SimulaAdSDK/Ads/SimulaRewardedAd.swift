@@ -103,6 +103,9 @@ public final class SimulaRewardedAd {
 
     #if os(iOS)
     private var presenter: RewardedPresenter?
+    /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
+    /// post-game ad flow).
+    private var fallbackPresenter: FallbackAdPresenter?
     #endif
 
     // MARK: - Init
@@ -144,7 +147,7 @@ public final class SimulaRewardedAd {
 
             do {
                 let threshold = self.minPlayThreshold > 0 ? Int(self.minPlayThreshold) : nil
-                let response = try await self.api.initRewarded(
+                let response = try await self.api.loadRewarded(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
                     minPlayThreshold: threshold,
@@ -201,6 +204,8 @@ public final class SimulaRewardedAd {
 
         let presenter = RewardedPresenter()
         let didPresent = presenter.present(
+            adId: response.adId,
+            apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
             onClose: { [weak self] earned, elapsedPlayTime in
@@ -209,6 +214,8 @@ public final class SimulaRewardedAd {
                 self.state = .idle
                 self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                 self.delegate?.rewardedDidClose(self)
+                // Show a fallback ad on close (parity with the minigame post-game flow).
+                self.presentFallbackAd(adId: response.adId)
                 // Preload the next ad after close (parity with the interstitial).
                 self.load()
             }
@@ -273,5 +280,26 @@ public final class SimulaRewardedAd {
 
     private func failDisplay(_ error: SimulaAdError) {
         delegate?.rewardedDidFailToDisplay(self, error: error)
+    }
+
+    // MARK: - Fallback ad (post-close)
+
+    /// After the minigame closes, fetch a fallback ad for `adId` and — when one is returned —
+    /// present it full-screen, mirroring the minigame menu's post-game ad flow. Best-effort: a
+    /// missing id, network error, or empty/no-fill response simply shows nothing.
+    private func presentFallbackAd(adId: String) {
+        #if os(iOS)
+        guard !adId.isEmpty else { return }
+        let api = self.api
+        Task { [weak self] in
+            let url = try? await api.fetchAdForMinigame(aid: adId)
+            guard let self, let url, !url.isEmpty else { return }
+            let presenter = FallbackAdPresenter()
+            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+                self?.fallbackPresenter = nil
+            }
+            if didPresent { self.fallbackPresenter = presenter }
+        }
+        #endif
     }
 }

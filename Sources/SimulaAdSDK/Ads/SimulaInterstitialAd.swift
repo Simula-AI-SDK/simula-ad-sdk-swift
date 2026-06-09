@@ -137,6 +137,9 @@ public final class SimulaInterstitialAd {
 
     #if os(iOS)
     private var presenter: InterstitialPresenter?
+    /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
+    /// post-game ad flow).
+    private var fallbackPresenter: FallbackAdPresenter?
     #endif
 
     // MARK: - Init
@@ -247,6 +250,8 @@ public final class SimulaInterstitialAd {
                 self.presenter = nil
                 self.state = .idle
                 self.delegate?.interstitialDidClose(self)
+                // Show a fallback ad on close (parity with the minigame post-game flow).
+                self.presentFallbackAd(adId: response.adId)
                 // Preload the next ad after close.
                 self.load()
             }
@@ -390,5 +395,26 @@ public final class SimulaInterstitialAd {
 
     private func failDisplay(_ error: SimulaAdError) {
         delegate?.interstitialDidFailToDisplay(self, error: error)
+    }
+
+    // MARK: - Fallback ad (post-close)
+
+    /// After the creative closes, fetch a fallback ad for `adId` and — when one is returned —
+    /// present it full-screen, mirroring the minigame's post-game ad flow. Best-effort: a missing
+    /// id, network error, or empty/no-fill response simply shows nothing.
+    private func presentFallbackAd(adId: String) {
+        #if os(iOS)
+        guard !adId.isEmpty else { return }
+        let api = self.api
+        Task { [weak self] in
+            let url = try? await api.fetchAdForMinigame(aid: adId)
+            guard let self, let url, !url.isEmpty else { return }
+            let presenter = FallbackAdPresenter()
+            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+                self?.fallbackPresenter = nil
+            }
+            if didPresent { self.fallbackPresenter = presenter }
+        }
+        #endif
     }
 }

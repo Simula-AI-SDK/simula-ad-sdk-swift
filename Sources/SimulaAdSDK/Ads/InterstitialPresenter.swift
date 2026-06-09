@@ -39,6 +39,7 @@ final class InterstitialPresenter {
         self.onClose = onClose
 
         let root = CreativeInterstitialView(
+            apiKey: apiKey,
             response: response,
             onClick: onClick,
             onRequestDismiss: { [weak self] in self?.dismiss() }
@@ -95,6 +96,7 @@ final class InterstitialPresenter {
 /// store-prompt badge (`store_prompt`) and an SKOverlay install banner (`skoverlay`) are
 /// layered on per their config.
 private struct CreativeInterstitialView: View {
+    let apiKey: String
     let response: AdLoadResponse
     let onClick: () -> Void
     let onRequestDismiss: () -> Void
@@ -132,10 +134,12 @@ private struct CreativeInterstitialView: View {
     private let nominalPlayableDuration: TimeInterval = 30
 
     init(
+        apiKey: String,
         response: AdLoadResponse,
         onClick: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
+        self.apiKey = apiKey
         self.response = response
         self.onClick = onClick
         self.onRequestDismiss = onRequestDismiss
@@ -150,6 +154,10 @@ private struct CreativeInterstitialView: View {
     /// from the creative's declared ad-unit type.
     private var isRewardCopy: Bool { response.adUnitType == .rewarded }
 
+    /// The close config to render: the server's `ad_behavior.close` when present, else a default
+    /// (compact, always-available top-right X) so ads without `ad_behavior` still get a small close.
+    private var closeConfig: CloseBehavior { response.adBehavior?.close ?? CloseBehavior() }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -159,28 +167,33 @@ private struct CreativeInterstitialView: View {
                 htmlCreativeView(html)
             }
 
-            // Close button — driven by `ad_behavior` when present; otherwise today's literal
-            // always-available top-right button (an absent ad_behavior renders exactly as before).
-            if let close = response.adBehavior?.close {
-                CloseButtonView(
-                    treatment: close.treatment,
-                    position: close.position,
-                    progressBarColor: close.progressBarColor,
-                    isRewardCopy: isRewardCopy,
-                    enabled: closeEnabled,
-                    remaining: closeRemaining,
-                    progress: closeProgress,
-                    onClose: { handleClose() }
-                )
-            } else {
-                legacyCloseButton
-            }
+            // Close button — always shown with the compact AppLovin-style chrome. Driven by
+            // `ad_behavior.close` when present; otherwise a default config (top-right, always
+            // available) so ads with no `ad_behavior` still get the small close, not a big one.
+            CloseButtonView(
+                treatment: closeConfig.treatment,
+                position: closeConfig.position,
+                progressBarColor: closeConfig.progressBarColor,
+                isRewardCopy: isRewardCopy,
+                enabled: closeEnabled,
+                remaining: closeRemaining,
+                progress: closeProgress,
+                onClose: { handleClose() }
+            )
 
             // Mid-ad store prompt — independent of the close button and SKOverlay. Rendered at the
             // server-resolved position (never recomputed) once the 50% playable mark is reached.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible {
                 StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
             }
+
+            // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
+            // report sheet overlays the creative + close button when open.
+            AdInfoReportOverlay(
+                adId: response.adId,
+                apiKey: apiKey,
+                closeAtBottomLeft: closeConfig.position == .bottomLeft
+            )
         }
         .opacity(visible ? 1 : 0)
         // Once a dismiss starts (`visible == false`) the surface is still on screen during the
@@ -208,30 +221,6 @@ private struct CreativeInterstitialView: View {
         }
     }
 
-    // MARK: Close button (legacy / no ad_behavior)
-
-    /// Today's literal top-right close button, rendered only when the payload omits
-    /// `ad_behavior`. Always available — kept byte-for-byte so non-experiment traffic is unchanged.
-    private var legacyCloseButton: some View {
-        VStack {
-            HStack {
-                Spacer()
-                Button(action: { handleClose() }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(Color(hex: "#1F2937"))
-                        .frame(width: 44, height: 44)
-                        .background(Circle().fill(Color.white.opacity(0.9)))
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 16)
-                .padding(.trailing, 16)
-                .accessibilityLabel("Close")
-            }
-            Spacer()
-        }
-    }
-
     // MARK: HTML creative
 
     @ViewBuilder
@@ -243,7 +232,7 @@ private struct CreativeInterstitialView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
-        .ignoresSafeArea()
+        // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
     }
 
     // MARK: Actions
@@ -432,11 +421,11 @@ private struct CloseButtonView: View {
     let progress: Double
     let onClose: () -> Void
 
-    // Visible close affordance sized to match AdMob / AppLovin (a compact ~28–30pt circle), while
-    // the tappable frame stays at the 44pt HIG minimum (see `minTouchTarget`). The 44pt circle used
-    // before was the touch-target minimum mistakenly used as the visual size.
-    private let glyphSize: CGFloat = 16
-    private let circleSize: CGFloat = 30
+    // Visible close affordance sized to match AppLovin (a compact ~22pt circle); the tappable frame
+    // stays at the 44pt HIG minimum (see `minTouchTarget`), close to IAB MRAID's 50×50dp close
+    // region. The visible graphic and the touch target are deliberately decoupled.
+    private let glyphSize: CGFloat = 10
+    private let circleSize: CGFloat = 16
     private let minTouchTarget: CGFloat = 44
 
     /// Tappable footprint, used identically by the in-delay indicator and the unlocked button so the
@@ -470,12 +459,16 @@ private struct CloseButtonView: View {
             // A tight 8pt inset keeps the button close to the corner (AdMob / AppLovin-style).
             buttonOrIndicator
                 .padding(8)
+                // When pinned bottom-left, nudge right just enough to clear the always-present info
+                // "i" that sits tight in that corner (the "i" stays closest to the edge), so the two
+                // sit snug side by side. (Tuned for the 16pt circles inside the 44pt touch frame.)
+                .padding(.leading, position == .bottomLeft ? 4 : 0)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
         }
     }
 
-    /// The full-width progress bar pinned to the very top edge of the screen for the `progress_bar`
-    /// treatment — spans edge-to-edge inside the top nav / status-bar region.
+    /// The full-width progress bar for the `progress_bar` treatment — pinned just below the top
+    /// safe-area inset (so it clears the notch / status-bar region) and spanning edge-to-edge.
     private var progressBar: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -486,7 +479,6 @@ private struct CloseButtonView: View {
         }
         .frame(height: 4)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .ignoresSafeArea(edges: .top)
     }
 
     @ViewBuilder
@@ -537,13 +529,14 @@ private struct CloseButtonView: View {
     }
 
     /// The text pill used by the `rewardOrCloseLabel` treatment (counting down, then "Close").
+    /// Compact, to match the small close chrome of the other treatments.
     private func labelPill(text: String) -> some View {
         Text(text)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundColor(Color(hex: "#1F2937"))
-            .padding(.horizontal, 14)
-            .frame(height: minTouchTarget)
-            .background(Capsule().fill(Color.white.opacity(0.9)))
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .frame(height: 24)
+            .background(Capsule().fill(Color.black.opacity(0.5)))
     }
 }
 

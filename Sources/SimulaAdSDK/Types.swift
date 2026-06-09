@@ -390,12 +390,6 @@ public enum CloseTreatment: Sendable, Equatable {
         default: return .hidden
         }
     }
-
-    /// `progress_bar` is a full-width top-edge bar, so it's the only treatment that can't render at
-    /// `bottom_left`; `hidden` / `reward_or_close_label` / `countdown_circle` allow all three corners.
-    var allowsBottomLeft: Bool {
-        self != .progressBar
-    }
 }
 
 /// Where the close button sits. v2 narrows this to three corners — `bottom_right` is excluded
@@ -514,9 +508,9 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
     ) {
         self.delaySeconds = delaySeconds
         self.treatment = treatment
-        // Snap an out-of-spec position (bottom_left under an edge-anchored treatment) to a safe
-        // default so the SDK renders the field exactly as constrained, per "snap to safe default".
-        self.position = (position == .bottomLeft && !treatment.allowsBottomLeft) ? .topRight : position
+        // Every treatment honors the configured corner. (`progress_bar` renders its bar at the top
+        // edge regardless; only its resolved close ✕ follows `position`.)
+        self.position = position
         self.progressBarColor = progressBarColor
     }
 
@@ -683,5 +677,29 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
+    }
+}
+
+/// User-selectable reasons for the in-ad report flow (the "i" → report sheet). `rawValue` is the wire
+/// `flag` sent to `POST /impressions/{adId}/report`; `label` is the user-facing copy.
+public enum AdReportReason: String, CaseIterable, Sendable {
+    case adNotShowing = "ad_not_showing"
+    case adInappropriate = "ad_inappropriate"
+    case adLooksWrong = "ad_looks_wrong"
+    case dislike
+    case other
+
+    /// The wire value posted as `flag`.
+    public var flag: String { rawValue }
+
+    /// User-facing menu copy.
+    public var label: String {
+        switch self {
+        case .adNotShowing: return "Ad isn't showing properly"
+        case .adInappropriate: return "Inappropriate or offensive"
+        case .adLooksWrong: return "Ad looks wrong or misleading"
+        case .dislike: return "I don't want to see this"
+        case .other: return "Other"
+        }
     }
 }

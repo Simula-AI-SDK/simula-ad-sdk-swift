@@ -19,6 +19,8 @@ public struct AdOverlayView: View {
     var playableHeightDp: CGFloat?
     /// Border color for bottom sheet drag handle area.
     var playableBorderColor: String = "#262626"
+    /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
+    var adId: String = ""
 
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
@@ -86,27 +88,32 @@ public struct AdOverlayView: View {
                             HStack {
                                 Spacer()
                                 if adCountdown <= 0 {
-                                    // Close button (matching React Native's CloseButton style)
+                                    // Compact close button, matching the interstitial/rewarded default
+                                    // (a ~16pt dark-translucent circle with a white X). Visible glyph
+                                    // stays small; the hit area is a full 44pt touch target.
                                     Button(action: onClose) {
-                                        Text("\u{00D7}")
-                                            .font(.system(size: 18, weight: .regular))
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.white)
-                                            .frame(width: 32, height: 32)
+                                            .frame(width: 16, height: 16)
                                             .background(
                                                 Circle()
-                                                    .fill(Color.black.opacity(0.6))
+                                                    .fill(Color.black.opacity(0.5))
                                             )
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
                                     }
                                     .buttonStyle(CloseButtonStyle())
-                                    .padding(.top, 16)
-                                    .padding(.trailing, 16)
+                                    .padding(.top, 8)
+                                    .padding(.trailing, 8)
                                     .accessibilityLabel("Close ad")
                                 } else {
-                                    // Countdown ring
+                                    // Countdown ring, sized to the same compact footprint (16pt circle
+                                    // centered in the same 44pt frame so nothing jumps when it unlocks).
                                     ZStack {
                                         Circle()
                                             .fill(Color.black.opacity(0.4))
-                                            .frame(width: 32, height: 32)
+                                            .frame(width: 16, height: 16)
 
                                         Circle()
                                             .trim(from: 1 - ringProgress, to: 1)
@@ -114,16 +121,16 @@ public struct AdOverlayView: View {
                                                 Color.white,
                                                 style: StrokeStyle(lineWidth: 2, lineCap: .round)
                                             )
-                                            .frame(width: 26, height: 26)
+                                            .frame(width: 12, height: 12)
                                             .rotationEffect(.degrees(-90))
 
                                         Text("\(adCountdown)")
-                                            .font(.system(size: 14, weight: .bold))
+                                            .font(.system(size: 9, weight: .bold))
                                             .foregroundColor(.white)
                                     }
-                                    .frame(width: 32, height: 32)
-                                    .padding(.top, 16)
-                                    .padding(.trailing, 16)
+                                    .frame(width: 44, height: 44)
+                                    .padding(.top, 8)
+                                    .padding(.trailing, 8)
                                 }
                             }
                             Spacer()
@@ -139,6 +146,15 @@ public struct AdOverlayView: View {
                 .offset(y: isBottomSheet ? geo.size.height - (playableHeightDp ?? geo.size.height) : 0)
             }
             .ignoresSafeArea()
+
+            // Persistent ad-info "i" + report sheet (required disclosure on the fallback / post-game ad).
+            // This overlay ignores the safe area, so use a larger corner inset to keep the "i" clear
+            // of the screen's rounded bottom-left corner (where it would otherwise be clipped).
+            #if os(iOS)
+            if !adId.isEmpty {
+                AdInfoReportOverlay(adId: adId, cornerInset: 18)
+            }
+            #endif
         }
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)

@@ -172,7 +172,8 @@ public struct MiniGameMenu: View {
                     iframeUrl: adUrl,
                     onClose: { handleAdIframeClose() },
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
-                    playableBorderColor: theme.resolvedPlayableBorderColor
+                    playableBorderColor: theme.resolvedPlayableBorderColor,
+                    adId: currentAdId ?? ""
                 )
                 .transition(.opacity)
                 .zIndex(3)
