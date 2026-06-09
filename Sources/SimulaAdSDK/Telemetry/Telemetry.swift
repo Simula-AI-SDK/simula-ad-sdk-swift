@@ -40,6 +40,9 @@ final class Telemetry: @unchecked Sendable {
             hostAppId: Bundle.main.bundleIdentifier ?? "unknown",
             devMode: devMode
         )
+        // In dev mode, mirror every (redacted) event to the console for local verification.
+        var consoleLog: (@Sendable (String) -> Void)?
+        if devMode { consoleLog = { line in print("[SimulaTelemetry] \(line)") } }
         let mgr = TelemetryManager(
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
@@ -47,7 +50,8 @@ final class Telemetry: @unchecked Sendable {
             // Re-gate on every flush: ppid only with consent (& not under COPPA); the advertising
             // id is already nil'd by the snapshot when not collectible.
             primaryUserIdProvider: { SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID ? primaryUserID : nil },
-            advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId }
+            advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
+            debugLog: consoleLog
         )
         lock.lock(); manager = mgr; lock.unlock()
         mgr.start()

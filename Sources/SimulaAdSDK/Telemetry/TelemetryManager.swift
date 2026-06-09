@@ -34,6 +34,8 @@ final class TelemetryManager: @unchecked Sendable {
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
+    // Dev-only sink: when set (devMode), each recorded event is logged here (already redacted).
+    private let debugLog: (@Sendable (String) -> Void)?
     private let flushThreshold: Int
     private let maxBuffer: Int
     private let maxErrorSignatures: Int
@@ -63,6 +65,7 @@ final class TelemetryManager: @unchecked Sendable {
         now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 * 1000 },
         random: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) },
         backoff: @escaping @Sendable (Int) -> TimeInterval = { telemetryBackoff(retryCount: $0) },
+        debugLog: (@Sendable (String) -> Void)? = nil,
         flushThreshold: Int = 20,
         maxBuffer: Int = 200,
         maxErrorSignatures: Int = 50,
@@ -76,6 +79,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.now = now
         self.random = random
         self.backoff = backoff
+        self.debugLog = debugLog
         self.flushThreshold = flushThreshold
         self.maxBuffer = maxBuffer
         self.maxErrorSignatures = maxErrorSignatures
@@ -168,6 +172,9 @@ final class TelemetryManager: @unchecked Sendable {
     /// signatures aggregate with a count instead of flooding the buffer. `message` is truncated;
     /// never pass raw URLs/tokens/PII.
     func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil) {
+        // Sanitize at the source so secrets are stripped from BOTH the dev log and the payload
+        // sent to the backend (exception text can embed URLs/tokens).
+        let redacted = redact(message)
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
         if var existing = errorAgg[signature] {
@@ -176,15 +183,17 @@ final class TelemetryManager: @unchecked Sendable {
         } else if errorAgg.count < maxErrorSignatures {
             var e = newEvent(type: TelemetryType.error, name: signature)
             e.errorCode = errorCode
-            e.message = message.map { String($0.prefix(maxMessageLen)) }
+            e.message = redacted
             e.breadcrumb = breadcrumb
             e.count = 1
             errorAgg[signature] = e
         } else {
             droppedCount += 1
         }
+        let logEvent = errorAgg[signature]
         store.save(snapshotLocked()) // errors are durable immediately
         lock.unlock()
+        if let logEvent { debugLog?(formatForLog(logEvent)) }
         Task { [weak self] in await self?.flush() } // eager — an error may precede a crash/kill
     }
 
@@ -204,6 +213,37 @@ final class TelemetryManager: @unchecked Sendable {
         TelemetryEvent(type: type, name: name, eventId: UUID().uuidString, timestamp: now())
     }
 
+    /// Compact one-line view for the dev console. Carries only non-sensitive event fields —
+    /// never the envelope's apiKey/ppid/advertising-id — and the message is already redacted.
+    private func formatForLog(_ e: TelemetryEvent) -> String {
+        var s = "\(e.type) \(e.name)"
+        if let v = e.statusCode { s += " status=\(v)" }
+        if let v = e.durationMs { s += " dur=\(v)ms" }
+        if let v = e.failureClass { s += " fail=\(v)" }
+        if let v = e.requestBytes { s += " reqB=\(v)" }
+        if let v = e.responseBytes { s += " respB=\(v)" }
+        if let v = e.success { s += " ok=\(v)" }
+        if let v = e.cacheHit { s += " cache=\(v)" }
+        if let v = e.adFormat { s += " fmt=\(v)" }
+        if let v = e.adUnitId { s += " unit=\(v)" }
+        if let v = e.adId { s += " ad=\(v)" }
+        if let v = e.serveId { s += " serve=\(v)" }
+        if let v = e.errorCode { s += " code=\(v)" }
+        if let v = e.count { s += " count=\(v)" }
+        if let v = e.message { s += " msg=\(v)" }
+        return s
+    }
+
+    /// Strips likely secrets from free-text (URL query strings, bearer tokens, key/secret
+    /// assignments) and caps length. Applied to error messages before they're stored or logged.
+    private func redact(_ message: String?) -> String? {
+        guard var r = message else { return nil }
+        r = r.replacingOccurrences(of: "\\?\\S*", with: "?…", options: .regularExpression)
+        r = r.replacingOccurrences(of: "(?i)bearer\\s+\\S+", with: "Bearer ***", options: .regularExpression)
+        r = r.replacingOccurrences(of: "(?i)(api[_-]?key|token|secret|password)([=:])\\S+", with: "$1$2***", options: .regularExpression)
+        return String(r.prefix(maxMessageLen))
+    }
+
     private func enqueuePerf(_ event: TelemetryEvent) {
         lock.lock()
         guard isEnabled, perfSampledIn else { lock.unlock(); return }
@@ -211,6 +251,7 @@ final class TelemetryManager: @unchecked Sendable {
         while buffer.count > maxBuffer { buffer.removeFirst(); droppedCount += 1 }
         let shouldFlush = buffer.count >= flushThreshold
         lock.unlock()
+        debugLog?(formatForLog(event))
         if shouldFlush { Task { [weak self] in await self?.flush() } } else { scheduleTimedFlush() }
     }
 

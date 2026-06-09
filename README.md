@@ -297,22 +297,6 @@ simula.updateConsent(tcString: newTC, gppString: newGPP)
 
 For the full App Store privacy guide, see [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md).
 
-## Telemetry
-
-The SDK reports **handled errors** and **performance metrics** (request timing, ad-load /
-render latencies, reward-verification timing, asset & WebView timings) to Simula for
-fleet-level diagnostics. It's batched, persisted across launches, and **consent-gated** — PII
-follows the same rules as ad tracking and is suppressed under COPPA (the privacy manifest
-declares Performance Data + Crash Data, not identity-linked, not tracking). Disable it
-entirely:
-
-```swift
-SimulaAds.initialize(apiKey: "YOUR_KEY", telemetryEnabled: false)
-// or, declarative: SimulaProviderView(apiKey: "YOUR_KEY", telemetryEnabled: false) { … }
-```
-
-Wire format + backend endpoint contract: [docs/TELEMETRY.md](docs/TELEMETRY.md).
-
 ## Documentation
 
 For complete documentation including all props, theming options, and advanced usage, visit:

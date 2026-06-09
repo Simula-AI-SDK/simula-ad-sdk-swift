@@ -61,7 +61,8 @@ final class TelemetryManagerTests: XCTestCase {
         sampleRate: Double = 1.0,
         random: @escaping @Sendable () -> Double = { 0.0 },
         ppid: String? = nil,
-        gaid: String? = nil
+        gaid: String? = nil,
+        debugLog: (@Sendable (String) -> Void)? = nil
     ) -> TelemetryManager {
         TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -74,9 +75,18 @@ final class TelemetryManagerTests: XCTestCase {
             now: { 1_000 },
             random: random,
             backoff: { _ in 0 }, // instant retries — keep tests fast
+            debugLog: debugLog,
             flushThreshold: 20,
             flushInterval: 0.05 // sub-threshold perf flushes promptly via the timer
         )
+    }
+
+    /// Thread-safe line collector for the debug-log tests.
+    private final class LogSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return lines }
     }
 
     private func allEvents(_ s: [TelemetryEnvelope]) -> [TelemetryEvent] { s.flatMap { $0.events } }
@@ -201,6 +211,38 @@ final class TelemetryManagerTests: XCTestCase {
         let events = allEvents(sender.batches)
         XCTAssertFalse(events.contains { $0.type == TelemetryType.network }, "perf suppressed by sampling")
         XCTAssertTrue(events.contains { $0.type == TelemetryType.error }, "errors always sent")
+    }
+
+    // MARK: - Dev-mode console log + redaction
+
+    func testDebugLogReceivesALinePerRecordedEvent() async {
+        let sink = LogSink()
+        let mgr = build(store: FakeStore(), sender: FakeSender(), debugLog: { sink.append($0) })
+
+        mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)
+        mgr.recordError(signature: "api:x", errorCode: "x", message: "boom")
+        await waitUntil { sink.all.count >= 2 }
+
+        XCTAssertTrue(sink.all.contains { $0.hasPrefix("network POST /load/interstitial") })
+        XCTAssertTrue(sink.all.contains { $0.hasPrefix("error api:x") })
+    }
+
+    func testErrorMessagesAreSanitizedOfSecretsBeforeSendAndLog() async {
+        let sink = LogSink()
+        let sender = FakeSender()
+        let mgr = build(store: FakeStore(), sender: sender, debugLog: { sink.append($0) })
+
+        mgr.recordError(signature: "api:net", errorCode: "net", message: "GET https://x.com/cb?token=abc123&u=9 failed; Authorization: Bearer xyz789 apiKey=SEKRIT")
+        await waitUntil { !sender.batches.isEmpty && !sink.all.isEmpty }
+
+        let sent = allEvents(sender.batches).first { $0.type == TelemetryType.error }?.message ?? ""
+        let logged = sink.all.first { $0.hasPrefix("error api:net") } ?? ""
+        for haystack in [sent, logged] {
+            XCTAssertFalse(haystack.contains("abc123"), "query/token stripped")
+            XCTAssertFalse(haystack.contains("xyz789"), "bearer token stripped")
+            XCTAssertFalse(haystack.contains("SEKRIT"), "key value stripped")
+            XCTAssertFalse(haystack.contains("?token"), "query string stripped")
+        }
     }
 
     func testServerKillSwitchMakesRecordingNoOp() async {
