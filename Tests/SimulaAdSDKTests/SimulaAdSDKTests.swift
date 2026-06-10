@@ -163,13 +163,13 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdLoadHappyPath() throws {
         let json = """
-        {"ad_id":"ad_1","ad_inserted":true,"ad_unit_id":"unit_1","rewarded":true,
+        {"impression_id":"ad_1","ad_inserted":true,"ad_unit_id":"unit_1","rewarded":true,
          "destination":"web","rendered_format":"rewarded_video",
          "rendered_html":"<b>hi</b>",
          "tracking_url":"https://x/click"}
         """
         let r = try decodeAdLoad(json)
-        XCTAssertEqual(r.adId, "ad_1")
+        XCTAssertEqual(r.impressionId, "ad_1")
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.adUnitId, "unit_1")
         XCTAssertEqual(r.destination, "web")
@@ -180,14 +180,14 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testAdLoadDestinationDefaultsToAppstoreWhenAbsent() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         XCTAssertEqual(r.destination, "appstore")
         XCTAssertEqual(r.destinationKind, .appstore)
     }
 
     func testAdLoadDestinationUnknownFallsBackToAppstore() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"destination":"carousel"}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"destination":"carousel"}"#
         let r = try decodeAdLoad(json)
         // The raw string is preserved, but destinationKind maps unknown → .appstore.
         XCTAssertEqual(r.destination, "carousel")
@@ -195,13 +195,13 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testAdLoadMissingRenderedFormatIsNil() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         XCTAssertNil(r.renderedFormat)
     }
 
     func testAdLoadAdInsertedFalseDecodes() throws {
-        let json = #"{"ad_id":"a","ad_inserted":false,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":false,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         XCTAssertFalse(r.adInserted)
     }
@@ -214,7 +214,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdLoadDecodesRenderedHtml() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "rendered_html":"<html><body>hi</body></html>"}
         """
         let r = try decodeAdLoad(json)
@@ -224,14 +224,14 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testAdLoadRenderedHtmlAbsentIsNil() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         XCTAssertNil(r.renderedHtml)
         XCTAssertNil(r.htmlCreative)
     }
 
     func testAdLoadRenderedHtmlBlankYieldsNilCreative() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"   \n\t  "}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"   \n\t  "}"#
         let r = try decodeAdLoad(json)
         // The raw whitespace string is preserved by the decoder...
         XCTAssertFalse(r.renderedHtml?.isEmpty ?? true)
@@ -242,7 +242,7 @@ final class SimulaAdSDKTests: XCTestCase {
     /// A payload with a non-blank `rendered_html` is fillable (mirrors the `load()`
     /// no-fill rule: fill = adInserted && htmlCreative != nil).
     func testAdLoadHtmlOnlyPayloadIsFillable() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"<b>x</b>"}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"rendered_html":"<b>x</b>"}"#
         let r = try decodeAdLoad(json)
         XCTAssertNotNil(r.htmlCreative)
         XCTAssertTrue(r.adInserted && r.htmlCreative != nil)
@@ -251,7 +251,7 @@ final class SimulaAdSDKTests: XCTestCase {
     /// No `rendered_html` (even with `ad_inserted == true`) is a no-fill: there is
     /// no other creative to render now that the carousel/asset path is gone.
     func testAdLoadNoHtmlIsNoFill() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         XCTAssertNil(r.htmlCreative)
         XCTAssertFalse(r.adInserted && r.htmlCreative != nil)
@@ -314,7 +314,7 @@ final class SimulaAdSDKTests: XCTestCase {
     // MARK: - Ad behavior (ad_behavior decode, v2 schema)
 
     func testAdBehaviorAbsentDecodesToNil() throws {
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false}"#
         let r = try decodeAdLoad(json)
         // Absent ad_behavior → nil so the renderer falls back to today's literal behavior.
         XCTAssertNil(r.adBehavior)
@@ -324,7 +324,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdBehaviorHappyPath() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "creative":{"type":"playable","bundle_url":"https://b","ad_unit_type":"rewarded"},
          "experiment":{"experiment_id":"playable_close_q3","variant_id":"countdown_circle_top_right_3s","layer":"close_chrome"},
          "ad_behavior":{"close":{"delay_seconds":3,"treatment":"countdown_circle",
@@ -360,7 +360,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdBehaviorEmptyObjectUsesDefaults() throws {
         // Present-but-empty ad_behavior is non-nil and fully defaulted; the new nodes stay nil.
-        let json = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
         XCTAssertEqual(b.close.delaySeconds, 0)
         XCTAssertEqual(b.close.treatment, .hidden)
@@ -372,7 +372,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdBehaviorPartialCloseFillsDefaults() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"delay_seconds":3}}}
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
@@ -385,7 +385,7 @@ final class SimulaAdSDKTests: XCTestCase {
     func testAdBehaviorHyphenNormalization() throws {
         // Hyphenated wire spellings normalize to the same tolerant enums as underscores.
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"treatment":"reward-or-close-label","position":"top-left"},
            "skoverlay":{"enabled":true,"timing":"during-play","position":"bottom-raised"}}}
         """
@@ -400,7 +400,7 @@ final class SimulaAdSDKTests: XCTestCase {
         // v2 excludes bottom_right (and legacy bottom_corner) → snaps to the safe top_right default.
         for raw in ["bottom_right", "bottom_corner"] {
             let json = """
-            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+            {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
              "ad_behavior":{"close":{"treatment":"hidden","position":"\(raw)"}}}
             """
             XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .topRight)
@@ -412,7 +412,7 @@ final class SimulaAdSDKTests: XCTestCase {
         // the top edge, but its resolved close position follows the config.
         for treatment in ["hidden", "reward_or_close_label", "countdown_circle", "progress_bar"] {
             let json = """
-            {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+            {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
              "ad_behavior":{"close":{"treatment":"\(treatment)","position":"bottom_left"}}}
             """
             XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.position, .bottomLeft)
@@ -421,7 +421,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testCloseTreatmentUnknownFallsBackToHidden() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"treatment":"sparkles","position":"galaxy"}}}
         """
         let b = try XCTUnwrap(try decodeAdLoad(json).adBehavior)
@@ -442,13 +442,13 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testProgressBarColorDecodesAndFallsBack() throws {
         let good = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"progress_bar_color":"#abcdef"}}}
         """
         XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(good).adBehavior).close.progressBarColor, "#ABCDEF")
 
         let bad = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"progress_bar_color":"not-a-color"}}}
         """
         XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(bad).adBehavior).close.progressBarColor, "#FFFFFF")
@@ -456,7 +456,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testStorePromptVerbatimPositionAndPlatform() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"store_prompt":{"enabled":true,"position":"bottom_left","platform":"android"}}}
         """
         let prompt = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).storePrompt)
@@ -469,7 +469,7 @@ final class SimulaAdSDKTests: XCTestCase {
     func testSKOverlayDefaultsAndValues() throws {
         // Empty skoverlay object → defaults (disabled, on_click, bottom, dismissible).
         let empty = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"skoverlay":{}}}
         """
         let d = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(empty).adBehavior).skoverlay)
@@ -480,7 +480,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
         // Explicit values, including a clamped negative delay.
         let full = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"skoverlay":{"enabled":true,"timing":"delayed","delay_seconds":-3,
            "position":"bottom_raised","dismissible":false}}}
         """
@@ -495,17 +495,17 @@ final class SimulaAdSDKTests: XCTestCase {
     func testAdUnitTypeFallsBackToLegacyFlags() throws {
         // No creative node: adUnitType derives from the legacy `rendered_format` (the imperative
         // HTML model dropped the flat `rewarded` flag, so a stray `rewarded` key is ignored).
-        let renderedFormat = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rendered_format":"rewarded_video"}"#
+        let renderedFormat = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rendered_format":"rewarded_video"}"#
         XCTAssertEqual(try decodeAdLoad(renderedFormat).adUnitType, .rewarded)
 
-        let plain = #"{"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
+        let plain = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":true}"#
         XCTAssertEqual(try decodeAdLoad(plain).adUnitType, .interstitial)
     }
 
     func testAdBehaviorResilientToUnknownEnums() throws {
         // Unknown enum strings fall back per-field; delay_seconds is still parsed.
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"delay_seconds":12,"treatment":"spinner","position":"middle",
            "progress_bar_color":"warp"},"store_open":"warp"}}
         """
@@ -519,7 +519,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdBehaviorNegativeDelayClampsToZero() throws {
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"delay_seconds":-5}}}
         """
         XCTAssertEqual(try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds, 0)
@@ -528,7 +528,7 @@ final class SimulaAdSDKTests: XCTestCase {
     func testAdBehaviorOversizedDelayClampsToMax() throws {
         // A bad/oversized delay must clamp so it can't trap the user behind a blocked close.
         let json = """
-        {"ad_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
          "ad_behavior":{"close":{"delay_seconds":600}}}
         """
         XCTAssertEqual(
@@ -555,34 +555,51 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(ad.adUnitId, "u")
     }
 
-    // MARK: - Global character context (SimulaAds)
+    // MARK: - Character context (per-load)
 
     @MainActor
-    func testSimulaAdsSetCharacterUpdatesGlobalContext() {
-        SimulaAds.setCharacter(
+    func testInterstitialLoadAcceptsPerCallCharacterContext() {
+        // Character context now flows through `load(...)` instead of global SimulaAds
+        // state. Without `initialize` it fails fast with .notInitialized, but the call
+        // must still accept the per-call character arguments (compile + runtime).
+        XCTAssertFalse(SimulaAds.isInitialized, "Test assumes SimulaAds is not initialized")
+
+        let delegate = InterstitialMockDelegate()
+        let ad = SimulaInterstitialAd(adUnitId: "test_unit")
+        ad.delegate = delegate
+
+        ad.load(
             charId: "char_7",
             charName: "Mentor",
             charImage: "https://x/a.png",
             charDesc: "a wise mentor"
         )
-        XCTAssertEqual(SimulaAds.charId, "char_7")
-        XCTAssertEqual(SimulaAds.charName, "Mentor")
-        XCTAssertEqual(SimulaAds.charImage, "https://x/a.png")
-        XCTAssertEqual(SimulaAds.charDesc, "a wise mentor")
 
-        // Direct property assignment updates a single field on the fly.
-        SimulaAds.charName = "Sage"
-        XCTAssertEqual(SimulaAds.charName, "Sage")
+        guard case .notInitialized? = delegate.loadFailedError else {
+            return XCTFail("Expected .notInitialized, got \(String(describing: delegate.loadFailedError))")
+        }
+    }
 
-        // setCharacter replaces wholesale: omitted fields are cleared (no stale carry-over).
-        SimulaAds.setCharacter(charId: "char_8")
-        XCTAssertEqual(SimulaAds.charId, "char_8")
-        XCTAssertNil(SimulaAds.charName)
-        XCTAssertNil(SimulaAds.charImage)
-        XCTAssertNil(SimulaAds.charDesc)
-
-        // Reset global state so other tests aren't affected.
-        SimulaAds.setCharacter()
+    @MainActor
+    func testStaleAndDuplicateRequestErrorMessages() {
+        // These messages are part of the public contract, shared with Kotlin — verbatim
+        // except the "loading" copy names this platform's load callback (the `didLoad`
+        // delegate callback, vs Kotlin's `onAdLoaded`).
+        XCTAssertEqual(
+            SimulaAdError.stale.errorDescription,
+            "The loaded ad has expired (1 hour limit) and can no longer be shown. "
+                + "Call load() to request a new ad."
+        )
+        XCTAssertEqual(
+            SimulaAdError.duplicateRequest(retryInSeconds: 42).errorDescription,
+            "An ad for this placement is already loaded. Call show() to display it, "
+                + "or load() again in 42 seconds."
+        )
+        XCTAssertEqual(
+            SimulaAdError.duplicateRequest(retryInSeconds: nil).errorDescription,
+            "An ad for this placement is already loading. "
+                + "Wait for the didLoad delegate callback before calling load() again."
+        )
     }
 
     // MARK: - Rewarded init parsing (RewardedInitResponse decode)
@@ -592,24 +609,54 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testRewardedInitHappyPath() throws {
-        let json = #"{"serve_id":"srv_1","iframe_url":"https://x/play","ad_id":"ad_9","duration_seconds":30}"#
+        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","duration_seconds":30}"#
         let r = try decodeRewardedInit(json)
-        XCTAssertEqual(r.serveId, "srv_1")
+        XCTAssertEqual(r.impressionId, "imp_1")
         XCTAssertEqual(r.iframeUrl, "https://x/play")
-        XCTAssertEqual(r.adId, "ad_9")
         XCTAssertEqual(r.durationSeconds, 30)
     }
 
     func testRewardedInitMissingFieldsFallBackToDefaults() throws {
-        // Tolerant decode: a partial payload must not fail the whole decode.
-        let r = try decodeRewardedInit(#"{"serve_id":"srv_2","iframe_url":"https://x/p"}"#)
-        XCTAssertEqual(r.serveId, "srv_2")
-        XCTAssertEqual(r.adId, "")           // missing → ""
+        // Tolerant decode: a partial payload must not fail the whole decode. Legacy
+        // `serve_id`/`ad_id` keys are unknown now and must be ignored, not remapped.
+        let r = try decodeRewardedInit(#"{"iframe_url":"https://x/p","serve_id":"srv_2","ad_id":"a"}"#)
+        XCTAssertEqual(r.impressionId, "")   // missing → ""
         XCTAssertEqual(r.durationSeconds, 0) // missing → 0
     }
 
     func testRewardedInitMalformedJSONThrows() {
         XCTAssertThrowsError(try decodeRewardedInit("not json"))
+    }
+
+    // MARK: - Fallback ads parsing (GET /load/fallbacks/{impression_id})
+
+    func testFallbacksResponseDecodesScreensInOrder() throws {
+        let json = """
+        {"impression_id":"imp_1","ads":[
+          {"ad_id":"a1","html":"<html>1</html>","iframe_url":"https://i/1"},
+          {"ad_id":"a2","html":"<html>2</html>","iframe_url":"https://i/2"}
+        ]}
+        """
+        let r = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data(json))
+        XCTAssertEqual(r.impressionId, "imp_1")
+        XCTAssertEqual(r.ads.count, 2)
+        XCTAssertEqual(r.ads[0].adId, "a1")
+        XCTAssertEqual(r.ads[0].iframeUrl, "https://i/1")
+        XCTAssertEqual(r.ads[1].adId, "a2")
+    }
+
+    func testFallbacksResponseToleratesEmptyAndPartialPayloads() throws {
+        let empty = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data(#"{"impression_id":"i","ads":[]}"#))
+        XCTAssertTrue(empty.ads.isEmpty)
+
+        let bare = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data("{}"))
+        XCTAssertNil(bare.impressionId)
+        XCTAssertTrue(bare.ads.isEmpty)
+
+        let partial = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data(#"{"ads":[{"ad_id":"a1"}]}"#))
+        XCTAssertEqual(partial.ads[0].adId, "a1")
+        XCTAssertNil(partial.ads[0].iframeUrl)
+        XCTAssertNil(partial.ads[0].html)
     }
 
     // MARK: - Verify reward parsing (VerifyRewardResponse decode)

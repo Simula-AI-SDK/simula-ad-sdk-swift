@@ -51,6 +51,14 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case noFill
     /// `show()` was called before an ad was loaded.
     case notReady
+    /// `show()` was called on an ad that loaded more than an hour ago (expired).
+    case stale
+    /// `load()` was blocked because a matching ad is already loaded or in flight
+    /// (same ad unit id, character id, character name, session id) within the
+    /// 5-minute dedup window. When the matching ad is already loaded,
+    /// `retryInSeconds` carries the time left in that window (after which `load()`
+    /// unblocks); while it is still loading, `retryInSeconds` is `nil`.
+    case duplicateRequest(retryInSeconds: Int?)
     /// `show()` was called while an ad was already showing.
     case alreadyShowing
     /// No active window scene was available to present in.
@@ -70,6 +78,16 @@ public enum SimulaAdError: LocalizedError, Sendable {
             return "No ad available to show right now (no fill)."
         case .notReady:
             return "No ad is ready. Call load() and wait for LOADED before show()."
+        case .stale:
+            return "The loaded ad has expired (1 hour limit) and can no longer be shown. "
+                + "Call load() to request a new ad."
+        case .duplicateRequest(let retryInSeconds):
+            if let retryInSeconds {
+                return "An ad for this placement is already loaded. Call show() to display it, "
+                    + "or load() again in \(retryInSeconds) seconds."
+            }
+            return "An ad for this placement is already loading. "
+                + "Wait for the didLoad delegate callback before calling load() again."
         case .alreadyShowing:
             return "An interstitial is already being shown."
         case .noPresentationContext:
@@ -90,6 +108,8 @@ extension SimulaAdError {
         case .noSession: return "no_session"
         case .noFill: return "no_fill"
         case .notReady: return "not_ready"
+        case .stale: return "stale"
+        case .duplicateRequest: return "duplicate_request"
         case .alreadyShowing: return "already_showing"
         case .noPresentationContext: return "no_presentation_context"
         case .unsupportedPlatform: return "unsupported_platform"
@@ -135,21 +155,39 @@ public final class SimulaInterstitialAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
-    // Character context is global: set it on `SimulaAds` (via `initialize` or
-    // `setCharacter`), and every `load()` reads the current values from there.
+    // Character context is passed per `load()` call (see below); there is no global
+    // character state to keep in sync.
+
+    /// A loaded ad expires this long after it became ready (staleness).
+    private static let staleAfter: TimeInterval = 60 * 60 // 1 hour
+    /// Re-loads of the same dedup key are blocked for this long.
+    private static let dedupWindow: TimeInterval = 5 * 60 // 5 minutes
 
     // MARK: - State
 
     private enum State {
         case idle
         case loading
-        case ready(AdLoadResponse)
+        /// `loadedAt` is when the creative became ready (used for staleness).
+        case ready(AdLoadResponse, loadedAt: Date)
         case showing(AdLoadResponse)
     }
 
     private var state: State = .idle
     private var loadTask: Task<Void, Never>?
     private let api = SimulaAPI()
+
+    // Dedup: the (ad unit, character, session) key of the load currently in flight or
+    // ready, and when that load was initiated. Re-loads of the same key are blocked for
+    // `dedupWindow`. Main-actor isolated.
+    private var currentKey: String?
+    private var currentKeyAt: Date = .distantPast
+
+    // Character context of the last load(), replayed by the post-close auto-preload.
+    private var lastCharId: String?
+    private var lastCharName: String?
+    private var lastCharImage: String?
+    private var lastCharDesc: String?
 
     // Monotonic stage markers for telemetry latencies (0 = not yet started).
     private var loadStartNanos: UInt64 = 0
@@ -171,24 +209,58 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Load
 
-    /// Preloads an ad. Fires `LOADED` on success or `LOAD_FAILED` on failure.
+    /// Preloads an ad for the given character context.
     ///
-    /// No-op while a load is already in flight or an ad is ready (single
-    /// in-flight load per instance). Fails fast with `.notInitialized` when the
-    /// SDK has not been initialized.
-    public func load() {
-        switch state {
-        case .loading, .ready, .showing:
-            return // single in-flight load; don't disturb a ready/showing ad
-        case .idle:
-            break
-        }
-
+    /// The character fields are sent on the `/load/interstitial` request so the
+    /// backend can target the creative; all are optional. Behavior:
+    ///
+    /// - **Single in-flight load.** While a load for the same ad is in flight or
+    ///   ready, calling `load()` again with the **same** key — (ad unit id, `charId`,
+    ///   `charName`, session id) — is blocked for 5 minutes and fires `LOAD_FAILED`
+    ///   with `.duplicateRequest`. A **different** ad unit or character is treated as
+    ///   new and supersedes the pending/ready ad.
+    /// - **Staleness.** A loaded ad expires after 1 hour; `show()` then fires
+    ///   `DISPLAY_FAILED` with `.stale`.
+    /// - **No-op while showing.** Ignored while an ad is on screen; the next ad is
+    ///   preloaded automatically on close.
+    public func load(
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
         guard SimulaAds.isInitialized, let provider = SimulaAds.shared else {
             failLoad(.notInitialized)
             return
         }
 
+        // Replay the same character context on the post-close auto-preload.
+        lastCharId = charId
+        lastCharName = charName
+        lastCharImage = charImage
+        lastCharDesc = charDesc
+
+        let key = Self.dedupKey(adUnitId: adUnitId, charId: charId, charName: charName, sessionId: provider.sessionId)
+        let now = Date()
+
+        switch state {
+        case .showing:
+            return // an ad is on screen; the next one preloads on close
+        case .loading, .ready:
+            // A matching ad is already loading/ready: block a same-key re-load within
+            // the dedup window; a different key falls through and supersedes it.
+            if currentKey == key, now.timeIntervalSince(currentKeyAt) < Self.dedupWindow {
+                reportLoadBlocked()
+                return
+            }
+        case .idle:
+            break // nothing held — proceed
+        }
+
+        // Supersede any in-flight load / discard any ready ad, then start fresh.
+        loadTask?.cancel()
+        currentKey = key
+        currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
         loadTask = Task { [weak self] in
@@ -200,15 +272,20 @@ public final class SimulaInterstitialAd {
                 self.failLoad(.noSession)
                 return
             }
+            // The real session id is now known. Refresh the dedup key — the
+            // synchronous gate at load() time may have keyed on an empty session
+            // during cold-start warm-up — so a subsequent same-key load() still
+            // deduplicates. `currentKeyAt` intentionally stays at the original load time.
+            self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
 
             do {
                 let response = try await self.api.loadAd(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
-                    charId: SimulaAds.charId,
-                    charName: SimulaAds.charName,
-                    charImage: SimulaAds.charImage,
-                    charDesc: SimulaAds.charDesc
+                    charId: charId,
+                    charName: charName,
+                    charImage: charImage,
+                    charDesc: charDesc
                 )
                 if Task.isCancelled { return }
                 // Fillable only when the payload carries a non-blank `rendered_html`
@@ -223,9 +300,9 @@ public final class SimulaInterstitialAd {
                 #endif
                 Telemetry.shared.recordLifecycle(
                     stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.adId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
+                    adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
                 )
-                self.state = .ready(response)
+                self.state = .ready(response, loadedAt: Date())
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
@@ -239,6 +316,12 @@ public final class SimulaInterstitialAd {
         }
     }
 
+    /// Dedup key: (ad unit id, character id, character name, current session id),
+    /// joined with a NUL separator so values containing spaces can't collide.
+    private static func dedupKey(adUnitId: String, charId: String?, charName: String?, sessionId: String?) -> String {
+        [adUnitId, charId ?? "", charName ?? "", sessionId ?? ""].joined(separator: "\u{0}")
+    }
+
     // MARK: - Show
 
     /// Presents the loaded creative full-screen. Fires `DISPLAYED` on success or
@@ -250,7 +333,14 @@ public final class SimulaInterstitialAd {
     public func show() {
         let response: AdLoadResponse
         switch state {
-        case .ready(let loaded):
+        case .ready(let loaded, let loadedAt):
+            // A loaded ad expires after 1 hour. Drop it (back to idle so the host can
+            // load() again — the dedup window is long gone) and report stale.
+            if Date().timeIntervalSince(loadedAt) > Self.staleAfter {
+                state = .idle
+                failDisplay(.stale)
+                return
+            }
             response = loaded
         case .showing:
             failDisplay(.alreadyShowing)
@@ -274,19 +364,24 @@ public final class SimulaInterstitialAd {
             response: response,
             onClick: { [weak self] in
                 guard let self else { return }
-                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.adId)
+                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClick(self)
             },
             onClose: { [weak self] in
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
-                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.adId)
+                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClose(self)
-                // Show a fallback ad on close (parity with the minigame post-game flow).
-                self.presentFallbackAd(adId: response.adId)
-                // Preload the next ad after close.
-                self.load()
+                // Show the fallback ad screens on close (parity with the minigame post-game flow).
+                self.presentFallbackAds(impressionId: response.impressionId)
+                // Preload the next ad after close, reusing the last character context.
+                self.load(
+                    charId: self.lastCharId,
+                    charName: self.lastCharName,
+                    charImage: self.lastCharImage,
+                    charDesc: self.lastCharDesc
+                )
             }
         )
 
@@ -303,15 +398,15 @@ public final class SimulaInterstitialAd {
         self.presenter = presenter
         Telemetry.shared.recordLifecycle(
             stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: response.adId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
+            adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.interstitialDidDisplay(self)
         // Fire the impression once, only after the present succeeded.
         let api = self.api
         let apiKey = provider.apiKey
-        let adId = response.adId
+        let impressionId = response.impressionId
         let experiment = response.experiment
-        Task { await api.trackImpression(adId: adId, apiKey: apiKey, experiment: experiment) }
+        Task { await api.trackImpression(adId: impressionId, apiKey: apiKey, experiment: experiment) }
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -377,15 +472,22 @@ public final class SimulaInterstitialAd {
             position: ClosePosition.from(closePosition),
             progressBarColor: validatedHexColor(progressBarColor)
         )
-        // Mirror the server's collision rule: render the store-prompt badge opposite the close button.
-        let storePromptPosition: ClosePosition = close.position == .topRight ? .topLeft : .topRight
+        // Mirror the server's collision rule: place the store-prompt badge opposite the close button.
+        // top_right → top_left; top_left → top_right; bottom_left → top_left (the default position,
+        // since a bottom-left close doesn't occupy either top corner).
+        let storePromptPosition: ClosePosition
+        switch close.position {
+        case .topRight: storePromptPosition = .topLeft
+        case .topLeft: storePromptPosition = .topRight
+        case .bottomLeft: storePromptPosition = .topLeft
+        }
         let behavior = AdBehavior(
             close: close,
             storePrompt: storePrompt ? StorePrompt(enabled: true, position: storePromptPosition, platform: .ios) : nil,
             skoverlay: skOverlay ? SKOverlayConfig(enabled: true, timing: .duringPlay) : nil
         )
         let response = AdLoadResponse(
-            adId: "",                     // empty → no impression is ever tracked for a preview
+            impressionId: "",             // empty → no impression is ever tracked for a preview
             adInserted: true,
             adUnitId: adUnitId,
             trackingUrl: Self.previewTrackingURL,  // lets SKOverlay resolve an adamId + store taps route
@@ -434,6 +536,27 @@ public final class SimulaInterstitialAd {
         delegate?.interstitialDidFailToLoad(self, error: error)
     }
 
+    /// Report a dedup-blocked load without disturbing state — the in-flight or ready
+    /// ad that triggered the block must survive (it stays loadable/showable). The error
+    /// message reflects whether that ad is ready (with the seconds left in the dedup
+    /// window) or still loading.
+    private func reportLoadBlocked() {
+        let retryInSeconds: Int?
+        if case .ready = state {
+            let remaining = Self.dedupWindow - Date().timeIntervalSince(currentKeyAt)
+            retryInSeconds = Int(max(0, remaining).rounded(.up))
+        } else {
+            retryInSeconds = nil
+        }
+        let error = SimulaAdError.duplicateRequest(retryInSeconds: retryInSeconds)
+        // Observable like any other rejected load() (sampled); no real load ran, so no duration.
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: nil, serveId: nil, durationMs: nil, errorCode: error.telemetryCode
+        )
+        delegate?.interstitialDidFailToLoad(self, error: error)
+    }
+
     private func failDisplay(_ error: SimulaAdError) {
         Telemetry.shared.recordLifecycle(stage: "show_fail", adFormat: Self.adFormat, adUnitId: adUnitId, errorCode: error.telemetryCode)
         delegate?.interstitialDidFailToDisplay(self, error: error)
@@ -445,20 +568,21 @@ public final class SimulaInterstitialAd {
         return Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
     }
 
-    // MARK: - Fallback ad (post-close)
+    // MARK: - Fallback ads (post-close)
 
-    /// After the creative closes, fetch a fallback ad for `adId` and — when one is returned —
-    /// present it full-screen, mirroring the minigame's post-game ad flow. Best-effort: a missing
-    /// id, network error, or empty/no-fill response simply shows nothing.
-    private func presentFallbackAd(adId: String) {
+    /// After the creative closes, fetch the serve's fallback ad screens
+    /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
+    /// full-screen in reveal order, mirroring the minigame's post-game ad flow. Best-effort:
+    /// a missing id, network error, or empty response simply shows nothing.
+    private func presentFallbackAds(impressionId: String) {
         #if os(iOS)
-        guard !adId.isEmpty else { return }
+        guard !impressionId.isEmpty else { return }
         let api = self.api
         Task { [weak self] in
-            let url = try? await api.fetchAdForMinigame(aid: adId)
-            guard let self, let url, !url.isEmpty else { return }
+            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
+            guard let self, !ads.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(ads: ads) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }
