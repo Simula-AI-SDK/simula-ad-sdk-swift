@@ -276,18 +276,22 @@ public final class SimulaRewardedAd {
 
         let presenter = RewardedPresenter()
         let didPresent = presenter.present(
-            adId: response.adId,
+            impressionId: response.impressionId,
             apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
+            storePrompt: response.adBehavior?.storePrompt,
+            trackingUrl: response.trackingUrl,
+            destination: response.destinationKind,
+            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
                 self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                 self.delegate?.rewardedDidClose(self)
-                // Show a fallback ad on close (parity with the minigame post-game flow).
-                self.presentFallbackAd(adId: response.adId)
+                // Show the fallback ad screens on close (parity with the minigame post-game flow).
+                self.presentFallbackAds(impressionId: response.impressionId)
                 // Preload the next ad after close, reusing the last character context.
                 self.load(
                     charId: self.lastCharId,
@@ -310,12 +314,95 @@ public final class SimulaRewardedAd {
         self.presenter = presenter
         delegate?.rewardedDidDisplay(self)
         // Fire the impression once, only after the present succeeded.
-        if !response.adId.isEmpty {
+        if !response.impressionId.isEmpty {
             let api = self.api
             let apiKey = provider.apiKey
-            let adId = response.adId
-            Task { await api.trackImpression(adId: adId, apiKey: apiKey) }
+            let impressionId = response.impressionId
+            Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
         }
+        #else
+        failDisplay(.unsupportedPlatform)
+        #endif
+    }
+
+    // MARK: - Preview (debug / QA)
+
+    /// A real App Store URL so a store-prompt tap from `showPreview` routes somewhere.
+    private static let previewTrackingURL = "https://apps.apple.com/app/id375380948"
+
+    /// A self-contained placeholder "playable" so `showPreview` can render the play-to-earn gate +
+    /// store-prompt chrome over a visible surface without loading a network iframe.
+    private static let previewMinigameHTML = """
+    <!doctype html><html><head><meta name="viewport" \
+    content="width=device-width, initial-scale=1, viewport-fit=cover"></head>\
+    <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;\
+    background:linear-gradient(160deg,#0f766e,#7c3aed);\
+    font-family:-apple-system,system-ui,sans-serif;color:#fff;text-align:center">\
+    <div><div style="font-size:22px;font-weight:700">Rewarded Minigame Preview</div>\
+    <div style="opacity:.8;margin-top:8px;font-size:15px">Mid-ad store prompt — no network</div></div>\
+    </body></html>
+    """
+
+    /// Present the rewarded minigame with a **hardcoded** placeholder playable and a mid-ad store
+    /// prompt — no network call and no impression tracked. Lets a host/sample app preview the
+    /// store-prompt badge timing: it appears at half the play-to-earn duration (`durationSeconds / 2`)
+    /// and is removed the moment the reward unlocks. iOS only.
+    ///
+    /// - Parameters:
+    ///   - durationSeconds: the play-to-earn gate; the badge shows at `durationSeconds / 2`.
+    ///   - storePrompt: whether to show the mid-ad store-prompt badge.
+    ///   - storePromptPlatform: `.ios` (▶| App Store) / `.android` (▶| Google Play).
+    public func showPreview(
+        durationSeconds: Int = 8,
+        storePrompt: Bool = true,
+        storePromptPlatform: StorePromptPlatform = .ios
+    ) {
+        #if os(iOS)
+        if case .showing = state {
+            failDisplay(.alreadyShowing)
+            return
+        }
+        guard let provider = SimulaAds.shared else {
+            failDisplay(.notInitialized)
+            return
+        }
+        // The reward/close pill always sits top-right, so the badge defaults to the opposite
+        // corner (top-left) — matching the server's collision resolution for a rewarded play.
+        let prompt = storePrompt
+            ? StorePrompt(enabled: true, position: .topLeft, platform: storePromptPlatform)
+            : nil
+        let duration = max(0, durationSeconds)
+
+        let presenter = RewardedPresenter()
+        let didPresent = presenter.present(
+            impressionId: "", // empty → no impression is ever tracked for a preview
+            apiKey: provider.apiKey,
+            iframeUrl: "",
+            durationSeconds: duration,
+            storePrompt: prompt,
+            trackingUrl: Self.previewTrackingURL,
+            destination: .appstore,
+            storeOpen: .skstoreproduct,
+            previewHTML: Self.previewMinigameHTML,
+            onClose: { [weak self] earned, _ in
+                guard let self else { return }
+                self.presenter = nil
+                self.state = .idle
+                if earned { self.delegate?.rewardedDidEarnReward(self) }
+                self.delegate?.rewardedDidClose(self)
+                // Preview is local-only: no reward verification, no fallback, no auto-preload.
+            }
+        )
+
+        guard didPresent else {
+            failDisplay(.noPresentationContext)
+            return
+        }
+        // Track a synthetic showing state so a second showPreview is a no-op.
+        state = .showing(RewardedInitResponse(impressionId: "", iframeUrl: "", durationSeconds: duration))
+        self.presenter = presenter
+        delegate?.rewardedDidDisplay(self)
+        // Preview is local-only: deliberately no `trackImpression`.
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -331,8 +418,9 @@ public final class SimulaRewardedAd {
 
         delegate?.rewardedDidEarnReward(self)
 
+        // The wire body still names the field `serve_id`; its value is the load's impression id.
         RewardVerificationManager.shared.queueVerification(
-            serveId: response.serveId,
+            serveId: response.impressionId,
             sessionId: sessionId,
             elapsedPlayTime: elapsedPlayTime
         ) { [weak self] result in
@@ -365,20 +453,21 @@ public final class SimulaRewardedAd {
         delegate?.rewardedDidFailToDisplay(self, error: error)
     }
 
-    // MARK: - Fallback ad (post-close)
+    // MARK: - Fallback ads (post-close)
 
-    /// After the minigame closes, fetch a fallback ad for `adId` and — when one is returned —
-    /// present it full-screen, mirroring the minigame menu's post-game ad flow. Best-effort: a
-    /// missing id, network error, or empty/no-fill response simply shows nothing.
-    private func presentFallbackAd(adId: String) {
+    /// After the minigame closes, fetch the serve's fallback ad screens
+    /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
+    /// full-screen in reveal order, mirroring the minigame menu's post-game ad flow.
+    /// Best-effort: a missing id, network error, or empty response simply shows nothing.
+    private func presentFallbackAds(impressionId: String) {
         #if os(iOS)
-        guard !adId.isEmpty else { return }
+        guard !impressionId.isEmpty else { return }
         let api = self.api
         Task { [weak self] in
-            let url = try? await api.fetchAdForMinigame(aid: adId)
-            guard let self, let url, !url.isEmpty else { return }
+            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
+            guard let self, !ads.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(ads: ads) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

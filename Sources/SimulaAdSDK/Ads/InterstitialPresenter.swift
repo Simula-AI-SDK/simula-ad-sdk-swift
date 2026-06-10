@@ -189,7 +189,7 @@ private struct CreativeInterstitialView: View {
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
             // report sheet overlays the creative + close button when open.
             AdInfoReportOverlay(
-                adId: response.adId,
+                adId: response.impressionId,
                 apiKey: apiKey,
                 closeAtBottomLeft: closeConfig.position == .bottomLeft
             )
@@ -534,9 +534,13 @@ private struct CloseButtonView: View {
 
 /// The mid-ad store prompt (`store_prompt`): a tappable "▶| App Store" / "▶| Google Play" badge
 /// rendered at the server-resolved corner. The SDK never recomputes the position — it trusts the
-/// backend's collision resolution (opposite the close button).
-private struct StorePromptBadge: View {
+/// backend's collision resolution (opposite the close button). Shared with the rewarded minigame
+/// (`RewardedPresenter`).
+struct StorePromptBadge: View {
     let prompt: StorePrompt
+    /// Inset from the safe-area edge. The interstitial uses 16 (aligns with its close button);
+    /// the rewarded minigame passes 8 so the badge shares the reward pill's baseline.
+    var edgePadding: CGFloat = 16
     let onTap: () -> Void
 
     private var label: String {
@@ -552,7 +556,7 @@ private struct StorePromptBadge: View {
 
     var body: some View {
         badge
-            .padding(16)
+            .padding(edgePadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
 

@@ -330,8 +330,8 @@ public final class SimulaInterstitialAd {
                 self.presenter = nil
                 self.state = .idle
                 self.delegate?.interstitialDidClose(self)
-                // Show a fallback ad on close (parity with the minigame post-game flow).
-                self.presentFallbackAd(adId: response.adId)
+                // Show the fallback ad screens on close (parity with the minigame post-game flow).
+                self.presentFallbackAds(impressionId: response.impressionId)
                 // Preload the next ad after close, reusing the last character context.
                 self.load(
                     charId: self.lastCharId,
@@ -357,9 +357,9 @@ public final class SimulaInterstitialAd {
         // Fire the impression once, only after the present succeeded.
         let api = self.api
         let apiKey = provider.apiKey
-        let adId = response.adId
+        let impressionId = response.impressionId
         let experiment = response.experiment
-        Task { await api.trackImpression(adId: adId, apiKey: apiKey, experiment: experiment) }
+        Task { await api.trackImpression(adId: impressionId, apiKey: apiKey, experiment: experiment) }
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -440,7 +440,7 @@ public final class SimulaInterstitialAd {
             skoverlay: skOverlay ? SKOverlayConfig(enabled: true, timing: .duringPlay) : nil
         )
         let response = AdLoadResponse(
-            adId: "",                     // empty → no impression is ever tracked for a preview
+            impressionId: "",             // empty → no impression is ever tracked for a preview
             adInserted: true,
             adUnitId: adUnitId,
             trackingUrl: Self.previewTrackingURL,  // lets SKOverlay resolve an adamId + store taps route
@@ -495,20 +495,21 @@ public final class SimulaInterstitialAd {
         delegate?.interstitialDidFailToDisplay(self, error: error)
     }
 
-    // MARK: - Fallback ad (post-close)
+    // MARK: - Fallback ads (post-close)
 
-    /// After the creative closes, fetch a fallback ad for `adId` and — when one is returned —
-    /// present it full-screen, mirroring the minigame's post-game ad flow. Best-effort: a missing
-    /// id, network error, or empty/no-fill response simply shows nothing.
-    private func presentFallbackAd(adId: String) {
+    /// After the creative closes, fetch the serve's fallback ad screens
+    /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
+    /// full-screen in reveal order, mirroring the minigame's post-game ad flow. Best-effort:
+    /// a missing id, network error, or empty response simply shows nothing.
+    private func presentFallbackAds(impressionId: String) {
         #if os(iOS)
-        guard !adId.isEmpty else { return }
+        guard !impressionId.isEmpty else { return }
         let api = self.api
         Task { [weak self] in
-            let url = try? await api.fetchAdForMinigame(aid: adId)
-            guard let self, let url, !url.isEmpty else { return }
+            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
+            guard let self, !ads.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(ads: ads) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

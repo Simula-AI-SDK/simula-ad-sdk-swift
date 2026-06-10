@@ -60,8 +60,10 @@ public struct MiniGameMenu: View {
     @State private var catalogLoading = true
     @State private var catalogError = false
     @State private var adFetched = false
-    @State private var adIframeUrl: String?
-    @State private var currentAdId: String?
+    // Post-game ad screens (`GET /load/fallbacks/{serveId}`), revealed one per close tap.
+    @State private var fallbackAds: [FallbackAd] = []
+    @State private var fallbackAdIndex = 0
+    @State private var currentServeId: String?
     @State private var showGameIframe = false
     @State private var showAdOverlay = false
     @State private var lastGameHeightDp: CGFloat?
@@ -106,7 +108,7 @@ public struct MiniGameMenu: View {
                     messages: messages,
                     delegateChar: delegateChar,
                     onClose: { handleIframeClose() },
-                    onAdIdReceived: { adId in handleAdIdReceived(adId) },
+                    onServeIdReceived: { serveId in handleServeIdReceived(serveId) },
                     charDesc: charDesc,
                     menuId: menuId,
                     playableHeight: theme.playableHeight,
@@ -166,15 +168,17 @@ public struct MiniGameMenu: View {
                 .zIndex(2.5)
             }
 
-            // Ad Overlay (full-screen cover)
-            if showAdOverlay, let adUrl = adIframeUrl {
+            // Ad Overlay (full-screen cover) — shows the current fallback screen; `.id` gives
+            // each revealed screen fresh overlay state (countdown, web view).
+            if showAdOverlay, let fallbackAd = fallbackAds.indices.contains(fallbackAdIndex) ? fallbackAds[fallbackAdIndex] : nil {
                 AdOverlayView(
-                    iframeUrl: adUrl,
+                    iframeUrl: fallbackAd.iframeUrl,
                     onClose: { handleAdIframeClose() },
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
                     playableBorderColor: theme.resolvedPlayableBorderColor,
-                    adId: currentAdId ?? ""
+                    adId: fallbackAd.adId
                 )
+                .id(fallbackAdIndex)
                 .transition(.opacity)
                 .zIndex(3)
             }
@@ -485,33 +489,30 @@ public struct MiniGameMenu: View {
         selectedGameId = gameId
         showGameIframe = true
         adFetched = false
-        currentAdId = nil
+        fallbackAds = []
+        fallbackAdIndex = 0
+        currentServeId = nil
     }
 
-    private func handleAdIdReceived(_ adId: String) {
-        currentAdId = adId
+    private func handleServeIdReceived(_ serveId: String) {
+        currentServeId = serveId
     }
 
     private func handleIframeClose() {
         showGameIframe = false
         selectedGameId = nil
 
-        if !adFetched, let adId = currentAdId {
+        if !adFetched, let serveId = currentServeId {
             adLoading = true
             Task {
-                do {
-                    let iframeUrl = try await api.fetchAdForMinigame(aid: adId)
-                    await MainActor.run {
-                        adLoading = false
-                        if let url = iframeUrl {
-                            self.adIframeUrl = url
-                            self.adFetched = true
-                            self.showAdOverlay = true
-                        }
-                    }
-                } catch {
-                    await MainActor.run {
-                        adLoading = false
+                let ads = (try? await api.fetchFallbacks(impressionId: serveId)) ?? []
+                await MainActor.run {
+                    adLoading = false
+                    if !ads.isEmpty {
+                        self.fallbackAds = ads
+                        self.fallbackAdIndex = 0
+                        self.adFetched = true
+                        self.showAdOverlay = true
                     }
                 }
             }
@@ -519,8 +520,14 @@ public struct MiniGameMenu: View {
     }
 
     private func handleAdIframeClose() {
-        showAdOverlay = false
-        adIframeUrl = nil
+        // Reveal the next fetched ad screen on each close tap; close after the last one.
+        if fallbackAdIndex + 1 < fallbackAds.count {
+            fallbackAdIndex += 1
+        } else {
+            showAdOverlay = false
+            fallbackAds = []
+            fallbackAdIndex = 0
+        }
     }
 
     private func loadCatalog() async {
