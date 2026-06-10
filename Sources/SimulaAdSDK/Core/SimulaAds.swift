@@ -74,6 +74,9 @@ public enum SimulaAds {
     ///   - charId/charName/charImage/charDesc: Optional initial character context for
     ///     the imperative interstitial. Update later via `setCharacter(...)` or by
     ///     assigning the `charId`/`charName`/`charImage`/`charDesc` properties.
+    ///   - telemetryEnabled: Opt out of in-house SDK telemetry (handled-error + performance
+    ///     metrics sent to Simula). Default `true`. PII in telemetry is consent-gated exactly
+    ///     like ad tracking; pass `false` to disable the pipeline entirely.
     public static func initialize(
         apiKey: String,
         devMode: Bool = false,
@@ -83,7 +86,8 @@ public enum SimulaAds {
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
-        charDesc: String? = nil
+        charDesc: String? = nil,
+        telemetryEnabled: Bool = true
     ) {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
@@ -108,7 +112,8 @@ public enum SimulaAds {
             devMode: devMode,
             primaryUserID: primaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
-            privacy: privacy
+            privacy: privacy,
+            telemetryEnabled: telemetryEnabled
         )
         shared = provider
 

@@ -44,7 +44,9 @@ public final class SimulaProvider: ObservableObject {
     // MARK: - Session State
 
     /// The server session ID, set after successful session creation
-    @Published public private(set) var sessionId: String?
+    @Published public private(set) var sessionId: String? {
+        didSet { Telemetry.shared.setSessionId(sessionId) } // correlate telemetry to the session
+    }
 
     /// The in-flight session-creation task, if any. Lets concurrent callers
     /// coalesce onto a single request instead of each firing their own.
@@ -76,7 +78,8 @@ public final class SimulaProvider: ObservableObject {
         devMode: Bool = false,
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
-        privacy: SimulaPrivacyConfig? = nil
+        privacy: SimulaPrivacyConfig? = nil,
+        telemetryEnabled: Bool = true
     ) {
         // Validate at init (matches React's validateSimulaProviderProps call)
         do {
@@ -98,6 +101,16 @@ public final class SimulaProvider: ObservableObject {
         if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
         self.privacyConfig = resolved
         self.api = SimulaAPI()
+
+        // Install telemetry before the first request so the /session/create call (and every
+        // subsequent SDK request) is captured. First call wins, so a re-created provider
+        // doesn't churn it; the facade re-gates PII on the live consent snapshot.
+        Telemetry.shared.initialize(
+            apiKey: apiKey,
+            devMode: devMode,
+            enabled: telemetryEnabled,
+            primaryUserID: primaryUserID
+        )
 
         // Feed the process-wide store, then re-sync the session whenever consent
         // changes (host CMP refresh or ATT result) so the backend sees current signals.
@@ -314,6 +327,7 @@ public struct SimulaProviderView<Content: View>: View {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
+        telemetryEnabled: Bool = true,
         @ViewBuilder content: @escaping () -> Content
     ) {
         // Resolve the privacy config: an explicit `privacy` wins; otherwise the
@@ -340,7 +354,8 @@ public struct SimulaProviderView<Content: View>: View {
                 devMode: devMode,
                 primaryUserID: primaryUserID,
                 hasPrivacyConsent: hasPrivacyConsent,
-                privacy: privacy
+                privacy: privacy,
+                telemetryEnabled: telemetryEnabled
             )
         }
         self._provider = StateObject(wrappedValue: provider)

@@ -34,7 +34,14 @@ struct CachedAsyncImage<Content: View>: View {
         // mirroring AsyncImage.
         phase = .empty
 
+        let startNanos = DispatchTime.now().uptimeNanoseconds
         let result = await CoverImageCache.shared.load(url: url.absoluteString)
+        let success: Bool = { if case .failed = result { return false }; return true }()
+        Telemetry.shared.recordOperation(
+            name: "image_load",
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
+            success: success
+        )
         switch result {
         case .staticImage(let image):
             phase = .success(Image(platformImage: image))
