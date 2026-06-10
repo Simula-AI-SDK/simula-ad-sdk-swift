@@ -444,9 +444,18 @@ public final class SimulaRewardedAd {
     }
 
     /// Report a dedup-blocked load without disturbing state — the in-flight or ready
-    /// ad that triggered the block must survive (it stays loadable/showable).
+    /// ad that triggered the block must survive (it stays loadable/showable). The error
+    /// message reflects whether that ad is ready (with the seconds left in the dedup
+    /// window) or still loading.
     private func reportLoadBlocked() {
-        delegate?.rewardedDidFailToLoad(self, error: .duplicateRequest)
+        let retryInSeconds: Int?
+        if case .ready = state {
+            let remaining = Self.dedupWindow - Date().timeIntervalSince(currentKeyAt)
+            retryInSeconds = Int(max(0, remaining).rounded(.up))
+        } else {
+            retryInSeconds = nil
+        }
+        delegate?.rewardedDidFailToLoad(self, error: .duplicateRequest(retryInSeconds: retryInSeconds))
     }
 
     private func failDisplay(_ error: SimulaAdError) {

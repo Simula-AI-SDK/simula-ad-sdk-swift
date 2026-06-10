@@ -582,11 +582,23 @@ final class SimulaAdSDKTests: XCTestCase {
 
     @MainActor
     func testStaleAndDuplicateRequestErrorMessages() {
-        // The stale message is part of the public contract (shared verbatim with Kotlin).
-        XCTAssertEqual(SimulaAdError.stale.errorDescription, "Ad is stale, please load again")
+        // These messages are part of the public contract, shared with Kotlin — verbatim
+        // except the "loading" copy names this platform's load callback (the `didLoad`
+        // delegate callback, vs Kotlin's `onAdLoaded`).
         XCTAssertEqual(
-            SimulaAdError.duplicateRequest.errorDescription,
-            "Duplicate ad request — a matching ad is already loaded or loading."
+            SimulaAdError.stale.errorDescription,
+            "The loaded ad has expired (1 hour limit) and can no longer be shown. "
+                + "Call load() to request a new ad."
+        )
+        XCTAssertEqual(
+            SimulaAdError.duplicateRequest(retryInSeconds: 42).errorDescription,
+            "An ad for this placement is already loaded. Call show() to display it, "
+                + "or load() again in 42 seconds."
+        )
+        XCTAssertEqual(
+            SimulaAdError.duplicateRequest(retryInSeconds: nil).errorDescription,
+            "An ad for this placement is already loading. "
+                + "Wait for the didLoad delegate callback before calling load() again."
         )
     }
 

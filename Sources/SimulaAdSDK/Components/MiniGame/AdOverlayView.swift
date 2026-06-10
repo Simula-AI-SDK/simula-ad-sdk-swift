@@ -8,7 +8,7 @@ import SwiftUI
 /// Features:
 /// - Full-screen dark overlay (matching Kotlin's Color(0xCC000000))
 /// - 5-second countdown timer with animated ring before close button appears
-/// - Close button (top-right, white circle with × symbol) after countdown
+/// - Close button (top-right, dark-translucent circle with a white ✕) after countdown
 /// - WKWebView loading the ad iframe URL
 /// - Bottom sheet mode support (uses last game height/border color)
 /// - Status bar hiding when full screen or near full screen
@@ -25,8 +25,9 @@ public struct AdOverlayView: View {
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
-    /// Ring progress (1.0 = full, 0.0 = empty)
-    @State private var ringProgress: CGFloat = 1.0
+    /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
+    /// (right to left) over the countdown.
+    @State private var ringProgress: CGFloat = 0.0
     /// Guards against countdown restarting when modals are dismissed
     @State private var countdownStarted = false
 
@@ -116,7 +117,7 @@ public struct AdOverlayView: View {
                                             .frame(width: 16, height: 16)
 
                                         Circle()
-                                            .trim(from: 1 - ringProgress, to: 1)
+                                            .trim(from: 0, to: ringProgress)
                                             .stroke(
                                                 Color.white,
                                                 style: StrokeStyle(lineWidth: 2, lineCap: .round)
@@ -172,9 +173,9 @@ public struct AdOverlayView: View {
         guard !countdownStarted else { return }
         countdownStarted = true
 
-        // Animate ring from 1.0 to 0.0 over 5 seconds (matching Kotlin's tween(5000))
+        // Animate ring from 0.0 to 1.0 over 5 seconds (matching Kotlin's tween(5000))
         withAnimation(.linear(duration: 5.0)) {
-            ringProgress = 0
+            ringProgress = 1
         }
 
         // Tick the countdown every second

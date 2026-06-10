@@ -173,11 +173,14 @@ ad.load(charId: "char_456", charName: "Sage")
 - `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
   or `.noFill` when the payload carries no `rendered_html` creative.
 - A loaded ad is cached and **expires after 1 hour** — `show()` then fires
-  `DISPLAY_FAILED` with `.stale` (`"Ad is stale, please load again"`); just `load()`
-  again. Loads are **deduplicated** by (ad unit id, character id, character name,
-  session id): while a matching ad is already loaded or in flight, a re-load of the
-  same key within 5 minutes fires `LOAD_FAILED` with `.duplicateRequest`. A different
-  ad unit or character supersedes the pending/ready ad.
+  `DISPLAY_FAILED` with `.stale` (`"The loaded ad has expired (1 hour limit) and can
+  no longer be shown. Call load() to request a new ad."`); just `load()` again. Loads
+  are **deduplicated** by (ad unit id, character id, character name, session id):
+  while a matching ad is already loaded or in flight, a re-load of the same key
+  within 5 minutes fires `LOAD_FAILED` with `.duplicateRequest` — when the matching
+  ad is ready, `retryInSeconds` carries the time left in the window; while it is
+  still loading, it is `nil`. A different ad unit or character supersedes the
+  pending/ready ad.
 - The creative is the server-rendered HTML; it owns its own CTA, so there is no
   SDK-drawn button to configure. The interstitial is dismissed via the close button,
   not by the click-through. `CLICKED` fires on a user-initiated link tap regardless

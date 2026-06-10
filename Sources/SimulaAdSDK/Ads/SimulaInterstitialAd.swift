@@ -55,8 +55,10 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case stale
     /// `load()` was blocked because a matching ad is already loaded or in flight
     /// (same ad unit id, character id, character name, session id) within the
-    /// 5-minute dedup window.
-    case duplicateRequest
+    /// 5-minute dedup window. When the matching ad is already loaded,
+    /// `retryInSeconds` carries the time left in that window (after which `load()`
+    /// unblocks); while it is still loading, `retryInSeconds` is `nil`.
+    case duplicateRequest(retryInSeconds: Int?)
     /// `show()` was called while an ad was already showing.
     case alreadyShowing
     /// No active window scene was available to present in.
@@ -77,9 +79,15 @@ public enum SimulaAdError: LocalizedError, Sendable {
         case .notReady:
             return "No ad is ready. Call load() and wait for LOADED before show()."
         case .stale:
-            return "Ad is stale, please load again"
-        case .duplicateRequest:
-            return "Duplicate ad request — a matching ad is already loaded or loading."
+            return "The loaded ad has expired (1 hour limit) and can no longer be shown. "
+                + "Call load() to request a new ad."
+        case .duplicateRequest(let retryInSeconds):
+            if let retryInSeconds {
+                return "An ad for this placement is already loaded. Call show() to display it, "
+                    + "or load() again in \(retryInSeconds) seconds."
+            }
+            return "An ad for this placement is already loading. "
+                + "Wait for the didLoad delegate callback before calling load() again."
         case .alreadyShowing:
             return "An interstitial is already being shown."
         case .noPresentationContext:
@@ -486,9 +494,18 @@ public final class SimulaInterstitialAd {
     }
 
     /// Report a dedup-blocked load without disturbing state — the in-flight or ready
-    /// ad that triggered the block must survive (it stays loadable/showable).
+    /// ad that triggered the block must survive (it stays loadable/showable). The error
+    /// message reflects whether that ad is ready (with the seconds left in the dedup
+    /// window) or still loading.
     private func reportLoadBlocked() {
-        delegate?.interstitialDidFailToLoad(self, error: .duplicateRequest)
+        let retryInSeconds: Int?
+        if case .ready = state {
+            let remaining = Self.dedupWindow - Date().timeIntervalSince(currentKeyAt)
+            retryInSeconds = Int(max(0, remaining).rounded(.up))
+        } else {
+            retryInSeconds = nil
+        }
+        delegate?.interstitialDidFailToLoad(self, error: .duplicateRequest(retryInSeconds: retryInSeconds))
     }
 
     private func failDisplay(_ error: SimulaAdError) {
