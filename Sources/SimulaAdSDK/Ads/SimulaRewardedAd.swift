@@ -87,12 +87,18 @@ public final class SimulaRewardedAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaRewardedAdDelegate?
 
+    /// A loaded ad expires this long after it became ready (staleness).
+    private static let staleAfter: TimeInterval = 60 * 60 // 1 hour
+    /// Re-loads of the same dedup key are blocked for this long.
+    private static let dedupWindow: TimeInterval = 5 * 60 // 5 minutes
+
     // MARK: - State
 
     private enum State {
         case idle
         case loading
-        case ready(RewardedInitResponse)
+        /// `loadedAt` is when the ad became ready (used for staleness).
+        case ready(RewardedInitResponse, loadedAt: Date)
         case showing(RewardedInitResponse)
     }
 
@@ -100,6 +106,18 @@ public final class SimulaRewardedAd {
     private var loadTask: Task<Void, Never>?
     private var sessionId: String?
     private let api = SimulaAPI()
+
+    // Dedup: the (ad unit, character, session) key of the load currently in flight or
+    // ready, and when that load was initiated. Re-loads of the same key are blocked for
+    // `dedupWindow`. Main-actor isolated.
+    private var currentKey: String?
+    private var currentKeyAt: Date = .distantPast
+
+    // Character context of the last load(), replayed by the post-close auto-preload.
+    private var lastCharId: String?
+    private var lastCharName: String?
+    private var lastCharImage: String?
+    private var lastCharDesc: String?
 
     // Monotonic stage markers for telemetry latencies (0 = not yet started).
     private var loadStartNanos: UInt64 = 0
@@ -123,22 +141,58 @@ public final class SimulaRewardedAd {
 
     // MARK: - Load
 
-    /// Preloads a rewarded minigame. Fires `LOADED` on success or `LOAD_FAILED` on
-    /// failure. No-op while a load is in flight or an ad is ready. Fails fast with
-    /// `.notInitialized` when `SimulaAds.initialize` has not been called.
-    public func load() {
-        switch state {
-        case .loading, .ready, .showing:
-            return // single in-flight load; don't disturb a ready/showing ad
-        case .idle:
-            break
-        }
-
+    /// Preloads a rewarded minigame for the given character context.
+    ///
+    /// The character fields are sent on the `/load/rewarded` request so the backend
+    /// can target the creative; all are optional. Behavior:
+    ///
+    /// - **Single in-flight load.** While a load for the same ad is in flight or
+    ///   ready, calling `load()` again with the **same** key — (ad unit id, `charId`,
+    ///   `charName`, session id) — is blocked for 5 minutes and fires `LOAD_FAILED`
+    ///   with `.duplicateRequest`. A **different** ad unit or character is treated as
+    ///   new and supersedes the pending/ready ad.
+    /// - **Staleness.** A loaded ad expires after 1 hour; `show()` then fires
+    ///   `DISPLAY_FAILED` with `.stale`.
+    /// - **No-op while showing.** Ignored while an ad is on screen; the next ad is
+    ///   preloaded automatically on close.
+    public func load(
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil
+    ) {
         guard SimulaAds.isInitialized, let provider = SimulaAds.shared else {
             failLoad(.notInitialized)
             return
         }
 
+        // Replay the same character context on the post-close auto-preload.
+        lastCharId = charId
+        lastCharName = charName
+        lastCharImage = charImage
+        lastCharDesc = charDesc
+
+        let key = Self.dedupKey(adUnitId: adUnitId, charId: charId, charName: charName, sessionId: provider.sessionId)
+        let now = Date()
+
+        switch state {
+        case .showing:
+            return // an ad is on screen; the next one preloads on close
+        case .loading, .ready:
+            // A matching ad is already loading/ready: block a same-key re-load within
+            // the dedup window; a different key falls through and supersedes it.
+            if currentKey == key, now.timeIntervalSince(currentKeyAt) < Self.dedupWindow {
+                reportLoadBlocked()
+                return
+            }
+        case .idle:
+            break // nothing held — proceed
+        }
+
+        // Supersede any in-flight load / discard any ready ad, then start fresh.
+        loadTask?.cancel()
+        currentKey = key
+        currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
         loadTask = Task { [weak self] in
@@ -151,6 +205,11 @@ public final class SimulaRewardedAd {
                 return
             }
             self.sessionId = sessionId
+            // The real session id is now known. Refresh the dedup key — the
+            // synchronous gate at load() time may have keyed on an empty session
+            // during cold-start warm-up — so a subsequent same-key load() still
+            // deduplicates. `currentKeyAt` intentionally stays at the original load time.
+            self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
 
             do {
                 let threshold = self.minPlayThreshold > 0 ? Int(self.minPlayThreshold) : nil
@@ -158,10 +217,10 @@ public final class SimulaRewardedAd {
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
                     minPlayThreshold: threshold,
-                    charId: SimulaAds.charId,
-                    charName: SimulaAds.charName,
-                    charImage: SimulaAds.charImage,
-                    charDesc: SimulaAds.charDesc
+                    charId: charId,
+                    charName: charName,
+                    charImage: charImage,
+                    charDesc: charDesc
                 )
                 if Task.isCancelled { return }
                 // A rewarded ad with no iframe to render is a no-fill.
@@ -176,9 +235,9 @@ public final class SimulaRewardedAd {
                 #endif
                 Telemetry.shared.recordLifecycle(
                     stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.adId, serveId: response.serveId, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
+                    adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
                 )
-                self.state = .ready(response)
+                self.state = .ready(response, loadedAt: Date())
                 self.delegate?.rewardedDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
@@ -190,6 +249,12 @@ public final class SimulaRewardedAd {
         }
     }
 
+    /// Dedup key: (ad unit id, character id, character name, current session id),
+    /// joined with a NUL separator so values containing spaces can't collide.
+    private static func dedupKey(adUnitId: String, charId: String?, charName: String?, sessionId: String?) -> String {
+        [adUnitId, charId ?? "", charName ?? "", sessionId ?? ""].joined(separator: "\u{0}")
+    }
+
     // MARK: - Show
 
     /// Presents the loaded minigame full-screen. Fires `DISPLAYED` on success or
@@ -199,7 +264,14 @@ public final class SimulaRewardedAd {
     public func show() {
         let response: RewardedInitResponse
         switch state {
-        case .ready(let loaded):
+        case .ready(let loaded, let loadedAt):
+            // A loaded ad expires after 1 hour. Drop it (back to idle so the host can
+            // load() again — the dedup window is long gone) and report stale.
+            if Date().timeIntervalSince(loadedAt) > Self.staleAfter {
+                state = .idle
+                failDisplay(.stale)
+                return
+            }
             response = loaded
         case .showing:
             failDisplay(.alreadyShowing)
@@ -218,22 +290,31 @@ public final class SimulaRewardedAd {
         let presenter = RewardedPresenter()
         showStartNanos = DispatchTime.now().uptimeNanoseconds
         let didPresent = presenter.present(
-            adId: response.adId,
+            impressionId: response.impressionId,
             apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
             adVerifications: response.adVerifications,
+            storePrompt: response.adBehavior?.storePrompt,
+            trackingUrl: response.trackingUrl,
+            destination: response.destinationKind,
+            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
                 self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
-                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.adId, serveId: response.serveId)
+                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
                 self.delegate?.rewardedDidClose(self)
-                // Show a fallback ad on close (parity with the minigame post-game flow).
-                self.presentFallbackAd(adId: response.adId)
-                // Preload the next ad after close (parity with the interstitial).
-                self.load()
+                // Show the fallback ad screens on close (parity with the minigame post-game flow).
+                self.presentFallbackAds(impressionId: response.impressionId)
+                // Preload the next ad after close, reusing the last character context.
+                self.load(
+                    charId: self.lastCharId,
+                    charName: self.lastCharName,
+                    charImage: self.lastCharImage,
+                    charDesc: self.lastCharDesc
+                )
             }
         )
 
@@ -249,16 +330,99 @@ public final class SimulaRewardedAd {
         self.presenter = presenter
         Telemetry.shared.recordLifecycle(
             stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: response.adId, serveId: response.serveId, durationMs: msSince(showStartNanos), errorCode: nil
+            adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.rewardedDidDisplay(self)
         // Fire the impression once, only after the present succeeded.
-        if !response.adId.isEmpty {
+        if !response.impressionId.isEmpty {
             let api = self.api
             let apiKey = provider.apiKey
-            let adId = response.adId
-            Task { await api.trackImpression(adId: adId, apiKey: apiKey) }
+            let impressionId = response.impressionId
+            Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
         }
+        #else
+        failDisplay(.unsupportedPlatform)
+        #endif
+    }
+
+    // MARK: - Preview (debug / QA)
+
+    /// A real App Store URL so a store-prompt tap from `showPreview` routes somewhere.
+    private static let previewTrackingURL = "https://apps.apple.com/app/id375380948"
+
+    /// A self-contained placeholder "playable" so `showPreview` can render the play-to-earn gate +
+    /// store-prompt chrome over a visible surface without loading a network iframe.
+    private static let previewMinigameHTML = """
+    <!doctype html><html><head><meta name="viewport" \
+    content="width=device-width, initial-scale=1, viewport-fit=cover"></head>\
+    <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;\
+    background:linear-gradient(160deg,#0f766e,#7c3aed);\
+    font-family:-apple-system,system-ui,sans-serif;color:#fff;text-align:center">\
+    <div><div style="font-size:22px;font-weight:700">Rewarded Minigame Preview</div>\
+    <div style="opacity:.8;margin-top:8px;font-size:15px">Mid-ad store prompt — no network</div></div>\
+    </body></html>
+    """
+
+    /// Present the rewarded minigame with a **hardcoded** placeholder playable and a mid-ad store
+    /// prompt — no network call and no impression tracked. Lets a host/sample app preview the
+    /// store-prompt badge timing: it appears at half the play-to-earn duration (`durationSeconds / 2`)
+    /// and is removed the moment the reward unlocks. iOS only.
+    ///
+    /// - Parameters:
+    ///   - durationSeconds: the play-to-earn gate; the badge shows at `durationSeconds / 2`.
+    ///   - storePrompt: whether to show the mid-ad store-prompt badge.
+    ///   - storePromptPlatform: `.ios` (▶| App Store) / `.android` (▶| Google Play).
+    public func showPreview(
+        durationSeconds: Int = 8,
+        storePrompt: Bool = true,
+        storePromptPlatform: StorePromptPlatform = .ios
+    ) {
+        #if os(iOS)
+        if case .showing = state {
+            failDisplay(.alreadyShowing)
+            return
+        }
+        guard let provider = SimulaAds.shared else {
+            failDisplay(.notInitialized)
+            return
+        }
+        // The reward/close pill always sits top-right, so the badge defaults to the opposite
+        // corner (top-left) — matching the server's collision resolution for a rewarded play.
+        let prompt = storePrompt
+            ? StorePrompt(enabled: true, position: .topLeft, platform: storePromptPlatform)
+            : nil
+        let duration = max(0, durationSeconds)
+
+        let presenter = RewardedPresenter()
+        let didPresent = presenter.present(
+            impressionId: "", // empty → no impression is ever tracked for a preview
+            apiKey: provider.apiKey,
+            iframeUrl: "",
+            durationSeconds: duration,
+            storePrompt: prompt,
+            trackingUrl: Self.previewTrackingURL,
+            destination: .appstore,
+            storeOpen: .skstoreproduct,
+            previewHTML: Self.previewMinigameHTML,
+            onClose: { [weak self] earned, _ in
+                guard let self else { return }
+                self.presenter = nil
+                self.state = .idle
+                if earned { self.delegate?.rewardedDidEarnReward(self) }
+                self.delegate?.rewardedDidClose(self)
+                // Preview is local-only: no reward verification, no fallback, no auto-preload.
+            }
+        )
+
+        guard didPresent else {
+            failDisplay(.noPresentationContext)
+            return
+        }
+        // Track a synthetic showing state so a second showPreview is a no-op.
+        state = .showing(RewardedInitResponse(impressionId: "", iframeUrl: "", durationSeconds: duration))
+        self.presenter = presenter
+        delegate?.rewardedDidDisplay(self)
+        // Preview is local-only: deliberately no `trackImpression`.
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -272,18 +436,20 @@ public final class SimulaRewardedAd {
     private func handleClose(response: RewardedInitResponse, earned: Bool, elapsedPlayTime: Double) {
         guard earned, let sessionId = self.sessionId, !sessionId.isEmpty else { return }
 
-        Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.adId, serveId: response.serveId)
+        Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.impressionId, serveId: nil)
         delegate?.rewardedDidEarnReward(self)
 
         // Captured as values so the verification callback (off-main, possibly after retries)
         // records telemetry without touching `self`. End-to-end latency includes queue backoff.
+        // The consolidated `impressionId` is the single id; the verify wire body still names it
+        // `serve_id`, but telemetry carries it in `adId` (serve id is gone) for cross-format parity.
         let adUnitId = self.adUnitId
-        let adId = response.adId
-        let serveId = response.serveId
+        let adId = response.impressionId
+        let serveId: String? = nil
         let verifyStartNanos = DispatchTime.now().uptimeNanoseconds
 
         RewardVerificationManager.shared.queueVerification(
-            serveId: response.serveId,
+            serveId: response.impressionId,
             sessionId: sessionId,
             elapsedPlayTime: elapsedPlayTime
         ) { [weak self] result in
@@ -320,6 +486,27 @@ public final class SimulaRewardedAd {
         delegate?.rewardedDidFailToLoad(self, error: error)
     }
 
+    /// Report a dedup-blocked load without disturbing state — the in-flight or ready
+    /// ad that triggered the block must survive (it stays loadable/showable). The error
+    /// message reflects whether that ad is ready (with the seconds left in the dedup
+    /// window) or still loading.
+    private func reportLoadBlocked() {
+        let retryInSeconds: Int?
+        if case .ready = state {
+            let remaining = Self.dedupWindow - Date().timeIntervalSince(currentKeyAt)
+            retryInSeconds = Int(max(0, remaining).rounded(.up))
+        } else {
+            retryInSeconds = nil
+        }
+        let error = SimulaAdError.duplicateRequest(retryInSeconds: retryInSeconds)
+        // Observable like any other rejected load() (sampled); no real load ran, so no duration.
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: nil, serveId: nil, durationMs: nil, errorCode: error.telemetryCode
+        )
+        delegate?.rewardedDidFailToLoad(self, error: error)
+    }
+
     private func failDisplay(_ error: SimulaAdError) {
         Telemetry.shared.recordLifecycle(stage: "show_fail", adFormat: Self.adFormat, adUnitId: adUnitId, errorCode: error.telemetryCode)
         delegate?.rewardedDidFailToDisplay(self, error: error)
@@ -331,20 +518,21 @@ public final class SimulaRewardedAd {
         return Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
     }
 
-    // MARK: - Fallback ad (post-close)
+    // MARK: - Fallback ads (post-close)
 
-    /// After the minigame closes, fetch a fallback ad for `adId` and — when one is returned —
-    /// present it full-screen, mirroring the minigame menu's post-game ad flow. Best-effort: a
-    /// missing id, network error, or empty/no-fill response simply shows nothing.
-    private func presentFallbackAd(adId: String) {
+    /// After the minigame closes, fetch the serve's fallback ad screens
+    /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
+    /// full-screen in reveal order, mirroring the minigame menu's post-game ad flow.
+    /// Best-effort: a missing id, network error, or empty response simply shows nothing.
+    private func presentFallbackAds(impressionId: String) {
         #if os(iOS)
-        guard !adId.isEmpty else { return }
+        guard !impressionId.isEmpty else { return }
         let api = self.api
         Task { [weak self] in
-            let url = try? await api.fetchAdForMinigame(aid: adId)
-            guard let self, let url, !url.isEmpty else { return }
+            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
+            guard let self, !ads.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(adId: adId, iframeUrl: url) { [weak self] in
+            let didPresent = presenter.present(ads: ads) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

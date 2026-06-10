@@ -13,7 +13,7 @@ import WebKit
 /// - Bottom sheet mode when `playableHeight` is set (with draggable handle)
 /// - Dragging above 95% of screen snaps to full screen and hides status bar
 /// - Fade-in overlay animation
-/// - PostMessage communication from game iframe (onAdIdReceived)
+/// - PostMessage communication from game iframe (onServeIdReceived)
 public struct GameIframeView: View {
     // MARK: - Props (matching React's GameIframeProps)
 
@@ -24,7 +24,9 @@ public struct GameIframeView: View {
     var messages: [Message] = []
     var delegateChar: Bool = true
     let onClose: () -> Void
-    var onAdIdReceived: ((String) -> Void)?
+    /// The minigame serve id — the menu fetches the post-game ad screens with it
+    /// (`GET /load/fallbacks/{serveId}`).
+    var onServeIdReceived: ((String) -> Void)?
     var charDesc: String?
     var menuId: String?
     /// Controls the height of the game iframe (nil = fullscreen). Minimum 500px.
@@ -309,9 +311,9 @@ public struct GameIframeView: View {
             self.adVerifications = response.adVerifications
             self.omImpressionId = response.adId
 
-            // Callback with the ad_id for tracking (matching React's onAdIdReceived)
-            if !response.adId.isEmpty {
-                onAdIdReceived?(response.adId)
+            // Callback with the serve id (the post-game fallbacks handle).
+            if !response.serveId.isEmpty {
+                onServeIdReceived?(response.serveId)
             }
             self.loading = false
         } catch {

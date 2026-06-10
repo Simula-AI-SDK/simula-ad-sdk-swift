@@ -63,7 +63,7 @@ final class AdVerificationDecodingTests: XCTestCase {
 
     func testWithRenderedHtmlPreservesVerifications() {
         let original = AdLoadResponse(
-            adId: "x", adInserted: true, adUnitId: "u", renderedHtml: "<a>",
+            impressionId: "x", adInserted: true, adUnitId: "u", renderedHtml: "<a>",
             adVerifications: [
                 AdVerification(vendorKey: "v", javascriptResourceUrl: "https://v", verificationParameters: nil)
             ]
@@ -71,6 +71,6 @@ final class AdVerificationDecodingTests: XCTestCase {
         let injected = original.withRenderedHtml("<a>injected</a>")
         XCTAssertEqual(injected.renderedHtml, "<a>injected</a>")
         XCTAssertEqual(injected.adVerifications.count, 1)
-        XCTAssertEqual(injected.adId, "x")
+        XCTAssertEqual(injected.impressionId, "x")
     }
 }

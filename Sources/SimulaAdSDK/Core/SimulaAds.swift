@@ -37,20 +37,8 @@ public enum SimulaAds {
     /// any network call when the host forgot to initialize).
     public static var isInitialized: Bool { shared != nil }
 
-    // MARK: - Character context
-
-    /// Character context attached to every imperative interstitial
-    /// (`/ads/load/interstitial`) request. Seed it via `initialize`; update it on the
-    /// fly by assigning these directly or calling `setCharacter(...)`. The next
-    /// `SimulaInterstitialAd.load()` reads the current values, so there is no stale
-    /// per-ad copy to keep in sync.
-    public static var charId: String?
-    /// Character name sent on the imperative `/ads/load/interstitial` request.
-    public static var charName: String?
-    /// Character avatar URL sent on the imperative `/ads/load/interstitial` request.
-    public static var charImage: String?
-    /// Character description sent on the imperative `/ads/load/interstitial` request.
-    public static var charDesc: String?
+    // Character context is no longer global: pass charId/charName/charImage/charDesc
+    // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
     /// Initializes the SDK with the given API key. Safe to call more than once;
     /// the first valid call wins and subsequent calls are ignored so existing ad
@@ -71,9 +59,6 @@ public enum SimulaAds {
     ///     + IDFA opt-in). When provided it takes precedence over `hasPrivacyConsent`;
     ///     when `nil` the SDK seeds a config from `hasPrivacyConsent` and still
     ///     auto-reads IAB-standard CMP keys. Mirrors `SimulaProviderView`'s `privacy`.
-    ///   - charId/charName/charImage/charDesc: Optional initial character context for
-    ///     the imperative interstitial. Update later via `setCharacter(...)` or by
-    ///     assigning the `charId`/`charName`/`charImage`/`charDesc` properties.
     ///   - telemetryEnabled: Opt out of in-house SDK telemetry (handled-error + performance
     ///     metrics sent to Simula). Default `true`. PII in telemetry is consent-gated exactly
     ///     like ad tracking; pass `false` to disable the pipeline entirely.
@@ -86,10 +71,6 @@ public enum SimulaAds {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
-        charId: String? = nil,
-        charName: String? = nil,
-        charImage: String? = nil,
-        charDesc: String? = nil,
         telemetryEnabled: Bool = true,
         openMeasurementEnabled: Bool = true
     ) {
@@ -104,12 +85,6 @@ public enum SimulaAds {
 
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else { return }
-
-        // Seed the character context (changeable later via setCharacter()).
-        Self.charId = charId
-        Self.charName = charName
-        Self.charImage = charImage
-        Self.charDesc = charDesc
 
         let provider = SimulaProvider(
             apiKey: apiKey,
@@ -137,22 +112,5 @@ public enum SimulaAds {
         // without waiting for the next rewarded play. This kicks off its own Task, so a
         // slow/failed session create can't delay or skip recovery.
         RewardVerificationManager.shared.triggerProcessQueue()
-    }
-
-    /// Replaces the character context used for subsequent interstitial loads. Call
-    /// this when the active character changes; the next `SimulaInterstitialAd.load()`
-    /// sends the new values. Omitted arguments are cleared, so a character switch
-    /// never carries a stale field. For a single-field tweak, assign the property
-    /// directly (e.g. `SimulaAds.charName = "Luna"`). Safe to call before `initialize`.
-    public static func setCharacter(
-        charId: String? = nil,
-        charName: String? = nil,
-        charImage: String? = nil,
-        charDesc: String? = nil
-    ) {
-        Self.charId = charId
-        Self.charName = charName
-        Self.charImage = charImage
-        Self.charDesc = charDesc
     }
 }

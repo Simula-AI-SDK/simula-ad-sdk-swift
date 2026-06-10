@@ -27,11 +27,16 @@ final class RewardedPresenter {
     ///   which case `onClose` is never called).
     @discardableResult
     func present(
-        adId: String,
+        impressionId: String,
         apiKey: String,
         iframeUrl: String,
         durationSeconds: Int,
         adVerifications: [AdVerification] = [],
+        storePrompt: StorePrompt? = nil,
+        trackingUrl: String? = nil,
+        destination: AdDestination = .appstore,
+        storeOpen: StoreOpen = .skstoreproduct,
+        previewHTML: String? = nil,
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
         guard let scene = Self.activeWindowScene() else {
@@ -40,11 +45,16 @@ final class RewardedPresenter {
         self.onClose = onClose
 
         let root = RewardedGameView(
-            adId: adId,
+            impressionId: impressionId,
             apiKey: apiKey,
             iframeUrl: iframeUrl,
             durationSeconds: durationSeconds,
             adVerifications: adVerifications,
+            storePrompt: storePrompt,
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeOpen: storeOpen,
+            previewHTML: previewHTML,
             onFinish: { [weak self] earned, elapsed in
                 self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
             }
@@ -95,17 +105,26 @@ final class RewardedPresenter {
 /// reward by accident. On a qualifying close, `onFinish(earned, elapsedPlayTime)`
 /// fires after the dismiss fade.
 private struct RewardedGameView: View {
-    let adId: String
+    /// The impression id from /load/rewarded — drives the ad-info report overlay.
+    let impressionId: String
     let apiKey: String
     let iframeUrl: String
     let durationSeconds: Int
     /// OMID verification resources for the game iframe. Empty unless the backend sends them;
     /// when non-empty, a native-display session is started against the iframe WebView.
     let adVerifications: [AdVerification]
+    // Mid-ad store prompt config + tap routing. `storePrompt == nil` → no badge.
+    let storePrompt: StorePrompt?
+    let trackingUrl: String?
+    let destination: AdDestination
+    let storeOpen: StoreOpen
+    /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
+    let previewHTML: String?
     let onFinish: (Bool, Double) -> Void
 
     @State private var elapsedPlayTime: Double = 0
     @State private var rewardEarned = false
+    @State private var storePromptVisible = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     /// OMID native-display session (only when `adVerifications` is non-empty).
@@ -122,8 +141,10 @@ private struct RewardedGameView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if let url = URL(string: iframeUrl) {
-                // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
+            // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
+            if let previewHTML {
+                WebViewRepresentable(htmlString: previewHTML)
+            } else if let url = URL(string: iframeUrl) {
                 WebViewRepresentable(
                     url: url,
                     onContentRendered: { webView in startOMSession(webView) }
@@ -138,8 +159,16 @@ private struct RewardedGameView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 .animation(.default, value: rewardEarned)
 
+            // Mid-ad store prompt — appears at half the play-to-earn duration and is removed the
+            // instant the reward unlocks (the reward/close pill takes over). Rendered at the
+            // server-resolved corner (verbatim); a tap routes to the advertised store.
+            if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
+                // Match the reward/close pill's 8pt inset so both share the same top baseline.
+                StorePromptBadge(prompt: prompt, edgePadding: 8, onTap: { handleStorePromptTap() })
+            }
+
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
-            AdInfoReportOverlay(adId: adId, apiKey: apiKey)
+            AdInfoReportOverlay(adId: impressionId, apiKey: apiKey)
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a
@@ -161,7 +190,7 @@ private struct RewardedGameView: View {
     private func startOMSession(_ webView: WKWebView) {
         guard omSession == nil, !adVerifications.isEmpty else { return }
         omSession = OMAdSession.startNativeSession(
-            adView: webView, verifications: adVerifications, impressionId: adId
+            adView: webView, verifications: adVerifications, impressionId: impressionId
         )
         omSession?.fireLoaded()
         omSession?.fireImpression()
@@ -207,11 +236,20 @@ private struct RewardedGameView: View {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
                 elapsedPlayTime += 1
+                // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
+                if elapsedPlayTime >= Double(durationSeconds) / 2 {
+                    withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+                }
                 if elapsedPlayTime >= Double(durationSeconds) {
                     rewardEarned = true
                 }
             }
         }
+    }
+
+    /// Routes a store-prompt tap to the advertised destination (shared CTA router).
+    private func handleStorePromptTap() {
+        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen)
     }
 
     // MARK: Close

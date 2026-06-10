@@ -282,15 +282,18 @@ public struct MinigameResponse: Sendable {
     public let adType: String
     public let adInserted: Bool
     public let adId: String
+    /// The minigame serve id — the handle for the post-game `fetchFallbacks` call.
+    public let serveId: String
     public let iframeUrl: String
     /// OMID verification resources for the game iframe (empty unless the backend sends them).
     public let adVerifications: [AdVerification]
 
-    public init(adType: String, adInserted: Bool, adId: String, iframeUrl: String,
-                adVerifications: [AdVerification] = []) {
+    public init(adType: String, adInserted: Bool, adId: String, serveId: String = "",
+                iframeUrl: String, adVerifications: [AdVerification] = []) {
         self.adType = adType
         self.adInserted = adInserted
         self.adId = adId
+        self.serveId = serveId
         self.iframeUrl = iframeUrl
         self.adVerifications = adVerifications
     }
@@ -305,11 +308,13 @@ private struct MinigameAPIResponse: Decodable {
 
 private struct MinigameAdResponse: Decodable {
     let adId: String?
+    let serveId: String?
     let iframeUrl: String?
     let adVerifications: [AdVerification]
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
+        case serveId = "serve_id"
         case iframeUrl = "iframe_url"
         case adVerifications = "ad_verifications"
     }
@@ -317,6 +322,7 @@ private struct MinigameAdResponse: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.adId = try? c.decode(String.self, forKey: .adId)
+        self.serveId = try? c.decode(String.self, forKey: .serveId)
         self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
         self.adVerifications = c.decodeAdVerifications(forKey: .adVerifications)
     }
@@ -411,7 +417,9 @@ public struct AdLoadRequest: Encodable, Sendable {
 /// redirect to open. Decoding is tolerant: missing fields fall back to defaults so
 /// a partial payload can't fail the whole decode (malformed JSON still throws).
 public struct AdLoadResponse: Decodable, Sendable {
-    public let adId: String
+    /// The impression id — the SDK's single handle for fallbacks, tracking and reporting.
+    /// Empty on a no-fill (the server sends an explicit null).
+    public let impressionId: String
     public let adInserted: Bool
     public let adUnitId: String
     public let destination: String
@@ -440,7 +448,7 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// preserving every other field.
     public func withRenderedHtml(_ html: String?) -> AdLoadResponse {
         AdLoadResponse(
-            adId: adId, adInserted: adInserted, adUnitId: adUnitId, destination: destination,
+            impressionId: impressionId, adInserted: adInserted, adUnitId: adUnitId, destination: destination,
             renderedFormat: renderedFormat, trackingUrl: trackingUrl, renderedHtml: html,
             adBehavior: adBehavior, creative: creative, experiment: experiment,
             adVerifications: adVerifications
@@ -463,7 +471,7 @@ public struct AdLoadResponse: Decodable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case adId = "ad_id"
+        case impressionId = "impression_id"
         case adInserted = "ad_inserted"
         case adUnitId = "ad_unit_id"
         case destination
@@ -478,7 +486,7 @@ public struct AdLoadResponse: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
+        self.impressionId = (try? c.decode(String.self, forKey: .impressionId)) ?? ""
         self.adInserted = (try? c.decode(Bool.self, forKey: .adInserted)) ?? false
         self.adUnitId = (try? c.decode(String.self, forKey: .adUnitId)) ?? ""
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
@@ -495,7 +503,7 @@ public struct AdLoadResponse: Decodable, Sendable {
 
     /// Member-wise init for internal construction and tests.
     public init(
-        adId: String,
+        impressionId: String,
         adInserted: Bool,
         adUnitId: String,
         destination: String = "appstore",
@@ -507,7 +515,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         experiment: Experiment? = nil,
         adVerifications: [AdVerification] = []
     ) {
-        self.adId = adId
+        self.impressionId = impressionId
         self.adInserted = adInserted
         self.adUnitId = adUnitId
         self.destination = destination
@@ -566,44 +574,112 @@ public struct RewardedInitRequest: Encodable, Sendable {
     }
 }
 
-/// Payload from POST /minigames/init/rewarded. The SDK renders `iframeUrl` in a
+/// Payload from POST /load/rewarded. The SDK renders `iframeUrl` in a
 /// WebView and enforces `durationSeconds` before the reward can be earned. Decoding
 /// is tolerant: missing fields fall back to defaults so a partial payload can't fail
 /// the whole decode (malformed JSON still throws).
 public struct RewardedInitResponse: Decodable, Sendable {
-    public let serveId: String
+    /// The impression id — replaces the old `serve_id`/`ad_id` pair as the single handle
+    /// for verify-reward, fallbacks, tracking and reporting.
+    public let impressionId: String
     public let iframeUrl: String
-    public let adId: String
     public let durationSeconds: Int
     /// OMID verification resources for the game iframe. Empty unless the backend sends
     /// them (forward-compatible); drives an optional native-display OMID session.
     public let adVerifications: [AdVerification]
+    // Mirrors the interstitial response: drives the mid-ad store prompt + its tap routing.
+    // `adBehavior` is nil when the payload omits `ad_behavior` → no store prompt.
+    public let destination: String
+    public let trackingUrl: String?
+    public let adBehavior: AdBehavior?
+
+    /// The advertiser destination kind (App Store vs web); defaults to `.appstore`.
+    public var destinationKind: AdDestination {
+        AdDestination(rawValue: destination) ?? .appstore
+    }
 
     enum CodingKeys: String, CodingKey {
-        case serveId = "serve_id"
+        case impressionId = "impression_id"
         case iframeUrl = "iframe_url"
-        case adId = "ad_id"
         case durationSeconds = "duration_seconds"
         case adVerifications = "ad_verifications"
+        case destination
+        case trackingUrl = "tracking_url"
+        case adBehavior = "ad_behavior"
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.serveId = (try? c.decode(String.self, forKey: .serveId)) ?? ""
+        self.impressionId = (try? c.decode(String.self, forKey: .impressionId)) ?? ""
         self.iframeUrl = (try? c.decode(String.self, forKey: .iframeUrl)) ?? ""
-        self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
         self.durationSeconds = (try? c.decode(Int.self, forKey: .durationSeconds)) ?? 0
         self.adVerifications = c.decodeAdVerifications(forKey: .adVerifications)
+        self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
+        self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
     }
 
     /// Member-wise init for internal construction and tests.
-    public init(serveId: String, iframeUrl: String, adId: String = "", durationSeconds: Int,
-                adVerifications: [AdVerification] = []) {
-        self.serveId = serveId
+    public init(
+        impressionId: String,
+        iframeUrl: String,
+        durationSeconds: Int,
+        destination: String = AdDestination.appstore.rawValue,
+        trackingUrl: String? = nil,
+        adBehavior: AdBehavior? = nil,
+        adVerifications: [AdVerification] = []
+    ) {
+        self.impressionId = impressionId
         self.iframeUrl = iframeUrl
-        self.adId = adId
         self.durationSeconds = durationSeconds
+        self.destination = destination
+        self.trackingUrl = trackingUrl
+        self.adBehavior = adBehavior
         self.adVerifications = adVerifications
+    }
+}
+
+// MARK: - Fallback Ads
+
+/// One post-play ad screen from `GET /load/fallbacks/{impression_id}`. `adId` is the
+/// screen's own impression id (drives its report overlay).
+public struct FallbackAd: Sendable {
+    public let adId: String
+    public let iframeUrl: String
+
+    public init(adId: String, iframeUrl: String) {
+        self.adId = adId
+        self.iframeUrl = iframeUrl
+    }
+}
+
+/// Wire payload from `GET /load/fallbacks/{impression_id}` — every ad screen linked to
+/// the serve (campaign creative, then the "Get the App" end screen) in reveal order.
+struct FallbackAdsAPIResponse: Decodable {
+    let impressionId: String?
+    let ads: [FallbackAdItem]
+
+    enum CodingKeys: String, CodingKey {
+        case impressionId = "impression_id"
+        case ads
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.impressionId = try? c.decode(String.self, forKey: .impressionId)
+        self.ads = (try? c.decode([FallbackAdItem].self, forKey: .ads)) ?? []
+    }
+}
+
+struct FallbackAdItem: Decodable {
+    let adId: String?
+    let html: String?
+    let iframeUrl: String?
+
+    enum CodingKeys: String, CodingKey {
+        case adId = "ad_id"
+        case html
+        case iframeUrl = "iframe_url"
     }
 }
 
@@ -979,24 +1055,26 @@ public final class SimulaAPI: @unchecked Sendable {
             adType: apiResponse.adType ?? "minigame",
             adInserted: apiResponse.adInserted ?? false,
             adId: adId,
+            serveId: adResponse.serveId ?? "",
             iframeUrl: iframeUrl,
             adVerifications: adResponse.adVerifications
         )
     }
 
-    // MARK: - Fetch Ad for Minigame
+    // MARK: - Fetch Fallback Ads
 
-    /// Fetches a fallback ad after minigame play.
-    /// Translates `fetchAdForMinigame()` from api.ts
-    public func fetchAdForMinigame(aid: String) async throws -> String? {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/fallback_ad/\(aid)") else {
+    /// Fetches the fallback ad screens for a serve via `GET /load/fallbacks/{impression_id}`,
+    /// keyed on the `impression_id` the load call returned. Returns every screen linked to
+    /// the serve (campaign creative, then the "Get the App" end screen) in reveal order,
+    /// skipping entries without a loadable iframe URL. Side-effect-free on the backend.
+    public func fetchFallbacks(impressionId: String) async throws -> [FallbackAd] {
+        guard let url = URL(string: "\(API_BASE_URL)/load/fallbacks/\(impressionId)") else {
             throw SimulaAPIError.invalidURL
         }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        request.httpMethod = "GET"
         applyHeaders(makeHeaders(), to: &request)
-        request.httpBody = nil
 
         let (data, response) = try await session.data(for: request)
 
@@ -1007,14 +1085,11 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try JSONDecoder().decode(MinigameAPIResponse.self, from: data)
-
-        if let adResponse = apiResponse.adResponse,
-           let iframeUrl = adResponse.iframeUrl, !iframeUrl.isEmpty {
-            return iframeUrl
+        let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
+        return apiResponse.ads.compactMap { item in
+            guard let iframeUrl = item.iframeUrl, !iframeUrl.isEmpty else { return nil }
+            return FallbackAd(adId: item.adId ?? "", iframeUrl: iframeUrl)
         }
-
-        return nil
     }
 
     // MARK: - Track Menu Game Click
