@@ -59,12 +59,16 @@ public enum SimulaAds {
     ///     + IDFA opt-in). When provided it takes precedence over `hasPrivacyConsent`;
     ///     when `nil` the SDK seeds a config from `hasPrivacyConsent` and still
     ///     auto-reads IAB-standard CMP keys. Mirrors `SimulaProviderView`'s `privacy`.
+    ///   - telemetryEnabled: Opt out of in-house SDK telemetry (handled-error + performance
+    ///     metrics sent to Simula). Default `true`. PII in telemetry is consent-gated exactly
+    ///     like ad tracking; pass `false` to disable the pipeline entirely.
     public static func initialize(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
-        privacy: SimulaPrivacyConfig? = nil
+        privacy: SimulaPrivacyConfig? = nil,
+        telemetryEnabled: Bool = true
     ) {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
@@ -83,7 +87,8 @@ public enum SimulaAds {
             devMode: devMode,
             primaryUserID: primaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
-            privacy: privacy
+            privacy: privacy,
+            telemetryEnabled: telemetryEnabled
         )
         shared = provider
 

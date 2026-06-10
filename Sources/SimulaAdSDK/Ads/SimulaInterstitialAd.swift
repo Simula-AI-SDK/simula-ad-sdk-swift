@@ -100,6 +100,24 @@ public enum SimulaAdError: LocalizedError, Sendable {
     }
 }
 
+extension SimulaAdError {
+    /// Stable, low-cardinality code for this error, used as the `error_code` on telemetry events.
+    var telemetryCode: String {
+        switch self {
+        case .notInitialized: return "not_initialized"
+        case .noSession: return "no_session"
+        case .noFill: return "no_fill"
+        case .notReady: return "not_ready"
+        case .stale: return "stale"
+        case .duplicateRequest: return "duplicate_request"
+        case .alreadyShowing: return "already_showing"
+        case .noPresentationContext: return "no_presentation_context"
+        case .unsupportedPlatform: return "unsupported_platform"
+        case .network: return "network"
+        }
+    }
+}
+
 // MARK: - SimulaInterstitialAd
 
 /// An imperative, preloadable full-screen interstitial ad.
@@ -171,6 +189,11 @@ public final class SimulaInterstitialAd {
     private var lastCharImage: String?
     private var lastCharDesc: String?
 
+    // Monotonic stage markers for telemetry latencies (0 = not yet started).
+    private var loadStartNanos: UInt64 = 0
+    private var showStartNanos: UInt64 = 0
+    private nonisolated static let adFormat = "interstitial"
+
     #if os(iOS)
     private var presenter: InterstitialPresenter?
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
@@ -239,6 +262,7 @@ public final class SimulaInterstitialAd {
         currentKey = key
         currentKeyAt = now
         state = .loading
+        loadStartNanos = DispatchTime.now().uptimeNanoseconds
         loadTask = Task { [weak self] in
             guard let self else { return }
 
@@ -274,11 +298,19 @@ public final class SimulaInterstitialAd {
                 // Warm a WKWebView so the first spin-up is off the present() critical path.
                 WebViewPool.shared.prewarm()
                 #endif
+                Telemetry.shared.recordLifecycle(
+                    stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
+                )
                 self.state = .ready(response, loadedAt: Date())
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
+                // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
+                // lifecycle event comes from failLoad()).
+                Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
                 self.failLoad(.network(apiError))
             } catch {
+                Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
                 self.failLoad(.network(.invalidResponse))
             }
         }
@@ -325,18 +357,21 @@ public final class SimulaInterstitialAd {
         }
 
         let presenter = InterstitialPresenter()
+        showStartNanos = DispatchTime.now().uptimeNanoseconds
 
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
             onClick: { [weak self] in
                 guard let self else { return }
+                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClick(self)
             },
             onClose: { [weak self] in
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
+                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 self.presentFallbackAds(impressionId: response.impressionId)
@@ -361,6 +396,10 @@ public final class SimulaInterstitialAd {
         // Only now is the ad actually on screen.
         state = .showing(response)
         self.presenter = presenter
+        Telemetry.shared.recordLifecycle(
+            stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
+        )
         delegate?.interstitialDidDisplay(self)
         // Fire the impression once, only after the present succeeded.
         let api = self.api
@@ -490,6 +529,10 @@ public final class SimulaInterstitialAd {
 
     private func failLoad(_ error: SimulaAdError) {
         state = .idle
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: error.telemetryCode
+        )
         delegate?.interstitialDidFailToLoad(self, error: error)
     }
 
@@ -505,11 +548,24 @@ public final class SimulaInterstitialAd {
         } else {
             retryInSeconds = nil
         }
-        delegate?.interstitialDidFailToLoad(self, error: .duplicateRequest(retryInSeconds: retryInSeconds))
+        let error = SimulaAdError.duplicateRequest(retryInSeconds: retryInSeconds)
+        // Observable like any other rejected load() (sampled); no real load ran, so no duration.
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
+            adId: nil, serveId: nil, durationMs: nil, errorCode: error.telemetryCode
+        )
+        delegate?.interstitialDidFailToLoad(self, error: error)
     }
 
     private func failDisplay(_ error: SimulaAdError) {
+        Telemetry.shared.recordLifecycle(stage: "show_fail", adFormat: Self.adFormat, adUnitId: adUnitId, errorCode: error.telemetryCode)
         delegate?.interstitialDidFailToDisplay(self, error: error)
+    }
+
+    /// Monotonic ms since the given marker (nil if not started).
+    private func msSince(_ startNanos: UInt64) -> Int? {
+        guard startNanos != 0 else { return nil }
+        return Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
     }
 
     // MARK: - Fallback ads (post-close)

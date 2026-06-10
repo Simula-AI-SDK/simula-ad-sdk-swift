@@ -1,0 +1,280 @@
+import XCTest
+@testable import SimulaAdSDK
+
+/// Tier-1 tests for `TelemetryManager` — the batching / dedup / backoff engine behind in-house
+/// SDK telemetry. Exercised with an in-memory store, a fake sender, an injected clock, and zero
+/// retry backoff so flush triggering, error aggregation, durability, retry, sampling, the
+/// kill-switch, and consent-gated PII are validated without the network or wall-clock timing.
+final class TelemetryManagerTests: XCTestCase {
+
+    // MARK: - Test doubles
+
+    private final class FakeStore: TelemetryStoring, @unchecked Sendable {
+        private let lock = NSLock()
+        private var data: [TelemetryEvent] = []
+        init(_ initial: [TelemetryEvent] = []) { data = initial }
+        func load() -> [TelemetryEvent] { lock.lock(); defer { lock.unlock() }; return data }
+        func save(_ events: [TelemetryEvent]) { lock.lock(); data = events; lock.unlock() }
+    }
+
+    /// Records decoded batches; replays queued acks then falls back to `defaultAck`. Optional
+    /// one-shot gate so a test can hold the first send in flight while it enqueues more work.
+    private final class FakeSender: TelemetrySending, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _batches: [TelemetryEnvelope] = []
+        private var acks: [TelemetryAck] = []
+        var defaultAck: TelemetryAck = .accepted
+        private var gateCont: CheckedContinuation<Void, Never>?
+        private var gated = false
+
+        var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
+        func enqueueAcks(_ a: [TelemetryAck]) { lock.lock(); acks = a; lock.unlock() }
+        func gateFirst() { lock.lock(); gated = true; lock.unlock() }
+        func release() {
+            lock.lock(); let c = gateCont; gateCont = nil; gated = false; lock.unlock()
+            c?.resume()
+        }
+
+        func send(_ body: Data) async -> TelemetryAck {
+            lock.lock()
+            let shouldGate = gated
+            lock.unlock()
+            if shouldGate {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    lock.lock(); gateCont = cont; lock.unlock()
+                }
+            }
+            lock.lock()
+            if let env = try? JSONDecoder().decode(TelemetryEnvelope.self, from: body) { _batches.append(env) }
+            let ack = acks.isEmpty ? defaultAck : acks.removeFirst()
+            lock.unlock()
+            return ack
+        }
+    }
+
+    // MARK: - Builder
+
+    private func build(
+        store: TelemetryStoring,
+        sender: TelemetrySending,
+        enabled: Bool = true,
+        sampleRate: Double = 1.0,
+        random: @escaping @Sendable () -> Double = { 0.0 },
+        ppid: String? = nil,
+        gaid: String? = nil,
+        debugLog: (@Sendable (String) -> Void)? = nil
+    ) -> TelemetryManager {
+        TelemetryManager(
+            ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
+            store: store,
+            sender: sender,
+            primaryUserIdProvider: { ppid },
+            advertisingIdProvider: { gaid },
+            enabled: enabled,
+            sampleRate: sampleRate,
+            now: { 1_000 },
+            random: random,
+            backoff: { _ in 0 }, // instant retries — keep tests fast
+            debugLog: debugLog,
+            flushThreshold: 20,
+            flushInterval: 0.05 // sub-threshold perf flushes promptly via the timer
+        )
+    }
+
+    /// Thread-safe line collector for the debug-log tests.
+    private final class LogSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return lines }
+    }
+
+    private func allEvents(_ s: [TelemetryEnvelope]) -> [TelemetryEvent] { s.flatMap { $0.events } }
+
+    private func waitUntil(timeout: TimeInterval = 2, _ condition: @escaping () -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
+            try? await Task.sleep(nanoseconds: 5_000_000) // 5ms
+        }
+    }
+
+    // MARK: - Batching + flush
+
+    func testSubThresholdPerfFlushesOnTimerAndClears() async {
+        let store = FakeStore(); let sender = FakeSender()
+        let mgr = build(store: store, sender: sender)
+
+        for _ in 0..<3 {
+            mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)
+        }
+        await waitUntil { !sender.batches.isEmpty }
+
+        let net = allEvents(sender.batches).filter { $0.type == TelemetryType.network }
+        XCTAssertEqual(net.count, 3)
+        XCTAssertTrue(net.allSatisfy { $0.name == "POST /load/interstitial" && $0.durationMs == 12 })
+        await waitUntil { store.load().isEmpty }
+    }
+
+    func testEnvelopeCarriesContextAndSessionId() async {
+        let sender = FakeSender()
+        let mgr = build(store: FakeStore(), sender: sender)
+        mgr.setSessionId("sess-42")
+        mgr.recordError(signature: "api:boom", errorCode: "boom", message: "msg")
+        await waitUntil { !sender.batches.isEmpty }
+
+        let env = sender.batches.first!
+        XCTAssertEqual(env.sdkVersion, "9.9")
+        XCTAssertEqual(env.platform, "ios")
+        XCTAssertEqual(env.hostAppId, "com.test")
+        XCTAssertEqual(env.sessionId, "sess-42")
+    }
+
+    // MARK: - Error dedup + eager flush
+
+    func testIdenticalErrorsAggregateWithNoOccurrenceLost() async {
+        let store = FakeStore()
+        let sender = FakeSender(); sender.gateFirst() // hold the first send so #2/#3 pile up
+        let mgr = build(store: store, sender: sender)
+
+        for _ in 0..<3 { mgr.recordError(signature: "api:decode", errorCode: "decode", message: "bad json") }
+        // Give the eager flushes time to enqueue + park on the gate.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        sender.release()
+        await waitUntil { store.load().isEmpty }
+
+        let errors = allEvents(sender.batches).filter { $0.type == TelemetryType.error }
+        XCTAssertTrue(errors.allSatisfy { $0.name == "api:decode" }, "only one distinct error signature")
+        XCTAssertEqual(errors.reduce(0) { $0 + ($1.count ?? 0) }, 3, "all 3 occurrences accounted for")
+    }
+
+    func testErrorTriggersEagerFlush() async {
+        let sender = FakeSender()
+        let mgr = build(store: FakeStore(), sender: sender)
+        mgr.recordError(signature: "api:fatal", errorCode: "fatal", message: "x")
+        await waitUntil { !sender.batches.isEmpty }
+        XCTAssertTrue(allEvents(sender.batches).contains { $0.type == TelemetryType.error && $0.name == "api:fatal" })
+    }
+
+    // MARK: - Durability + recovery
+
+    func testStartRecoversBufferLeftByPriorProcess() async {
+        var seeded = TelemetryEvent(type: TelemetryType.network, name: "GET /catalog", eventId: "id-prev", timestamp: 1)
+        seeded.durationMs = 7
+        let store = FakeStore([seeded]); let sender = FakeSender()
+        let mgr = build(store: store, sender: sender)
+
+        mgr.start()
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertTrue(allEvents(sender.batches).contains { $0.eventId == "id-prev" })
+        await waitUntil { store.load().isEmpty }
+    }
+
+    // MARK: - Retry + drop
+
+    func testFailedBatchRetriesUntilAccepted() async {
+        let store = FakeStore()
+        let sender = FakeSender(); sender.enqueueAcks([.retry, .retry, .accepted])
+        let mgr = build(store: store, sender: sender)
+
+        mgr.recordError(signature: "api:net", errorCode: "net", message: "timeout")
+        await waitUntil { store.load().isEmpty }
+
+        XCTAssertEqual(sender.batches.count, 3, "1 initial attempt + 2 retries")
+        XCTAssertTrue(sender.batches.allSatisfy { env in env.events.contains { $0.name == "api:net" } })
+    }
+
+    func testPermanent4xxDropsWithoutRetry() async {
+        let store = FakeStore()
+        let sender = FakeSender(); sender.defaultAck = .drop
+        let mgr = build(store: store, sender: sender)
+
+        mgr.recordError(signature: "api:bad", errorCode: "bad", message: "x")
+        await waitUntil { store.load().isEmpty }
+        // Settle a beat to ensure no spurious retry was scheduled.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(sender.batches.count, 1, "no retry on a permanent error")
+    }
+
+    // MARK: - Sampling + kill-switch
+
+    func testSamplingDropsPerfButNotErrors() async {
+        let sender = FakeSender()
+        // random 0.9 >= sampleRate 0.5 → this session is NOT sampled in for perf.
+        let mgr = build(store: FakeStore(), sender: sender, sampleRate: 0.5, random: { 0.9 })
+
+        mgr.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 10, failureClass: nil)
+        mgr.recordError(signature: "api:err", errorCode: "err", message: "x")
+        await waitUntil { !sender.batches.isEmpty }
+
+        let events = allEvents(sender.batches)
+        XCTAssertFalse(events.contains { $0.type == TelemetryType.network }, "perf suppressed by sampling")
+        XCTAssertTrue(events.contains { $0.type == TelemetryType.error }, "errors always sent")
+    }
+
+    // MARK: - Dev-mode console log + redaction
+
+    func testDebugLogReceivesALinePerRecordedEvent() async {
+        let sink = LogSink()
+        let mgr = build(store: FakeStore(), sender: FakeSender(), debugLog: { sink.append($0) })
+
+        mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)
+        mgr.recordError(signature: "api:x", errorCode: "x", message: "boom")
+        await waitUntil { sink.all.count >= 2 }
+
+        XCTAssertTrue(sink.all.contains { $0.hasPrefix("network POST /load/interstitial") })
+        XCTAssertTrue(sink.all.contains { $0.hasPrefix("error api:x") })
+    }
+
+    func testErrorMessagesAreSanitizedOfSecretsBeforeSendAndLog() async {
+        let sink = LogSink()
+        let sender = FakeSender()
+        let mgr = build(store: FakeStore(), sender: sender, debugLog: { sink.append($0) })
+
+        mgr.recordError(signature: "api:net", errorCode: "net", message: "GET https://x.com/cb?token=abc123&u=9 failed; Authorization: Bearer xyz789 apiKey=SEKRIT")
+        await waitUntil { !sender.batches.isEmpty && !sink.all.isEmpty }
+
+        let sent = allEvents(sender.batches).first { $0.type == TelemetryType.error }?.message ?? ""
+        let logged = sink.all.first { $0.hasPrefix("error api:net") } ?? ""
+        for haystack in [sent, logged] {
+            XCTAssertFalse(haystack.contains("abc123"), "query/token stripped")
+            XCTAssertFalse(haystack.contains("xyz789"), "bearer token stripped")
+            XCTAssertFalse(haystack.contains("SEKRIT"), "key value stripped")
+            XCTAssertFalse(haystack.contains("?token"), "query string stripped")
+        }
+    }
+
+    func testServerKillSwitchMakesRecordingNoOp() async {
+        let store = FakeStore(); let sender = FakeSender()
+        let mgr = build(store: store, sender: sender)
+        mgr.applyServerConfig(enabled: false, sampleRate: 1.0)
+
+        mgr.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 10, failureClass: nil)
+        mgr.recordError(signature: "api:err", errorCode: "err", message: "x")
+        try? await Task.sleep(nanoseconds: 100_000_000) // can't poll for absence; settle then assert
+
+        XCTAssertTrue(sender.batches.isEmpty)
+        XCTAssertTrue(store.load().isEmpty)
+    }
+
+    // MARK: - Consent-gated PII
+
+    func testPiiIncludedWhenProvidedAndOmittedWhenNot() async {
+        let withPii = FakeSender()
+        // Retain the manager: its eager-flush Task captures `self` weakly (in production the
+        // manager is retained by Telemetry.shared), so a temporary would be freed before flush.
+        let mgrWith = build(store: FakeStore(), sender: withPii, ppid: "user-1", gaid: "gaid-1")
+        mgrWith.recordError(signature: "e", errorCode: "c", message: "m")
+        await waitUntil { !withPii.batches.isEmpty }
+        XCTAssertEqual(withPii.batches.first?.primaryUserId, "user-1")
+        XCTAssertEqual(withPii.batches.first?.advertisingId, "gaid-1")
+
+        let noPii = FakeSender()
+        let mgrWithout = build(store: FakeStore(), sender: noPii, ppid: nil, gaid: nil)
+        mgrWithout.recordError(signature: "e", errorCode: "c", message: "m")
+        await waitUntil { !noPii.batches.isEmpty }
+        XCTAssertNil(noPii.batches.first?.primaryUserId)
+        XCTAssertNil(noPii.batches.first?.advertisingId)
+    }
+}

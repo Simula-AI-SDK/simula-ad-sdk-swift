@@ -134,12 +134,14 @@ final class WebViewPool {
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (String) -> Void
     ) -> WKWebView {
+        let startNanos = DispatchTime.now().uptimeNanoseconds
         // Drop any prewarmed views whose storage policy no longer matches the
         // current consent, then reuse a matching one (or build fresh).
         let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
         while let last = idle.last, last.persistent != wantPersistent {
             idle.removeLast()
         }
+        let reusedWarm = idle.last != nil
         let pooled = idle.popLast() ?? makePooled()
 
         pooled.forwarder.onMessage = onMessage
@@ -152,6 +154,12 @@ final class WebViewPool {
         // the following one (e.g. the post-game ad) is also warm.
         Task { @MainActor [weak self] in self?.prewarm() }
 
+        // Warm (pool hit) vs cold (had to create) — surfaces prewarm effectiveness + cold cost.
+        Telemetry.shared.recordOperation(
+            name: reusedWarm ? "webview_acquire_warm" : "webview_acquire_cold",
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
+            success: true
+        )
         return pooled.webView
     }
 
