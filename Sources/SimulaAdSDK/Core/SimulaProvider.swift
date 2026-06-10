@@ -366,6 +366,9 @@ public struct SimulaProviderView<Content: View>: View {
         content()
             .environmentObject(provider)
             .task {
+                // Activate OMID so minigame surfaces used via the declarative provider
+                // (without SimulaAds.initialize) are measurable. Idempotent + guarded.
+                OpenMeasurement.activate(enabled: true)
                 await provider.createSession()
             }
             // Push privacy-prop changes into the store. SwiftUI does not re-init

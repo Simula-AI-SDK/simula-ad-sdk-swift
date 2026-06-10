@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import WebKit
 
 // MARK: - RewardedPresenter
 
@@ -30,6 +31,7 @@ final class RewardedPresenter {
         apiKey: String,
         iframeUrl: String,
         durationSeconds: Int,
+        adVerifications: [AdVerification] = [],
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
         guard let scene = Self.activeWindowScene() else {
@@ -42,6 +44,7 @@ final class RewardedPresenter {
             apiKey: apiKey,
             iframeUrl: iframeUrl,
             durationSeconds: durationSeconds,
+            adVerifications: adVerifications,
             onFinish: { [weak self] earned, elapsed in
                 self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
             }
@@ -96,12 +99,17 @@ private struct RewardedGameView: View {
     let apiKey: String
     let iframeUrl: String
     let durationSeconds: Int
+    /// OMID verification resources for the game iframe. Empty unless the backend sends them;
+    /// when non-empty, a native-display session is started against the iframe WebView.
+    let adVerifications: [AdVerification]
     let onFinish: (Bool, Double) -> Void
 
     @State private var elapsedPlayTime: Double = 0
     @State private var rewardEarned = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
+    /// OMID native-display session (only when `adVerifications` is non-empty).
+    @State private var omSession: OMAdSession?
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -116,7 +124,10 @@ private struct RewardedGameView: View {
 
             if let url = URL(string: iframeUrl) {
                 // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
-                WebViewRepresentable(url: url)
+                WebViewRepresentable(
+                    url: url,
+                    onContentRendered: { webView in startOMSession(webView) }
+                )
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -140,7 +151,20 @@ private struct RewardedGameView: View {
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
+            // Finish OMID measurement; the pool keeps the web view alive ~1s to flush.
+            omSession?.finish()
         }
+    }
+
+    /// Starts a native-display OMID session for the game iframe once it loads — only when
+    /// the response carried verification resources. One-shot; no-op otherwise.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil, !adVerifications.isEmpty else { return }
+        omSession = OMAdSession.startNativeSession(
+            adView: webView, verifications: adVerifications, impressionId: adId
+        )
+        omSession?.fireLoaded()
+        omSession?.fireImpression()
     }
 
     @ViewBuilder
@@ -193,6 +217,9 @@ private struct RewardedGameView: View {
     // MARK: Close
 
     private func finish(earned: Bool) {
+        // Finish OMID before teardown so the pool's deferred release runs (and keeps the
+        // web view alive ~1s for the verification flush) ahead of `dismantleUIView`.
+        omSession?.finish()
         let elapsed = elapsedPlayTime
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 // MARK: - GameIframeView
 
@@ -41,6 +42,14 @@ public struct GameIframeView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var appeared = false
+    /// OMID verification resources for the game iframe (empty unless the backend sends them).
+    @State private var adVerifications: [AdVerification] = []
+    /// Ad id used as the OMID session reference (custom reference identifier).
+    @State private var omImpressionId = ""
+    #if os(iOS)
+    /// OMID native-display session (only when `adVerifications` is non-empty).
+    @State private var omSession: OMAdSession?
+    #endif
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
     /// Height captured at drag start, used to compute live height from translation
@@ -160,7 +169,12 @@ public struct GameIframeView: View {
                                 onNavigationFailed: { _ in
                                     self.error = "Failed to load game. Please try again."
                                 },
-                                onMessageReceived: { _ in }
+                                onMessageReceived: { _ in },
+                                onContentRendered: { webView in
+                                    #if os(iOS)
+                                    startOMSession(webView)
+                                    #endif
+                                }
                             )
                         }
 
@@ -223,6 +237,10 @@ public struct GameIframeView: View {
     // MARK: - Close Handler
 
     private func handleClose() {
+        #if os(iOS)
+        // Finish OMID measurement before teardown so the pool defers the web view release.
+        omSession?.finish()
+        #endif
         // Report dimensions on close (matching Kotlin's onDimensionsOnClose)
         if isBottomSheetMode {
             let isStillBottomSheet = currentHeight < screenHeight * 0.95
@@ -230,6 +248,19 @@ public struct GameIframeView: View {
         }
         onClose()
     }
+
+    #if os(iOS)
+    /// Starts a native-display OMID session for the game iframe once it loads — only when
+    /// the response carried verification resources. One-shot; no-op otherwise.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil, !adVerifications.isEmpty else { return }
+        omSession = OMAdSession.startNativeSession(
+            adView: webView, verifications: adVerifications, impressionId: omImpressionId
+        )
+        omSession?.fireLoaded()
+        omSession?.fireImpression()
+    }
+    #endif
 
     // MARK: - Load Minigame
 
@@ -275,6 +306,8 @@ public struct GameIframeView: View {
 
             let response = try await api.getMinigame(request)
             self.iframeUrl = response.iframeUrl
+            self.adVerifications = response.adVerifications
+            self.omImpressionId = response.adId
 
             // Callback with the ad_id for tracking (matching React's onAdIdReceived)
             if !response.adId.isEmpty {

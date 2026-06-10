@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 // MARK: - AdOverlayView
 
@@ -21,8 +22,14 @@ public struct AdOverlayView: View {
     var playableBorderColor: String = "#262626"
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
+    /// OMID verification resources for the fallback ad iframe (empty unless plumbed; no-op today).
+    var adVerifications: [AdVerification] = []
 
     @State private var appeared = false
+    #if os(iOS)
+    /// OMID native-display session (only when `adVerifications` is non-empty).
+    @State private var omSession: OMAdSession?
+    #endif
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (1.0 = full, 0.0 = empty)
@@ -57,7 +64,7 @@ public struct AdOverlayView: View {
             Color.black.opacity(0.8)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    if adCountdown <= 0 { onClose() }
+                    if adCountdown <= 0 { close() }
                 }
 
             // Content: bottom sheet or fullscreen (GeometryReader layout matches GameIframeView)
@@ -80,7 +87,14 @@ public struct AdOverlayView: View {
                     ZStack {
                         // Ad iframe
                         if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url)
+                            WebViewRepresentable(
+                                url: url,
+                                onContentRendered: { webView in
+                                    #if os(iOS)
+                                    startOMSession(webView)
+                                    #endif
+                                }
+                            )
                         }
 
                         // Close button / countdown ring — top right
@@ -91,7 +105,7 @@ public struct AdOverlayView: View {
                                     // Compact close button, matching the interstitial/rewarded default
                                     // (a ~16pt dark-translucent circle with a white X). Visible glyph
                                     // stays small; the hit area is a full 44pt touch target.
-                                    Button(action: onClose) {
+                                    Button(action: close) {
                                         Image(systemName: "xmark")
                                             .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.white)
@@ -184,6 +198,30 @@ public struct AdOverlayView: View {
             }
         }
     }
+
+    // MARK: - Close / OMID
+
+    /// Finishes OMID measurement (if any) before tearing down, so the pool defers the
+    /// web view release for the verification flush, then forwards to `onClose`.
+    private func close() {
+        #if os(iOS)
+        omSession?.finish()
+        #endif
+        onClose()
+    }
+
+    #if os(iOS)
+    /// Starts a native-display OMID session for the fallback ad iframe once it loads —
+    /// only when verification resources are present. One-shot; no-op otherwise.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil, !adVerifications.isEmpty else { return }
+        omSession = OMAdSession.startNativeSession(
+            adView: webView, verifications: adVerifications, impressionId: adId
+        )
+        omSession?.fireLoaded()
+        omSession?.fireImpression()
+    }
+    #endif
 }
 
 

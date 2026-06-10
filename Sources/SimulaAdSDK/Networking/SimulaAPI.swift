@@ -283,6 +283,17 @@ public struct MinigameResponse: Sendable {
     public let adInserted: Bool
     public let adId: String
     public let iframeUrl: String
+    /// OMID verification resources for the game iframe (empty unless the backend sends them).
+    public let adVerifications: [AdVerification]
+
+    public init(adType: String, adInserted: Bool, adId: String, iframeUrl: String,
+                adVerifications: [AdVerification] = []) {
+        self.adType = adType
+        self.adInserted = adInserted
+        self.adId = adId
+        self.iframeUrl = iframeUrl
+        self.adVerifications = adVerifications
+    }
 }
 
 /// Internal raw JSON response for init minigame
@@ -295,10 +306,19 @@ private struct MinigameAPIResponse: Decodable {
 private struct MinigameAdResponse: Decodable {
     let adId: String?
     let iframeUrl: String?
+    let adVerifications: [AdVerification]
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case iframeUrl = "iframe_url"
+        case adVerifications = "ad_verifications"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.adId = try? c.decode(String.self, forKey: .adId)
+        self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
+        self.adVerifications = c.decodeAdVerifications(forKey: .adVerifications)
     }
 }
 
@@ -308,6 +328,39 @@ private struct MinigameAdResponse: Decodable {
 public enum AdDestination: String, Sendable {
     case appstore
     case web
+}
+
+/// One IAB Open Measurement verification vendor entry from a response `ad_verifications`
+/// array. All fields are optional so a partial/unexpected shape is tolerated; an entry
+/// without `javascript_resource_url` is unusable and dropped when building OMID resources.
+/// Forward-compatible — the backend does not send this today.
+public struct AdVerification: Decodable, Sendable {
+    public let vendorKey: String?
+    public let javascriptResourceUrl: String
+    public let verificationParameters: String?
+
+    enum CodingKeys: String, CodingKey {
+        case vendorKey = "vendor_key"
+        case javascriptResourceUrl = "javascript_resource_url"
+        case verificationParameters = "verification_parameters"
+    }
+}
+
+/// Decodes an `ad_verifications` array tolerantly: missing/partial entries are skipped,
+/// a missing key yields an empty array (never throws).
+extension KeyedDecodingContainer {
+    func decodeAdVerifications(forKey key: Key) -> [AdVerification] {
+        ((try? decode([FailableVerification].self, forKey: key)) ?? [])
+            .compactMap { $0.value }
+    }
+}
+
+/// Wrapper so one malformed entry doesn't fail the whole `ad_verifications` array.
+private struct FailableVerification: Decodable {
+    let value: AdVerification?
+    init(from decoder: Decoder) throws {
+        value = try? AdVerification(from: decoder)
+    }
 }
 
 /// Request body for POST /ads/load/interstitial — the imperative `.load()` prefetch call.
@@ -374,10 +427,24 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let creative: Creative?
     /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
     public let experiment: Experiment?
+    /// OMID verification resources (`ad_verifications`). Empty unless the backend sends them
+    /// (forward-compatible). HTML interstitials are measured via injected JS, not this list.
+    public let adVerifications: [AdVerification]
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
         AdDestination(rawValue: destination) ?? .appstore
+    }
+
+    /// Returns a copy with `renderedHtml` replaced (e.g. after OMID script injection),
+    /// preserving every other field.
+    public func withRenderedHtml(_ html: String?) -> AdLoadResponse {
+        AdLoadResponse(
+            adId: adId, adInserted: adInserted, adUnitId: adUnitId, destination: destination,
+            renderedFormat: renderedFormat, trackingUrl: trackingUrl, renderedHtml: html,
+            adBehavior: adBehavior, creative: creative, experiment: experiment,
+            adVerifications: adVerifications
+        )
     }
 
     /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
@@ -406,6 +473,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case adBehavior = "ad_behavior"
         case creative
         case experiment
+        case adVerifications = "ad_verifications"
     }
 
     public init(from decoder: Decoder) throws {
@@ -422,6 +490,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
+        self.adVerifications = c.decodeAdVerifications(forKey: .adVerifications)
     }
 
     /// Member-wise init for internal construction and tests.
@@ -435,7 +504,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
         creative: Creative? = nil,
-        experiment: Experiment? = nil
+        experiment: Experiment? = nil,
+        adVerifications: [AdVerification] = []
     ) {
         self.adId = adId
         self.adInserted = adInserted
@@ -447,6 +517,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adBehavior = adBehavior
         self.creative = creative
         self.experiment = experiment
+        self.adVerifications = adVerifications
     }
 }
 
@@ -504,12 +575,16 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public let iframeUrl: String
     public let adId: String
     public let durationSeconds: Int
+    /// OMID verification resources for the game iframe. Empty unless the backend sends
+    /// them (forward-compatible); drives an optional native-display OMID session.
+    public let adVerifications: [AdVerification]
 
     enum CodingKeys: String, CodingKey {
         case serveId = "serve_id"
         case iframeUrl = "iframe_url"
         case adId = "ad_id"
         case durationSeconds = "duration_seconds"
+        case adVerifications = "ad_verifications"
     }
 
     public init(from decoder: Decoder) throws {
@@ -518,14 +593,17 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.iframeUrl = (try? c.decode(String.self, forKey: .iframeUrl)) ?? ""
         self.adId = (try? c.decode(String.self, forKey: .adId)) ?? ""
         self.durationSeconds = (try? c.decode(Int.self, forKey: .durationSeconds)) ?? 0
+        self.adVerifications = c.decodeAdVerifications(forKey: .adVerifications)
     }
 
     /// Member-wise init for internal construction and tests.
-    public init(serveId: String, iframeUrl: String, adId: String = "", durationSeconds: Int) {
+    public init(serveId: String, iframeUrl: String, adId: String = "", durationSeconds: Int,
+                adVerifications: [AdVerification] = []) {
         self.serveId = serveId
         self.iframeUrl = iframeUrl
         self.adId = adId
         self.durationSeconds = durationSeconds
+        self.adVerifications = adVerifications
     }
 }
 
@@ -901,7 +979,8 @@ public final class SimulaAPI: @unchecked Sendable {
             adType: apiResponse.adType ?? "minigame",
             adInserted: apiResponse.adInserted ?? false,
             adId: adId,
-            iframeUrl: iframeUrl
+            iframeUrl: iframeUrl,
+            adVerifications: adResponse.adVerifications
         )
     }
 

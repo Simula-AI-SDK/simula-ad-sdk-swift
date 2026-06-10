@@ -222,6 +222,7 @@ public final class SimulaRewardedAd {
             apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
+            adVerifications: response.adVerifications,
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
                 self.presenter = nil
