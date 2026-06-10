@@ -532,7 +532,7 @@ private struct CloseButtonView: View {
 
 // MARK: - StorePromptBadge
 
-/// The mid-ad store prompt (`store_prompt`): a tappable "▶| App Store" / "▶| Google Play" badge
+/// The mid-ad store prompt (`store_prompt`): a tappable skip-next ▶| badge labelled "App Store" / "Google Play"
 /// rendered at the server-resolved corner. The SDK never recomputes the position — it trusts the
 /// backend's collision resolution (opposite the close button). Shared with the rewarded minigame
 /// (`RewardedPresenter`).
@@ -544,7 +544,7 @@ struct StorePromptBadge: View {
     let onTap: () -> Void
 
     private var label: String {
-        prompt.platform == .android ? "▶| Google Play" : "▶| App Store"
+        prompt.platform == .android ? "Google Play" : "App Store"
     }
     private var cornerAlignment: Alignment {
         switch prompt.position {
@@ -560,15 +560,21 @@ struct StorePromptBadge: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
 
-    // Sized to match the rewarded minigame's "Play to earn" status pill (RewardedPresenter).
+    // Compact AppLovin-style pill: the filled skip-next glyph (`forward.end.fill` ≈ ▶|) then the
+    // store name, with tight padding, a fully-rounded (capsule) outline, and a small gap between
+    // the two.
     private var badge: some View {
         Button(action: onTap) {
-            Text(label)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.white)
-                .padding(.vertical, 5)
-                .padding(.horizontal, 10)
-                .background(Capsule().fill(Color.black.opacity(0.6)))
+            HStack(spacing: 8) {
+                Image(systemName: "forward.end.fill")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .padding(.vertical, 4)
+            .padding(.horizontal, 6)
+            .background(Capsule().fill(Color.black.opacity(0.6)))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Install")
