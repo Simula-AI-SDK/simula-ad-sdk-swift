@@ -21,7 +21,11 @@ let package = Package(
                 .copy("Resources/PrivacyInfo.xcprivacy"),
                 .copy("Resources/games_unavailable.png"),
                 .copy("Resources/minigame_interstitial_background.png"),
-                .copy("Resources/game_icon.png")
+                .copy("Resources/game_icon.png"),
+                .copy("Resources/char_superman.png"),
+                .copy("Resources/char_hammy.png"),
+                .copy("Resources/char_maya.png"),
+                .copy("Resources/char_charles.png")
             ]
         ),
         .testTarget(

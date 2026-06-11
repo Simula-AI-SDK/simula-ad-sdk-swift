@@ -77,6 +77,90 @@ public struct GameData: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+// MARK: - CharacterData
+
+/// A selectable character in `CharacterPicker`. `image` is a 1:1 portrait URL.
+/// Maps to the backend `PublicCharacter` (`character_id`→id, `character_name`→name,
+/// `images_1_1[0]`/`avatar_url`→image, `description`→description).
+public struct CharacterData: Identifiable, Sendable, Equatable {
+    public let id: String
+    public let name: String
+    public let image: String
+    public let description: String?
+
+    public init(id: String, name: String, image: String, description: String? = nil) {
+        self.id = id
+        self.name = name
+        self.image = image
+        self.description = description
+    }
+}
+
+// MARK: - CharacterPickerTheme
+
+/// Theme for `CharacterPicker`. Colors are CSS strings (hex/rgba); a nil field falls
+/// back to a `resolved*` value mirroring the reference HTML. Sizes are in points.
+public struct CharacterPickerTheme: Sendable, Equatable {
+    public var backgroundColor: String?
+    public var titleColor: String?
+    public var titleFontSize: CGFloat?
+    public var cardBackgroundColor: String?
+    public var cardBorderColor: String?
+    public var cardCornerRadius: CGFloat?
+    /// Selected-card border / active launch-button color. Default `#3d9a66`.
+    public var selectedColor: String?
+    public var nameColor: String?
+    public var launchTextColor: String?
+    /// Disabled launch-button background. Default `#3a3a3a`.
+    public var launchDisabledColor: String?
+    public var launchCornerRadius: CGFloat?
+    /// Font family name (e.g. "Inter"). Default: system font.
+    public var fontFamily: String?
+
+    public init(
+        backgroundColor: String? = nil,
+        titleColor: String? = nil,
+        titleFontSize: CGFloat? = nil,
+        cardBackgroundColor: String? = nil,
+        cardBorderColor: String? = nil,
+        cardCornerRadius: CGFloat? = nil,
+        selectedColor: String? = nil,
+        nameColor: String? = nil,
+        launchTextColor: String? = nil,
+        launchDisabledColor: String? = nil,
+        launchCornerRadius: CGFloat? = nil,
+        fontFamily: String? = nil
+    ) {
+        self.backgroundColor = backgroundColor
+        self.titleColor = titleColor
+        self.titleFontSize = titleFontSize
+        self.cardBackgroundColor = cardBackgroundColor
+        self.cardBorderColor = cardBorderColor
+        self.cardCornerRadius = cardCornerRadius
+        self.selectedColor = selectedColor
+        self.nameColor = nameColor
+        self.launchTextColor = launchTextColor
+        self.launchDisabledColor = launchDisabledColor
+        self.launchCornerRadius = launchCornerRadius
+        self.fontFamily = fontFamily
+    }
+
+    // Resolved defaults mirror the reference "Select Your Game Partner" HTML.
+    public var resolvedBackgroundColor: String { backgroundColor ?? "#000000" }
+    public var resolvedTitleColor: String { titleColor ?? "#ffffff" }
+    public var resolvedTitleFontSize: CGFloat { titleFontSize ?? 26 }
+    public var resolvedCardBackgroundColor: String { cardBackgroundColor ?? "#14161a" }
+    public var resolvedCardBorderColor: String { cardBorderColor ?? "#343a42" }
+    public var resolvedCardCornerRadius: CGFloat { cardCornerRadius ?? 18 }
+    public var resolvedSelectedColor: String { selectedColor ?? "#3d9a66" }
+    public var resolvedNameColor: String { nameColor ?? "#ffffff" }
+    public var resolvedLaunchTextColor: String { launchTextColor ?? "#ffffff" }
+    public var resolvedLaunchDisabledColor: String { launchDisabledColor ?? "#3a3a3a" }
+    public var resolvedLaunchCornerRadius: CGFloat { launchCornerRadius ?? 14 }
+    /// nil → system font (matches the HTML's `-apple-system` stack).
+    public var resolvedFontFamily: String? { fontFamily }
+}
+
 // MARK: - PlayableHeight
 
 /// Represents the height of the Mini Game iframe in bottom sheet mode.
