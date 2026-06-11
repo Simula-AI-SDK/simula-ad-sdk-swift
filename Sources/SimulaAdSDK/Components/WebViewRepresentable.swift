@@ -35,13 +35,19 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
     var onAdClick: (() -> Void)?
 
+    /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the
+    /// creative are routed to it (and `GET_*` replies are posted back via the web view). `nil`
+    /// for the game iframe / previews, which keep the plain `onMessageReceived` path.
+    var bridge: CreativeBridge?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        bridge: CreativeBridge? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -49,6 +55,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.bridge = bridge
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -62,10 +69,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
         let coordinator = context.coordinator
-        return WebViewPool.shared.acquire(
+        let webView = WebViewPool.shared.acquire(
             delegate: coordinator,
-            onMessage: { [weak coordinator] body in coordinator?.onMessageReceived?(body) }
+            onMessage: { [weak coordinator] body in coordinator?.handleMessage(body) }
         )
+        // The coordinator needs the web view to post `GET_*` replies back into the page.
+        coordinator.webView = webView
+        return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
@@ -97,7 +107,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
-            onAdClick: onAdClick
+            onAdClick: onAdClick,
+            bridge: bridge
         )
     }
 
@@ -109,6 +120,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: (() -> Void)?
+        /// The WebView ↔ SDK bridge (PRD §3); `nil` for non-ad web views.
+        var bridge: CreativeBridge?
+        /// The web view this coordinator drives — used to post `GET_*` replies back into the page.
+        weak var webView: WKWebView?
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -130,12 +145,27 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
-            onAdClick: (() -> Void)? = nil
+            onAdClick: (() -> Void)? = nil,
+            bridge: CreativeBridge? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
+            self.bridge = bridge
+        }
+
+        /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
+        /// when one is attached — which posts `GET_*` replies back via this web view — else to
+        /// the legacy `onMessageReceived` callback (game iframe).
+        func handleMessage(_ body: String) {
+            if let bridge {
+                bridge.handle(body) { [weak self] js in
+                    self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+                }
+            } else {
+                onMessageReceived?(body)
+            }
         }
 
         // MARK: - WKNavigationDelegate
@@ -270,11 +300,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             didReceive message: WKScriptMessage
         ) {
             if let body = message.body as? String {
-                onMessageReceived?(body)
+                handleMessage(body)
             } else if let dict = message.body as? [String: Any],
                       let data = try? JSONSerialization.data(withJSONObject: dict),
                       let str = String(data: data, encoding: .utf8) {
-                onMessageReceived?(str)
+                handleMessage(str)
             }
         }
     }
@@ -321,6 +351,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         let postMessageScript = WKUserScript(
             source: """
             window.addEventListener('message', function(event) {
+                if (event.data && event.data.__simulaSdkResponse) { return; }
                 if (event.data && typeof event.data === 'string') {
                     window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
                 } else if (event.data && typeof event.data === 'object') {

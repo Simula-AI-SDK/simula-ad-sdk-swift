@@ -73,6 +73,9 @@ final class WebViewPool {
     private static let postMessageScript = WKUserScript(
         source: """
         window.addEventListener('message', function(event) {
+            // The SDK delivers query responses back via window.postMessage carrying this
+            // marker; don't forward those to native (they're for the creative, not us).
+            if (event.data && event.data.__simulaSdkResponse) { return; }
             if (event.data && typeof event.data === 'string') {
                 window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
             } else if (event.data && typeof event.data === 'object') {

@@ -38,14 +38,19 @@ final class InterstitialPresenter {
         }
         self.onClose = onClose
 
+        // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
+        // hosting controller + window created below.
+        let bridge = CreativeBridge()
+
         let root = CreativeInterstitialView(
             apiKey: apiKey,
             response: response,
+            bridge: bridge,
             onClick: onClick,
             onRequestDismiss: { [weak self] in self?.dismiss() }
         )
 
-        let hosting = UIHostingController(rootView: root)
+        let hosting = OrientationLockingHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 
         // Remember who held key so we can hand it back on dismiss.
@@ -57,6 +62,9 @@ final class InterstitialPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        // Give the bridge the orientation host + window now that they exist.
+        bridge.orientationHost = hosting
+        bridge.window = window
         return true
     }
 
@@ -98,6 +106,8 @@ final class InterstitialPresenter {
 private struct CreativeInterstitialView: View {
     let apiKey: String
     let response: AdLoadResponse
+    /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
+    let bridge: CreativeBridge
     let onClick: () -> Void
     let onRequestDismiss: () -> Void
 
@@ -134,11 +144,13 @@ private struct CreativeInterstitialView: View {
     init(
         apiKey: String,
         response: AdLoadResponse,
+        bridge: CreativeBridge,
         onClick: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
         self.apiKey = apiKey
         self.response = response
+        self.bridge = bridge
         self.onClick = onClick
         self.onRequestDismiss = onRequestDismiss
         // Close starts enabled unless the server-driven `close.delay_seconds` gates it.
@@ -218,6 +230,14 @@ private struct CreativeInterstitialView: View {
                 SKOverlayPresenter.dismiss()
             }
         }
+        // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
+        // immediately, cancelling the close-delay gate.
+        .onReceive(bridge.$earlyComplete) { earlyComplete in
+            guard earlyComplete, !closeEnabled else { return }
+            gateTask?.cancel()
+            gateTask = nil
+            withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
+        }
     }
 
     // MARK: HTML creative
@@ -226,7 +246,8 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onAdClick: { handleHtmlClick() }
+            onAdClick: { handleHtmlClick() },
+            bridge: bridge
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)

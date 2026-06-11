@@ -42,6 +42,11 @@ final class RewardedPresenter {
         }
         self.onClose = onClose
 
+        // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
+        // orientation lock, and device/audio/orientation queries. Owned here so the orientation
+        // handler can reach the hosting controller + window created below.
+        let bridge = CreativeBridge()
+
         let root = RewardedGameView(
             impressionId: impressionId,
             apiKey: apiKey,
@@ -52,12 +57,13 @@ final class RewardedPresenter {
             destination: destination,
             storeOpen: storeOpen,
             previewHTML: previewHTML,
+            bridge: bridge,
             onFinish: { [weak self] earned, elapsed in
                 self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
             }
         )
 
-        let hosting = UIHostingController(rootView: root)
+        let hosting = OrientationLockingHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 
         originalKeyWindow = scene.keyWindow
@@ -68,6 +74,9 @@ final class RewardedPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        // Give the bridge the orientation host + window now that they exist.
+        bridge.orientationHost = hosting
+        bridge.window = window
         return true
     }
 
@@ -114,6 +123,8 @@ private struct RewardedGameView: View {
     let storeOpen: StoreOpen
     /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
     let previewHTML: String?
+    /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
+    let bridge: CreativeBridge
     let onFinish: (Bool, Double) -> Void
 
     @State private var elapsedPlayTime: Double = 0
@@ -135,9 +146,9 @@ private struct RewardedGameView: View {
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML)
+                WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url)
+                WebViewRepresentable(url: url, bridge: bridge)
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -169,6 +180,14 @@ private struct RewardedGameView: View {
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
+        }
+        // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
+        // reward and reveal the close button immediately, bypassing the play timer.
+        .onReceive(bridge.$earlyComplete) { earlyComplete in
+            guard earlyComplete, !rewardEarned else { return }
+            timerTask?.cancel()
+            timerTask = nil
+            rewardEarned = true
         }
     }
 
