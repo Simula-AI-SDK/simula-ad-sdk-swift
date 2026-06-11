@@ -22,13 +22,13 @@ public struct AdOverlayView: View {
     var playableBorderColor: String = "#262626"
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
-    /// OMID verification resources for the fallback ad iframe (empty unless plumbed; no-op today).
-    var adVerifications: [AdVerification] = []
 
     @State private var appeared = false
     #if os(iOS)
-    /// OMID native-display session (only when `adVerifications` is non-empty).
+    /// OMID HTML session for the fallback ad iframe (started after the OM service is injected).
     @State private var omSession: OMAdSession?
+    /// Guards re-entry while the async session start is in flight.
+    @State private var omStarting = false
     #endif
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
@@ -212,15 +212,18 @@ public struct AdOverlayView: View {
     }
 
     #if os(iOS)
-    /// Starts a native-display OMID session for the fallback ad iframe once it loads —
-    /// only when verification resources are present. One-shot; no-op otherwise.
+    /// Injects the OM service into the live fallback page, then starts an HTML ad session
+    /// and fires loaded + impression. One-shot; no-op when OM is inactive.
     private func startOMSession(_ webView: WKWebView) {
-        guard omSession == nil, !adVerifications.isEmpty else { return }
-        omSession = OMAdSession.startNativeSession(
-            adView: webView, verifications: adVerifications, impressionId: adId
-        )
-        omSession?.fireLoaded()
-        omSession?.fireImpression()
+        guard omSession == nil, !omStarting else { return }
+        omStarting = true
+        Task { @MainActor in
+            guard await OpenMeasurement.injectServiceScript(into: webView) else { return }
+            let session = OMAdSession.startHTMLSession(webView: webView, impressionId: adId)
+            session?.fireLoaded()
+            session?.fireImpression()
+            omSession = session
+        }
     }
     #endif
 }

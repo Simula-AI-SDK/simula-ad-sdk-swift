@@ -44,13 +44,13 @@ public struct GameIframeView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var appeared = false
-    /// OMID verification resources for the game iframe (empty unless the backend sends them).
-    @State private var adVerifications: [AdVerification] = []
     /// Ad id used as the OMID session reference (custom reference identifier).
     @State private var omImpressionId = ""
     #if os(iOS)
-    /// OMID native-display session (only when `adVerifications` is non-empty).
+    /// OMID HTML session for the game iframe (started after the OM service is injected).
     @State private var omSession: OMAdSession?
+    /// Guards re-entry while the async session start is in flight.
+    @State private var omStarting = false
     #endif
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
@@ -252,15 +252,18 @@ public struct GameIframeView: View {
     }
 
     #if os(iOS)
-    /// Starts a native-display OMID session for the game iframe once it loads — only when
-    /// the response carried verification resources. One-shot; no-op otherwise.
+    /// Injects the OM service into the live game page, then starts an HTML ad session and
+    /// fires loaded + impression. One-shot; no-op when OM is inactive.
     private func startOMSession(_ webView: WKWebView) {
-        guard omSession == nil, !adVerifications.isEmpty else { return }
-        omSession = OMAdSession.startNativeSession(
-            adView: webView, verifications: adVerifications, impressionId: omImpressionId
-        )
-        omSession?.fireLoaded()
-        omSession?.fireImpression()
+        guard omSession == nil, !omStarting else { return }
+        omStarting = true
+        Task { @MainActor in
+            guard await OpenMeasurement.injectServiceScript(into: webView) else { return }
+            let session = OMAdSession.startHTMLSession(webView: webView, impressionId: omImpressionId)
+            session?.fireLoaded()
+            session?.fireImpression()
+            omSession = session
+        }
     }
     #endif
 
@@ -308,7 +311,6 @@ public struct GameIframeView: View {
 
             let response = try await api.getMinigame(request)
             self.iframeUrl = response.iframeUrl
-            self.adVerifications = response.adVerifications
             self.omImpressionId = response.adId
 
             // Callback with the serve id (the post-game fallbacks handle).

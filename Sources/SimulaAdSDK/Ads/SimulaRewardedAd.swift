@@ -294,7 +294,6 @@ public final class SimulaRewardedAd {
             apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
             durationSeconds: response.durationSeconds,
-            adVerifications: response.adVerifications,
             storePrompt: response.adBehavior?.storePrompt,
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,

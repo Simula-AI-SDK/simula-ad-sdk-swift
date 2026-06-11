@@ -33,9 +33,6 @@ enum OpenMeasurement {
     /// The cached OMID partner; nil until `activate` succeeds.
     static var cachedPartner: OMIDSimulaadPartner? { partner }
 
-    /// The OM JS service script (for native ad-session contexts). Nil until cached.
-    static var cachedOMIDJS: String? { omidJS }
-
     /// Activate OMID once, at SDK init. Cheap, main-thread; the ~50KB service-script
     /// read is pushed to a detached Task so nothing touches disk on an ad path.
     /// Idempotent and safe to call repeatedly (e.g. from both entry points).
@@ -76,6 +73,23 @@ enum OpenMeasurement {
             Telemetry.shared.recordError(signature: "om:inject", message: error.localizedDescription)
             return html
         }
+    }
+
+    /// Inject the OMID service script into a live `webView` whose page we don't author —
+    /// the remote-URL surfaces (rewarded game / minigame / fallback). An HTML ad session
+    /// needs the service running in the page, so the caller starts the session only after
+    /// this resolves `true`. Returns `false` when OM is inactive or the script can't be
+    /// read; the ad then renders unmeasured.
+    @discardableResult
+    static func injectServiceScript(into webView: WKWebView) async -> Bool {
+        guard isActive else { return false }
+        let cached: String?
+        if let omidJS { cached = omidJS } else { cached = await ensureJSLoaded() }
+        guard let js = cached else { return false }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            webView.evaluateJavaScript(js) { _, _ in cont.resume() }
+        }
+        return true
     }
 
     /// Loads + caches the service script if the activation-time read hasn't finished yet.

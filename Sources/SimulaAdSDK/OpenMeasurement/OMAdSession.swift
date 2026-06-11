@@ -30,10 +30,13 @@ final class OMAdSession {
         self.measuredWebView = webView
     }
 
-    /// HTML ad session for a server-rendered creative (OM JS already spliced into the
-    /// HTML via `OpenMeasurement.injectOMID`). The creative does not emit OMID events,
-    /// so impression ownership is NATIVE and we fire loaded/impression ourselves at
-    /// first paint. Nil when OM is inactive or session creation throws.
+    /// HTML ad session for any WebView surface — the interstitial (OM JS spliced into the
+    /// HTML via `OpenMeasurement.injectOMID`) as well as the remote-URL surfaces (rewarded
+    /// game / minigame / fallback), whose live WebView has the OM service injected via
+    /// `OpenMeasurement.injectServiceScript(into:)` before this is called. The creative
+    /// does not emit OMID events, so impression ownership is NATIVE and we fire
+    /// loaded/impression ourselves at first paint. Nil when OM is inactive or session
+    /// creation throws.
     static func startHTMLSession(webView: WKWebView, impressionId: String?) -> OMAdSession? {
         guard OpenMeasurement.isActive, let partner = OpenMeasurement.cachedPartner else { return nil }
         do {
@@ -53,43 +56,6 @@ final class OMAdSession {
             return try begin(config: config, context: context, mainView: webView, measuredWebView: webView)
         } catch {
             Telemetry.shared.recordError(signature: "om:html_session", message: error.localizedDescription)
-            return nil
-        }
-    }
-
-    /// Native-display session for a remote-URL surface (rewarded game / minigame /
-    /// fallback) whose page can't be injected. Created only when `verifications` is
-    /// non-empty — the session exists solely to run vendor scripts against the
-    /// registered view. Nil when OM is inactive, no service script is cached, no usable
-    /// verification resource survives, or creation throws.
-    static func startNativeSession(
-        adView: UIView,
-        verifications: [AdVerification],
-        impressionId: String?
-    ) -> OMAdSession? {
-        guard OpenMeasurement.isActive, !verifications.isEmpty,
-              let partner = OpenMeasurement.cachedPartner,
-              let js = OpenMeasurement.cachedOMIDJS else { return nil }
-        let resources = verifications.compactMap { $0.toResource() }
-        guard !resources.isEmpty else { return nil }
-        do {
-            let config = try OMIDSimulaadAdSessionConfiguration(
-                creativeType: .nativeDisplay,
-                impressionType: .beginToRender,
-                impressionOwner: .nativeOwner,
-                mediaEventsOwner: .noneOwner,
-                isolateVerificationScripts: false
-            )
-            let context = try OMIDSimulaadAdSessionContext(
-                partner: partner,
-                script: js,
-                resources: resources,
-                contentUrl: nil,
-                customReferenceIdentifier: impressionId
-            )
-            return try begin(config: config, context: context, mainView: adView, measuredWebView: adView as? WKWebView)
-        } catch {
-            Telemetry.shared.recordError(signature: "om:native_session", message: error.localizedDescription)
             return nil
         }
     }
@@ -139,17 +105,6 @@ final class OMAdSession {
         if let webView = measuredWebView {
             WebViewPool.shared.markForDelayedRelease(webView)
         }
-    }
-}
-
-private extension AdVerification {
-    /// Build an OMID verification resource, dropping entries with a malformed URL.
-    func toResource() -> OMIDSimulaadVerificationScriptResource? {
-        guard let url = URL(string: javascriptResourceUrl) else { return nil }
-        if let vendorKey, let parameters = verificationParameters {
-            return OMIDSimulaadVerificationScriptResource(url: url, vendorKey: vendorKey, parameters: parameters)
-        }
-        return OMIDSimulaadVerificationScriptResource(url: url)
     }
 }
 
