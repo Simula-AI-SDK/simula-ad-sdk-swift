@@ -35,13 +35,19 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
     var onAdClick: (() -> Void)?
 
+    /// Called once the real content finishes loading, with the backing `WKWebView`.
+    /// Used to start an OMID ad session against the rendered view. Distinct from
+    /// `onNavigationFinished` (which carries no view); `nil` when measurement isn't wired.
+    var onContentRendered: ((WKWebView) -> Void)?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        onContentRendered: ((WKWebView) -> Void)? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -49,6 +55,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.onContentRendered = onContentRendered
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -97,7 +104,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
-            onAdClick: onAdClick
+            onAdClick: onAdClick,
+            onContentRendered: onContentRendered
         )
     }
 
@@ -109,6 +117,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: (() -> Void)?
+        var onContentRendered: ((WKWebView) -> Void)?
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -130,12 +139,14 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
-            onAdClick: (() -> Void)? = nil
+            onAdClick: (() -> Void)? = nil,
+            onContentRendered: ((WKWebView) -> Void)? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
+            self.onContentRendered = onContentRendered
         }
 
         // MARK: - WKNavigationDelegate
@@ -144,6 +155,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Ignore the pool's prewarm load — only the real content load counts.
             if webView.url?.absoluteString == "about:blank" { return }
             onNavigationFinished?()
+            // Hand the rendered view to the OMID session starter (no-op when unwired).
+            onContentRendered?(webView)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -295,6 +308,8 @@ struct WebViewRepresentable: NSViewRepresentable {
     /// Accepted for signature parity with the iOS variant (the imperative HTML
     /// creative is iOS-only, so this is unused on macOS).
     var onAdClick: (() -> Void)?
+    /// Accepted for signature parity with iOS (OMID is iOS-only — unused on macOS).
+    var onContentRendered: ((WKWebView) -> Void)?
 
     init(
         url: URL? = nil,
@@ -302,7 +317,8 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        onContentRendered: ((WKWebView) -> Void)? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -310,6 +326,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.onContentRendered = onContentRendered
     }
 
     func makeNSView(context: Context) -> WKWebView {

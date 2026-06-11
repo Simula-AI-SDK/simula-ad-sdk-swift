@@ -290,7 +290,7 @@ public final class SimulaInterstitialAd {
                 if Task.isCancelled { return }
                 // Fillable only when the payload carries a non-blank `rendered_html`
                 // creative (whitespace-only HTML trims to nil → no-fill).
-                guard response.adInserted, response.htmlCreative != nil else {
+                guard response.adInserted, let html = response.htmlCreative else {
                     self.failLoad(.noFill)
                     return
                 }
@@ -298,11 +298,17 @@ public final class SimulaInterstitialAd {
                 // Warm a WKWebView so the first spin-up is off the present() critical path.
                 WebViewPool.shared.prewarm()
                 #endif
+                // Splice the OMID service script into the creative off the present() path.
+                // No-op + original html when OM is inactive; the HTML ad session is created
+                // later once the WebView finishes loading (InterstitialPresenter).
+                let omHTML = await OpenMeasurement.injectOMID(intoHTML: html)
+                let measured = response.withRenderedHtml(omHTML)
+                if Task.isCancelled { return }
                 Telemetry.shared.recordLifecycle(
                     stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
                     adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
                 )
-                self.state = .ready(response, loadedAt: Date())
+                self.state = .ready(measured, loadedAt: Date())
                 self.delegate?.interstitialDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`

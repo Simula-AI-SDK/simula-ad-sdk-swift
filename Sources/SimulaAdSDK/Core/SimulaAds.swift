@@ -62,13 +62,17 @@ public enum SimulaAds {
     ///   - telemetryEnabled: Opt out of in-house SDK telemetry (handled-error + performance
     ///     metrics sent to Simula). Default `true`. PII in telemetry is consent-gated exactly
     ///     like ad tracking; pass `false` to disable the pipeline entirely.
+    ///   - openMeasurementEnabled: Opt out of IAB Open Measurement (OMID) viewability/verification
+    ///     measurement. Default `true`. When `false`, OMID is never activated and ads render
+    ///     identically, just unmeasured. Measurement failures never affect ad delivery.
     public static func initialize(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
-        telemetryEnabled: Bool = true
+        telemetryEnabled: Bool = true,
+        openMeasurementEnabled: Bool = true
     ) {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
@@ -91,6 +95,10 @@ public enum SimulaAds {
             telemetryEnabled: telemetryEnabled
         )
         shared = provider
+
+        // Activate OMID (cheap, main thread; the service-script read is deferred to a
+        // background Task inside activate). Guarded — a failure here never affects ads.
+        OpenMeasurement.activate(enabled: openMeasurementEnabled)
 
         // Warm the session so the first `load()` doesn't pay session creation.
         // Inherits the main actor from the enclosing `@MainActor` context.

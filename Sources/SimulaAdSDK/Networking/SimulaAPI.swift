@@ -285,6 +285,15 @@ public struct MinigameResponse: Sendable {
     /// The minigame serve id — the handle for the post-game `fetchFallbacks` call.
     public let serveId: String
     public let iframeUrl: String
+
+    public init(adType: String, adInserted: Bool, adId: String, serveId: String = "",
+                iframeUrl: String) {
+        self.adType = adType
+        self.adInserted = adInserted
+        self.adId = adId
+        self.serveId = serveId
+        self.iframeUrl = iframeUrl
+    }
 }
 
 /// Internal raw JSON response for init minigame
@@ -303,6 +312,13 @@ private struct MinigameAdResponse: Decodable {
         case adId = "ad_id"
         case serveId = "serve_id"
         case iframeUrl = "iframe_url"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.adId = try? c.decode(String.self, forKey: .adId)
+        self.serveId = try? c.decode(String.self, forKey: .serveId)
+        self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
     }
 }
 
@@ -384,6 +400,16 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
         AdDestination(rawValue: destination) ?? .appstore
+    }
+
+    /// Returns a copy with `renderedHtml` replaced (e.g. after OMID script injection),
+    /// preserving every other field.
+    public func withRenderedHtml(_ html: String?) -> AdLoadResponse {
+        AdLoadResponse(
+            impressionId: impressionId, adInserted: adInserted, adUnitId: adUnitId, destination: destination,
+            renderedFormat: renderedFormat, trackingUrl: trackingUrl, renderedHtml: html,
+            adBehavior: adBehavior, creative: creative, experiment: experiment
+        )
     }
 
     /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`

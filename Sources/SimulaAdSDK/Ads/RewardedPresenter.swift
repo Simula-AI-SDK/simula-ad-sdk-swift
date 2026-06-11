@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import WebKit
 
 // MARK: - RewardedPresenter
 
@@ -121,6 +122,10 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
+    /// OMID HTML session for the game iframe (started after the OM service is injected).
+    @State private var omSession: OMAdSession?
+    /// Guards re-entry while the async session start is in flight.
+    @State private var omStarting = false
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -137,7 +142,10 @@ private struct RewardedGameView: View {
             if let previewHTML {
                 WebViewRepresentable(htmlString: previewHTML)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url)
+                WebViewRepresentable(
+                    url: url,
+                    onContentRendered: { webView in startOMSession(webView) }
+                )
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -169,6 +177,22 @@ private struct RewardedGameView: View {
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
+            // Finish OMID measurement; the pool keeps the web view alive ~1s to flush.
+            omSession?.finish()
+        }
+    }
+
+    /// Injects the OM service into the live game page, then starts an HTML ad session and
+    /// fires loaded + impression. One-shot; no-op when OM is inactive.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil, !omStarting else { return }
+        omStarting = true
+        Task { @MainActor in
+            guard await OpenMeasurement.injectServiceScript(into: webView) else { return }
+            let session = OMAdSession.startHTMLSession(webView: webView, impressionId: impressionId)
+            session?.fireLoaded()
+            session?.fireImpression()
+            omSession = session
         }
     }
 
@@ -231,6 +255,9 @@ private struct RewardedGameView: View {
     // MARK: Close
 
     private func finish(earned: Bool) {
+        // Finish OMID before teardown so the pool's deferred release runs (and keeps the
+        // web view alive ~1s for the verification flush) ahead of `dismantleUIView`.
+        omSession?.finish()
         let elapsed = elapsedPlayTime
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

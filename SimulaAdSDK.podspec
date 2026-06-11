@@ -23,10 +23,14 @@ Pod::Spec.new do |s|
 
   s.source_files     = "Sources/SimulaAdSDK/**/*.swift"
 
+  # IAB Open Measurement SDK (OMID) 1.6.6, partner-namespaced as "Simulaad".
+  s.vendored_frameworks = "Frameworks/OMSDK_Simulaad.xcframework"
+
   s.resource_bundles = {
     "SimulaAdSDK" => [
       "Sources/SimulaAdSDK/Resources/*.png",
-      "Sources/SimulaAdSDK/Resources/PrivacyInfo.xcprivacy"
+      "Sources/SimulaAdSDK/Resources/PrivacyInfo.xcprivacy",
+      "Sources/SimulaAdSDK/Resources/omsdk-v1.js"
     ]
   }
 

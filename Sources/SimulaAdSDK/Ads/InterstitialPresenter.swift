@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import WebKit
 
 // MARK: - InterstitialPresenter
 
@@ -128,6 +129,10 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
+    /// OMID HTML ad session, started once the creative finishes loading. The OM service
+    /// script was already spliced into the HTML at load time.
+    @State private var omSession: OMAdSession?
+
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
@@ -213,6 +218,8 @@ private struct CreativeInterstitialView: View {
             storePromptTask = nil
             skOverlayTask?.cancel()
             skOverlayTask = nil
+            // Finish OMID if the close path didn't (e.g. external dismissal). Idempotent.
+            omSession?.finish()
             // Tear the install banner down with the ad so it doesn't leak into the host app.
             if skOverlayPresented, #available(iOS 14.0, *) {
                 SKOverlayPresenter.dismiss()
@@ -226,11 +233,22 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onAdClick: { handleHtmlClick() }
+            onAdClick: { handleHtmlClick() },
+            onContentRendered: { webView in startOMSession(webView) }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
+    }
+
+    /// Starts the OMID HTML ad session once the creative finishes loading, then fires
+    /// loaded + impression (the creative doesn't emit OMID events itself; `adId` rides
+    /// along as the session reference). One-shot; no-op when OM is inactive.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil else { return }
+        omSession = OMAdSession.startHTMLSession(webView: webView, impressionId: response.impressionId)
+        omSession?.fireLoaded()
+        omSession?.fireImpression()
     }
 
     // MARK: Actions
@@ -246,6 +264,10 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleClose() {
+        // Finish OMID measurement before the fade. The WebViewPool then keeps the web
+        // view alive ~1s (through the 0.25s fade + deferred release) so the verification
+        // script can flush.
+        omSession?.finish()
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

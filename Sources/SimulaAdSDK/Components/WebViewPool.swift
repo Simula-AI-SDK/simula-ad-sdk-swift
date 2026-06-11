@@ -66,6 +66,15 @@ final class WebViewPool {
     /// shown sequentially, so a small buffer is enough; `acquire` refills.
     private let maxIdle = 2
 
+    /// OMID requires the integration to keep a strong reference to the web view for
+    /// ≥1s after `adSession.finish()` so the verification script can flush.
+    private static let omFlushDelayNanos: UInt64 = 1_000_000_000
+
+    /// Web views whose `release` must be deferred ~1s for an OMID flush.
+    private var pendingFlush: Set<ObjectIdentifier> = []
+    /// Web views whose deferral timer is already running (guards double-release).
+    private var flushing: Set<ObjectIdentifier> = []
+
     private init() {}
 
     /// Forwards `window.postMessage` payloads to the native message handler.
@@ -163,10 +172,41 @@ final class WebViewPool {
         return pooled.webView
     }
 
+    /// Marks a web view that hosted an OMID session so its next `release` is deferred
+    /// ~1s — keeping the view (and its Web Content process) alive while the verification
+    /// script flushes after `adSession.finish()`. Must be called before `release`.
+    func markForDelayedRelease(_ webView: WKWebView) {
+        pendingFlush.insert(ObjectIdentifier(webView))
+    }
+
     /// Reset a finished web view and return it to the pool (or discard if full /
     /// privacy mismatch). Idempotent: a second call for the same view no-ops
     /// because `active` no longer holds it.
+    ///
+    /// When the view was marked via `markForDelayedRelease`, the actual reset is
+    /// deferred ~1s (the `about:blank` reset tears down the JS context, so it must
+    /// wait out the OMID flush window). The view stays retained in `active` until then.
     func release(_ webView: WKWebView) {
+        let id = ObjectIdentifier(webView)
+        if pendingFlush.contains(id) {
+            // First release for a flush-marked view: schedule the deferred reset. Repeat
+            // releases during the window are ignored so the delay can't be short-circuited.
+            guard !flushing.contains(id) else { return }
+            flushing.insert(id)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: WebViewPool.omFlushDelayNanos)
+                guard let self else { return }
+                self.pendingFlush.remove(id)
+                self.flushing.remove(id)
+                self.performRelease(webView)
+            }
+            return
+        }
+        performRelease(webView)
+    }
+
+    /// The actual reset + re-pool step. See `release`.
+    private func performRelease(_ webView: WKWebView) {
         guard let pooled = active.removeValue(forKey: ObjectIdentifier(webView)) else {
             return
         }

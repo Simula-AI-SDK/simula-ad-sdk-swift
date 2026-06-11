@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 // MARK: - GameIframeView
 
@@ -43,6 +44,14 @@ public struct GameIframeView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var appeared = false
+    /// Ad id used as the OMID session reference (custom reference identifier).
+    @State private var omImpressionId = ""
+    #if os(iOS)
+    /// OMID HTML session for the game iframe (started after the OM service is injected).
+    @State private var omSession: OMAdSession?
+    /// Guards re-entry while the async session start is in flight.
+    @State private var omStarting = false
+    #endif
     /// Current animated height for bottom sheet mode (in points)
     @State private var currentHeight: CGFloat = 0
     /// Height captured at drag start, used to compute live height from translation
@@ -162,7 +171,12 @@ public struct GameIframeView: View {
                                 onNavigationFailed: { _ in
                                     self.error = "Failed to load game. Please try again."
                                 },
-                                onMessageReceived: { _ in }
+                                onMessageReceived: { _ in },
+                                onContentRendered: { webView in
+                                    #if os(iOS)
+                                    startOMSession(webView)
+                                    #endif
+                                }
                             )
                         }
 
@@ -225,6 +239,10 @@ public struct GameIframeView: View {
     // MARK: - Close Handler
 
     private func handleClose() {
+        #if os(iOS)
+        // Finish OMID measurement before teardown so the pool defers the web view release.
+        omSession?.finish()
+        #endif
         // Report dimensions on close (matching Kotlin's onDimensionsOnClose)
         if isBottomSheetMode {
             let isStillBottomSheet = currentHeight < screenHeight * 0.95
@@ -232,6 +250,22 @@ public struct GameIframeView: View {
         }
         onClose()
     }
+
+    #if os(iOS)
+    /// Injects the OM service into the live game page, then starts an HTML ad session and
+    /// fires loaded + impression. One-shot; no-op when OM is inactive.
+    private func startOMSession(_ webView: WKWebView) {
+        guard omSession == nil, !omStarting else { return }
+        omStarting = true
+        Task { @MainActor in
+            guard await OpenMeasurement.injectServiceScript(into: webView) else { return }
+            let session = OMAdSession.startHTMLSession(webView: webView, impressionId: omImpressionId)
+            session?.fireLoaded()
+            session?.fireImpression()
+            omSession = session
+        }
+    }
+    #endif
 
     // MARK: - Load Minigame
 
@@ -277,6 +311,7 @@ public struct GameIframeView: View {
 
             let response = try await api.getMinigame(request)
             self.iframeUrl = response.iframeUrl
+            self.omImpressionId = response.adId
 
             // Callback with the serve id (the post-game fallbacks handle).
             if !response.serveId.isEmpty {
