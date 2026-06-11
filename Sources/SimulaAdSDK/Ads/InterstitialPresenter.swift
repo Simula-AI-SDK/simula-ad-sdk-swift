@@ -195,7 +195,8 @@ private struct CreativeInterstitialView: View {
             // server-resolved position (never recomputed) during the [closeTime/2, closeTime)
             // window; `!closeEnabled` removes it the instant the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
-                StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
+                // Center the badge in the same 44pt touch-target band as the close button (so they line up).
+                StorePromptBadge(prompt: prompt, rowHeight: 44, onTap: { handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -469,6 +470,9 @@ private struct CloseButtonView: View {
             // isn't proposed a full-size container, which made every position render at the same spot.
             // A tight 8pt inset keeps the button close to the corner (AdMob / AppLovin-style).
             buttonOrIndicator
+                // Center every state in the touch-target band so the gated pill / ring and the
+                // unlocked ✕ share one centerline (and line up with the store badge).
+                .frame(height: touchSize)
                 .padding(8)
                 // When pinned bottom-left, nudge right just enough to clear the always-present info
                 // "i" that sits tight in that corner (the "i" stays closest to the edge), so the two
@@ -495,16 +499,11 @@ private struct CloseButtonView: View {
     @ViewBuilder
     private var buttonOrIndicator: some View {
         if enabled {
-            // The resolved tap target: a labelled pill for `rewardOrCloseLabel`, the circular X
-            // for every other treatment.
+            // Unlocked: the compact ✕ for every treatment (matches all other close buttons).
             Button(action: onClose) {
-                if treatment == .rewardOrCloseLabel {
-                    labelPill(text: "Close")
-                } else {
-                    closeGlyph
-                        .frame(width: touchSize, height: touchSize)
-                        .contentShape(Rectangle())
-                }
+                closeGlyph
+                    .frame(width: touchSize, height: touchSize)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close")
@@ -559,9 +558,12 @@ private struct CloseButtonView: View {
 /// (`RewardedPresenter`).
 struct StorePromptBadge: View {
     let prompt: StorePrompt
-    /// Inset from the safe-area edge. The interstitial uses 16 (aligns with its close button);
-    /// the rewarded minigame passes 8 so the badge shares the reward pill's baseline.
-    var edgePadding: CGFloat = 16
+    /// Inset from the safe-area edge. Both the interstitial and the rewarded minigame use 8 so the
+    /// badge shares its close affordance's baseline.
+    var edgePadding: CGFloat = 8
+    /// When set, the pill is vertically centered within this height so it lines up with a close
+    /// button whose glyph sits in a touch-target band (the interstitial). nil → bare pill (rewarded).
+    var rowHeight: CGFloat? = nil
     let onTap: () -> Void
 
     private var label: String {
@@ -577,6 +579,9 @@ struct StorePromptBadge: View {
 
     var body: some View {
         badge
+            // nil → bare pill (rewarded); set → centered within the band so it lines up with the
+            // interstitial close button's touch-target row.
+            .frame(height: rowHeight)
             .padding(edgePadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
