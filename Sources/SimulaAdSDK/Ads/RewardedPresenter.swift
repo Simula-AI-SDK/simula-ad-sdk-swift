@@ -34,6 +34,7 @@ final class RewardedPresenter {
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
         storeOpen: StoreOpen = .skstoreproduct,
+        attribution: AdAttribution? = nil,
         previewHTML: String? = nil,
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
@@ -56,6 +57,7 @@ final class RewardedPresenter {
             trackingUrl: trackingUrl,
             destination: destination,
             storeOpen: storeOpen,
+            attribution: attribution,
             previewHTML: previewHTML,
             bridge: bridge,
             onFinish: { [weak self] earned, elapsed in
@@ -121,6 +123,8 @@ private struct RewardedGameView: View {
     let trackingUrl: String?
     let destination: AdDestination
     let storeOpen: StoreOpen
+    /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
+    let attribution: AdAttribution?
     /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
     let previewHTML: String?
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
@@ -244,7 +248,7 @@ private struct RewardedGameView: View {
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     private func handleStorePromptTap() {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen)
+        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, attribution: attribution)
     }
 
     // MARK: Close

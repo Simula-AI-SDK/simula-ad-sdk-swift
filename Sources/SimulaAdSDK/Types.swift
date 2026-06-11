@@ -643,25 +643,94 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     }
 }
 
+/// Ad-network attribution tokens for the StoreKit-rendered store surfaces (`attribution` node).
+/// iOS-only: `SKOverlay` / `SKStoreProductViewController` can't navigate an MMP tracking URL, so
+/// attribution rides on these tokens instead — the App Analytics campaign/provider tokens and, when
+/// the ad network supplies a signed SKAdNetwork payload, the full `skan` set. Every field is optional;
+/// an absent or partial object means "no token wired" and the store surface falls back to today's
+/// behavior. The SDK passes these through verbatim — it never mints or signs them (the backend does).
+public struct AdAttribution: Sendable, Equatable, Decodable {
+    /// App Analytics campaign token (`SKStoreProductParameterCampaignToken` / `SKOverlay…campaignToken`).
+    public let campaignToken: String?
+    /// App Analytics provider token (`SKStoreProductParameterProviderToken` / `SKOverlay…providerToken`).
+    public let providerToken: String?
+    /// Signed SKAdNetwork payload. Present only when the ad network can vouch for the install postback.
+    public let skan: SKANParameters?
+
+    public init(campaignToken: String? = nil, providerToken: String? = nil, skan: SKANParameters? = nil) {
+        self.campaignToken = campaignToken
+        self.providerToken = providerToken
+        self.skan = skan
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case campaignToken = "campaign_token"
+        case providerToken = "provider_token"
+        case skan
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.campaignToken = try? c.decode(String.self, forKey: .campaignToken)
+        self.providerToken = try? c.decode(String.self, forKey: .providerToken)
+        self.skan = try? c.decode(SKANParameters.self, forKey: .skan)
+    }
+}
+
+/// The signed SKAdNetwork parameters the ad network computes server-side, mapped 1:1 to StoreKit's
+/// `SKStoreProductParameterAdNetwork*` keys (applied in `CreativeCTARouter`). All-or-nothing: StoreKit
+/// needs the complete signed set to generate a valid install postback, so the required fields are
+/// non-optional — a payload missing any of them fails to decode and the whole `skan` block is dropped
+/// (the store still opens, just without SKAN). `campaignIdentifier` (SKAN ≤3) and `sourceIdentifier`
+/// (SKAN 4) are the version-specific alternatives; supply whichever matches `version`.
+///
+/// NOTE: the snake_case `CodingKeys` below are provisional — confirm them against the backend
+/// (`~/project-any-sdk-api`) `attribution.skan` contract before shipping.
+public struct SKANParameters: Sendable, Equatable, Decodable {
+    public let version: String
+    public let adNetworkIdentifier: String
+    public let sourceAppStoreIdentifier: Int
+    public let nonce: String
+    public let timestamp: Int
+    public let attributionSignature: String
+    public let campaignIdentifier: Int?
+    public let sourceIdentifier: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case adNetworkIdentifier = "ad_network_id"
+        case sourceAppStoreIdentifier = "source_app_store_id"
+        case nonce
+        case timestamp
+        case attributionSignature = "attribution_signature"
+        case campaignIdentifier = "campaign_id"
+        case sourceIdentifier = "source_id"
+    }
+}
+
 /// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
 /// response: an absent object means "render today's defaults". A present-but-partial object
-/// fills each missing field with its default; `store_prompt` / `skoverlay` are nil when omitted.
+/// fills each missing field with its default; `store_prompt` / `skoverlay` / `attribution` are nil
+/// when omitted.
 public struct AdBehavior: Sendable, Equatable, Decodable {
     public let close: CloseBehavior
     public let storeOpen: StoreOpen
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
+    public let attribution: AdAttribution?
 
     public init(
         close: CloseBehavior = CloseBehavior(),
         storeOpen: StoreOpen = .external,
         storePrompt: StorePrompt? = nil,
-        skoverlay: SKOverlayConfig? = nil
+        skoverlay: SKOverlayConfig? = nil,
+        attribution: AdAttribution? = nil
     ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
+        self.attribution = attribution
     }
 
     enum CodingKeys: String, CodingKey {
@@ -669,6 +738,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storeOpen = "store_open"
         case storePrompt = "store_prompt"
         case skoverlay
+        case attribution
     }
 
     public init(from decoder: Decoder) throws {
@@ -677,6 +747,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
+        self.attribution = try? c.decode(AdAttribution.self, forKey: .attribution)
     }
 }
 

@@ -16,9 +16,10 @@ import StoreKit
 @available(iOS 14.0, *)
 @MainActor
 enum SKOverlayPresenter {
-    /// Presents an SKOverlay for `appID` (numeric App Store id) honoring position + dismissibility.
+    /// Presents an SKOverlay for `appID` (numeric App Store id) honoring position + dismissibility, and
+    /// carrying any [attribution] tokens so the install the overlay drives is credited to the campaign.
     /// Best-effort: a disabled config or a missing scene simply no-ops (the impression is unaffected).
-    static func present(appID: String, config: SKOverlayConfig) {
+    static func present(appID: String, config: SKOverlayConfig, attribution: AdAttribution? = nil) {
         guard config.enabled, !appID.isEmpty, let scene = activeWindowScene() else { return }
 
         let position: SKOverlay.Position = config.position == .bottomRaised ? .bottomRaised : .bottom
@@ -26,6 +27,16 @@ enum SKOverlayPresenter {
         // `dismissible == false` asks for no user-dismiss control. SKOverlay still renders a system
         // dismiss affordance on some OS versions (documented limitation), so this is best-effort.
         appConfig.userDismissible = config.dismissible
+
+        // Attribution tokens: campaign/provider via the typed properties; the signed SKAdNetwork set
+        // via `setAdditionalValue` with the shared `SKStoreProductParameterAdNetwork*` keys (StoreKit
+        // records the SKAN install postback when the overlay drives the install). The MMP click for
+        // this engagement is fired separately when the app id is resolved (`is_skoverlay=true`).
+        if let campaign = attribution?.campaignToken, !campaign.isEmpty { appConfig.campaignToken = campaign }
+        if let provider = attribution?.providerToken, !provider.isEmpty { appConfig.providerToken = provider }
+        for (key, value) in CreativeCTARouter.skanAdditionalValues(attribution) {
+            appConfig.setAdditionalValue(value, forKey: key)
+        }
 
         let overlay = SKOverlay(configuration: appConfig)
         overlay.present(in: scene)

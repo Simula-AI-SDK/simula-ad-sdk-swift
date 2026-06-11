@@ -368,6 +368,54 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
         XCTAssertNil(b.storePrompt)
         XCTAssertNil(b.skoverlay)
+        XCTAssertNil(b.attribution)
+    }
+
+    // MARK: - Ad behavior: attribution tokens (SKOverlay / SKStoreProduct)
+
+    func testAdBehaviorAttributionDecodesCampaignProviderAndSkan() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"attribution":{
+           "campaign_token":"camp_tok","provider_token":"prov_tok",
+           "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
+             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,
+             "attribution_signature":"sig==","source_id":1234}}}}
+        """
+        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        XCTAssertEqual(a.campaignToken, "camp_tok")
+        XCTAssertEqual(a.providerToken, "prov_tok")
+        let skan = try XCTUnwrap(a.skan)
+        XCTAssertEqual(skan.version, "4.0")
+        XCTAssertEqual(skan.adNetworkIdentifier, "net123.skadnetwork")
+        XCTAssertEqual(skan.sourceAppStoreIdentifier, 987_654_321)
+        XCTAssertEqual(skan.nonce, "00000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(skan.timestamp, 1_700_000_000_000)
+        XCTAssertEqual(skan.attributionSignature, "sig==")
+        XCTAssertEqual(skan.sourceIdentifier, 1234)
+        XCTAssertNil(skan.campaignIdentifier)
+    }
+
+    func testAdBehaviorAttributionAbsentIsNil() throws {
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        XCTAssertNil(try decodeAdLoad(json).adBehavior?.attribution)
+    }
+
+    func testAttributionSkanAllOrNothingDropsPartialButKeepsTokens() throws {
+        // The SKAN block is missing `attribution_signature` (a required field) → StoreKit could not
+        // build a valid postback, so the whole `skan` decodes to nil. The App Analytics tokens, which
+        // are independent, still decode.
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"attribution":{
+           "campaign_token":"camp_tok",
+           "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
+             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,"source_id":1234}}}}
+        """
+        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        XCTAssertEqual(a.campaignToken, "camp_tok")
+        XCTAssertNil(a.providerToken)
+        XCTAssertNil(a.skan)
     }
 
     func testAdBehaviorPartialCloseFillsDefaults() throws {
