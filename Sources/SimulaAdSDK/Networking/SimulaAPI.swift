@@ -667,11 +667,6 @@ public final class SimulaAPI: @unchecked Sendable {
         )
     }()
 
-    /// Cached ISO-8601 formatter. `ISO8601DateFormatter` construction is costly,
-    /// and the viewport tracking calls would otherwise allocate one per event.
-    /// `string(from:)` is thread-safe, so a single shared instance is fine.
-    private static let iso8601Formatter = ISO8601DateFormatter()
-
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
     }
@@ -1075,44 +1070,6 @@ public final class SimulaAPI: @unchecked Sendable {
         var body: [String: Any] = ["flag": flag]
         if let note, !note.isEmpty { body["note"] = note }
         request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
-
-        _ = try? await session.data(for: request)
-    }
-
-    // MARK: - Track Viewport Entry
-
-    /// Tracks when an ad enters the viewport.
-    /// Translates `trackViewportEntry()` from api.ts
-    public func trackViewportEntry(adId: String, apiKey: String) async {
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/viewport_entry/\(adId)") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-
-        let body: [String: Any] = [
-            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        _ = try? await session.data(for: request)
-    }
-
-    // MARK: - Track Viewport Exit
-
-    /// Tracks when an ad exits the viewport.
-    /// Translates `trackViewportExit()` from api.ts
-    public func trackViewportExit(adId: String, apiKey: String) async {
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/viewport_exit/\(adId)") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-
-        let body: [String: Any] = [
-            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         _ = try? await session.data(for: request)
     }
