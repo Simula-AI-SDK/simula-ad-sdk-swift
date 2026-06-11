@@ -230,6 +230,114 @@ func parseCatalog(_ data: Data) throws -> CatalogResponse {
     return CatalogResponse(menuId: "", games: items.items.map { $0.toGameData() })
 }
 
+// MARK: - Character Picker Models
+
+/// One character as returned by the companions endpoint. `id`/`name` are required
+/// (an entry missing either is dropped by `LossyCompanionItems`); the image resolves
+/// from `images_1_1[0]`, then `avatar_url`, then `image`. Decoding is tolerant —
+/// unknown fields are ignored, and backend (`character_id`) or short (`id`) names work.
+struct CompanionItem: Decodable {
+    let id: String
+    let name: String
+    let image: String
+    let description: String?
+
+    enum CodingKeys: String, CodingKey {
+        case characterId = "character_id"
+        case id
+        case characterName = "character_name"
+        case name
+        case images11 = "images_1_1"
+        case avatarUrl = "avatar_url"
+        case image
+        case description
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let id = (try? c.decode(String.self, forKey: .characterId))
+            ?? (try? c.decode(String.self, forKey: .id)),
+            let name = (try? c.decode(String.self, forKey: .characterName))
+            ?? (try? c.decode(String.self, forKey: .name))
+        else {
+            throw SimulaAPIError.invalidResponse // dropped by the lossy wrapper
+        }
+        self.id = id
+        self.name = name
+        let firstImage = (try? c.decode([String].self, forKey: .images11))?.first
+        self.image = firstImage
+            ?? (try? c.decode(String.self, forKey: .avatarUrl))
+            ?? (try? c.decode(String.self, forKey: .image))
+            ?? ""
+        self.description = try? c.decode(String.self, forKey: .description)
+    }
+
+    func toCharacterData() -> CharacterData {
+        CharacterData(id: id, name: name, image: image, description: description)
+    }
+}
+
+/// Decodes a characters array element-by-element, skipping any entry that fails to
+/// decode so one malformed character can't drop the rest.
+struct LossyCompanionItems: Decodable {
+    let items: [CompanionItem]
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var items: [CompanionItem] = []
+        while !container.isAtEnd {
+            let wrapped = try container.decode(FailableDecodable<CompanionItem>.self)
+            if let item = wrapped.value { items.append(item) }
+        }
+        self.items = items
+    }
+}
+
+/// The `characters` field when it arrives as an object wrapping a `data` array.
+private struct CompanionsDataObject: Decodable {
+    let data: LossyCompanionItems?
+}
+
+/// Top-level companions response. `characters` may be a direct array, an object with
+/// a `data` array, or absent (then a top-level `data` array, or a bare array via
+/// `parseCharacters`).
+struct CompanionsAPIResponse: Decodable {
+    let characters: [CompanionItem]
+
+    enum CodingKeys: String, CodingKey {
+        case characters
+        case data
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let array = try? c.decode(LossyCompanionItems.self, forKey: .characters) {
+            self.characters = array.items                       // characters: [ … ]
+        } else if let object = try? c.decode(CompanionsDataObject.self, forKey: .characters) {
+            self.characters = object.data?.items ?? []          // characters: { data: [ … ] }
+        } else if let array = try? c.decode(LossyCompanionItems.self, forKey: .data) {
+            self.characters = array.items                       // data: [ … ]
+        } else {
+            self.characters = []
+        }
+    }
+}
+
+/// Decodes a companions payload into `[CharacterData]`. Pure and testable; tolerant of
+/// the shapes the server may return (object with `characters`/`characters.data`/`data`,
+/// or a bare array) and lossy per character. Returns `[]` for any unexpected shape so
+/// the picker silently falls back to its bundled placeholders.
+func parseCharacters(_ data: Data) -> [CharacterData] {
+    let decoder = JSONDecoder()
+    if let response = try? decoder.decode(CompanionsAPIResponse.self, from: data),
+       !response.characters.isEmpty {
+        return response.characters.map { $0.toCharacterData() }
+    }
+    if let items = try? decoder.decode(LossyCompanionItems.self, from: data) {
+        return items.items.map { $0.toCharacterData() }
+    }
+    return []
+}
+
 /// Request body for POST /minigames/init
 public struct InitMinigameRequest: Sendable {
     public let gameType: String
@@ -785,6 +893,45 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Builds the catalog request URL, adding `session_id` when available. Pure/testable.
     static func catalogURL(sessionId: String? = nil) -> URL? {
         guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalog") else {
+            return nil
+        }
+        if let sessionId, !sessionId.isEmpty {
+            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
+        }
+        return components.url
+    }
+
+    // MARK: - Fetch Characters (Character Picker)
+
+    /// Fetches the selectable characters for the Character Picker. Best-effort and
+    /// **never throws**: returns an empty list on any failure so the caller falls back
+    /// to its bundled placeholder characters.
+    ///
+    /// NOTE: the public `/minigames/companions` endpoint is not built yet — this call
+    /// will currently 404 and resolve to the fallback. No SDK change is needed once it
+    /// ships; `parseCharacters` already tolerates its expected shape.
+    public func fetchCharacters(sessionId: String? = nil) async -> [CharacterData] {
+        guard let url = Self.companionsURL(sessionId: sessionId) else { return [] }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyHeaders(makeHeaders(), to: &request)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else {
+                return []
+            }
+            return parseCharacters(data)
+        } catch {
+            return []
+        }
+    }
+
+    /// Builds the companions request URL, adding `session_id` when available. Pure/testable.
+    static func companionsURL(sessionId: String? = nil) -> URL? {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/companions") else {
             return nil
         }
         if let sessionId, !sessionId.isEmpty {
