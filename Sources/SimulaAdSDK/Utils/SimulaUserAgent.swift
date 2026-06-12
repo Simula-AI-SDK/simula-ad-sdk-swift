@@ -17,11 +17,19 @@ enum SimulaUserAgent {
     /// The composed UA string. Computed once, thread-safe via `static let` lazy init.
     static let value: String = build()
 
-    /// A `.default` URLSession configuration carrying the UA header, for the ancillary sessions
-    /// (CTA / tracker clicks) that don't go through `SimulaAPI`'s shared session.
+    /// The SDK's standard request headers stamped on every outbound request: the custom User-Agent
+    /// plus the `X-Device-Id` device identifier (omitted when the platform supplies none).
+    static func standardHeaders() -> [String: String] {
+        var headers = ["User-Agent": value]
+        if let deviceId = SimulaDeviceId.value { headers["X-Device-Id"] = deviceId }
+        return headers
+    }
+
+    /// A `.default` URLSession configuration carrying the standard headers, for the ancillary
+    /// sessions (CTA / tracker clicks) that don't go through `SimulaAPI`'s shared session.
     static func sessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = ["User-Agent": value]
+        config.httpAdditionalHeaders = standardHeaders()
         return config
     }
 

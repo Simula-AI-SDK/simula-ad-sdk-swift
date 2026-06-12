@@ -787,9 +787,9 @@ public final class SimulaAPI: @unchecked Sendable {
         config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
         config.timeoutIntervalForResource = 20  // overall ceiling for one resource
         config.waitsForConnectivity = false     // fail fast when offline
-        // Custom UA on every request through this session (PRD). Per-request headers never set
-        // User-Agent, so this session-wide value applies to all API + telemetry calls.
-        config.httpAdditionalHeaders = ["User-Agent": SimulaUserAgent.value]
+        // Custom UA + device id on every request through this session. Per-request headers never
+        // set these, so the session-wide values apply to all API + telemetry calls.
+        config.httpAdditionalHeaders = SimulaUserAgent.standardHeaders()
         // Session-wide task delegate harvests URLSessionTaskMetrics into telemetry for every
         // request (skipping the telemetry endpoint itself). Async `data(for:)` still works.
         return URLSession(
