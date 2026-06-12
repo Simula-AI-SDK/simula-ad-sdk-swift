@@ -810,9 +810,33 @@ public enum AutoStoreRedirectTrigger: String, Sendable, Equatable {
     }
 }
 
+extension AutoStoreRedirectTrigger {
+    /// Custom-scheme markers a playable creative navigates to when an end card renders, so the SDK
+    /// can fire an end-screen `auto_store_redirect` by intercepting the navigation — no JS bridge.
+    /// The SDK consumes the navigation and never actually loads the URL. Contract shared with the
+    /// creative:
+    ///
+    /// ```js
+    /// window.location.href = "simula://end-screen-1"; // when END SCREEN 1 renders
+    /// window.location.href = "simula://end-screen-2"; // when END SCREEN 2 renders
+    /// ```
+    ///
+    /// Returns the end-screen trigger `urlString` signals, or nil when it isn't a marker. (PLAYABLE_END
+    /// is SDK-native — fired when the close button appears — and has no marker.)
+    static func endScreenTrigger(forMarkerURL urlString: String) -> AutoStoreRedirectTrigger? {
+        let normalized = urlString.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        switch normalized {
+        case "simula://end-screen-1": return .endScreen1Open
+        case "simula://end-screen-2": return .endScreen2Open
+        default: return nil
+        }
+    }
+}
+
 /// Auto store redirect (`auto_store_redirect` node): when `enabled`, the SDK opens the advertiser
-/// store once per impression the first time the creative reports the `trigger` moment — no user tap.
-/// Disabled by default (a missing block / `enabled:false` is a no-op).
+/// store once per impression at the `trigger` moment — no user tap. PLAYABLE_END fires when the close
+/// button appears; END_SCREEN_1/2_OPEN fire when the creative navigates to the matching end-screen
+/// marker (see `AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL:)`). Disabled by default.
 public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let trigger: AutoStoreRedirectTrigger

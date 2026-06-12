@@ -158,7 +158,11 @@ private struct RewardedGameView: View {
             if let previewHTML {
                 WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, bridge: bridge)
+                WebViewRepresentable(
+                    url: url,
+                    bridge: bridge,
+                    onCreativeMarker: { marker in handleEndScreenMarker(marker) }
+                )
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -186,7 +190,11 @@ private struct RewardedGameView: View {
         .allowsHitTesting(visible)
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
-        .onAppear { startTimer() }
+        .onAppear {
+            startTimer()
+            // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
+            fireAutoStoreRedirectIfCloseShown()
+        }
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
@@ -199,18 +207,35 @@ private struct RewardedGameView: View {
             timerTask = nil
             rewardEarned = true
         }
-        // CREATIVE_MOMENT (PRD): fire an enabled auto_store_redirect once when its trigger arrives.
-        .onReceive(bridge.$creativeMoment) { moment in
-            handleCreativeMoment(moment)
+        // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
+        // (here, when the reward is earned and the reward/close pill becomes a close button).
+        .onChange(of: rewardEarned) { earned in
+            if earned { fireAutoStoreRedirectIfCloseShown() }
         }
     }
 
-    /// Fires the auto store redirect once, when the reported `moment` matches the configured trigger.
-    private func handleCreativeMoment(_ moment: String?) {
-        guard let moment, let redirect = autoStoreRedirect, redirect.enabled,
-              !autoRedirectFired, moment == redirect.trigger.rawValue else { return }
+    // MARK: auto_store_redirect
+
+    /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
+    private func fireAutoStoreRedirect() {
+        guard !autoRedirectFired else { return }
         autoRedirectFired = true
         handleStorePromptTap()
+    }
+
+    /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
+    private func fireAutoStoreRedirectIfCloseShown() {
+        guard rewardEarned, let redirect = autoStoreRedirect, redirect.enabled,
+              redirect.trigger == .playableEnd else { return }
+        fireAutoStoreRedirect()
+    }
+
+    /// END_SCREEN_1/2_OPEN — fire when the creative navigates to the matching end-screen marker.
+    private func handleEndScreenMarker(_ urlString: String) {
+        guard let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: urlString),
+              let redirect = autoStoreRedirect, redirect.enabled,
+              redirect.trigger == trigger else { return }
+        fireAutoStoreRedirect()
     }
 
     @ViewBuilder

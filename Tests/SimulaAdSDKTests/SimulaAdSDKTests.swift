@@ -408,6 +408,17 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(r.trigger, .playableEnd)
     }
 
+    func testEndScreenMarkerMapping() {
+        // END_SCREEN_1/2_OPEN are detected by the creative navigating to a simula:// marker (no bridge).
+        XCTAssertEqual(AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: "simula://end-screen-1"), .endScreen1Open)
+        XCTAssertEqual(AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: "simula://end-screen-2"), .endScreen2Open)
+        // Case-insensitive + tolerant of a trailing slash.
+        XCTAssertEqual(AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: "SIMULA://END-SCREEN-1/"), .endScreen1Open)
+        // Non-markers (real URLs, PLAYABLE_END which is native, unknown) map to nil.
+        XCTAssertNil(AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: "https://apps.apple.com/app/id123"))
+        XCTAssertNil(AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: "simula://playable-end"))
+    }
+
     // MARK: - User-Agent (PRD)
 
     func testUserAgentComposeMatchesPRDFormat() {

@@ -45,6 +45,10 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// `nil` for the game iframe / previews (no attribution to apply).
     var attribution: AdAttribution?
 
+    /// Called (with the raw marker URL) when the creative navigates to a `simula://` end-screen marker,
+    /// so the presenter can fire an `auto_store_redirect`. The navigation itself is consumed (never loaded).
+    var onCreativeMarker: ((String) -> Void)?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
@@ -53,7 +57,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
         bridge: CreativeBridge? = nil,
-        attribution: AdAttribution? = nil
+        attribution: AdAttribution? = nil,
+        onCreativeMarker: ((String) -> Void)? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -63,6 +68,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onAdClick = onAdClick
         self.bridge = bridge
         self.attribution = attribution
+        self.onCreativeMarker = onCreativeMarker
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -116,7 +122,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
             bridge: bridge,
-            attribution: attribution
+            attribution: attribution,
+            onCreativeMarker: onCreativeMarker
         )
     }
 
@@ -132,6 +139,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         var bridge: CreativeBridge?
         /// Attribution tokens applied to the in-app store sheet this coordinator routes CTAs to.
         var attribution: AdAttribution?
+        /// Called when the creative navigates to a `simula://` end-screen marker (consumed, not loaded).
+        var onCreativeMarker: ((String) -> Void)?
         /// The web view this coordinator drives — used to post `GET_*` replies back into the page.
         weak var webView: WKWebView?
 
@@ -157,7 +166,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: ((String) -> Void)?,
             onAdClick: (() -> Void)? = nil,
             bridge: CreativeBridge? = nil,
-            attribution: AdAttribution? = nil
+            attribution: AdAttribution? = nil,
+            onCreativeMarker: ((String) -> Void)? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
@@ -165,6 +175,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onAdClick = onAdClick
             self.bridge = bridge
             self.attribution = attribution
+            self.onCreativeMarker = onCreativeMarker
         }
 
         /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
@@ -224,6 +235,15 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Block javascript: URLs for security
             if scheme == "javascript" {
+                decisionHandler(.cancel)
+                return
+            }
+
+            // auto_store_redirect end-screen marker (simula://end-screen-1/2): the creative navigates
+            // here when an end card renders. Consume the custom-scheme navigation (never load it) and
+            // report the marker so the presenter can fire the redirect if its trigger matches.
+            if scheme == "simula" {
+                onCreativeMarker?(url.absoluteString)
                 decisionHandler(.cancel)
                 return
             }

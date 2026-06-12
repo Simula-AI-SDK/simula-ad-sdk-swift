@@ -222,6 +222,8 @@ private struct CreativeInterstitialView: View {
             startGate()
             startStorePromptTrigger()
             startSKOverlay()
+            // PLAYABLE_END: if the close button is already available (delay 0), fire immediately.
+            fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
             gateTask?.cancel()
@@ -243,20 +245,35 @@ private struct CreativeInterstitialView: View {
             gateTask = nil
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
-        // CREATIVE_MOMENT (PRD): when an enabled auto_store_redirect's trigger moment arrives, open
-        // the advertiser store once (no user tap), reusing the shared CTA path.
-        .onReceive(bridge.$creativeMoment) { moment in
-            handleCreativeMoment(moment)
+        // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears.
+        .onChange(of: closeEnabled) { enabled in
+            if enabled { fireAutoStoreRedirectIfCloseShown() }
         }
     }
 
-    /// Fires the auto store redirect once, when the reported `moment` matches the configured trigger.
-    private func handleCreativeMoment(_ moment: String?) {
-        guard let moment,
-              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
-              !autoRedirectFired, moment == redirect.trigger.rawValue else { return }
+    // MARK: auto_store_redirect
+
+    /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
+    private func fireAutoStoreRedirect() {
+        guard !autoRedirectFired else { return }
         autoRedirectFired = true
         handleStorePromptTap()
+    }
+
+    /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
+    private func fireAutoStoreRedirectIfCloseShown() {
+        guard closeEnabled,
+              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
+              redirect.trigger == .playableEnd else { return }
+        fireAutoStoreRedirect()
+    }
+
+    /// END_SCREEN_1/2_OPEN — fire when the creative navigates to the matching end-screen marker.
+    private func handleEndScreenMarker(_ urlString: String) {
+        guard let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: urlString),
+              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
+              redirect.trigger == trigger else { return }
+        fireAutoStoreRedirect()
     }
 
     // MARK: HTML creative
@@ -267,7 +284,8 @@ private struct CreativeInterstitialView: View {
             htmlString: html,
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
-            attribution: response.adBehavior?.attribution
+            attribution: response.adBehavior?.attribution,
+            onCreativeMarker: { marker in handleEndScreenMarker(marker) }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
