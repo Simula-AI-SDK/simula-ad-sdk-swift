@@ -134,3 +134,73 @@ struct CharacterCard: View {
             )
     }
 }
+
+// MARK: - CharacterSkeletonCard
+
+/// Loading skeleton for a grid slot whose character is still being fetched — same
+/// footprint as `CharacterCard` (1:1 image area + name bar) with a horizontal shimmer,
+/// so swapping in the real card doesn't shift the layout. Not selectable.
+struct CharacterSkeletonCard: View {
+    let theme: CharacterPickerTheme
+
+    /// 0…1 sweep phase, animated forever on appear.
+    @State private var phase: CGFloat = 0
+
+    private var cornerRadius: CGFloat { theme.resolvedCardCornerRadius }
+    private var borderColor: Color { Color(hex: theme.resolvedCardBorderColor) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Image area — square, matching CharacterCard's imageWrap sizing.
+            Color.clear
+                .frame(maxWidth: .infinity)
+                .aspectRatio(1, contentMode: .fit)
+                .overlay { shimmer }
+                .clipped()
+
+            // Name bar — short placeholder pill on the translucent backing.
+            shimmer
+                .frame(width: 60, height: 12)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(0.4))
+                .overlay(
+                    Rectangle().frame(height: 1).foregroundColor(borderColor),
+                    alignment: .top
+                )
+        }
+        .frame(maxWidth: .infinity)
+        .background(Color(hex: theme.resolvedCardBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .stroke(borderColor, lineWidth: 2)
+        )
+        .onAppear {
+            phase = 0
+            withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
+                phase = 1
+            }
+        }
+        .accessibilityLabel("Loading")
+    }
+
+    // A base fill with a highlight band swept left→right by `phase`.
+    private var shimmer: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            Color(hex: "#2a2a2f")
+                .overlay(
+                    LinearGradient(
+                        gradient: Gradient(colors: [.clear, Color(hex: "#3c3c46"), .clear]),
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: w)
+                    .offset(x: -w + phase * (2 * w))
+                )
+                .clipped()
+        }
+    }
+}
