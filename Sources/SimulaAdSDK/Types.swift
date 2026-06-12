@@ -439,8 +439,9 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 
 /// Hard cap on the server-driven close delay. The close button (and, on Android, the system
 /// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
-/// trap the user with no exit. PRD arms are 0/3/5s; 15s leaves headroom without the footgun.
-let maxCloseDelaySeconds = 15
+/// trap the user with no exit. The `close_chrome` experiment arms are 20/30/45s (default 30),
+/// so the cap is 45 to honor the largest authored value while still bounding a malformed one.
+let maxCloseDelaySeconds = 45
 
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
@@ -792,15 +793,61 @@ public struct SKANParameters: Sendable, Equatable, Decodable {
     }
 }
 
+/// The creative-lifecycle moment at which an enabled `auto_store_redirect` fires. The `rawValue` is
+/// the wire token the server sends AND the token the creative emits via the `CREATIVE_MOMENT` bridge
+/// event; the two are matched verbatim. Unknown/missing → `.playableEnd` (the server's own default).
+public enum AutoStoreRedirectTrigger: String, Sendable, Equatable {
+    case playableEnd = "playable_end"
+    case endScreen1Open = "end_screen_1_open"
+    case endScreen2Open = "end_screen_2_open"
+
+    static func from(_ raw: String?) -> AutoStoreRedirectTrigger {
+        switch normalizeBehaviorToken(raw) {
+        case "end_screen_1_open": return .endScreen1Open
+        case "end_screen_2_open": return .endScreen2Open
+        default: return .playableEnd
+        }
+    }
+}
+
+/// Auto store redirect (`auto_store_redirect` node): when `enabled`, the SDK opens the advertiser
+/// store once per impression the first time the creative reports the `trigger` moment — no user tap.
+/// Disabled by default (a missing block / `enabled:false` is a no-op).
+public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
+    public let enabled: Bool
+    public let trigger: AutoStoreRedirectTrigger
+
+    public init(enabled: Bool = false, trigger: AutoStoreRedirectTrigger = .playableEnd) {
+        self.enabled = enabled
+        self.trigger = trigger
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, trigger
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        self.trigger = .from(try? c.decode(String.self, forKey: .trigger))
+    }
+}
+
 /// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
 /// response: an absent object means "render today's defaults". A present-but-partial object
-/// fills each missing field with its default; `store_prompt` / `skoverlay` / `attribution` are nil
-/// when omitted.
+/// fills each missing field with its default; `store_prompt` / `skoverlay` / `auto_store_redirect` /
+/// `attribution` are nil when omitted.
+///
+/// NOTE: `attribution` is intentionally inert today — the backend (`~/project-any-sdk-api`) does not
+/// yet emit an `attribution` node in `ad_behavior`, so it always decodes to nil and the StoreKit
+/// surfaces fall back to their default (un-attributed) behavior. The plumbing is retained so the
+/// tokens flow the moment the API ships the contract; the Android SDK deliberately doesn't model it.
 public struct AdBehavior: Sendable, Equatable, Decodable {
     public let close: CloseBehavior
     public let storeOpen: StoreOpen
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
+    public let autoStoreRedirect: AutoStoreRedirect?
     public let attribution: AdAttribution?
 
     public init(
@@ -808,12 +855,14 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         storeOpen: StoreOpen = .external,
         storePrompt: StorePrompt? = nil,
         skoverlay: SKOverlayConfig? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
         attribution: AdAttribution? = nil
     ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
+        self.autoStoreRedirect = autoStoreRedirect
         self.attribution = attribution
     }
 
@@ -822,6 +871,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storeOpen = "store_open"
         case storePrompt = "store_prompt"
         case skoverlay
+        case autoStoreRedirect = "auto_store_redirect"
         case attribution
     }
 
@@ -831,6 +881,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
+        self.autoStoreRedirect = try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect)
         self.attribution = try? c.decode(AdAttribution.self, forKey: .attribution)
     }
 }

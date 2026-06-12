@@ -138,6 +138,10 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
+    // auto_store_redirect — fires the store open once, the first time the creative reports the
+    // configured moment.
+    @State private var autoRedirectFired = false
+
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
@@ -239,6 +243,20 @@ private struct CreativeInterstitialView: View {
             gateTask = nil
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
+        // CREATIVE_MOMENT (PRD): when an enabled auto_store_redirect's trigger moment arrives, open
+        // the advertiser store once (no user tap), reusing the shared CTA path.
+        .onReceive(bridge.$creativeMoment) { moment in
+            handleCreativeMoment(moment)
+        }
+    }
+
+    /// Fires the auto store redirect once, when the reported `moment` matches the configured trigger.
+    private func handleCreativeMoment(_ moment: String?) {
+        guard let moment,
+              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
+              !autoRedirectFired, moment == redirect.trigger.rawValue else { return }
+        autoRedirectFired = true
+        handleStorePromptTap()
     }
 
     // MARK: HTML creative

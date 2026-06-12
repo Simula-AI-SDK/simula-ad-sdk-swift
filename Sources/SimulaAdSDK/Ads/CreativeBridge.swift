@@ -40,6 +40,11 @@ final class CreativeBridge: ObservableObject {
     /// shows the close button / grants the reward immediately, bypassing the play timer.
     @Published var earlyComplete = false
 
+    /// The latest creative-lifecycle moment (`playable_end` / `end_screen_1_open` /
+    /// `end_screen_2_open`) reported via `CREATIVE_MOMENT`. The presenting view observes this to
+    /// fire an `auto_store_redirect` when the moment matches the configured trigger.
+    @Published var creativeMoment: String?
+
     /// The hosting controller whose `supportedInterfaceOrientations` we pin for
     /// `SET_ORIENTATION`. Set by the presenter once the window exists.
     weak var orientationHost: OrientationLockable?
@@ -74,6 +79,8 @@ final class CreativeBridge: ObservableObject {
         // Events
         case "AD_EARLY_COMPLETE":
             earlyComplete = true
+        case "CREATIVE_MOMENT":
+            if let moment = payload["moment"] as? String { creativeMoment = moment }
 
         // Commands
         case "TRIGGER_HAPTIC":

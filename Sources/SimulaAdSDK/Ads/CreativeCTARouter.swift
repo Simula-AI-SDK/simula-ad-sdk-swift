@@ -148,7 +148,7 @@ enum CreativeCTARouter {
         }
         resolverRef = resolver
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
         // This GET both resolves the advertised app id AND is the MMP click for the SKOverlay
         // engagement — `is_skoverlay=true` tells AppsFlyer/Adjust it's an SKOverlay view/click (so it's
@@ -324,7 +324,7 @@ enum CreativeCTARouter {
         }
         resolverRef = resolver
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
         session.dataTask(with: URLRequest(url: initialURL)).resume()
     }
@@ -360,7 +360,7 @@ enum CreativeCTARouter {
         resolverRef = resolver
         // Keep a strong reference so it isn't deallocated during the request.
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
         session.dataTask(with: URLRequest(url: url)).resume()
     }

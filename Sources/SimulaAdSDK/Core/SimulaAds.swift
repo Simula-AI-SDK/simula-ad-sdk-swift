@@ -37,6 +37,10 @@ public enum SimulaAds {
     /// any network call when the host forgot to initialize).
     public static var isInitialized: Bool { shared != nil }
 
+    /// The custom User-Agent the SDK sets on its native HTTP requests (PRD). Exposed so a React
+    /// Native bridge can retrieve the native string rather than reconstructing it in JS.
+    public static var userAgent: String { SimulaUserAgent.value }
+
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
@@ -81,6 +85,10 @@ public enum SimulaAds {
 
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else { return }
+
+        // Construct the custom User-Agent at init (PRD). It's a lazy `static let`, so touching it
+        // here forces it before the shared SimulaAPI session reads it for httpAdditionalHeaders.
+        _ = SimulaUserAgent.value
 
         let provider = SimulaProvider(
             apiKey: apiKey,

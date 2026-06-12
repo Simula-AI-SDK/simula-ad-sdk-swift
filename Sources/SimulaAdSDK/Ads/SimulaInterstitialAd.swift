@@ -71,13 +71,13 @@ public enum SimulaAdError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .notInitialized:
-            return "SimulaAds is not initialized. Call SimulaAds.initialize(apiKey:) first."
+            return "SimulaAds is not initialized — call SimulaAds.initialize() first."
         case .noSession:
             return "Could not create a session. Check the API key and network connection."
         case .noFill:
             return "No ad available to show right now (no fill)."
         case .notReady:
-            return "No ad is ready. Call load() and wait for LOADED before show()."
+            return "Ad not ready — call load() first and wait for the loaded callback before show()."
         case .stale:
             return "The loaded ad has expired (1 hour limit) and can no longer be shown. "
                 + "Call load() to request a new ad."
@@ -89,13 +89,15 @@ public enum SimulaAdError: LocalizedError, Sendable {
             return "An ad for this placement is already loading. "
                 + "Wait for the didLoad delegate callback before calling load() again."
         case .alreadyShowing:
-            return "An interstitial is already being shown."
+            return "An interstitial is already showing."
         case .noPresentationContext:
             return "No active window scene is available to present the ad."
         case .unsupportedPlatform:
             return "The imperative interstitial is only supported on iOS."
-        case .network(let underlying):
-            return underlying.errorDescription
+        case .network:
+            // Shared, descriptive copy (matches the Android SDK). The underlying `SimulaAPIError`
+            // stays available on the associated value for programmatic inspection / debugging.
+            return "Network error while loading the ad — check the connection and call load() again."
         }
     }
 }

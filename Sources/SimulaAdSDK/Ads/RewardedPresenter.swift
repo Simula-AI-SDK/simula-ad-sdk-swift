@@ -35,6 +35,7 @@ final class RewardedPresenter {
         destination: AdDestination = .appstore,
         storeOpen: StoreOpen = .skstoreproduct,
         attribution: AdAttribution? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
@@ -58,6 +59,7 @@ final class RewardedPresenter {
             destination: destination,
             storeOpen: storeOpen,
             attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             bridge: bridge,
             onFinish: { [weak self] earned, elapsed in
@@ -125,6 +127,8 @@ private struct RewardedGameView: View {
     let storeOpen: StoreOpen
     /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
     let attribution: AdAttribution?
+    /// auto_store_redirect config — fires the store open once at the configured creative moment.
+    let autoStoreRedirect: AutoStoreRedirect?
     /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
     let previewHTML: String?
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
@@ -136,6 +140,8 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
+    /// auto_store_redirect one-shot guard.
+    @State private var autoRedirectFired = false
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -193,6 +199,18 @@ private struct RewardedGameView: View {
             timerTask = nil
             rewardEarned = true
         }
+        // CREATIVE_MOMENT (PRD): fire an enabled auto_store_redirect once when its trigger arrives.
+        .onReceive(bridge.$creativeMoment) { moment in
+            handleCreativeMoment(moment)
+        }
+    }
+
+    /// Fires the auto store redirect once, when the reported `moment` matches the configured trigger.
+    private func handleCreativeMoment(_ moment: String?) {
+        guard let moment, let redirect = autoStoreRedirect, redirect.enabled,
+              !autoRedirectFired, moment == redirect.trigger.rawValue else { return }
+        autoRedirectFired = true
+        handleStorePromptTap()
     }
 
     @ViewBuilder

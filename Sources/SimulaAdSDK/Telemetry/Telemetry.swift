@@ -2,7 +2,7 @@ import Foundation
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.0.2"
+let SIMULA_SDK_VERSION = "1.1.0"
 
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
@@ -36,7 +36,7 @@ final class Telemetry: @unchecked Sendable {
         let ctx = TelemetryContext(
             sdkVersion: SIMULA_SDK_VERSION,
             osVersion: DeviceCapabilities.current.osVersion,
-            deviceModel: Telemetry.deviceModelIdentifier(),
+            deviceModel: SimulaUserAgent.deviceModelIdentifier(),
             hostAppId: Bundle.main.bundleIdentifier ?? "unknown",
             devMode: devMode
         )
@@ -109,15 +109,4 @@ final class Telemetry: @unchecked Sendable {
 
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
-
-    /// Hardware model identifier (e.g. `iPhone15,2`) via `uname` — no UIKit dependency.
-    private static func deviceModelIdentifier() -> String {
-        var sysinfo = utsname()
-        uname(&sysinfo)
-        let model = withUnsafeBytes(of: &sysinfo.machine) { raw -> String in
-            let bytes = raw.bindMemory(to: CChar.self)
-            return String(cString: Array(bytes))
-        }
-        return model.isEmpty ? "unknown" : model
-    }
 }

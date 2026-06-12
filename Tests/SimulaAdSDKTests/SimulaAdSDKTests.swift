@@ -368,7 +368,61 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
         XCTAssertNil(b.storePrompt)
         XCTAssertNil(b.skoverlay)
+        XCTAssertNil(b.autoStoreRedirect)
         XCTAssertNil(b.attribution)
+    }
+
+    // MARK: - Ad behavior: auto_store_redirect
+
+    func testAutoStoreRedirectAbsentIsNil() throws {
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        XCTAssertNil(try XCTUnwrap(try decodeAdLoad(json).adBehavior).autoStoreRedirect)
+    }
+
+    func testAutoStoreRedirectFullConfigDecodes() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{"enabled":true,"trigger":"end_screen_1_open"}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertTrue(r.enabled)
+        XCTAssertEqual(r.trigger, .endScreen1Open)
+    }
+
+    func testAutoStoreRedirectEmptyObjectDefaults() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertFalse(r.enabled)
+        XCTAssertEqual(r.trigger, .playableEnd)
+    }
+
+    func testAutoStoreRedirectUnknownTriggerFallsBack() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{"enabled":true,"trigger":"warp_drive"}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertEqual(r.trigger, .playableEnd)
+    }
+
+    // MARK: - User-Agent (PRD)
+
+    func testUserAgentComposeMatchesPRDFormat() {
+        let ua = SimulaUserAgent.compose(
+            sdkVersion: "1.2.3",
+            osVersion: "17.2",
+            locale: "en_US",
+            deviceModel: "iPhone16,1",
+            buildId: "21C52",
+            bundleId: "com.publisher.app"
+        )
+        XCTAssertEqual(
+            ua,
+            "Simula-SDK/1.2.3 (iOS 17.2; en_US; iPhone16,1; Build/21C52; com.publisher.app)"
+        )
     }
 
     // MARK: - Ad behavior: attribution tokens (SKOverlay / SKStoreProduct)
@@ -647,6 +701,36 @@ final class SimulaAdSDKTests: XCTestCase {
             SimulaAdError.duplicateRequest(retryInSeconds: nil).errorDescription,
             "An ad for this placement is already loading. "
                 + "Wait for the didLoad delegate callback before calling load() again."
+        )
+    }
+
+    @MainActor
+    func testAlignedErrorMessagesMatchAndroid() {
+        // These strings are kept verbatim-aligned with the Kotlin SDK's SimulaAdError so the two
+        // platforms surface identical diagnostics (platform-specific API names aside).
+        XCTAssertEqual(
+            SimulaAdError.notInitialized.errorDescription,
+            "SimulaAds is not initialized — call SimulaAds.initialize() first."
+        )
+        XCTAssertEqual(
+            SimulaAdError.noSession.errorDescription,
+            "Could not create a session. Check the API key and network connection."
+        )
+        XCTAssertEqual(
+            SimulaAdError.noFill.errorDescription,
+            "No ad available to show right now (no fill)."
+        )
+        XCTAssertEqual(
+            SimulaAdError.notReady.errorDescription,
+            "Ad not ready — call load() first and wait for the loaded callback before show()."
+        )
+        XCTAssertEqual(
+            SimulaAdError.alreadyShowing.errorDescription,
+            "An interstitial is already showing."
+        )
+        XCTAssertEqual(
+            SimulaAdError.network(.invalidResponse).errorDescription,
+            "Network error while loading the ad — check the connection and call load() again."
         )
     }
 

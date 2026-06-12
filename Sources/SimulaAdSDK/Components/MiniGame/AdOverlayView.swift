@@ -28,8 +28,12 @@ public struct AdOverlayView: View {
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
     /// (right to left) over the countdown.
     @State private var ringProgress: CGFloat = 0.0
-    /// Guards against countdown restarting when modals are dismissed
-    @State private var countdownStarted = false
+    /// The running countdown ticker. Held so it starts once and is cancelled on disappear, so it
+    /// can't outlive the overlay (or be double-started by a re-`onAppear`).
+    @State private var countdownTask: Task<Void, Never>?
+    /// Top safe-area inset captured once on appear (full-screen only), so the content insets below
+    /// the status bar / notch without re-reading the window on every body pass.
+    @State private var topSafeInset: CGFloat = 0
 
     private var isBottomSheet: Bool {
         guard let h = playableHeightDp else { return false }
@@ -138,6 +142,9 @@ public struct AdOverlayView: View {
                         }
                     }
                     .frame(maxWidth: .infinity)
+                    // Full-screen ads inset the creative + close button below the top safe area
+                    // (status bar / notch / Dynamic Island). Bottom-sheet mode keeps its own bounds.
+                    .padding(.top, isBottomSheet ? 0 : topSafeInset)
                     .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
@@ -163,25 +170,35 @@ public struct AdOverlayView: View {
         .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
             appeared = true
+            topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             startCountdown()
+        }
+        .onDisappear {
+            countdownTask?.cancel()
+            countdownTask = nil
         }
     }
 
     // MARK: - Countdown
 
     private func startCountdown() {
-        guard !countdownStarted else { return }
-        countdownStarted = true
+        // Start exactly once; a re-`onAppear` (or a SwiftUI double-fire) must not restart it.
+        guard countdownTask == nil else { return }
 
-        // Animate ring from 0.0 to 1.0 over 5 seconds (matching Kotlin's tween(5000))
-        withAnimation(.linear(duration: 5.0)) {
+        let total = adCountdown
+
+        // Fill the ring linearly over the countdown (matching Kotlin's tween).
+        withAnimation(.linear(duration: Double(total))) {
             ringProgress = 1
         }
 
-        // Tick the countdown every second
-        for second in 1...5 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(second)) {
-                adCountdown = 5 - second
+        // Tick once per second on the main actor. A cancellable Task (vs. fire-and-forget
+        // asyncAfter) means a dismiss stops it cleanly and it can't be silently dropped.
+        countdownTask = Task { @MainActor in
+            for remaining in stride(from: total - 1, through: 0, by: -1) {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                adCountdown = remaining
             }
         }
     }

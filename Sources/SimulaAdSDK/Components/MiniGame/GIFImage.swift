@@ -176,7 +176,10 @@ final class CoverImageCache: @unchecked Sendable {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: requestUrl)
+            // Carry the SDK User-Agent on this CDN fetch too (PRD: every outbound request).
+            var request = URLRequest(url: requestUrl)
+            request.setValue(SimulaUserAgent.value, forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
             let (result, cost) = decodeImage(data: data)
             store(result, cost: cost, for: url)
             return result

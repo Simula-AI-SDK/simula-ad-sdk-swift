@@ -299,6 +299,7 @@ public final class SimulaRewardedAd {
             destination: response.destinationKind,
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             attribution: response.adBehavior?.attribution,
+            autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
                 self.presenter = nil

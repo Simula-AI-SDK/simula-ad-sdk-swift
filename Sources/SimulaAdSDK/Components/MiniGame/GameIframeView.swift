@@ -195,6 +195,10 @@ public struct GameIframeView: View {
                         }
                     }
                     .frame(maxWidth: .infinity)
+                    // Full-screen games inset the game + close button below the top safe area
+                    // (status bar / notch / Dynamic Island). Bottom-sheet mode is anchored within its
+                    // own sheet bounds, so it isn't padded here.
+                    .padding(.top, isBottomSheetMode ? 0 : simulaTopSafeAreaInset())
                     .frame(maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity)
