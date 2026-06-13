@@ -95,6 +95,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         )
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView
+        // A native ad sizes to content and is not scrollable (PRD); disabling the inner scroll keeps
+        // it from intercepting the host feed's scroll. Set per-acquire since the pool reuses views.
+        webView.scrollView.isScrollEnabled = !reportsContentHeight
         return webView
     }
 
@@ -380,19 +383,36 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// maps 1 CSS px → 1 point, so the reported value is used directly as the SwiftUI height.
         static let heightReportingScript = """
         (function () {
-          function post() {
+          var lastH = 0, timer = null;
+          function measure() {
+            var de = document.documentElement, b = document.body;
+            if (!b) return de ? de.scrollHeight : 0;
+            // Measure the creative's NATURAL content height, independent of the height the SDK gave the
+            // WebView. A full-height creative (html,body{height:100%}) otherwise reports back the size we
+            // set, which feeds back and grows the slot on every resize. Forcing height:auto for the
+            // measurement (restored synchronously, before any paint) reads the true content height.
+            var prevDe = de.style.height, prevB = b.style.height;
+            de.style.height = 'auto';
+            b.style.height = 'auto';
+            var h = Math.max(de.scrollHeight, b.scrollHeight);
+            de.style.height = prevDe;
+            b.style.height = prevB;
+            return h;
+          }
+          function send() {
             try {
-              var de = document.documentElement, b = document.body;
-              var h = Math.max(
-                de ? de.scrollHeight : 0, b ? b.scrollHeight : 0,
-                de ? de.offsetHeight : 0, b ? b.offsetHeight : 0
-              );
-              if (h > 0 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.simulaSDK) {
+              var h = measure();
+              if (h > 0 && Math.abs(h - lastH) >= 1 &&
+                  window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.simulaSDK) {
+                lastH = h;
                 window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify({ type: 'SIMULA_AD_HEIGHT', height: h }));
               }
             } catch (e) {}
           }
-          post();
+          // Debounced so a creative that animates / settles its layout posts a stable height instead
+          // of streaming intermediate values that would thrash the host feed's layout.
+          function post() { if (timer) clearTimeout(timer); timer = setTimeout(send, 80); }
+          send();
           window.addEventListener('resize', post);
           try {
             if (window.ResizeObserver) {

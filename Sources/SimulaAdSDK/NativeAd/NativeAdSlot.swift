@@ -27,6 +27,10 @@ public struct NativeAdSlot: View {
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
 
+    /// Height the slot holds while the creative is measuring, so it never collapses to a sliver
+    /// between "filled" and "first height reported" (which would jolt the surrounding feed).
+    static let provisionalHeight: CGFloat = 160
+
     /// - Parameters:
     ///   - adUnitId: Simula ad unit id (measurement + targeting). Optional.
     ///   - position: Index position of the slot in the feed (sent to the backend).
@@ -52,6 +56,18 @@ public struct NativeAdSlot: View {
         self.previewHTML = previewHTML
         self.onImpression = onImpression
         self.onError = onError
+
+        // Seed the initial state from the per-slot cache so a recycled row paints the SAME ad on its
+        // first frame (no shimmer flash, no refetch). A preview / preload resolves in `.task`.
+        if previewHTML == nil, preloadedAdId == nil, let entry = NativeAdCache.shared.get(adUnitId, position) {
+            if let response = entry.response {
+                _phase = State(initialValue: .filled(response))
+                _heightPt = State(initialValue: entry.heightPt)
+                _impressionFired = State(initialValue: entry.impressionFired)
+            } else {
+                _phase = State(initialValue: .empty)
+            }
+        }
     }
 
     public var body: some View {
@@ -59,20 +75,35 @@ public struct NativeAdSlot: View {
             switch phase {
             case .filled(let response):
                 let impressionId = response.impressionId ?? ""
-                WebViewRepresentable(
-                    url: response.iframeURL.flatMap { URL(string: $0) },
-                    htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
-                    onMessageReceived: { handleMessage($0, impressionId: impressionId) },
-                    onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
-                    externalClickOnly: true,
-                    reportsContentHeight: true
-                )
-                // 1pt until the creative reports its height, then grow to fit. Transparent, no skeleton.
-                .frame(height: heightPt > 0 ? heightPt : 1)
-                .clipped()
-                .trackNativeAdViewability(enabled: heightPt > 0) {
-                    fireImpression(impressionId: impressionId, adFormat: response.adFormat)
+                ZStack {
+                    WebViewRepresentable(
+                        url: response.iframeURL.flatMap { URL(string: $0) },
+                        htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
+                        onMessageReceived: { handleMessage($0, impressionId: impressionId) },
+                        onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
+                        externalClickOnly: true,
+                        reportsContentHeight: true
+                    )
+                    // Hold a provisional height while the creative measures (never collapse), then grow.
+                    .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
+                    .trackNativeAdViewability(enabled: heightPt > 0) {
+                        fireImpression(impressionId: impressionId, adFormat: response.adFormat)
+                    }
+
+                    // Keep the shimmer over the slot until the creative reports its height. Without
+                    // this the slot would collapse between "filled" and "measured" and jolt the feed
+                    // below up then back down (it "looks broken").
+                    if heightPt <= 0 {
+                        NativeAdShimmer()
+                    }
+
+                    // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
+                    // Not interested / Report / About) — the SDK's standard dialog, once the ad shows.
+                    if heightPt > 0 {
+                        NativeAdInfoOverlay(adId: impressionId, apiKey: provider.apiKey)
+                    }
                 }
+                .clipped()
             case .loading:
                 // While the request is in flight, show a shimmer placeholder.
                 NativeAdShimmer()
@@ -88,10 +119,6 @@ public struct NativeAdSlot: View {
 
     @MainActor
     private func load() async {
-        phase = .loading
-        heightPt = 0
-        impressionFired = false
-
         // Preview/QA: render the supplied HTML with no network (mirrors imperative showPreview).
         if let previewHTML {
             phase = .filled(NativeAdResponse(
@@ -103,18 +130,32 @@ public struct NativeAdSlot: View {
             return
         }
 
-        do {
-            let response: NativeAdResponse
-            if let preloadedAdId, let cached = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
-                response = cached // render from cache; expired/unknown falls through to a live request
+        // 1. Honor a fresh preload first (a new id the publisher just preloaded).
+        if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
+            apply(preloaded)
+            return
+        }
+
+        // 2. Per-slot cache hit → render without a network call (no duplicate serve / impression).
+        if let entry = NativeAdCache.shared.get(adUnitId, position) {
+            if let response = entry.response {
+                heightPt = entry.heightPt
+                impressionFired = entry.impressionFired
+                phase = .filled(response)
             } else {
-                response = try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position)
+                phase = .empty
             }
-            phase = response.hasCreative ? .filled(response) : .empty // no-fill collapses silently (no onError)
+            return
+        }
+
+        // 3. Live request.
+        phase = .loading
+        do {
+            apply(try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position))
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
-            phase = .empty
+            phase = .empty // error → hide; not cached so it can retry next time
             onError(error)
         } catch {
             phase = .empty
@@ -122,9 +163,26 @@ public struct NativeAdSlot: View {
         }
     }
 
+    /// Caches the outcome so the next remount of this slot reuses it (no duplicate serve).
+    @MainActor
+    private func apply(_ response: NativeAdResponse) {
+        if response.hasCreative {
+            NativeAdCache.shared.putFill(adUnitId, position, response)
+            heightPt = 0
+            impressionFired = false
+            phase = .filled(response)
+        } else {
+            // No-fill collapses silently (no onError). PRD.
+            NativeAdCache.shared.putNoFill(adUnitId, position)
+            phase = .empty
+        }
+    }
+
     private func fireImpression(impressionId: String, adFormat: String) {
         guard !impressionFired else { return }
         impressionFired = true
+        // Remember it on the cache entry so a remount of the same serve never re-fires.
+        NativeAdCache.shared.get(adUnitId, position)?.impressionFired = true
         // Co-fire the callback and the server impression off the one viewability event (PRD).
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         let apiKey = provider.apiKey
@@ -138,7 +196,13 @@ public struct NativeAdSlot: View {
         switch type {
         case "SIMULA_AD_HEIGHT", "AD_RESIZE":
             if let h = (obj["height"] as? NSNumber)?.doubleValue, h > 0 {
-                heightPt = CGFloat(h)
+                let newHeight = CGFloat(h)
+                // Threshold sub-point churn so a measuring creative can't thrash the feed below.
+                if abs(newHeight - heightPt) >= 1 {
+                    heightPt = newHeight
+                    // Persist so a recycled row sizes correctly on its first frame.
+                    NativeAdCache.shared.get(adUnitId, position)?.heightPt = newHeight
+                }
             }
         case "AD_FEEDBACK":
             if let value = obj["value"] as? String { handleFeedback(value, impressionId: impressionId) }
@@ -152,7 +216,7 @@ public struct NativeAdSlot: View {
     private func handleFeedback(_ value: String, impressionId: String) {
         switch value {
         case "about":
-            if let url = URL(string: "https://simula.ad") { UIApplication.shared.open(url) }
+            if let url = URL(string: "https://www.simula.ad/privacy-policy") { UIApplication.shared.open(url) }
         case "interested", "not_interested", "report":
             let apiKey = provider.apiKey
             Task { await SimulaAPI().reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
@@ -176,7 +240,7 @@ private struct NativeAdShimmer: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 16)
             .fill(Color(red: 0.14, green: 0.14, blue: 0.17))
-            .frame(height: 160)
+            .frame(height: NativeAdSlot.provisionalHeight)
             .overlay(
                 GeometryReader { geo in
                     LinearGradient(

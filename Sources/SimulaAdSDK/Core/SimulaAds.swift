@@ -148,5 +148,18 @@ public enum SimulaAds {
     public static func destroyPreloadedAd(_ preloadedAdId: String) {
         NativeAdPreloadCache.shared.destroy(preloadedAdId)
     }
+
+    /// Drop the cached ad for a native slot so its next appearance fetches a fresh one. A
+    /// `NativeAdSlot` caches its resolved ad per `(adUnitId, position)` so scrolling it out and back
+    /// reuses the same serve (no duplicate request or impression); call this to force a refresh for
+    /// that slot. Use `invalidateNativeAds()` to clear them all.
+    public static func invalidateNativeAd(adUnitId: String? = nil, position: Int = 0) {
+        NativeAdCache.shared.invalidate(adUnitId, position)
+    }
+
+    /// Clear every cached native ad (all slots).
+    public static func invalidateNativeAds() {
+        NativeAdCache.shared.invalidateAll()
+    }
     #endif
 }
