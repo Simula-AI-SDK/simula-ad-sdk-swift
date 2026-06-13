@@ -465,7 +465,7 @@ private struct CreativeInterstitialView: View {
 /// corner: `hidden` shows nothing until the gate unlocks, `countdownCircle` draws a ring,
 /// `progressBar` a top-edge bar, `rewardOrCloseLabel` a counting-down text pill. `progressBarColor`
 /// tints the ring/bar fill. The `rewardOrCloseLabel` copy is reward- vs interstitial-aware.
-private struct CloseButtonView: View {
+struct CloseButtonView: View {
     let treatment: CloseTreatment
     let position: ClosePosition
     let progressBarColor: String

@@ -30,6 +30,7 @@ final class RewardedPresenter {
         apiKey: String,
         iframeUrl: String,
         durationSeconds: Int,
+        close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
@@ -54,6 +55,7 @@ final class RewardedPresenter {
             apiKey: apiKey,
             iframeUrl: iframeUrl,
             durationSeconds: durationSeconds,
+            close: close,
             storePrompt: storePrompt,
             trackingUrl: trackingUrl,
             destination: destination,
@@ -132,6 +134,9 @@ private struct RewardedGameView: View {
     let apiKey: String
     let iframeUrl: String
     let durationSeconds: Int
+    /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
+    /// label) — rendered by the shared `CloseButtonView`, gated on play-to-earn. `nil` → default.
+    let close: CloseBehavior?
     // Mid-ad store prompt config + tap routing. `storePrompt == nil` → no badge.
     let storePrompt: StorePrompt?
     let trackingUrl: String?
@@ -162,15 +167,9 @@ private struct RewardedGameView: View {
         max(0, durationSeconds - Int(elapsedPlayTime))
     }
 
-    /// Corner for the play-to-earn / close pill. Defaults to top-trailing, but flips to top-leading
-    /// when the mid-ad store prompt occupies the top-right — its only corner that would collide with
-    /// the pill — so the two never overlap. Computed from the (static) store-prompt config, so the
-    /// pill doesn't jump corners when the prompt appears at midpoint or is removed on reward.
-    private var pillAlignment: Alignment {
-        if let prompt = storePrompt, prompt.enabled, prompt.position == .topRight {
-            return .topLeading
-        }
-        return .topTrailing
+    /// 0→1 fill for the close treatment (progress bar / countdown ring), from play-to-earn progress.
+    private var closeProgress: Double {
+        durationSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(durationSeconds))) : 1.0
     }
 
     var body: some View {
@@ -184,14 +183,20 @@ private struct RewardedGameView: View {
                 WebViewRepresentable(url: url, bridge: bridge)
             }
 
-            // Reward/close pill: a "Play to earn" countdown while the reward is being earned
-            // (display-only — there is no early exit), which becomes the close button
-            // ("✕ Reward unlocked") the moment the reward is earned. The whole pill then dismisses.
-            // Sits opposite the store prompt when that would otherwise share the top-right corner.
-            rewardClosePill
-                .padding(8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: pillAlignment)
-                .animation(.default, value: rewardEarned)
+            // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
+            // progress bar / reward-or-close label) exactly like the interstitial, but gated on the
+            // play-to-earn progress: the ✕ unlocks only once the reward is earned.
+            CloseButtonView(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position,
+                progressBarColor: (close ?? CloseBehavior()).progressBarColor,
+                isRewardCopy: true,
+                enabled: rewardEarned,
+                remaining: secondsLeft,
+                progress: closeProgress,
+                onClose: { finish(earned: true) }
+            )
+            .animation(.default, value: rewardEarned)
 
             // Mid-ad store prompt — appears at half the play-to-earn duration and is removed the
             // instant the reward unlocks (the reward/close pill takes over). Rendered at the
@@ -252,31 +257,6 @@ private struct RewardedGameView: View {
         fireAutoStoreRedirect()
     }
 
-    @ViewBuilder
-    private var rewardClosePill: some View {
-        if rewardEarned {
-            // Earned: a compact circular X close button (AppLovin-style); tapping it dismisses.
-            Button(action: { finish(earned: true) }) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 16, height: 16)
-                    .background(Circle().fill(Color.black.opacity(0.5)))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Close")
-        } else {
-            // Still earning: a "Play to earn: Xs" countdown label (display-only — no early exit).
-            Text("Play to earn: \(secondsLeft)s")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.white)
-                .padding(.vertical, 5)
-                .padding(.horizontal, 10)
-                .background(Capsule().fill(Color.black.opacity(0.6)))
-        }
-    }
 
     // MARK: Timer
 
