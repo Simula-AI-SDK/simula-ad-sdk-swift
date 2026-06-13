@@ -58,8 +58,10 @@ public struct AdOverlayView: View {
 
     public var body: some View {
         ZStack {
-            // Backdrop (matching Kotlin: Color(0xCC000000) = 80% black)
-            Color.black.opacity(0.8)
+            // Backdrop: fully black full-screen (so the end screen's safe area is solid
+            // black, matching Android); the in-game bottom sheet keeps 80% to show the
+            // paused game behind it (matching Kotlin's Color(0xCC000000)).
+            Color.black.opacity(isBottomSheet ? 0.8 : 1.0)
                 .ignoresSafeArea()
                 .onTapGesture {
                     if adCountdown <= 0 { onClose() }

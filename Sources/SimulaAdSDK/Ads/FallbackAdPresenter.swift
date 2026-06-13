@@ -49,7 +49,9 @@ final class FallbackAdPresenter {
 
         let window = UIWindow(windowScene: scene)
         window.windowLevel = .normal + 1
-        window.backgroundColor = .clear
+        // Opaque black (not clear) so the host app never shows through — both behind the
+        // end screen's safe area and during the rootViewController swap between screens.
+        window.backgroundColor = .black
         window.rootViewController = hostingController(for: ads[0])
         window.makeKeyAndVisible()
         self.window = window
@@ -75,7 +77,7 @@ final class FallbackAdPresenter {
             adId: ad.adId
         )
         let hosting = UIHostingController(rootView: root)
-        hosting.view.backgroundColor = .clear
+        hosting.view.backgroundColor = .black
         return hosting
     }
 

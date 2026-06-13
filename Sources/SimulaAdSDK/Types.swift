@@ -79,26 +79,26 @@ public struct GameData: Codable, Identifiable, Sendable, Equatable {
 
 // MARK: - CharacterData
 
-/// A selectable character in `CharacterPicker`. `image` is a 1:1 portrait URL.
+/// A selectable character in `CharacterSelector`. `imageUrl` is a 1:1 portrait URL.
 /// Maps to the backend `PublicCharacter` (`character_id`→id, `character_name`→name,
-/// `images_1_1[0]`/`avatar_url`→image, `description`→description).
+/// `images_1_1[0]`/`avatar_url`→imageUrl, `description`→description).
 public struct CharacterData: Identifiable, Sendable, Equatable {
     public let id: String
     public let name: String
-    public let image: String
-    public let description: String?
+    public let imageUrl: String
+    public let description: String
 
-    public init(id: String, name: String, image: String, description: String? = nil) {
+    public init(id: String, name: String, imageUrl: String, description: String) {
         self.id = id
         self.name = name
-        self.image = image
+        self.imageUrl = imageUrl
         self.description = description
     }
 }
 
 // MARK: - CharacterPickerTheme
 
-/// Theme for `CharacterPicker`. Colors are CSS strings (hex/rgba); a nil field falls
+/// Theme for `CharacterSelector`. Colors are CSS strings (hex/rgba); a nil field falls
 /// back to a `resolved*` value mirroring the reference HTML. Sizes are in points.
 public struct CharacterPickerTheme: Sendable, Equatable {
     public var backgroundColor: String?

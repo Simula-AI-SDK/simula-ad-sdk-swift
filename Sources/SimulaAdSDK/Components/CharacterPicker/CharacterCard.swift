@@ -101,7 +101,7 @@ struct CharacterCard: View {
                             .resizable()
                             .scaledToFill()
                     } else {
-                        CachedAsyncImage(url: URL(string: entry.data.image)) { phase in
+                        CachedAsyncImage(url: URL(string: entry.data.imageUrl)) { phase in
                             switch phase {
                             case .success(let image):
                                 image.resizable().scaledToFill()

@@ -68,13 +68,15 @@ final class RewardedPresenter {
         )
 
         let hosting = OrientationLockingHostingController(rootView: root)
-        hosting.view.backgroundColor = .clear
+        // Opaque black (not clear) so the host app never shows through during the
+        // present/dismiss opacity fade — matches Android's blank-screen transition.
+        hosting.view.backgroundColor = .black
 
         originalKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
         window.windowLevel = .normal + 1
-        window.backgroundColor = .clear
+        window.backgroundColor = .black
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window

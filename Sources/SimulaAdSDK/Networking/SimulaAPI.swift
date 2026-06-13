@@ -242,7 +242,7 @@ struct CompanionItem: Decodable {
     let id: String
     let name: String
     let image: String
-    let description: String?
+    let description: String
 
     enum CodingKeys: String, CodingKey {
         case characterId = "character_id"
@@ -281,7 +281,7 @@ struct CompanionItem: Decodable {
     }
 
     func toCharacterData() -> CharacterData {
-        CharacterData(id: id, name: name, image: image, description: description)
+        CharacterData(id: id, name: name, imageUrl: image, description: description)
     }
 }
 
