@@ -23,14 +23,27 @@ final class FallbackAdPresenter {
     /// regains touch/keyboard focus.
     private weak var originalKeyWindow: UIWindow?
 
+    /// auto_store_redirect END_SCREEN_N: the primary ad's config + a closure that opens its store,
+    /// fired once when the fallback screen whose index matches the trigger is presented.
+    private var autoStoreRedirect: AutoStoreRedirect?
+    private var onAutoStoreRedirect: (@MainActor () -> Void)?
+    private var autoRedirectFired = false
+
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onClose` is then never called).
     @discardableResult
-    func present(ads: [FallbackAd], onClose: @escaping () -> Void) -> Bool {
+    func present(
+        ads: [FallbackAd],
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
+        onClose: @escaping () -> Void
+    ) -> Bool {
         guard !ads.isEmpty, let scene = Self.activeWindowScene() else { return false }
         self.ads = ads
         self.index = 0
         self.onClose = onClose
+        self.autoStoreRedirect = autoStoreRedirect
+        self.onAutoStoreRedirect = onAutoStoreRedirect
 
         originalKeyWindow = scene.keyWindow
 
@@ -40,7 +53,18 @@ final class FallbackAdPresenter {
         window.rootViewController = hostingController(for: ads[0])
         window.makeKeyAndVisible()
         self.window = window
+        fireAutoStoreRedirectIfMatching(index: 0)
         return true
+    }
+
+    /// END_SCREEN_N: open the primary ad's store once, when the fallback screen whose index matches
+    /// the configured trigger is presented (index 0 = END SCREEN 1, index 1 = END SCREEN 2).
+    private func fireAutoStoreRedirectIfMatching(index: Int) {
+        guard !autoRedirectFired, let redirect = autoStoreRedirect, redirect.enabled,
+              let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: index),
+              redirect.trigger == trigger else { return }
+        autoRedirectFired = true
+        onAutoStoreRedirect?()
     }
 
     /// A fresh hosting controller per screen so each gets its own overlay state (countdown ring).
@@ -60,6 +84,7 @@ final class FallbackAdPresenter {
         index += 1
         if index < ads.count, let window {
             window.rootViewController = hostingController(for: ads[index])
+            fireAutoStoreRedirectIfMatching(index: index)
         } else {
             dismiss()
         }

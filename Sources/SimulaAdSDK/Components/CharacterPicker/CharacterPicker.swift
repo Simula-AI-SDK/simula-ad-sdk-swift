@@ -1,18 +1,48 @@
 import SwiftUI
 
+/// The character grid maxes out at 4 cards (2×2).
+let maxCharacters = 4
+
+/// Builds the grid (≤ `maxCharacters` cards) from the host roster and the backend
+/// backfill: host cards lead, the backend fills the gap, and any slot the backend
+/// didn't fill keeps its bundled placeholder so the grid is never short. Pure/testable.
+///
+/// Backend items whose id already appears in the host roster are dropped (and the
+/// backend list is kept distinct), so a character never shows up twice — a dropped
+/// duplicate is topped up by a placeholder.
+///
+/// Used for both the instant seed (`fetched` empty → host + placeholders) and the
+/// post-fetch swap (`fetched` non-empty → host + results + leftover placeholders).
+func mergeRoster(
+    host: [CharacterPickerEntry],
+    fetched: [CharacterPickerEntry],
+    fallback: [CharacterPickerEntry]
+) -> [CharacterPickerEntry] {
+    let capped = Array(host.prefix(maxCharacters))
+    let fill = maxCharacters - capped.count
+    var seen = Set(capped.map { $0.data.id })
+    let deduped = fetched.filter { seen.insert($0.data.id).inserted }
+    let filled = Array(deduped.prefix(fill))
+    let padding = Array(fallback.prefix(fill).dropFirst(filled.count))
+    return capped + filled + padding
+}
+
 // MARK: - CharacterPickerEntry
 
 /// A picker row item: the public `CharacterData` plus an optional bundled image name
-/// used by the fallback placeholders (so they render with no network).
+/// used by the fallback placeholders (so they render with no network). `loading` marks
+/// a skeleton slot shown while the backend roster is in flight.
 struct CharacterPickerEntry: Identifiable, Equatable {
     let data: CharacterData
     var bundledImageName: String?
+    var loading: Bool
 
     var id: String { data.id }
 
-    init(data: CharacterData, bundledImageName: String? = nil) {
+    init(data: CharacterData, bundledImageName: String? = nil, loading: Bool = false) {
         self.data = data
         self.bundledImageName = bundledImageName
+        self.loading = loading
     }
 }
 
@@ -25,9 +55,12 @@ struct CharacterPickerEntry: Identifiable, Equatable {
 /// `onLaunch` with the selected character — the picker does not launch a game itself;
 /// the host wires the character into the minigame flow.
 ///
-/// Characters come from the (not-yet-built) companions endpoint, with an instant
-/// fallback to bundled placeholders so the grid never shows a spinner or empty state.
-/// Pass `characters` to supply them directly and skip the fetch.
+/// Characters come from the `/character-selector` endpoint, with an instant fallback
+/// to bundled placeholders so the grid never shows a spinner or empty state. Pass
+/// `characters` to supply them directly and skip the fetch.
+///
+/// Must be hosted within a `SimulaProviderView` — the fetch uses the provider's
+/// apiKey + session.
 ///
 /// Pixel-mapped from the reference HTML; presentation mirrors `MiniGameInterstitial`.
 ///
@@ -66,11 +99,12 @@ public struct CharacterPicker: View {
         self.launchText = launchText
         self.characters = characters
         self.theme = theme
-        // Seed instantly so the grid is never empty (perf goal): host list > fallback.
-        self._entries = State(
-            initialValue: characters?.map { CharacterPickerEntry(data: $0) }
-                ?? CharacterPicker.fallbackEntries
-        )
+        // Seed instantly so the grid is never empty: host cards render for real, the gap
+        // shows loading skeletons (swapped for backend results, or bundled placeholders if
+        // the fetch comes back empty) — never the placeholder characters mid-load.
+        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
+        let fill = maxCharacters - host.count
+        self._entries = State(initialValue: host + CharacterPicker.loadingEntries(fill))
     }
 
     // MARK: State
@@ -80,6 +114,7 @@ public struct CharacterPicker: View {
     @State private var entries: [CharacterPickerEntry]
     @State private var appeared = false
 
+    @EnvironmentObject private var provider: SimulaProvider
     private let api = SimulaAPI()
 
     private var isVisible: Bool { isOpen && !closedInternally }
@@ -178,14 +213,19 @@ public struct CharacterPicker: View {
         }
     }
 
+    @ViewBuilder
     private func card(for entry: CharacterPickerEntry) -> some View {
-        CharacterCard(
-            entry: entry,
-            selected: entry.data.id == selectedId,
-            selectionMade: selectedId != nil,
-            theme: theme,
-            onTap: { if selectedId != entry.data.id { selectedId = entry.data.id } }
-        )
+        if entry.loading {
+            CharacterSkeletonCard(theme: theme)
+        } else {
+            CharacterCard(
+                entry: entry,
+                selected: entry.data.id == selectedId,
+                selectionMade: selectedId != nil,
+                theme: theme,
+                onTap: { if selectedId != entry.data.id { selectedId = entry.data.id } }
+            )
+        }
     }
 
     private var launchButton: some View {
@@ -218,16 +258,22 @@ public struct CharacterPicker: View {
     private func resetAndLoad() {
         closedInternally = false
         selectedId = nil
-        entries = characters?.map { CharacterPickerEntry(data: $0) } ?? CharacterPicker.fallbackEntries
-        guard characters == nil else { return }
-        // Best-effort: swap in network results when the companions endpoint is live.
-        // Until then this resolves empty and the fallback stays on screen. `@MainActor`
-        // so the `entries` write lands on the main thread after the off-main fetch.
+        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
+        let fill = maxCharacters - host.count
+        entries = host + CharacterPicker.loadingEntries(fill) // back to the loading state
+        guard fill > 0 else { return }
+        // Backfill the gap from /character-selector (needs the publisher apiKey + a
+        // session). Resolve the loading state either way: real results when we got any,
+        // else bundled placeholders. `@MainActor` so the `entries` write lands on the
+        // main thread after the off-main fetch.
         Task { @MainActor in
-            let fetched = await api.fetchCharacters(sessionId: nil)
-            if !fetched.isEmpty {
-                entries = fetched.map { CharacterPickerEntry(data: $0) }
+            let sessionId = await provider.ensureSession()
+            var fetched: [CharacterPickerEntry] = []
+            if let sessionId, !sessionId.isEmpty {
+                fetched = await api.fetchCharacters(apiKey: provider.apiKey, sessionId: sessionId, fill: fill)
+                    .map { CharacterPickerEntry(data: $0) }
             }
+            entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterPicker.fallbackEntries)
         }
     }
 
@@ -247,7 +293,16 @@ public struct CharacterPicker: View {
 // MARK: - Fallback placeholders
 
 extension CharacterPicker {
-    /// Bundled placeholder characters shown until the companions endpoint returns data.
+    /// Skeleton slots for the gap while the backend roster is fetched. Synthetic ids
+    /// keep them distinct in the grid; they are never selectable.
+    static func loadingEntries(_ count: Int) -> [CharacterPickerEntry] {
+        guard count > 0 else { return [] }
+        return (0..<count).map {
+            CharacterPickerEntry(data: CharacterData(id: "loading-\($0)", name: "", image: ""), loading: true)
+        }
+    }
+
+    /// Bundled placeholder characters shown when the backend returns no roster.
     /// Images ship in `Resources/` (registered in `Package.swift`).
     static let fallbackEntries: [CharacterPickerEntry] = [
         CharacterPickerEntry(data: CharacterData(id: "superman", name: "Superman", image: ""), bundledImageName: "char_superman"),

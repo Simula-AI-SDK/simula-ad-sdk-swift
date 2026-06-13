@@ -35,13 +35,25 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
     var onAdClick: (() -> Void)?
 
+    /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the
+    /// creative are routed to it (and `GET_*` replies are posted back via the web view). `nil`
+    /// for the game iframe / previews, which keep the plain `onMessageReceived` path.
+    var bridge: CreativeBridge?
+
+    /// Ad-network attribution tokens carried into the in-app store sheet for click-through / auto-redirect
+    /// CTAs (so the SKAN install postback credits the campaign). Set for the imperative HTML creative;
+    /// `nil` for the game iframe / previews (no attribution to apply).
+    var attribution: AdAttribution?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        bridge: CreativeBridge? = nil,
+        attribution: AdAttribution? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -49,6 +61,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.bridge = bridge
+        self.attribution = attribution
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -62,10 +76,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
         let coordinator = context.coordinator
-        return WebViewPool.shared.acquire(
+        let webView = WebViewPool.shared.acquire(
             delegate: coordinator,
-            onMessage: { [weak coordinator] body in coordinator?.onMessageReceived?(body) }
+            onMessage: { [weak coordinator] body in coordinator?.handleMessage(body) }
         )
+        // The coordinator needs the web view to post `GET_*` replies back into the page.
+        coordinator.webView = webView
+        return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
@@ -97,7 +114,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
-            onAdClick: onAdClick
+            onAdClick: onAdClick,
+            bridge: bridge,
+            attribution: attribution
         )
     }
 
@@ -109,6 +128,12 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: (() -> Void)?
+        /// The WebView ↔ SDK bridge (PRD §3); `nil` for non-ad web views.
+        var bridge: CreativeBridge?
+        /// Attribution tokens applied to the in-app store sheet this coordinator routes CTAs to.
+        var attribution: AdAttribution?
+        /// The web view this coordinator drives — used to post `GET_*` replies back into the page.
+        weak var webView: WKWebView?
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -130,12 +155,29 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
-            onAdClick: (() -> Void)? = nil
+            onAdClick: (() -> Void)? = nil,
+            bridge: CreativeBridge? = nil,
+            attribution: AdAttribution? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
+            self.bridge = bridge
+            self.attribution = attribution
+        }
+
+        /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
+        /// when one is attached — which posts `GET_*` replies back via this web view — else to
+        /// the legacy `onMessageReceived` callback (game iframe).
+        func handleMessage(_ body: String) {
+            if let bridge {
+                bridge.handle(body) { [weak self] js in
+                    self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+                }
+            } else {
+                onMessageReceived?(body)
+            }
         }
 
         // MARK: - WKNavigationDelegate
@@ -196,7 +238,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // programmatic redirect to the store can't fake a click. Routing is
                 // unconditional (the game iframe's post-game auto-redirect still opens).
                 if navigationAction.navigationType == .linkActivated { onAdClick?() }
-                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
+                let attribution = self.attribution
+                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
                 decisionHandler(.cancel)
                 return
             }
@@ -205,7 +248,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             if scheme == "itms-apps" || scheme == "itms" {
                 if navigationAction.navigationType == .linkActivated { onAdClick?() } // CLICKED, user-activated only
                 if let appID = appStoreID(from: url) {
-                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID) }
+                    let attribution = self.attribution
+                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
                 } else {
                     // Couldn't extract app ID — let the system handle it
                     Task { @MainActor in UIApplication.shared.open(url) }
@@ -222,7 +266,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
                     onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
-                    Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
+                    let attribution = self.attribution
+                    Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     decisionHandler(.cancel)
                     return
                 }
@@ -253,7 +298,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // is only invoked for user-initiated new-window requests
                         // (target="_blank" / window.open), so this is a real click.
                         onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
-                        Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url) }
+                        let attribution = self.attribution
+                        Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))
@@ -270,11 +316,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             didReceive message: WKScriptMessage
         ) {
             if let body = message.body as? String {
-                onMessageReceived?(body)
+                handleMessage(body)
             } else if let dict = message.body as? [String: Any],
                       let data = try? JSONSerialization.data(withJSONObject: dict),
                       let str = String(data: data, encoding: .utf8) {
-                onMessageReceived?(str)
+                handleMessage(str)
             }
         }
     }
@@ -321,6 +367,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         let postMessageScript = WKUserScript(
             source: """
             window.addEventListener('message', function(event) {
+                if (event.data && event.data.__simulaSdkResponse) { return; }
                 if (event.data && typeof event.data === 'string') {
                     window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
                 } else if (event.data && typeof event.data === 'object') {

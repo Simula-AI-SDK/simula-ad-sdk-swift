@@ -368,6 +368,118 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
         XCTAssertNil(b.storePrompt)
         XCTAssertNil(b.skoverlay)
+        XCTAssertNil(b.autoStoreRedirect)
+        XCTAssertNil(b.attribution)
+    }
+
+    // MARK: - Ad behavior: auto_store_redirect
+
+    func testAutoStoreRedirectAbsentIsNil() throws {
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        XCTAssertNil(try XCTUnwrap(try decodeAdLoad(json).adBehavior).autoStoreRedirect)
+    }
+
+    func testAutoStoreRedirectFullConfigDecodes() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{"enabled":true,"trigger":"end_screen_1_open"}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertTrue(r.enabled)
+        XCTAssertEqual(r.trigger, .endScreen1Open)
+    }
+
+    func testAutoStoreRedirectEmptyObjectDefaults() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertFalse(r.enabled)
+        XCTAssertEqual(r.trigger, .playableEnd)
+    }
+
+    func testAutoStoreRedirectUnknownTriggerFallsBack() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"auto_store_redirect":{"enabled":true,"trigger":"warp_drive"}}}
+        """
+        let r = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.autoStoreRedirect)
+        XCTAssertEqual(r.trigger, .playableEnd)
+    }
+
+    func testEndScreenFallbackIndexMapping() {
+        // END_SCREEN_1/2_OPEN fire when the matching post-close fallback ad screen is presented:
+        // index 0 = END SCREEN 1, index 1 = END SCREEN 2 (no signal from the webview).
+        XCTAssertEqual(AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: 0), .endScreen1Open)
+        XCTAssertEqual(AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: 1), .endScreen2Open)
+        // No end-screen trigger for further indices (PLAYABLE_END is native, has no fallback index).
+        XCTAssertNil(AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: 2))
+        XCTAssertNil(AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: -1))
+    }
+
+    // MARK: - User-Agent (PRD)
+
+    func testUserAgentComposeMatchesPRDFormat() {
+        let ua = SimulaUserAgent.compose(
+            sdkVersion: "1.2.3",
+            osVersion: "17.2",
+            locale: "en_US",
+            deviceModel: "iPhone16,1",
+            buildId: "21C52",
+            bundleId: "com.publisher.app"
+        )
+        XCTAssertEqual(
+            ua,
+            "Simula-SDK/1.2.3 (iOS 17.2; en_US; iPhone16,1; Build/21C52; com.publisher.app)"
+        )
+    }
+
+    // MARK: - Ad behavior: attribution tokens (SKOverlay / SKStoreProduct)
+
+    func testAdBehaviorAttributionDecodesCampaignProviderAndSkan() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"attribution":{
+           "campaign_token":"camp_tok","provider_token":"prov_tok",
+           "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
+             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,
+             "attribution_signature":"sig==","source_id":1234}}}}
+        """
+        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        XCTAssertEqual(a.campaignToken, "camp_tok")
+        XCTAssertEqual(a.providerToken, "prov_tok")
+        let skan = try XCTUnwrap(a.skan)
+        XCTAssertEqual(skan.version, "4.0")
+        XCTAssertEqual(skan.adNetworkIdentifier, "net123.skadnetwork")
+        XCTAssertEqual(skan.sourceAppStoreIdentifier, 987_654_321)
+        XCTAssertEqual(skan.nonce, "00000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(skan.timestamp, 1_700_000_000_000)
+        XCTAssertEqual(skan.attributionSignature, "sig==")
+        XCTAssertEqual(skan.sourceIdentifier, 1234)
+        XCTAssertNil(skan.campaignIdentifier)
+    }
+
+    func testAdBehaviorAttributionAbsentIsNil() throws {
+        let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
+        XCTAssertNil(try decodeAdLoad(json).adBehavior?.attribution)
+    }
+
+    func testAttributionSkanAllOrNothingDropsPartialButKeepsTokens() throws {
+        // The SKAN block is missing `attribution_signature` (a required field) → StoreKit could not
+        // build a valid postback, so the whole `skan` decodes to nil. The App Analytics tokens, which
+        // are independent, still decode.
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"attribution":{
+           "campaign_token":"camp_tok",
+           "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
+             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,"source_id":1234}}}}
+        """
+        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        XCTAssertEqual(a.campaignToken, "camp_tok")
+        XCTAssertNil(a.providerToken)
+        XCTAssertNil(a.skan)
     }
 
     func testAdBehaviorPartialCloseFillsDefaults() throws {
@@ -599,6 +711,36 @@ final class SimulaAdSDKTests: XCTestCase {
             SimulaAdError.duplicateRequest(retryInSeconds: nil).errorDescription,
             "An ad for this placement is already loading. "
                 + "Wait for the didLoad delegate callback before calling load() again."
+        )
+    }
+
+    @MainActor
+    func testAlignedErrorMessagesMatchAndroid() {
+        // These strings are kept verbatim-aligned with the Kotlin SDK's SimulaAdError so the two
+        // platforms surface identical diagnostics (platform-specific API names aside).
+        XCTAssertEqual(
+            SimulaAdError.notInitialized.errorDescription,
+            "SimulaAds is not initialized — call SimulaAds.initialize() first."
+        )
+        XCTAssertEqual(
+            SimulaAdError.noSession.errorDescription,
+            "Could not create a session. Check the API key and network connection."
+        )
+        XCTAssertEqual(
+            SimulaAdError.noFill.errorDescription,
+            "No ad available to show right now (no fill)."
+        )
+        XCTAssertEqual(
+            SimulaAdError.notReady.errorDescription,
+            "Ad not ready — call load() first and wait for the loaded callback before show()."
+        )
+        XCTAssertEqual(
+            SimulaAdError.alreadyShowing.errorDescription,
+            "An interstitial is already showing."
+        )
+        XCTAssertEqual(
+            SimulaAdError.network(.invalidResponse).errorDescription,
+            "Network error while loading the ad — check the connection and call load() again."
         )
     }
 

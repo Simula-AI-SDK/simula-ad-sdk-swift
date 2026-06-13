@@ -38,14 +38,19 @@ final class InterstitialPresenter {
         }
         self.onClose = onClose
 
+        // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
+        // hosting controller + window created below.
+        let bridge = CreativeBridge()
+
         let root = CreativeInterstitialView(
             apiKey: apiKey,
             response: response,
+            bridge: bridge,
             onClick: onClick,
             onRequestDismiss: { [weak self] in self?.dismiss() }
         )
 
-        let hosting = UIHostingController(rootView: root)
+        let hosting = OrientationLockingHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 
         // Remember who held key so we can hand it back on dismiss.
@@ -57,6 +62,9 @@ final class InterstitialPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        // Give the bridge the orientation host + window now that they exist.
+        bridge.orientationHost = hosting
+        bridge.window = window
         return true
     }
 
@@ -98,6 +106,8 @@ final class InterstitialPresenter {
 private struct CreativeInterstitialView: View {
     let apiKey: String
     let response: AdLoadResponse
+    /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
+    let bridge: CreativeBridge
     let onClick: () -> Void
     let onRequestDismiss: () -> Void
 
@@ -128,17 +138,23 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
+    // auto_store_redirect — fires the store open once, the first time the creative reports the
+    // configured moment.
+    @State private var autoRedirectFired = false
+
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
     init(
         apiKey: String,
         response: AdLoadResponse,
+        bridge: CreativeBridge,
         onClick: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
         self.apiKey = apiKey
         self.response = response
+        self.bridge = bridge
         self.onClick = onClick
         self.onRequestDismiss = onRequestDismiss
         // Close starts enabled unless the server-driven `close.delay_seconds` gates it.
@@ -183,7 +199,8 @@ private struct CreativeInterstitialView: View {
             // server-resolved position (never recomputed) during the [closeTime/2, closeTime)
             // window; `!closeEnabled` removes it the instant the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
-                StorePromptBadge(prompt: prompt, onTap: { handleStorePromptTap() })
+                // Center the badge in the same 44pt touch-target band as the close button (so they line up).
+                StorePromptBadge(prompt: prompt, rowHeight: 44, onTap: { handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -205,6 +222,8 @@ private struct CreativeInterstitialView: View {
             startGate()
             startStorePromptTrigger()
             startSKOverlay()
+            // PLAYABLE_END: if the close button is already available (delay 0), fire immediately.
+            fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
             gateTask?.cancel()
@@ -218,6 +237,37 @@ private struct CreativeInterstitialView: View {
                 SKOverlayPresenter.dismiss()
             }
         }
+        // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
+        // immediately, cancelling the close-delay gate.
+        .onReceive(bridge.$earlyComplete) { earlyComplete in
+            guard earlyComplete, !closeEnabled else { return }
+            gateTask?.cancel()
+            gateTask = nil
+            withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
+        }
+        // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears.
+        .onChange(of: closeEnabled) { enabled in
+            if enabled { fireAutoStoreRedirectIfCloseShown() }
+        }
+    }
+
+    // MARK: auto_store_redirect
+
+    /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
+    private func fireAutoStoreRedirect() {
+        guard !autoRedirectFired else { return }
+        autoRedirectFired = true
+        handleStorePromptTap()
+    }
+
+    /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
+    /// (END_SCREEN_1/2_OPEN are handled in the post-close fallback flow, by index — see
+    /// `SimulaInterstitialAd.presentFallbackAds` / `FallbackAdPresenter`.)
+    private func fireAutoStoreRedirectIfCloseShown() {
+        guard closeEnabled,
+              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
+              redirect.trigger == .playableEnd else { return }
+        fireAutoStoreRedirect()
     }
 
     // MARK: HTML creative
@@ -226,7 +276,9 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onAdClick: { handleHtmlClick() }
+            onAdClick: { handleHtmlClick() },
+            bridge: bridge,
+            attribution: response.adBehavior?.attribution
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
@@ -329,7 +381,8 @@ private struct CreativeInterstitialView: View {
         CreativeCTARouter.open(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
-            storeOpen: storeOpen
+            storeOpen: storeOpen,
+            attribution: response.adBehavior?.attribution
         )
     }
 
@@ -375,7 +428,7 @@ private struct CreativeInterstitialView: View {
         }
         guard #available(iOS 14.0, *) else { return }
         skOverlayPresented = true
-        SKOverlayPresenter.present(appID: appID, config: config)
+        SKOverlayPresenter.present(appID: appID, config: config, attribution: response.adBehavior?.attribution)
     }
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).
@@ -448,6 +501,9 @@ private struct CloseButtonView: View {
             // isn't proposed a full-size container, which made every position render at the same spot.
             // A tight 8pt inset keeps the button close to the corner (AdMob / AppLovin-style).
             buttonOrIndicator
+                // Center every state in the touch-target band so the gated pill / ring and the
+                // unlocked ✕ share one centerline (and line up with the store badge).
+                .frame(height: touchSize)
                 .padding(8)
                 // When pinned bottom-left, nudge right just enough to clear the always-present info
                 // "i" that sits tight in that corner (the "i" stays closest to the edge), so the two
@@ -474,16 +530,11 @@ private struct CloseButtonView: View {
     @ViewBuilder
     private var buttonOrIndicator: some View {
         if enabled {
-            // The resolved tap target: a labelled pill for `rewardOrCloseLabel`, the circular X
-            // for every other treatment.
+            // Unlocked: the compact ✕ for every treatment (matches all other close buttons).
             Button(action: onClose) {
-                if treatment == .rewardOrCloseLabel {
-                    labelPill(text: "Close")
-                } else {
-                    closeGlyph
-                        .frame(width: touchSize, height: touchSize)
-                        .contentShape(Rectangle())
-                }
+                closeGlyph
+                    .frame(width: touchSize, height: touchSize)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close")
@@ -538,9 +589,12 @@ private struct CloseButtonView: View {
 /// (`RewardedPresenter`).
 struct StorePromptBadge: View {
     let prompt: StorePrompt
-    /// Inset from the safe-area edge. The interstitial uses 16 (aligns with its close button);
-    /// the rewarded minigame passes 8 so the badge shares the reward pill's baseline.
-    var edgePadding: CGFloat = 16
+    /// Inset from the safe-area edge. Both the interstitial and the rewarded minigame use 8 so the
+    /// badge shares its close affordance's baseline.
+    var edgePadding: CGFloat = 8
+    /// When set, the pill is vertically centered within this height so it lines up with a close
+    /// button whose glyph sits in a touch-target band (the interstitial). nil → bare pill (rewarded).
+    var rowHeight: CGFloat? = nil
     let onTap: () -> Void
 
     private var label: String {
@@ -556,6 +610,9 @@ struct StorePromptBadge: View {
 
     var body: some View {
         badge
+            // nil → bare pill (rewarded); set → centered within the band so it lines up with the
+            // interstitial close button's touch-target row.
+            .frame(height: rowHeight)
             .padding(edgePadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }

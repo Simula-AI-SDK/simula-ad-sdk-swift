@@ -439,8 +439,9 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 
 /// Hard cap on the server-driven close delay. The close button (and, on Android, the system
 /// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
-/// trap the user with no exit. PRD arms are 0/3/5s; 15s leaves headroom without the footgun.
-let maxCloseDelaySeconds = 15
+/// trap the user with no exit. The `close_chrome` experiment arms are 20/30/45s (default 30),
+/// so the cap is 45 to honor the largest authored value while still bounding a malformed one.
+let maxCloseDelaySeconds = 45
 
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
@@ -727,25 +728,159 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     }
 }
 
+/// Ad-network attribution tokens for the StoreKit-rendered store surfaces (`attribution` node).
+/// iOS-only: `SKOverlay` / `SKStoreProductViewController` can't navigate an MMP tracking URL, so
+/// attribution rides on these tokens instead — the App Analytics campaign/provider tokens and, when
+/// the ad network supplies a signed SKAdNetwork payload, the full `skan` set. Every field is optional;
+/// an absent or partial object means "no token wired" and the store surface falls back to today's
+/// behavior. The SDK passes these through verbatim — it never mints or signs them (the backend does).
+public struct AdAttribution: Sendable, Equatable, Decodable {
+    /// App Analytics campaign token (`SKStoreProductParameterCampaignToken` / `SKOverlay…campaignToken`).
+    public let campaignToken: String?
+    /// App Analytics provider token (`SKStoreProductParameterProviderToken` / `SKOverlay…providerToken`).
+    public let providerToken: String?
+    /// Signed SKAdNetwork payload. Present only when the ad network can vouch for the install postback.
+    public let skan: SKANParameters?
+
+    public init(campaignToken: String? = nil, providerToken: String? = nil, skan: SKANParameters? = nil) {
+        self.campaignToken = campaignToken
+        self.providerToken = providerToken
+        self.skan = skan
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case campaignToken = "campaign_token"
+        case providerToken = "provider_token"
+        case skan
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.campaignToken = try? c.decode(String.self, forKey: .campaignToken)
+        self.providerToken = try? c.decode(String.self, forKey: .providerToken)
+        self.skan = try? c.decode(SKANParameters.self, forKey: .skan)
+    }
+}
+
+/// The signed SKAdNetwork parameters the ad network computes server-side, mapped 1:1 to StoreKit's
+/// `SKStoreProductParameterAdNetwork*` keys (applied in `CreativeCTARouter`). All-or-nothing: StoreKit
+/// needs the complete signed set to generate a valid install postback, so the required fields are
+/// non-optional — a payload missing any of them fails to decode and the whole `skan` block is dropped
+/// (the store still opens, just without SKAN). `campaignIdentifier` (SKAN ≤3) and `sourceIdentifier`
+/// (SKAN 4) are the version-specific alternatives; supply whichever matches `version`.
+///
+/// NOTE: the snake_case `CodingKeys` below are provisional — confirm them against the backend
+/// (`~/project-any-sdk-api`) `attribution.skan` contract before shipping.
+public struct SKANParameters: Sendable, Equatable, Decodable {
+    public let version: String
+    public let adNetworkIdentifier: String
+    public let sourceAppStoreIdentifier: Int
+    public let nonce: String
+    public let timestamp: Int
+    public let attributionSignature: String
+    public let campaignIdentifier: Int?
+    public let sourceIdentifier: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case adNetworkIdentifier = "ad_network_id"
+        case sourceAppStoreIdentifier = "source_app_store_id"
+        case nonce
+        case timestamp
+        case attributionSignature = "attribution_signature"
+        case campaignIdentifier = "campaign_id"
+        case sourceIdentifier = "source_id"
+    }
+}
+
+/// The creative-lifecycle moment at which an enabled `auto_store_redirect` fires. The `rawValue` is
+/// the wire token the server sends AND the token the creative emits via the `CREATIVE_MOMENT` bridge
+/// event; the two are matched verbatim. Unknown/missing → `.playableEnd` (the server's own default).
+public enum AutoStoreRedirectTrigger: String, Sendable, Equatable {
+    case playableEnd = "playable_end"
+    case endScreen1Open = "end_screen_1_open"
+    case endScreen2Open = "end_screen_2_open"
+
+    static func from(_ raw: String?) -> AutoStoreRedirectTrigger {
+        switch normalizeBehaviorToken(raw) {
+        case "end_screen_1_open": return .endScreen1Open
+        case "end_screen_2_open": return .endScreen2Open
+        default: return .playableEnd
+        }
+    }
+}
+
+extension AutoStoreRedirectTrigger {
+    /// Maps the index of a post-close fallback ad (`GET /load/fallbacks`, presented one per close in
+    /// reveal order) to the end-screen trigger it represents: index 0 is END SCREEN 1, index 1 is END
+    /// SCREEN 2. Returns nil for any further index. The SDK fires the redirect when the matching
+    /// fallback screen is presented — there is no signal from the webview. (PLAYABLE_END is SDK-native
+    /// — fired when the close button appears — and has no fallback index.)
+    static func endScreenTrigger(forFallbackIndex index: Int) -> AutoStoreRedirectTrigger? {
+        switch index {
+        case 0: return .endScreen1Open
+        case 1: return .endScreen2Open
+        default: return nil
+        }
+    }
+}
+
+/// Auto store redirect (`auto_store_redirect` node): when `enabled`, the SDK opens the advertiser
+/// store once per impression at the `trigger` moment — no user tap. PLAYABLE_END fires when the close
+/// button appears; END_SCREEN_1/2_OPEN fire when the matching post-close fallback ad screen is
+/// presented (see `AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex:)`). The store opened is
+/// always the primary ad's (fallback ads carry no store link). Disabled by default.
+public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
+    public let enabled: Bool
+    public let trigger: AutoStoreRedirectTrigger
+
+    public init(enabled: Bool = false, trigger: AutoStoreRedirectTrigger = .playableEnd) {
+        self.enabled = enabled
+        self.trigger = trigger
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, trigger
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        self.trigger = .from(try? c.decode(String.self, forKey: .trigger))
+    }
+}
+
 /// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
 /// response: an absent object means "render today's defaults". A present-but-partial object
-/// fills each missing field with its default; `store_prompt` / `skoverlay` are nil when omitted.
+/// fills each missing field with its default; `store_prompt` / `skoverlay` / `auto_store_redirect` /
+/// `attribution` are nil when omitted.
+///
+/// NOTE: `attribution` is intentionally inert today — the backend (`~/project-any-sdk-api`) does not
+/// yet emit an `attribution` node in `ad_behavior`, so it always decodes to nil and the StoreKit
+/// surfaces fall back to their default (un-attributed) behavior. The plumbing is retained so the
+/// tokens flow the moment the API ships the contract; the Android SDK deliberately doesn't model it.
 public struct AdBehavior: Sendable, Equatable, Decodable {
     public let close: CloseBehavior
     public let storeOpen: StoreOpen
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
+    public let autoStoreRedirect: AutoStoreRedirect?
+    public let attribution: AdAttribution?
 
     public init(
         close: CloseBehavior = CloseBehavior(),
         storeOpen: StoreOpen = .external,
         storePrompt: StorePrompt? = nil,
-        skoverlay: SKOverlayConfig? = nil
+        skoverlay: SKOverlayConfig? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        attribution: AdAttribution? = nil
     ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
+        self.autoStoreRedirect = autoStoreRedirect
+        self.attribution = attribution
     }
 
     enum CodingKeys: String, CodingKey {
@@ -753,6 +888,8 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storeOpen = "store_open"
         case storePrompt = "store_prompt"
         case skoverlay
+        case autoStoreRedirect = "auto_store_redirect"
+        case attribution
     }
 
     public init(from decoder: Decoder) throws {
@@ -761,6 +898,8 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storeOpen = .from(try? c.decode(String.self, forKey: .storeOpen))
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
+        self.autoStoreRedirect = try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect)
+        self.attribution = try? c.decode(AdAttribution.self, forKey: .attribution)
     }
 }
 

@@ -36,13 +36,16 @@ enum CreativeCTARouter {
     static func open(
         trackingUrl: String?,
         destination: AdDestination,
-        storeOpen: StoreOpen = .skstoreproduct
+        storeOpen: StoreOpen = .skstoreproduct,
+        attribution: AdAttribution? = nil
     ) {
         guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
             return
         }
 
         if storeOpen == .external {
+            // `.external` leaves the app to the App Store / browser, which StoreKit attribution tokens
+            // can't ride on — they apply only to the in-app store sheet below.
             openExternally(initialURL: url, destination: destination)
             return
         }
@@ -52,9 +55,9 @@ enum CreativeCTARouter {
             // If the tracking URL is already an App Store URL, present the sheet
             // directly; otherwise resolve the attribution redirect chain first.
             if let appID = appStoreID(from: url) {
-                presentStoreProduct(appID: appID)
+                presentStoreProduct(appID: appID, attribution: attribution)
             } else {
-                resolveAndRoute(url: url)
+                resolveAndRoute(url: url, attribution: attribution)
             }
         case .web:
             let scheme = url.scheme?.lowercased() ?? ""
@@ -145,9 +148,15 @@ enum CreativeCTARouter {
         }
         resolverRef = resolver
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
-        session.dataTask(with: URLRequest(url: url)).resume()
+        // This GET both resolves the advertised app id AND is the MMP click for the SKOverlay
+        // engagement — `is_skoverlay=true` tells AppsFlyer/Adjust it's an SKOverlay view/click (so it's
+        // matched to the StoreKit/SKAN install). Folding it into this one request avoids firing the
+        // tracker twice (and double-counting the click). `resolveAppStoreID` is only ever called for
+        // the SKOverlay flow, so flagging every request here is correct.
+        let clickURL = appendingQueryItem(url, name: "is_skoverlay", value: "true")
+        session.dataTask(with: URLRequest(url: clickURL)).resume()
     }
 
     // MARK: - Presentation
@@ -165,8 +174,9 @@ enum CreativeCTARouter {
     /// resets it on dismiss.
     private static var isPresentingExternal = false
 
-    /// Presents `SKStoreProductViewController` in-app for the given App Store ID.
-    static func presentStoreProduct(appID: String) {
+    /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
+    /// campaign/provider/SKAN [attribution] tokens so the install it drives is credited to the campaign.
+    static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) {
         guard !isPresentingExternal else { return }
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
@@ -178,14 +188,67 @@ enum CreativeCTARouter {
         objc_setAssociatedObject(
             storeVC, &storeDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
-        storeVC.loadProduct(withParameters: [
-            SKStoreProductParameterITunesItemIdentifier: NSNumber(value: Int(appID) ?? 0)
-        ])
+        storeVC.loadProduct(withParameters: storeProductParameters(appID: appID, attribution: attribution))
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick true forever on a no-window early-return.
         if presentViewController(storeVC) {
             isPresentingExternal = true
         }
+    }
+
+    // MARK: - Attribution token mapping
+
+    /// The full `loadProduct` parameter set: the App Store item id plus any campaign/provider/SKAN
+    /// attribution tokens the backend supplied. Used by `presentStoreProduct`; the SKAN subset is
+    /// shared with `SKOverlayPresenter` (same `SKStoreProductParameterAdNetwork*` keys).
+    static func storeProductParameters(appID: String, attribution: AdAttribution?) -> [String: Any] {
+        var params: [String: Any] = [
+            SKStoreProductParameterITunesItemIdentifier: NSNumber(value: Int(appID) ?? 0)
+        ]
+        if let campaign = attribution?.campaignToken, !campaign.isEmpty {
+            params[SKStoreProductParameterCampaignToken] = campaign
+        }
+        if let provider = attribution?.providerToken, !provider.isEmpty {
+            params[SKStoreProductParameterProviderToken] = provider
+        }
+        params.merge(skanAdditionalValues(attribution)) { _, new in new }
+        return params
+    }
+
+    /// Maps a signed `SKANParameters` payload to StoreKit's `SKStoreProductParameterAdNetwork*` keys —
+    /// the same keys `SKStoreProductViewController.loadProduct` and `SKOverlay.AppConfiguration`'s
+    /// `setAdditionalValue(_:forKey:)` both consume. StoreKit uses them to generate the SKAdNetwork
+    /// install postback that credits the campaign without IDFA. Returns `[:]` when there's no SKAN
+    /// payload or the nonce isn't a valid UUID (StoreKit would reject a malformed set anyway).
+    static func skanAdditionalValues(_ attribution: AdAttribution?) -> [String: Any] {
+        guard let skan = attribution?.skan, let nonce = UUID(uuidString: skan.nonce) else { return [:] }
+        var values: [String: Any] = [
+            SKStoreProductParameterAdNetworkIdentifier: skan.adNetworkIdentifier,
+            SKStoreProductParameterAdNetworkVersion: skan.version,
+            SKStoreProductParameterAdNetworkNonce: nonce,
+            SKStoreProductParameterAdNetworkTimestamp: NSNumber(value: skan.timestamp),
+            SKStoreProductParameterAdNetworkSourceAppStoreIdentifier: NSNumber(value: skan.sourceAppStoreIdentifier),
+            SKStoreProductParameterAdNetworkAttributionSignature: skan.attributionSignature,
+        ]
+        // SKAN 4 keys the install by a numeric source identifier (iOS 16.1+); earlier versions use the
+        // campaign identifier. Supply whichever the backend signed for this `version`.
+        if #available(iOS 16.1, *), let sourceID = skan.sourceIdentifier {
+            values[SKStoreProductParameterAdNetworkSourceIdentifier] = NSNumber(value: sourceID)
+        } else if let campaignID = skan.campaignIdentifier {
+            values[SKStoreProductParameterAdNetworkCampaignIdentifier] = NSNumber(value: campaignID)
+        }
+        return values
+    }
+
+    /// Appends a query item to `url` (no-op if the name is already present), used to fold
+    /// `is_skoverlay=true` into the SKOverlay click without disturbing the rest of the tracker URL.
+    nonisolated static func appendingQueryItem(_ url: URL, name: String, value: String) -> URL {
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        var items = comps.queryItems ?? []
+        guard !items.contains(where: { $0.name == name }) else { return url }
+        items.append(URLQueryItem(name: name, value: value))
+        comps.queryItems = items
+        return comps.url ?? url
     }
 
     /// Presents `SFSafariViewController` for external links.
@@ -261,7 +324,7 @@ enum CreativeCTARouter {
         }
         resolverRef = resolver
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
         session.dataTask(with: URLRequest(url: initialURL)).resume()
     }
@@ -269,10 +332,10 @@ enum CreativeCTARouter {
     /// Follows the HTTP redirect chain to determine the final destination.
     /// If it resolves to an App Store URL → `SKStoreProductViewController`.
     /// Otherwise → `SFSafariViewController` with the final URL.
-    static func resolveAndRoute(url: URL) {
+    static func resolveAndRoute(url: URL, attribution: AdAttribution? = nil) {
         // Quick check — already an App Store URL?
         if let appID = appStoreID(from: url) {
-            presentStoreProduct(appID: appID)
+            presentStoreProduct(appID: appID, attribution: attribution)
             return
         }
 
@@ -286,7 +349,7 @@ enum CreativeCTARouter {
         let resolver = RedirectResolver { finalURL in
             DispatchQueue.main.async {
                 if let appID = appStoreID(from: finalURL) {
-                    presentStoreProduct(appID: appID)
+                    presentStoreProduct(appID: appID, attribution: attribution)
                 } else {
                     presentSafari(url: finalURL)
                 }
@@ -297,7 +360,7 @@ enum CreativeCTARouter {
         resolverRef = resolver
         // Keep a strong reference so it isn't deallocated during the request.
         activeResolvers.insert(resolver)
-        let session = URLSession(configuration: .default, delegate: resolver, delegateQueue: nil)
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
         resolver.session = session
         session.dataTask(with: URLRequest(url: url)).resume()
     }

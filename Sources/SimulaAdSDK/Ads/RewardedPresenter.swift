@@ -34,6 +34,8 @@ final class RewardedPresenter {
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
         storeOpen: StoreOpen = .skstoreproduct,
+        attribution: AdAttribution? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
@@ -41,6 +43,11 @@ final class RewardedPresenter {
             return false
         }
         self.onClose = onClose
+
+        // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
+        // orientation lock, and device/audio/orientation queries. Owned here so the orientation
+        // handler can reach the hosting controller + window created below.
+        let bridge = CreativeBridge()
 
         let root = RewardedGameView(
             impressionId: impressionId,
@@ -51,13 +58,16 @@ final class RewardedPresenter {
             trackingUrl: trackingUrl,
             destination: destination,
             storeOpen: storeOpen,
+            attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
+            bridge: bridge,
             onFinish: { [weak self] earned, elapsed in
                 self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
             }
         )
 
-        let hosting = UIHostingController(rootView: root)
+        let hosting = OrientationLockingHostingController(rootView: root)
         hosting.view.backgroundColor = .clear
 
         originalKeyWindow = scene.keyWindow
@@ -68,6 +78,9 @@ final class RewardedPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        // Give the bridge the orientation host + window now that they exist.
+        bridge.orientationHost = hosting
+        bridge.window = window
         return true
     }
 
@@ -112,8 +125,14 @@ private struct RewardedGameView: View {
     let trackingUrl: String?
     let destination: AdDestination
     let storeOpen: StoreOpen
+    /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
+    let attribution: AdAttribution?
+    /// auto_store_redirect config — fires the store open once at the configured creative moment.
+    let autoStoreRedirect: AutoStoreRedirect?
     /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
     let previewHTML: String?
+    /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
+    let bridge: CreativeBridge
     let onFinish: (Bool, Double) -> Void
 
     @State private var elapsedPlayTime: Double = 0
@@ -121,6 +140,8 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
+    /// auto_store_redirect one-shot guard.
+    @State private var autoRedirectFired = false
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -135,9 +156,9 @@ private struct RewardedGameView: View {
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML)
+                WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url)
+                WebViewRepresentable(url: url, bridge: bridge)
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -165,11 +186,46 @@ private struct RewardedGameView: View {
         .allowsHitTesting(visible)
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
-        .onAppear { startTimer() }
+        .onAppear {
+            startTimer()
+            // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
+            fireAutoStoreRedirectIfCloseShown()
+        }
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
         }
+        // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
+        // reward and reveal the close button immediately, bypassing the play timer.
+        .onReceive(bridge.$earlyComplete) { earlyComplete in
+            guard earlyComplete, !rewardEarned else { return }
+            timerTask?.cancel()
+            timerTask = nil
+            rewardEarned = true
+        }
+        // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
+        // (here, when the reward is earned and the reward/close pill becomes a close button).
+        .onChange(of: rewardEarned) { earned in
+            if earned { fireAutoStoreRedirectIfCloseShown() }
+        }
+    }
+
+    // MARK: auto_store_redirect
+
+    /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
+    private func fireAutoStoreRedirect() {
+        guard !autoRedirectFired else { return }
+        autoRedirectFired = true
+        handleStorePromptTap()
+    }
+
+    /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
+    /// (END_SCREEN_1/2_OPEN are handled in the post-close fallback flow, by index — see
+    /// `SimulaRewardedAd.presentFallbackAds` / `FallbackAdPresenter`.)
+    private func fireAutoStoreRedirectIfCloseShown() {
+        guard rewardEarned, let redirect = autoStoreRedirect, redirect.enabled,
+              redirect.trigger == .playableEnd else { return }
+        fireAutoStoreRedirect()
     }
 
     @ViewBuilder
@@ -225,7 +281,7 @@ private struct RewardedGameView: View {
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     private func handleStorePromptTap() {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen)
+        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, attribution: attribution)
     }
 
     // MARK: Close

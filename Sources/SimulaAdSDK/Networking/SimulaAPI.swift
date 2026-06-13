@@ -232,10 +232,12 @@ func parseCatalog(_ data: Data) throws -> CatalogResponse {
 
 // MARK: - Character Picker Models
 
-/// One character as returned by the companions endpoint. `id`/`name` are required
-/// (an entry missing either is dropped by `LossyCompanionItems`); the image resolves
-/// from `images_1_1[0]`, then `avatar_url`, then `image`. Decoding is tolerant —
-/// unknown fields are ignored, and backend (`character_id`) or short (`id`) names work.
+/// One character as returned by `/character-selector`. `name`, `description`, and the
+/// image are required (a card needs all three to render — an entry missing any is
+/// dropped by `LossyCompanionItems`); a blank `id` is tolerated. The image resolves
+/// from `imageUrl` (the field the endpoint sends), then `images_1_1[0]`, `avatar_url`,
+/// `image`. Decoding is tolerant — unknown fields are ignored, and backend
+/// (`character_id`) or short (`id`) names both work.
 struct CompanionItem: Decodable {
     let id: String
     let name: String
@@ -247,6 +249,7 @@ struct CompanionItem: Decodable {
         case id
         case characterName = "character_name"
         case name
+        case imageUrl
         case images11 = "images_1_1"
         case avatarUrl = "avatar_url"
         case image
@@ -255,21 +258,26 @@ struct CompanionItem: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        guard let id = (try? c.decode(String.self, forKey: .characterId))
-            ?? (try? c.decode(String.self, forKey: .id)),
-            let name = (try? c.decode(String.self, forKey: .characterName))
+        let name = (try? c.decode(String.self, forKey: .characterName))
             ?? (try? c.decode(String.self, forKey: .name))
-        else {
-            throw SimulaAPIError.invalidResponse // dropped by the lossy wrapper
-        }
-        self.id = id
-        self.name = name
+        let description = try? c.decode(String.self, forKey: .description)
         let firstImage = (try? c.decode([String].self, forKey: .images11))?.first
-        self.image = firstImage
+        let image = (try? c.decode(String.self, forKey: .imageUrl))
+            ?? firstImage
             ?? (try? c.decode(String.self, forKey: .avatarUrl))
             ?? (try? c.decode(String.self, forKey: .image))
+        // A card needs all three display fields; a blank id is tolerated.
+        guard let name, !name.isEmpty,
+              let description, !description.isEmpty,
+              let image, !image.isEmpty else {
+            throw SimulaAPIError.invalidResponse // dropped by the lossy wrapper
+        }
+        self.id = (try? c.decode(String.self, forKey: .characterId))
+            ?? (try? c.decode(String.self, forKey: .id))
             ?? ""
-        self.description = try? c.decode(String.self, forKey: .description)
+        self.name = name
+        self.image = image
+        self.description = description
     }
 
     func toCharacterData() -> CharacterData {
@@ -322,10 +330,23 @@ struct CompanionsAPIResponse: Decodable {
     }
 }
 
-/// Decodes a companions payload into `[CharacterData]`. Pure and testable; tolerant of
-/// the shapes the server may return (object with `characters`/`characters.data`/`data`,
-/// or a bare array) and lossy per character. Returns `[]` for any unexpected shape so
-/// the picker silently falls back to its bundled placeholders.
+/// Request body for `POST /character-selector`. `fill` is the number of roster slots
+/// to backfill (1–4); `sessionId` must belong to the authenticated publisher.
+struct CharacterSelectorRequest: Encodable {
+    let sessionId: String
+    let fill: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case fill
+    }
+}
+
+/// Decodes a `/character-selector` payload into `[CharacterData]`. Pure and testable;
+/// tolerant of the shapes the server may return (a bare array — what the endpoint sends
+/// — or an object with `characters`/`characters.data`/`data`) and lossy per character.
+/// Returns `[]` for any unexpected shape so the picker silently falls back to its
+/// bundled placeholders.
 func parseCharacters(_ data: Data) -> [CharacterData] {
     let decoder = JSONDecoder()
     if let response = try? decoder.decode(CompanionsAPIResponse.self, from: data),
@@ -766,6 +787,9 @@ public final class SimulaAPI: @unchecked Sendable {
         config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
         config.timeoutIntervalForResource = 20  // overall ceiling for one resource
         config.waitsForConnectivity = false     // fail fast when offline
+        // Custom UA + device id on every request through this session. Per-request headers never
+        // set these, so the session-wide values apply to all API + telemetry calls.
+        config.httpAdditionalHeaders = SimulaUserAgent.standardHeaders()
         // Session-wide task delegate harvests URLSessionTaskMetrics into telemetry for every
         // request (skipping the telemetry endpoint itself). Async `data(for:)` still works.
         return URLSession(
@@ -774,11 +798,6 @@ public final class SimulaAPI: @unchecked Sendable {
             delegateQueue: nil
         )
     }()
-
-    /// Cached ISO-8601 formatter. `ISO8601DateFormatter` construction is costly,
-    /// and the viewport tracking calls would otherwise allocate one per event.
-    /// `string(from:)` is thread-safe, so a single shared instance is fine.
-    private static let iso8601Formatter = ISO8601DateFormatter()
 
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
@@ -903,21 +922,24 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Fetch Characters (Character Picker)
 
-    /// Fetches the selectable characters for the Character Picker. Best-effort and
-    /// **never throws**: returns an empty list on any failure so the caller falls back
-    /// to its bundled placeholder characters.
+    /// Fetches characters for the Character Picker from `POST /character-selector`.
+    /// Best-effort and **never throws**: returns an empty list on any failure so the
+    /// caller falls back to its bundled placeholder characters.
     ///
-    /// NOTE: the public `/minigames/companions` endpoint is not built yet — this call
-    /// will currently 404 and resolve to the fallback. No SDK change is needed once it
-    /// ships; `parseCharacters` already tolerates its expected shape.
-    public func fetchCharacters(sessionId: String? = nil) async -> [CharacterData] {
-        guard let url = Self.companionsURL(sessionId: sessionId) else { return [] }
+    /// The endpoint backfills `fill` (1–4) random characters from Simula's roster. It
+    /// requires the publisher Bearer `apiKey` and a `sessionId` that belongs to that
+    /// publisher — the same auth contract as `/session`.
+    public func fetchCharacters(apiKey: String, sessionId: String, fill: Int = 4) async -> [CharacterData] {
+        guard let url = URL(string: "\(API_BASE_URL)/character-selector") else { return [] }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        applyHeaders(makeHeaders(), to: &request)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         do {
+            request.httpBody = try JSONEncoder().encode(
+                CharacterSelectorRequest(sessionId: sessionId, fill: fill)
+            )
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
@@ -927,17 +949,6 @@ public final class SimulaAPI: @unchecked Sendable {
         } catch {
             return []
         }
-    }
-
-    /// Builds the companions request URL, adding `session_id` when available. Pure/testable.
-    static func companionsURL(sessionId: String? = nil) -> URL? {
-        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/companions") else {
-            return nil
-        }
-        if let sessionId, !sessionId.isEmpty {
-            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
-        }
-        return components.url
     }
 
     // MARK: - Load Ad (imperative prefetch)
@@ -1222,44 +1233,6 @@ public final class SimulaAPI: @unchecked Sendable {
         var body: [String: Any] = ["flag": flag]
         if let note, !note.isEmpty { body["note"] = note }
         request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
-
-        _ = try? await session.data(for: request)
-    }
-
-    // MARK: - Track Viewport Entry
-
-    /// Tracks when an ad enters the viewport.
-    /// Translates `trackViewportEntry()` from api.ts
-    public func trackViewportEntry(adId: String, apiKey: String) async {
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/viewport_entry/\(adId)") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-
-        let body: [String: Any] = [
-            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        _ = try? await session.data(for: request)
-    }
-
-    // MARK: - Track Viewport Exit
-
-    /// Tracks when an ad exits the viewport.
-    /// Translates `trackViewportExit()` from api.ts
-    public func trackViewportExit(adId: String, apiKey: String) async {
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/viewport_exit/\(adId)") else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-
-        let body: [String: Any] = [
-            "timestamp": SimulaAPI.iso8601Formatter.string(from: Date()),
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         _ = try? await session.data(for: request)
     }
