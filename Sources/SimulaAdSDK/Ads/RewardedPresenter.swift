@@ -268,7 +268,7 @@ private struct RewardedGameView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Close")
         } else {
-            // Still earning: a small display-only status — no close affordance yet.
+            // Still earning: a "Play to earn: Xs" countdown label (display-only — no early exit).
             Text("Play to earn: \(secondsLeft)s")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white)
