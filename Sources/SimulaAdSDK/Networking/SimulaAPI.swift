@@ -995,6 +995,55 @@ public final class SimulaAPI: @unchecked Sendable {
         return try JSONDecoder().decode(AdLoadResponse.self, from: data)
     }
 
+    // MARK: - Load Native Ad
+
+    /// Loads a native sponsored-character card via `POST /load/native`.
+    ///
+    /// `ad_inserted == false` is a valid no-fill (NOT an error) — returned as-is so the slot can
+    /// collapse silently. A 401 (bad/unknown session) and any other non-2xx surface as
+    /// `SimulaAPIError.httpError`, which the slot maps to the right `SimulaAdError` per the PRD.
+    public func loadNative(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil
+    ) async throws -> NativeAdResponse {
+        guard let url = URL(string: "\(API_BASE_URL)/load/native") else {
+            throw SimulaAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(), to: &request)
+        request.httpBody = try JSONEncoder().encode(
+            NativeAdRequest(
+                position: position,
+                sessionId: sessionId,
+                adUnitId: adUnitId,
+                context: context,
+                width: width,
+                charId: charId,
+                charName: charName,
+                charDesc: charDesc
+            )
+        )
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw SimulaAPIError.httpError(
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
+            )
+        }
+
+        return try JSONDecoder().decode(NativeAdResponse.self, from: data)
+    }
+
     // MARK: - Rewarded Minigame
 
     /// Initializes a rewarded minigame via POST /minigames/init/rewarded. Returns the

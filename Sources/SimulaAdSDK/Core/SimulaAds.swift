@@ -77,7 +77,8 @@ public enum SimulaAds {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
-        telemetryEnabled: Bool = true
+        telemetryEnabled: Bool = true,
+        adContext: SimulaAdContext? = nil
     ) {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
@@ -103,7 +104,8 @@ public enum SimulaAds {
             primaryUserID: primaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
             privacy: privacy,
-            telemetryEnabled: telemetryEnabled
+            telemetryEnabled: telemetryEnabled,
+            adContext: adContext
         )
         shared = provider
 
@@ -120,4 +122,31 @@ public enum SimulaAds {
         // slow/failed session create can't delay or skip recovery.
         RewardVerificationManager.shared.triggerProcessQueue()
     }
+
+    // MARK: - Native ad targeting context + preloading
+
+    /// Replace the native-ad targeting context at runtime (e.g. when the feed category changes).
+    /// A full replacement, not a merge (PRD). No-op before `initialize`.
+    public static func updateContext(_ context: SimulaAdContext?) {
+        shared?.updateContext(context)
+    }
+
+    #if os(iOS)
+    /// Imperatively preload one native ad before its slot scrolls into view. Fires a single
+    /// `POST /load/native` using the current provider context, caches the full response, and returns
+    /// a `preloadedAdId` to pass into a `NativeAdSlot` (which then renders from cache with no live
+    /// network call). The entry is evicted once consumed; release any unconsumed id with
+    /// `destroyPreloadedAd`. At most 5 ads are kept (excess is dropped with an internal warning).
+    /// Returns `nil` before `initialize` or when the cap is reached.
+    @discardableResult
+    public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0) async -> String? {
+        guard let provider = shared else { return nil }
+        return NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position)
+    }
+
+    /// Release a preloaded native ad that was never consumed, cancelling its request if in flight.
+    public static func destroyPreloadedAd(_ preloadedAdId: String) {
+        NativeAdPreloadCache.shared.destroy(preloadedAdId)
+    }
+    #endif
 }

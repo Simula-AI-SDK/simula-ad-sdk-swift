@@ -1,0 +1,50 @@
+#if os(iOS)
+import Foundation
+
+/// Imperative one-at-a-time preload registry behind `SimulaAds.preloadNativeAd` /
+/// `SimulaAds.destroyPreloadedAd`.
+///
+/// Each `preload` fires exactly one `POST /load/native` (using the current provider context +
+/// session) into a held `Task`, and returns a `preloadedAdId`. When a `NativeAdSlot` mounts with
+/// that id it `consume`s the entry — rendering from cache with no live network call — and the entry
+/// is evicted. Unconsumed ids must be released with `destroy`.
+///
+/// At most `maxEntries` ads are kept at once; further preloads are dropped (PRD: "cap silently at 5,
+/// log warning internally"). MainActor-isolated: everything runs on the main thread, matching the
+/// rest of the imperative ad path.
+@MainActor
+final class NativeAdPreloadCache {
+    static let shared = NativeAdPreloadCache()
+
+    private let maxEntries = 5
+    private var tasks: [String: Task<NativeAdResponse, Error>] = [:]
+
+    private init() {}
+
+    /// Fire one preload and return its id, or nil if the cap is already reached.
+    func preload(provider: SimulaProvider, adUnitId: String?, position: Int) -> String? {
+        guard tasks.count < maxEntries else {
+            print("[SimulaSDK] preloadNativeAd ignored — at most \(maxEntries) preloaded ads are kept at once.")
+            return nil
+        }
+        let id = UUID().uuidString
+        tasks[id] = Task { @MainActor in
+            try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position)
+        }
+        return id
+    }
+
+    /// Await and remove the preloaded ad for `id`. Returns nil if the id is unknown (expired,
+    /// destroyed, already consumed) or its load failed — the caller then falls back to a live
+    /// request, surfacing no error (PRD).
+    func consume(_ id: String) async -> NativeAdResponse? {
+        guard let task = tasks.removeValue(forKey: id) else { return nil }
+        return try? await task.value
+    }
+
+    /// Release a preloaded ad that was never consumed, cancelling its request if still in flight.
+    func destroy(_ id: String) {
+        tasks.removeValue(forKey: id)?.cancel()
+    }
+}
+#endif
