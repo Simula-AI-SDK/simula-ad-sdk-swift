@@ -86,16 +86,26 @@ final class RewardedPresenter {
         return true
     }
 
-    /// Tears down the presentation window and fires the close callback once.
+    /// Fires the close callback, then tears down the presentation window — in that order, so the
+    /// callback can bring up the post-close fallback ad window (from a background prefetch, ready
+    /// synchronously) on top of this still-visible window before it's hidden. Tearing down first
+    /// flashed the app behind during the handoff.
     private func dismiss(earned: Bool, elapsedPlayTime: Double) {
-        window?.isHidden = true
-        window?.rootViewController = nil
+        // Capture the window refs and clear `self`'s references BEFORE invoking the callback: the
+        // callback nils the owner's reference to this presenter, so `self` may be deallocated by
+        // the time it returns. Operate on the locals afterwards instead of touching `self`.
+        let win = window
+        let hostKeyWindow = originalKeyWindow
         window = nil
-        originalKeyWindow?.makeKey()
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
         callback?(earned, elapsedPlayTime)
+        win?.isHidden = true
+        win?.rootViewController = nil
+        // Restore the host's key window so it regains focus. A fallback window presented in the
+        // callback stays visible on top and still receives touches via hit-testing.
+        hostKeyWindow?.makeKey()
     }
 
     /// Finds a foreground window scene to attach the overlay window to.
@@ -152,6 +162,17 @@ private struct RewardedGameView: View {
         max(0, durationSeconds - Int(elapsedPlayTime))
     }
 
+    /// Corner for the play-to-earn / close pill. Defaults to top-trailing, but flips to top-leading
+    /// when the mid-ad store prompt occupies the top-right — its only corner that would collide with
+    /// the pill — so the two never overlap. Computed from the (static) store-prompt config, so the
+    /// pill doesn't jump corners when the prompt appears at midpoint or is removed on reward.
+    private var pillAlignment: Alignment {
+        if let prompt = storePrompt, prompt.enabled, prompt.position == .topRight {
+            return .topLeading
+        }
+        return .topTrailing
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -163,12 +184,13 @@ private struct RewardedGameView: View {
                 WebViewRepresentable(url: url, bridge: bridge)
             }
 
-            // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
-            // earned (display-only — there is no early exit), which becomes the close button
+            // Reward/close pill: a "Play to earn" countdown while the reward is being earned
+            // (display-only — there is no early exit), which becomes the close button
             // ("✕ Reward unlocked") the moment the reward is earned. The whole pill then dismisses.
+            // Sits opposite the store prompt when that would otherwise share the top-right corner.
             rewardClosePill
                 .padding(8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: pillAlignment)
                 .animation(.default, value: rewardEarned)
 
             // Mid-ad store prompt — appears at half the play-to-earn duration and is removed the

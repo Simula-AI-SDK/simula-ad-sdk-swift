@@ -11,6 +11,10 @@ struct PendingVerification: Codable, Equatable {
     let elapsedPlayTime: Double
     var retryCount: Int
     var lastAttemptTimestamp: Double
+    /// Sent to verify-reward so the SSV callback resolves the ad unit. Optional (`var ... ?`) so
+    /// queue entries persisted before this field existed still decode (as `nil`) instead of being
+    /// dropped — which would lose the pending reward.
+    var adUnitId: String?
 }
 
 // MARK: - Seams (injected so the queue is unit-testable without the network/clock)
@@ -18,7 +22,7 @@ struct PendingVerification: Codable, Equatable {
 /// Performs one `verify-reward` call. `SimulaAPI` is the production implementation;
 /// tests substitute a fake. Mirrors the Kotlin `RewardVerifier`.
 protocol RewardVerifying: Sendable {
-    func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double) async throws -> VerifyRewardResponse
+    func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String) async throws -> VerifyRewardResponse
 }
 
 extension SimulaAPI: RewardVerifying {}
@@ -95,6 +99,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         serveId: String,
         sessionId: String,
         elapsedPlayTime: Double,
+        adUnitId: String = "",
         completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
     ) {
         lock.lock()
@@ -111,7 +116,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
                     sessionId: sessionId,
                     elapsedPlayTime: elapsedPlayTime,
                     retryCount: 0,
-                    lastAttemptTimestamp: 0
+                    lastAttemptTimestamp: 0,
+                    adUnitId: adUnitId
                 )
             )
             saveQueue(list)
@@ -147,7 +153,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 let res = try await verifier.verifyReward(
                     serveId: task.serveId,
                     sessionId: task.sessionId,
-                    elapsedPlayTime: task.elapsedPlayTime
+                    elapsedPlayTime: task.elapsedPlayTime,
+                    adUnitId: task.adUnitId ?? ""
                 )
                 removeTask(serveId: task.serveId)
                 invokeCallback(serveId: task.serveId, .success(res.token))

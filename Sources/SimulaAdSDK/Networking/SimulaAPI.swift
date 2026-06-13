@@ -737,17 +737,21 @@ public struct VerifyRewardRequest: Encodable, Sendable {
     public let serveId: String
     public let sessionId: String
     public let elapsedPlayTime: Double
+    /// Sent alongside serve_id so the SSV reward callback can resolve/validate the ad unit off the body.
+    public let adUnitId: String
 
     enum CodingKeys: String, CodingKey {
         case serveId = "serve_id"
         case sessionId = "session_id"
         case elapsedPlayTime = "elapsed_play_time"
+        case adUnitId = "ad_unit_id"
     }
 
-    public init(serveId: String, sessionId: String, elapsedPlayTime: Double) {
+    public init(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String = "") {
         self.serveId = serveId
         self.sessionId = sessionId
         self.elapsedPlayTime = elapsedPlayTime
+        self.adUnitId = adUnitId
     }
 }
 
@@ -1097,7 +1101,8 @@ public final class SimulaAPI: @unchecked Sendable {
     public func verifyReward(
         serveId: String,
         sessionId: String,
-        elapsedPlayTime: Double
+        elapsedPlayTime: Double,
+        adUnitId: String = ""
     ) async throws -> VerifyRewardResponse {
         guard let url = URL(string: "\(API_BASE_URL)/minigames/verify-reward") else {
             throw SimulaAPIError.invalidURL
@@ -1107,7 +1112,7 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime)
+            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime, adUnitId: adUnitId)
         )
 
         let (data, response) = try await session.data(for: request)
@@ -1250,7 +1255,7 @@ public final class SimulaAPI: @unchecked Sendable {
     public func trackImpression(adId: String, apiKey: String, experiment: Experiment? = nil) async {
         // An empty `adId` would POST to `.../impression/` (no id) — skip it.
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/impression/\(adId)") else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/track/impression/\(adId)") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

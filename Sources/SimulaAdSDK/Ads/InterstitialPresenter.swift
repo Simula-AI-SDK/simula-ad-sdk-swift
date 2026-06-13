@@ -70,17 +70,27 @@ final class InterstitialPresenter {
         return true
     }
 
-    /// Tears down the presentation window and fires the CLOSED callback once.
+    /// Fires the CLOSED callback, then tears down the presentation window — in that order.
+    /// The callback brings up the post-close fallback ad window (from a background prefetch, so
+    /// it's ready synchronously) on top of this still-visible window; only then do we hide it.
+    /// Tearing down first left a frame with neither window covering the screen, which flashed the
+    /// app/home behind during the handoff.
     private func dismiss() {
-        window?.isHidden = true
-        window?.rootViewController = nil
+        // Capture the window refs and clear `self`'s references BEFORE invoking the callback: the
+        // callback nils the owner's reference to this presenter, so `self` may be deallocated by
+        // the time it returns. Operate on the locals afterwards instead of touching `self`.
+        let win = window
+        let hostKeyWindow = originalKeyWindow
         window = nil
-        // Restore the host's key window so it regains touch/keyboard focus.
-        originalKeyWindow?.makeKey()
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
         callback?()
+        win?.isHidden = true
+        win?.rootViewController = nil
+        // Restore the host's key window so it regains focus. A fallback window presented in the
+        // callback stays visible on top and still receives touches via hit-testing.
+        hostKeyWindow?.makeKey()
     }
 
     /// Finds a foreground window scene to attach the overlay window to.

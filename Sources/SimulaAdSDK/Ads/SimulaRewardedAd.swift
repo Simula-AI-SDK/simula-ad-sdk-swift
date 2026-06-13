@@ -130,6 +130,13 @@ public final class SimulaRewardedAd {
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
     /// post-game ad flow).
     private var fallbackPresenter: FallbackAdPresenter?
+    /// Background prefetch of the post-close fallback screens, kicked off while the minigame is on
+    /// screen so they present instantly on close (no fetch-after-close flash). Consumed once in
+    /// `presentFallbackAds`.
+    private var fallbackPrefetch: Task<[FallbackAd], Never>?
+    /// The prefetch result once it lands, so the close path can present the fallback window
+    /// synchronously (before the primary window is torn down) rather than awaiting.
+    private var prefetchedFallbacks: [FallbackAd]?
     #endif
 
     // MARK: - Init
@@ -308,9 +315,9 @@ public final class SimulaRewardedAd {
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
                 self.delegate?.rewardedDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
+                // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
                 self.presentFallbackAds(
-                    impressionId: response.impressionId,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
                         CreativeCTARouter.open(
@@ -341,6 +348,10 @@ public final class SimulaRewardedAd {
 
         state = .showing(response)
         self.presenter = presenter
+        // Prefetch the post-close fallback screens now, in the background, so they're ready the
+        // instant the minigame closes — fetching after close left a gap that flashed the screen behind.
+        // GET /load/fallbacks is side-effect-free (no impression tracking), so this reports nothing early.
+        startFallbackPrefetch(impressionId: response.impressionId)
         Telemetry.shared.recordLifecycle(
             stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
@@ -464,7 +475,8 @@ public final class SimulaRewardedAd {
         RewardVerificationManager.shared.queueVerification(
             serveId: response.impressionId,
             sessionId: sessionId,
-            elapsedPlayTime: elapsedPlayTime
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId
         ) { [weak self] result in
             let verifyMs = Int((DispatchTime.now().uptimeNanoseconds &- verifyStartNanos) / 1_000_000)
             switch result {
@@ -537,27 +549,65 @@ public final class SimulaRewardedAd {
     /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
     /// full-screen in reveal order, mirroring the minigame menu's post-game ad flow.
     /// Best-effort: a missing id, network error, or empty response simply shows nothing.
+    /// Starts a background prefetch of the serve's fallback ad screens
+    /// (`GET /load/fallbacks/{impressionId}`) while the minigame is on screen, so they're ready the
+    /// instant the user closes. Best-effort: a missing id / network error / empty response resolves
+    /// to an empty list (nothing shown). The fetch is side-effect-free server-side.
+    private func startFallbackPrefetch(impressionId: String) {
+        #if os(iOS)
+        fallbackPrefetch?.cancel()
+        prefetchedFallbacks = nil
+        guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
+        let api = self.api
+        fallbackPrefetch = Task { [weak self] in
+            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
+            self?.prefetchedFallbacks = ads   // @MainActor self → main-thread write
+            return ads
+        }
+        #endif
+    }
+
+    /// Presents the prefetched fallback ad screens on close. Synchronous when the prefetch has
+    /// landed (the common case), so the fallback window is up before the minigame window is torn
+    /// down (see the presenter's `dismiss`) — no handoff flash; awaits only if the user closed
+    /// before the prefetch finished. Empty → nothing shown.
     private func presentFallbackAds(
-        impressionId: String,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
-        guard !impressionId.isEmpty else { return }
-        let api = self.api
-        Task { [weak self] in
-            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
-            guard let self, !ads.isEmpty else { return }
-            let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(
-                ads: ads,
-                autoStoreRedirect: autoStoreRedirect,
-                onAutoStoreRedirect: onAutoStoreRedirect
-            ) { [weak self] in
-                self?.fallbackPresenter = nil
+        let ready = prefetchedFallbacks
+        let prefetch = fallbackPrefetch
+        prefetchedFallbacks = nil
+        fallbackPrefetch = nil
+        if let ready {
+            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+        } else if let prefetch {
+            Task { [weak self] in
+                let ads = await prefetch.value
+                self?.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
             }
-            if didPresent { self.fallbackPresenter = presenter }
         }
+        #endif
+    }
+
+    /// Presents the fallback ad window for `ads` (no-op if empty). Best-effort.
+    private func presentFallbackWindow(
+        _ ads: [FallbackAd],
+        autoStoreRedirect: AutoStoreRedirect?,
+        onAutoStoreRedirect: @escaping @MainActor () -> Void
+    ) {
+        #if os(iOS)
+        guard !ads.isEmpty else { return }
+        let presenter = FallbackAdPresenter()
+        let didPresent = presenter.present(
+            ads: ads,
+            autoStoreRedirect: autoStoreRedirect,
+            onAutoStoreRedirect: onAutoStoreRedirect
+        ) { [weak self] in
+            self?.fallbackPresenter = nil
+        }
+        if didPresent { self.fallbackPresenter = presenter }
         #endif
     }
 }

@@ -238,7 +238,7 @@ private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
     func gate(_ serveId: String) { lock.lock(); gated.insert(serveId); lock.unlock() }
     func callCount(_ serveId: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[serveId] ?? 0 }
 
-    func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double) async throws -> VerifyRewardResponse {
+    func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String) async throws -> VerifyRewardResponse {
         lock.lock()
         counts[serveId, default: 0] += 1
         let isGated = gated.contains(serveId)
