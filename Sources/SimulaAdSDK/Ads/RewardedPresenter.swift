@@ -158,11 +158,7 @@ private struct RewardedGameView: View {
             if let previewHTML {
                 WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(
-                    url: url,
-                    bridge: bridge,
-                    onCreativeMarker: { marker in handleEndScreenMarker(marker) }
-                )
+                WebViewRepresentable(url: url, bridge: bridge)
             }
 
             // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
@@ -224,17 +220,11 @@ private struct RewardedGameView: View {
     }
 
     /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
+    /// (END_SCREEN_1/2_OPEN are handled in the post-close fallback flow, by index — see
+    /// `SimulaRewardedAd.presentFallbackAds` / `FallbackAdPresenter`.)
     private func fireAutoStoreRedirectIfCloseShown() {
         guard rewardEarned, let redirect = autoStoreRedirect, redirect.enabled,
               redirect.trigger == .playableEnd else { return }
-        fireAutoStoreRedirect()
-    }
-
-    /// END_SCREEN_1/2_OPEN — fire when the creative navigates to the matching end-screen marker.
-    private func handleEndScreenMarker(_ urlString: String) {
-        guard let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: urlString),
-              let redirect = autoStoreRedirect, redirect.enabled,
-              redirect.trigger == trigger else { return }
         fireAutoStoreRedirect()
     }
 

@@ -811,23 +811,15 @@ public enum AutoStoreRedirectTrigger: String, Sendable, Equatable {
 }
 
 extension AutoStoreRedirectTrigger {
-    /// Custom-scheme markers a playable creative navigates to when an end card renders, so the SDK
-    /// can fire an end-screen `auto_store_redirect` by intercepting the navigation — no JS bridge.
-    /// The SDK consumes the navigation and never actually loads the URL. Contract shared with the
-    /// creative:
-    ///
-    /// ```js
-    /// window.location.href = "simula://end-screen-1"; // when END SCREEN 1 renders
-    /// window.location.href = "simula://end-screen-2"; // when END SCREEN 2 renders
-    /// ```
-    ///
-    /// Returns the end-screen trigger `urlString` signals, or nil when it isn't a marker. (PLAYABLE_END
-    /// is SDK-native — fired when the close button appears — and has no marker.)
-    static func endScreenTrigger(forMarkerURL urlString: String) -> AutoStoreRedirectTrigger? {
-        let normalized = urlString.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        switch normalized {
-        case "simula://end-screen-1": return .endScreen1Open
-        case "simula://end-screen-2": return .endScreen2Open
+    /// Maps the index of a post-close fallback ad (`GET /load/fallbacks`, presented one per close in
+    /// reveal order) to the end-screen trigger it represents: index 0 is END SCREEN 1, index 1 is END
+    /// SCREEN 2. Returns nil for any further index. The SDK fires the redirect when the matching
+    /// fallback screen is presented — there is no signal from the webview. (PLAYABLE_END is SDK-native
+    /// — fired when the close button appears — and has no fallback index.)
+    static func endScreenTrigger(forFallbackIndex index: Int) -> AutoStoreRedirectTrigger? {
+        switch index {
+        case 0: return .endScreen1Open
+        case 1: return .endScreen2Open
         default: return nil
         }
     }
@@ -835,8 +827,9 @@ extension AutoStoreRedirectTrigger {
 
 /// Auto store redirect (`auto_store_redirect` node): when `enabled`, the SDK opens the advertiser
 /// store once per impression at the `trigger` moment — no user tap. PLAYABLE_END fires when the close
-/// button appears; END_SCREEN_1/2_OPEN fire when the creative navigates to the matching end-screen
-/// marker (see `AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL:)`). Disabled by default.
+/// button appears; END_SCREEN_1/2_OPEN fire when the matching post-close fallback ad screen is
+/// presented (see `AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex:)`). The store opened is
+/// always the primary ad's (fallback ads carry no store link). Disabled by default.
 public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let trigger: AutoStoreRedirectTrigger

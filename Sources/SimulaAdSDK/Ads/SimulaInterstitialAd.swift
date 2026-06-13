@@ -376,7 +376,19 @@ public final class SimulaInterstitialAd {
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
-                self.presentFallbackAds(impressionId: response.impressionId)
+                // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
+                self.presentFallbackAds(
+                    impressionId: response.impressionId,
+                    autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+                    onAutoStoreRedirect: {
+                        CreativeCTARouter.open(
+                            trackingUrl: response.trackingUrl,
+                            destination: response.destinationKind,
+                            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                            attribution: response.adBehavior?.attribution
+                        )
+                    }
+                )
                 // Preload the next ad after close, reusing the last character context.
                 self.load(
                     charId: self.lastCharId,
@@ -576,7 +588,11 @@ public final class SimulaInterstitialAd {
     /// (`GET /load/fallbacks/{impressionId}`) and — when any are returned — present them
     /// full-screen in reveal order, mirroring the minigame's post-game ad flow. Best-effort:
     /// a missing id, network error, or empty response simply shows nothing.
-    private func presentFallbackAds(impressionId: String) {
+    private func presentFallbackAds(
+        impressionId: String,
+        autoStoreRedirect: AutoStoreRedirect?,
+        onAutoStoreRedirect: @escaping @MainActor () -> Void
+    ) {
         #if os(iOS)
         guard !impressionId.isEmpty else { return }
         let api = self.api
@@ -584,7 +600,11 @@ public final class SimulaInterstitialAd {
             let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
             guard let self, !ads.isEmpty else { return }
             let presenter = FallbackAdPresenter()
-            let didPresent = presenter.present(ads: ads) { [weak self] in
+            let didPresent = presenter.present(
+                ads: ads,
+                autoStoreRedirect: autoStoreRedirect,
+                onAutoStoreRedirect: onAutoStoreRedirect
+            ) { [weak self] in
                 self?.fallbackPresenter = nil
             }
             if didPresent { self.fallbackPresenter = presenter }

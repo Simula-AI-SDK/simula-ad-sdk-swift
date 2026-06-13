@@ -261,18 +261,12 @@ private struct CreativeInterstitialView: View {
     }
 
     /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
+    /// (END_SCREEN_1/2_OPEN are handled in the post-close fallback flow, by index — see
+    /// `SimulaInterstitialAd.presentFallbackAds` / `FallbackAdPresenter`.)
     private func fireAutoStoreRedirectIfCloseShown() {
         guard closeEnabled,
               let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
               redirect.trigger == .playableEnd else { return }
-        fireAutoStoreRedirect()
-    }
-
-    /// END_SCREEN_1/2_OPEN — fire when the creative navigates to the matching end-screen marker.
-    private func handleEndScreenMarker(_ urlString: String) {
-        guard let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forMarkerURL: urlString),
-              let redirect = response.adBehavior?.autoStoreRedirect, redirect.enabled,
-              redirect.trigger == trigger else { return }
         fireAutoStoreRedirect()
     }
 
@@ -284,8 +278,7 @@ private struct CreativeInterstitialView: View {
             htmlString: html,
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
-            attribution: response.adBehavior?.attribution,
-            onCreativeMarker: { marker in handleEndScreenMarker(marker) }
+            attribution: response.adBehavior?.attribution
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
