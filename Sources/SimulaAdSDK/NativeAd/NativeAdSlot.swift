@@ -15,12 +15,14 @@ import UIKit
 /// this slot is hosted within (PRD). Must be used inside a `SimulaProviderView`.
 public struct NativeAdSlot: View {
     @EnvironmentObject private var provider: SimulaProvider
+    @Environment(\.colorScheme) private var colorScheme
 
     private let adUnitId: String?
     private let position: Int
     private let preloadedAdId: String?
     private let previewHTML: String?
     private let dimension: ParsedDimension
+    private let theme: String?
     private let onImpression: (NativeAdData) -> Void
     private let onError: (SimulaAdError) -> Void
 
@@ -47,6 +49,8 @@ public struct NativeAdSlot: View {
     ///     fraction `0 < n < 1` (e.g. `0.8`) is a percentage. Anything invalid (negative, zero,
     ///     out-of-range %, bool, array, garbage) falls back to fill. A fixed/percentage width below
     ///     `minWidthPt` (300pt) is raised to it. Mirrors the Android SDK's `width`.
+    ///   - theme: Creative color theme — `"dark"`, `"light"`, `"system"`, or `nil`. `"system"` resolves
+    ///     to dark/light from the view's `colorScheme`; `nil` is omitted (backend defaults to light).
     ///   - preloadedAdId: An id from `SimulaAds.preloadNativeAd`; renders that cached ad instead of a
     ///     live request. An expired/unknown id falls back to a live call with no error surfaced.
     ///   - onImpression: Fired once when the viewability threshold is met (co-fired with the server
@@ -59,6 +63,7 @@ public struct NativeAdSlot: View {
         adUnitId: String? = nil,
         position: Int = 0,
         width: Any? = nil,
+        theme: String? = nil,
         preloadedAdId: String? = nil,
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
         onError: @escaping (SimulaAdError) -> Void = { _ in },
@@ -67,6 +72,7 @@ public struct NativeAdSlot: View {
         self.adUnitId = adUnitId
         self.position = position
         self.dimension = parseDimension(width).clampMinWidth(Self.minWidthPt)
+        self.theme = theme
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
@@ -207,7 +213,12 @@ public struct NativeAdSlot: View {
         // 3. Live request.
         phase = .loading
         do {
-            apply(try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position))
+            apply(try await NativeAdController.load(
+                provider: provider,
+                adUnitId: adUnitId,
+                position: position,
+                theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark)
+            ))
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {

@@ -13,7 +13,8 @@ enum NativeAdController {
     static func load(
         provider: SimulaProvider,
         adUnitId: String?,
-        position: Int
+        position: Int,
+        theme: String? = nil
     ) async throws -> NativeAdResponse {
         let sessionId = await provider.ensureSession()
         guard let sessionId, !sessionId.isEmpty else { throw SimulaAdError.noSession }
@@ -23,7 +24,8 @@ enum NativeAdController {
                 position: position,
                 sessionId: sessionId,
                 adUnitId: adUnitId,
-                context: provider.adContext
+                context: provider.adContext,
+                theme: theme
             )
         } catch let SimulaAPIError.httpError(code) where code == 401 {
             // Bad/unknown session — non-retryable (PRD).

@@ -81,8 +81,8 @@ struct CharacterCard: View {
 
     // Image wrap — a 1:1 square. `Color.clear` (no intrinsic size) is the size driver, so the
     // square is always width×width; the image lives in an `.overlay` and `scaledToFill`s into it.
-    // (Putting the image directly in the sized layer let its intrinsic ratio — portrait vs square
-    // across the placeholders — leak into the layout and make some cards taller.)
+    // (Putting the image directly in the sized layer let its intrinsic ratio leak into the
+    // layout and make some cards taller.)
     private var imageWrap: some View {
         Color.clear
             .frame(maxWidth: .infinity)
@@ -95,19 +95,12 @@ struct CharacterCard: View {
                         endPoint: .bottom
                     )
 
-                    if let name = entry.bundledImageName,
-                       let img = BundledImageCache.image(named: name) {
-                        Image(platformImage: img)
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        CachedAsyncImage(url: URL(string: entry.data.imageUrl)) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            default:
-                                Color.clear
-                            }
+                    CachedAsyncImage(url: URL(string: entry.data.imageUrl)) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        default:
+                            Color.clear
                         }
                     }
                 }

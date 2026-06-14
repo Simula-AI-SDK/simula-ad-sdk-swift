@@ -22,6 +22,21 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertNil(obj["char_image"])
     }
 
+    func testThemeEncodesTopLevelWhenSet() throws {
+        let body = try JSONEncoder().encode(
+            NativeAdRequest(position: 0, sessionId: "s", theme: "dark")
+        )
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        // theme is a top-level sibling of position / session_id, not nested.
+        XCTAssertEqual(obj["theme"] as? String, "dark")
+    }
+
+    func testThemeOmittedWhenNil() throws {
+        let body = try JSONEncoder().encode(NativeAdRequest(position: 0, sessionId: "s"))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertNil(obj["theme"]) // omitted entirely → backend defaults to light
+    }
+
     func testContextEncodesCamelCaseWireKeys() throws {
         let ctx = SimulaAdContext(
             searchTerm: "fantasy rpg",

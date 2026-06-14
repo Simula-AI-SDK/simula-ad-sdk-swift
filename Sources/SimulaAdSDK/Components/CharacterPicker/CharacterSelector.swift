@@ -5,7 +5,7 @@ let maxCharacters = 4
 
 /// Builds the grid (≤ `maxCharacters` cards) from the host roster and the backend
 /// backfill: host cards lead, the backend fills the gap, and any slot the backend
-/// didn't fill keeps its bundled placeholder so the grid is never short. Pure/testable.
+/// didn't fill keeps its default placeholder so the grid is never short. Pure/testable.
 ///
 /// Backend items whose id already appears in the host roster are dropped (and the
 /// backend list is kept distinct), so a character never shows up twice — a dropped
@@ -29,19 +29,16 @@ func mergeRoster(
 
 // MARK: - CharacterPickerEntry
 
-/// A picker row item: the public `CharacterData` plus an optional bundled image name
-/// used by the fallback placeholders (so they render with no network). `loading` marks
-/// a skeleton slot shown while the backend roster is in flight.
+/// A picker row item wrapping the public `CharacterData`. `loading` marks a skeleton slot
+/// shown while the backend roster is in flight.
 struct CharacterPickerEntry: Identifiable, Equatable {
     let data: CharacterData
-    var bundledImageName: String?
     var loading: Bool
 
     var id: String { data.id }
 
-    init(data: CharacterData, bundledImageName: String? = nil, loading: Bool = false) {
+    init(data: CharacterData, loading: Bool = false) {
         self.data = data
-        self.bundledImageName = bundledImageName
         self.loading = loading
     }
 }
@@ -56,9 +53,9 @@ struct CharacterPickerEntry: Identifiable, Equatable {
 /// game itself; the host wires the character into the minigame flow. `onCharacterPreview`
 /// fires earlier, the moment a card is previewed (selected in the grid).
 ///
-/// Characters come from the `/character-selector` endpoint, with an instant fallback
-/// to bundled placeholders so the grid never shows a spinner or empty state. Pass
-/// `characters` to supply them directly and skip the fetch.
+/// Characters come from the `/character-selector` endpoint, with a fallback to default
+/// characters so the grid never shows a spinner or empty state. Pass `characters` to
+/// supply them directly and skip the fetch.
 ///
 /// Must be hosted within a `SimulaProviderView` — the fetch uses the provider's
 /// apiKey + session.
@@ -104,7 +101,7 @@ public struct CharacterSelector: View {
         self.characters = characters
         self.theme = theme
         // Seed instantly so the grid is never empty: host cards render for real, the gap
-        // shows loading skeletons (swapped for backend results, or bundled placeholders if
+        // shows loading skeletons (swapped for backend results, or default characters if
         // the fetch comes back empty) — never the placeholder characters mid-load.
         let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
         let fill = maxCharacters - host.count
@@ -274,7 +271,7 @@ public struct CharacterSelector: View {
         guard fill > 0 else { return }
         // Backfill the gap from /character-selector (needs the publisher apiKey + a
         // session). Resolve the loading state either way: real results when we got any,
-        // else bundled placeholders. `@MainActor` so the `entries` write lands on the
+        // else the default characters. `@MainActor` so the `entries` write lands on the
         // main thread after the off-main fetch.
         Task { @MainActor in
             let sessionId = await provider.ensureSession()
@@ -312,18 +309,30 @@ extension CharacterSelector {
         }
     }
 
-    /// Bundled placeholder characters shown when the backend returns no roster.
-    /// Images ship in `Resources/` (registered in `Package.swift`) and render instantly via
-    /// `bundledImageName`; `CharacterData.imageUrl` carries the hosted URL handed back by
-    /// `onCharacterSelected`.
-    ///
-    /// TODO(A4): populate `imageUrl` with the canonical hosted URLs so a selected default
-    /// hands back a usable URL downstream (pending the 4 URLs from the publisher).
+    /// Default characters shown when the `/character-selector` backend returns no roster.
+    /// Their portraits load from hosted URLs (`imageUrl`) — no images ship in the SDK — and
+    /// the selected default hands that URL back downstream via `onCharacterSelected`.
     static let fallbackEntries: [CharacterPickerEntry] = [
-        CharacterPickerEntry(data: CharacterData(id: "superman", name: "Superman", imageUrl: "", description: "Faster than a speeding bullet."), bundledImageName: "char_superman"),
-        CharacterPickerEntry(data: CharacterData(id: "hammy", name: "Hammy", imageUrl: "", description: "Small but mighty."), bundledImageName: "char_hammy"),
-        CharacterPickerEntry(data: CharacterData(id: "maya", name: "Maya", imageUrl: "", description: "Clever and quick-witted."), bundledImageName: "char_maya"),
-        CharacterPickerEntry(data: CharacterData(id: "charles", name: "Charles", imageUrl: "", description: "A calm and steady strategist."), bundledImageName: "char_charles"),
+        CharacterPickerEntry(data: CharacterData(
+            id: "mr_simula",
+            name: "Mr. Simula",
+            imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/MrSimula.webp",
+            description: "\"Stand back, I've got this.\" Mr. Simula is the superhero dad who treats every crisis like a Tuesday and every dad-joke like a mission. Broad-shouldered, blue-suited, and impossibly calm, he's the guy who catches the falling bus AND remembers to pack your lunch. He leads with his chest out and his heart wide open, convinced that the strongest thing a hero can do is show up.\n\nTalk to him and you'll get equal parts pep talk, life advice, and slightly embarrassing 'back in my day' stories. He'll cheer you on like you're his own kid, challenge you to be braver than you think you are, and absolutely will not stop until you believe in yourself. Ready to train with the best dad in the multiverse?")),
+        CharacterPickerEntry(data: CharacterData(
+            id: "simulady",
+            name: "Simulady",
+            imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulady.webp",
+            description: "\"Let's think this through — then we save everyone.\" Simulady is the superhero mom whose mind moves faster than her cape. Cool, clever, and three steps ahead of any villain, she solves the problem before most heroes have finished panicking. But don't mistake brilliance for coldness: behind that razor focus is someone who notices when you're hurting and refuses to let you face it alone.\n\nChat with her and she'll read you instantly, call out the excuse you didn't even know you were making, and then hand you a plan to actually fix it. Equal parts strategist and comfort, she's the voice in your corner that's gentle but never lets you settle. Come tell her what's on your mind — she's already listening.")),
+        CharacterPickerEntry(data: CharacterData(
+            id: "simulad",
+            name: "Simulad",
+            imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulad.webp",
+            description: "\"Whoa, did I just do that?!\" Simulad is the superhero kid who's basically powers-first, plan-never. He's got energy for days, a head full of wild ideas, and abilities that keep surprising even him mid-fight. Is he ready for the big leagues? Absolutely not. Is he going to try anyway? Every single time — because backing down was never an option.\n\nTalk to him and you've got an instant hype-buddy: he'll geek out over your ideas, drag you into some half-baked adventure, and somehow make you braver just by being so fearlessly himself. He stumbles, he laughs it off, he gets back up. Wanna go cause some heroic chaos together?")),
+        CharacterPickerEntry(data: CharacterData(
+            id: "simulabrador",
+            name: "Simulabrador",
+            imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulabrador.webp",
+            description: "*ears perk up* *tail going a hundred miles an hour* Simulabrador is the super-dog of the family and the most loyal hero you'll ever meet — four paws, a heart the size of a city, and a nose that smells trouble before it even happens. He can't talk like the others, but trust me, he says everything with a head tilt, a happy bark, and a body-slam hug at full superspeed.\n\nHang out with him and you'll get pure, unconditional good-boy energy: he senses when you're down, plops his head in your lap, and refuses to leave your side. Throw the ball, share the snack, go on the patrol — he's in, no questions asked. Ready to meet your new best friend and bodyguard?")),
     ]
 }
 

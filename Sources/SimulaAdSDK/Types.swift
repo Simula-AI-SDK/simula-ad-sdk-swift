@@ -1081,6 +1081,7 @@ public struct NativeAdRequest: Encodable, Sendable {
     public let sessionId: String
     public let adUnitId: String?
     public let context: SimulaAdContext?
+    public let theme: String?
     /// Sent as a string (the backend accepts number | string); reserved — sizing is client-side.
     public let width: String?
     public let charId: String?
@@ -1092,6 +1093,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         case sessionId = "session_id"
         case adUnitId = "ad_unit_id"
         case context
+        case theme
         case width
         case charId = "char_id"
         case charName = "char_name"
@@ -1103,6 +1105,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         sessionId: String,
         adUnitId: String? = nil,
         context: SimulaAdContext? = nil,
+        theme: String? = nil,
         width: String? = nil,
         charId: String? = nil,
         charName: String? = nil,
@@ -1112,6 +1115,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         self.sessionId = sessionId
         self.adUnitId = adUnitId
         self.context = context
+        self.theme = theme
         self.width = width
         self.charId = charId
         self.charName = charName
