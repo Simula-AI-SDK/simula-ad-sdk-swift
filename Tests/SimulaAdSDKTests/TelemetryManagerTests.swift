@@ -179,7 +179,9 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: store, sender: sender)
 
         mgr.recordError(signature: "api:net", errorCode: "net", message: "timeout")
-        await waitUntil { store.load().isEmpty }
+        // Error persistence is async (off the caller's thread), so wait on the observable
+        // outcome — all sends done + the buffer reconciled empty — not the initial write.
+        await waitUntil { sender.batches.count == 3 && store.load().isEmpty }
 
         XCTAssertEqual(sender.batches.count, 3, "1 initial attempt + 2 retries")
         XCTAssertTrue(sender.batches.allSatisfy { env in env.events.contains { $0.name == "api:net" } })
@@ -191,7 +193,8 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: store, sender: sender)
 
         mgr.recordError(signature: "api:bad", errorCode: "bad", message: "x")
-        await waitUntil { store.load().isEmpty }
+        // Async error persistence → wait on the send + reconcile, not the initial write.
+        await waitUntil { sender.batches.count == 1 && store.load().isEmpty }
         // Settle a beat to ensure no spurious retry was scheduled.
         try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(sender.batches.count, 1, "no retry on a permanent error")

@@ -42,6 +42,12 @@ final class TelemetryManager: @unchecked Sendable {
     private let maxMessageLen = 300
     private let flushInterval: TimeInterval
 
+    // Serial queue so the UserDefaults encode + write never runs on the caller's thread
+    // (often the main thread during ad-failure callbacks). Writes stay ordered: errors
+    // persist via `persistAsync` (prompt, non-blocking) while the background / flush
+    // paths persist via `persistSync` (must complete before returning).
+    private let persistQueue = DispatchQueue(label: "ad.simula.telemetry.persist", qos: .utility)
+
     private let lock = NSLock()
     private var buffer: [TelemetryEvent] = []
     private var errorAgg: [String: TelemetryEvent] = [:]
@@ -191,8 +197,13 @@ final class TelemetryManager: @unchecked Sendable {
             droppedCount += 1
         }
         let logEvent = errorAgg[signature]
-        store.save(snapshotLocked()) // errors are durable immediately
+        let snapshot = snapshotLocked()
         lock.unlock()
+        // Persist off the caller's thread (often the main thread during ad-failure
+        // callbacks). The serial queue keeps the write ordered and prompt, so the error
+        // still lands quickly before a possible crash without blocking the caller on a
+        // JSON encode + UserDefaults write.
+        persistAsync(snapshot)
         if let logEvent { debugLog?(formatForLog(logEvent)) }
         Task { [weak self] in await self?.flush() } // eager — an error may precede a crash/kill
     }
@@ -204,7 +215,10 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     private func persistNow() {
-        lock.lock(); store.save(snapshotLocked()); lock.unlock()
+        // App-background path: snapshot under lock, then block until the write lands
+        // (ordered after any pending async writes) so nothing is lost on suspension.
+        lock.lock(); let snapshot = snapshotLocked(); lock.unlock()
+        persistSync(snapshot)
     }
 
     // MARK: - Internals
@@ -257,6 +271,17 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
     private func snapshotLocked() -> [TelemetryEvent] { buffer + Array(errorAgg.values) }
+
+    /// Persist off the caller's thread (non-blocking), ordered via the serial queue.
+    private func persistAsync(_ events: [TelemetryEvent]) {
+        persistQueue.async { [store] in store.save(events) }
+    }
+
+    /// Persist and block until written, ordered after any pending async writes — used
+    /// where durability must complete before returning (app background, flush reconcile).
+    private func persistSync(_ events: [TelemetryEvent]) {
+        persistQueue.sync { [store] in store.save(events) }
+    }
 
     /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
     /// reconcile (sync, under lock). All `NSLock` use stays in the synchronous helpers.
@@ -311,13 +336,13 @@ final class TelemetryManager: @unchecked Sendable {
             }
             droppedCount = max(0, droppedCount - batch.droppedSnap)
             retryCount = 0
-            store.save(snapshotLocked())
+            persistSync(snapshotLocked())
             isFlushing = false
             // Re-drain leftovers that arrived mid-send: perf once it re-hits the threshold,
             // errors promptly (low-volume, valuable).
             return (buffer.count >= flushThreshold || !errorAgg.isEmpty, false)
         case .retry:
-            store.save(snapshotLocked())
+            persistSync(snapshotLocked())
             retryCount += 1
             isFlushing = false
             return (false, true)

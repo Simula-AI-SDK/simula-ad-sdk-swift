@@ -23,7 +23,7 @@ enum TelemetryType {
 /// for sanitization + consent rules. `count` aggregates repeated errors of the same
 /// signature. `eventId` is a per-event idempotency key (also used internally to remove
 /// flushed events without positional races).
-struct TelemetryEvent: Codable, Equatable {
+struct TelemetryEvent: Codable, Equatable, Sendable {
     let type: String
     let name: String
     let eventId: String
