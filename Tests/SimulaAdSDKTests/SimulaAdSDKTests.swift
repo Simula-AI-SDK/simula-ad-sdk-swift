@@ -751,11 +751,12 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testRewardedInitHappyPath() throws {
-        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","duration_seconds":30}"#
+        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","ad_behavior":{"close":{"delay_seconds":30}}}"#
         let r = try decodeRewardedInit(json)
         XCTAssertEqual(r.impressionId, "imp_1")
         XCTAssertEqual(r.iframeUrl, "https://x/play")
-        XCTAssertEqual(r.durationSeconds, 30)
+        // The play-to-earn gate now rides on `ad_behavior.close.delay_seconds` (no top-level field).
+        XCTAssertEqual(r.adBehavior?.close.delaySeconds, 30)
     }
 
     func testRewardedInitMissingFieldsFallBackToDefaults() throws {
@@ -763,7 +764,7 @@ final class SimulaAdSDKTests: XCTestCase {
         // `serve_id`/`ad_id` keys are unknown now and must be ignored, not remapped.
         let r = try decodeRewardedInit(#"{"iframe_url":"https://x/p","serve_id":"srv_2","ad_id":"a"}"#)
         XCTAssertEqual(r.impressionId, "")   // missing → ""
-        XCTAssertEqual(r.durationSeconds, 0) // missing → 0
+        XCTAssertNil(r.adBehavior)           // absent `ad_behavior` → nil → no gate, no store prompt
     }
 
     func testRewardedInitMalformedJSONThrows() {

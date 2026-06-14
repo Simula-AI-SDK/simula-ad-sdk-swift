@@ -41,6 +41,11 @@ public final class SimulaProvider: ObservableObject {
     /// `SimulaPrivacy` store, which also auto-reads IAB-standard CMP keys.
     public let privacyConfig: SimulaPrivacyConfig
 
+    /// Native-ad targeting context attached to every `POST /load/native` under this provider.
+    /// Set at init and replaceable wholesale at runtime via `updateContext(_:)` (PRD). Read on the
+    /// main thread by `NativeAdSlot` / the preload path.
+    public private(set) var adContext: SimulaAdContext?
+
     // MARK: - Session State
 
     /// The server session ID, set after successful session creation
@@ -79,7 +84,8 @@ public final class SimulaProvider: ObservableObject {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
-        telemetryEnabled: Bool = true
+        telemetryEnabled: Bool = true,
+        adContext: SimulaAdContext? = nil
     ) {
         // Validate at init (matches React's validateSimulaProviderProps call)
         do {
@@ -93,6 +99,7 @@ public final class SimulaProvider: ObservableObject {
         self.devMode = devMode
         self.primaryUserID = primaryUserID
         self.hasPrivacyConsent = hasPrivacyConsent
+        self.adContext = adContext
 
         // When an explicit `privacy` config is given it wins; otherwise the legacy
         // `hasPrivacyConsent` flag seeds the config so existing call sites behave
@@ -203,6 +210,15 @@ public final class SimulaProvider: ObservableObject {
     /// session re-syncs automatically.
     public func updateConsent(_ config: SimulaPrivacyConfig) {
         SimulaPrivacy.shared.apply(config)
+    }
+
+    // MARK: - Native Ad Context
+
+    /// Replace the native-ad targeting context at runtime (e.g. when the feed category changes).
+    /// A full replacement, not a merge (PRD); all subsequent `POST /load/native` calls use the new
+    /// value. Ads already preloaded under the old context are unaffected.
+    public func updateContext(_ context: SimulaAdContext?) {
+        adContext = context
     }
 
     /// Merge a partial consent update at runtime. Only the supplied fields change.
@@ -320,6 +336,9 @@ public struct SimulaProviderView<Content: View>: View {
     /// The resolved config, kept so prop changes can be pushed to the store —
     /// `@StateObject` is initialized only once and ignores later init args.
     private let resolvedConfig: SimulaPrivacyConfig
+    /// Native-ad targeting context, kept so prop changes can be pushed to the (possibly reused)
+    /// provider — like `resolvedConfig`, the `@StateObject` ignores later init args.
+    private let adContext: SimulaAdContext?
 
     public init(
         apiKey: String,
@@ -328,8 +347,10 @@ public struct SimulaProviderView<Content: View>: View {
         hasPrivacyConsent: Bool = true,
         privacy: SimulaPrivacyConfig? = nil,
         telemetryEnabled: Bool = true,
+        adContext: SimulaAdContext? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) {
+        self.adContext = adContext
         // Resolve the privacy config: an explicit `privacy` wins; otherwise the
         // legacy `hasPrivacyConsent` flag seeds it. Kept so prop changes can be
         // pushed into the store via `.task(id: resolvedConfig)` below.
@@ -355,7 +376,8 @@ public struct SimulaProviderView<Content: View>: View {
                 primaryUserID: primaryUserID,
                 hasPrivacyConsent: hasPrivacyConsent,
                 privacy: privacy,
-                telemetryEnabled: telemetryEnabled
+                telemetryEnabled: telemetryEnabled,
+                adContext: adContext
             )
         }
         self._provider = StateObject(wrappedValue: provider)
@@ -373,6 +395,12 @@ public struct SimulaProviderView<Content: View>: View {
             // so without this a host updating them at render time would be ignored.
             .task(id: resolvedConfig) {
                 provider.updateConsent(resolvedConfig)
+            }
+            // Push native-ad context prop changes onto the (possibly reused) provider. Only when a
+            // value is supplied, so a host setting context imperatively via SimulaAds.updateContext
+            // isn't clobbered by a nil prop.
+            .task(id: adContext) {
+                if let adContext { provider.updateContext(adContext) }
             }
     }
 }

@@ -45,6 +45,15 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// `nil` for the game iframe / previews (no attribution to apply).
     var attribution: AdAttribution?
 
+    /// Native-ad mode: open any user-activated navigation that leaves the page in the **external**
+    /// system browser (Safari/Chrome) instead of the in-app store / SFSafari sheet (PRD). `false`
+    /// for the interstitial HTML creative / game iframe — their behavior is unchanged.
+    var externalClickOnly: Bool
+
+    /// Native-ad mode: after load, inject a script that reports the creative's content height over
+    /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
+    var reportsContentHeight: Bool
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
@@ -53,7 +62,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
         bridge: CreativeBridge? = nil,
-        attribution: AdAttribution? = nil
+        attribution: AdAttribution? = nil,
+        externalClickOnly: Bool = false,
+        reportsContentHeight: Bool = false
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -63,6 +74,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onAdClick = onAdClick
         self.bridge = bridge
         self.attribution = attribution
+        self.externalClickOnly = externalClickOnly
+        self.reportsContentHeight = reportsContentHeight
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -82,6 +95,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         )
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView
+        // A native ad sizes to content and is not scrollable (PRD); disabling the inner scroll keeps
+        // it from intercepting the host feed's scroll. Set per-acquire since the pool reuses views.
+        webView.scrollView.isScrollEnabled = !reportsContentHeight
         return webView
     }
 
@@ -116,7 +132,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
             bridge: bridge,
-            attribution: attribution
+            attribution: attribution,
+            externalClickOnly: externalClickOnly,
+            reportsContentHeight: reportsContentHeight
         )
     }
 
@@ -134,6 +152,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         var attribution: AdAttribution?
         /// The web view this coordinator drives — used to post `GET_*` replies back into the page.
         weak var webView: WKWebView?
+        /// Native-ad mode: route user clicks to the external browser; report content height.
+        var externalClickOnly: Bool
+        var reportsContentHeight: Bool
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -157,7 +178,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: ((String) -> Void)?,
             onAdClick: (() -> Void)? = nil,
             bridge: CreativeBridge? = nil,
-            attribution: AdAttribution? = nil
+            attribution: AdAttribution? = nil,
+            externalClickOnly: Bool = false,
+            reportsContentHeight: Bool = false
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
@@ -165,6 +188,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onAdClick = onAdClick
             self.bridge = bridge
             self.attribution = attribution
+            self.externalClickOnly = externalClickOnly
+            self.reportsContentHeight = reportsContentHeight
         }
 
         /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
@@ -186,6 +211,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Ignore the pool's prewarm load — only the real content load counts.
             if webView.url?.absoluteString == "about:blank" { return }
             onNavigationFinished?()
+            // Native ad: start reporting content height so the slot can size its container.
+            if reportsContentHeight {
+                webView.evaluateJavaScript(Coordinator.heightReportingScript, completionHandler: nil)
+            }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -225,6 +254,22 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Block javascript: URLs for security
             if scheme == "javascript" {
                 decisionHandler(.cancel)
+                return
+            }
+
+            // Native ad: a user-activated navigation that leaves the page opens in the EXTERNAL
+            // system browser (PRD) — never the in-app store/SFSafari sheet. Subresource and
+            // server-redirect navigations (.other) pass through so the creative loads normally.
+            if externalClickOnly {
+                if navigationAction.navigationType == .linkActivated,
+                   scheme == "http" || scheme == "https" || scheme == "itms-apps" || scheme == "itms" {
+                    onAdClick?()
+                    Task { @MainActor in UIApplication.shared.open(url) }
+                    decisionHandler(.cancel)
+                    return
+                }
+                // Anything else (the initial load, same-origin, subresources) loads in place.
+                decisionHandler(.allow)
                 return
             }
 
@@ -288,6 +333,14 @@ struct WebViewRepresentable: UIViewRepresentable {
         ) -> WKWebView? {
             if let url = navigationAction.request.url {
                 let scheme = url.scheme?.lowercased() ?? ""
+                // Native ad: target="_blank" / window.open → external browser (PRD).
+                if externalClickOnly {
+                    if scheme == "http" || scheme == "https" {
+                        onAdClick?()
+                        Task { @MainActor in UIApplication.shared.open(url) }
+                    }
+                    return nil
+                }
                 if scheme == "http" || scheme == "https" {
                     let currentHost = currentURL?.host?.lowercased() ?? ""
                     let targetHost = url.host?.lowercased() ?? ""
@@ -323,6 +376,53 @@ struct WebViewRepresentable: UIViewRepresentable {
                 handleMessage(str)
             }
         }
+
+        /// Injected (via `evaluateJavaScript`) after a native-ad creative loads: posts the content
+        /// height to native (over the pool's `simulaSDK` channel) on load + whenever it changes, so
+        /// the slot resizes to fit. A `<meta viewport width=device-width,initial-scale=1>` creative
+        /// maps 1 CSS px → 1 point, so the reported value is used directly as the SwiftUI height.
+        static let heightReportingScript = """
+        (function () {
+          var lastH = 0, timer = null;
+          function measure() {
+            var de = document.documentElement, b = document.body;
+            if (!b) return de ? de.scrollHeight : 0;
+            // Measure the creative's NATURAL content height, independent of the height the SDK gave the
+            // WebView. A full-height creative (html,body{height:100%}) otherwise reports back the size we
+            // set, which feeds back and grows the slot on every resize. Forcing height:auto for the
+            // measurement (restored synchronously, before any paint) reads the true content height.
+            var prevDe = de.style.height, prevB = b.style.height;
+            de.style.height = 'auto';
+            b.style.height = 'auto';
+            var h = Math.max(de.scrollHeight, b.scrollHeight);
+            de.style.height = prevDe;
+            b.style.height = prevB;
+            return h;
+          }
+          function send() {
+            try {
+              var h = measure();
+              if (h > 0 && Math.abs(h - lastH) >= 1 &&
+                  window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.simulaSDK) {
+                lastH = h;
+                window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify({ type: 'SIMULA_AD_HEIGHT', height: h }));
+              }
+            } catch (e) {}
+          }
+          // Debounced so a creative that animates / settles its layout posts a stable height instead
+          // of streaming intermediate values that would thrash the host feed's layout.
+          function post() { if (timer) clearTimeout(timer); timer = setTimeout(send, 80); }
+          send();
+          window.addEventListener('resize', post);
+          try {
+            if (window.ResizeObserver) {
+              var ro = new ResizeObserver(function () { post(); });
+              if (document.documentElement) ro.observe(document.documentElement);
+              if (document.body) ro.observe(document.body);
+            }
+          } catch (e) {}
+        })();
+        """
     }
 }
 

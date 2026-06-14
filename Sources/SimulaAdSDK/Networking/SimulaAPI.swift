@@ -242,7 +242,7 @@ struct CompanionItem: Decodable {
     let id: String
     let name: String
     let image: String
-    let description: String?
+    let description: String
 
     enum CodingKeys: String, CodingKey {
         case characterId = "character_id"
@@ -281,7 +281,7 @@ struct CompanionItem: Decodable {
     }
 
     func toCharacterData() -> CharacterData {
-        CharacterData(id: id, name: name, image: image, description: description)
+        CharacterData(id: id, name: name, imageUrl: image, description: description)
     }
 }
 
@@ -589,7 +589,7 @@ public struct AdLoadResponse: Decodable, Sendable {
 
 /// Request body for POST /minigames/init/rewarded — the rewarded `.load()` call.
 /// `minPlayThreshold` (seconds) is optional; when omitted the server decides the
-/// required play duration and returns it as `duration_seconds`.
+/// required play duration and returns it as `ad_behavior.close.delay_seconds`.
 public struct RewardedInitRequest: Encodable, Sendable {
     public let adUnitId: String
     public let sessionId: String
@@ -631,17 +631,20 @@ public struct RewardedInitRequest: Encodable, Sendable {
 }
 
 /// Payload from POST /load/rewarded. The SDK renders `iframeUrl` in a
-/// WebView and enforces `durationSeconds` before the reward can be earned. Decoding
-/// is tolerant: missing fields fall back to defaults so a partial payload can't fail
-/// the whole decode (malformed JSON still throws).
+/// WebView and enforces `adBehavior.close.delaySeconds` (the play-to-earn gate) before the
+/// reward can be earned. Decoding is tolerant: missing fields fall back to defaults so a
+/// partial payload can't fail the whole decode (malformed JSON still throws).
 public struct RewardedInitResponse: Decodable, Sendable {
     /// The impression id — replaces the old `serve_id`/`ad_id` pair as the single handle
     /// for verify-reward, fallbacks, tracking and reporting.
     public let impressionId: String
     public let iframeUrl: String
-    public let durationSeconds: Int
-    // Mirrors the interstitial response: drives the mid-ad store prompt + its tap routing.
-    // `adBehavior` is nil when the payload omits `ad_behavior` → no store prompt.
+    /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty (parity with the
+    /// interstitial), so the playable fills the surface the same way.
+    public let renderedHtml: String
+    // Mirrors the interstitial response: the play-to-earn gate (`close.delaySeconds`) plus the
+    // mid-ad store prompt + its tap routing. `adBehavior` is nil when the payload omits
+    // `ad_behavior` → no gate (instantly earned) and no store prompt.
     public let destination: String
     public let trackingUrl: String?
     public let adBehavior: AdBehavior?
@@ -654,7 +657,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case iframeUrl = "iframe_url"
-        case durationSeconds = "duration_seconds"
+        case renderedHtml = "rendered_html"
         case destination
         case trackingUrl = "tracking_url"
         case adBehavior = "ad_behavior"
@@ -664,7 +667,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.impressionId = (try? c.decode(String.self, forKey: .impressionId)) ?? ""
         self.iframeUrl = (try? c.decode(String.self, forKey: .iframeUrl)) ?? ""
-        self.durationSeconds = (try? c.decode(Int.self, forKey: .durationSeconds)) ?? 0
+        self.renderedHtml = (try? c.decode(String.self, forKey: .renderedHtml)) ?? ""
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
@@ -674,14 +677,14 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public init(
         impressionId: String,
         iframeUrl: String,
-        durationSeconds: Int,
+        renderedHtml: String = "",
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
         adBehavior: AdBehavior? = nil
     ) {
         self.impressionId = impressionId
         self.iframeUrl = iframeUrl
-        self.durationSeconds = durationSeconds
+        self.renderedHtml = renderedHtml
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.adBehavior = adBehavior
@@ -737,17 +740,21 @@ public struct VerifyRewardRequest: Encodable, Sendable {
     public let serveId: String
     public let sessionId: String
     public let elapsedPlayTime: Double
+    /// Sent alongside serve_id so the SSV reward callback can resolve/validate the ad unit off the body.
+    public let adUnitId: String
 
     enum CodingKeys: String, CodingKey {
         case serveId = "serve_id"
         case sessionId = "session_id"
         case elapsedPlayTime = "elapsed_play_time"
+        case adUnitId = "ad_unit_id"
     }
 
-    public init(serveId: String, sessionId: String, elapsedPlayTime: Double) {
+    public init(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String = "") {
         self.serveId = serveId
         self.sessionId = sessionId
         self.elapsedPlayTime = elapsedPlayTime
+        self.adUnitId = adUnitId
     }
 }
 
@@ -995,11 +1002,60 @@ public final class SimulaAPI: @unchecked Sendable {
         return try JSONDecoder().decode(AdLoadResponse.self, from: data)
     }
 
+    // MARK: - Load Native Ad
+
+    /// Loads a native sponsored-character card via `POST /load/native`.
+    ///
+    /// `ad_inserted == false` is a valid no-fill (NOT an error) — returned as-is so the slot can
+    /// collapse silently. A 401 (bad/unknown session) and any other non-2xx surface as
+    /// `SimulaAPIError.httpError`, which the slot maps to the right `SimulaAdError` per the PRD.
+    public func loadNative(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil
+    ) async throws -> NativeAdResponse {
+        guard let url = URL(string: "\(API_BASE_URL)/load/native") else {
+            throw SimulaAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(), to: &request)
+        request.httpBody = try JSONEncoder().encode(
+            NativeAdRequest(
+                position: position,
+                sessionId: sessionId,
+                adUnitId: adUnitId,
+                context: context,
+                width: width,
+                charId: charId,
+                charName: charName,
+                charDesc: charDesc
+            )
+        )
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw SimulaAPIError.httpError(
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
+            )
+        }
+
+        return try JSONDecoder().decode(NativeAdResponse.self, from: data)
+    }
+
     // MARK: - Rewarded Minigame
 
     /// Initializes a rewarded minigame via POST /minigames/init/rewarded. Returns the
     /// iframe URL, the `serve_id` that ties the play to its later verification, and the
-    /// `duration_seconds` the SDK must enforce before a reward can be earned.
+    /// `ad_behavior` whose `close.delay_seconds` the SDK enforces before a reward.
     public func loadRewarded(
         adUnitId: String,
         sessionId: String = "",
@@ -1048,7 +1104,8 @@ public final class SimulaAPI: @unchecked Sendable {
     public func verifyReward(
         serveId: String,
         sessionId: String,
-        elapsedPlayTime: Double
+        elapsedPlayTime: Double,
+        adUnitId: String = ""
     ) async throws -> VerifyRewardResponse {
         guard let url = URL(string: "\(API_BASE_URL)/minigames/verify-reward") else {
             throw SimulaAPIError.invalidURL
@@ -1058,7 +1115,7 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime)
+            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime, adUnitId: adUnitId)
         )
 
         let (data, response) = try await session.data(for: request)
@@ -1201,7 +1258,7 @@ public final class SimulaAPI: @unchecked Sendable {
     public func trackImpression(adId: String, apiKey: String, experiment: Experiment? = nil) async {
         // An empty `adId` would POST to `.../impression/` (no id) — skip it.
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/track/engagement/impression/\(adId)") else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/track/impression/\(adId)") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

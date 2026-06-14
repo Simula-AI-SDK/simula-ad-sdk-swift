@@ -46,14 +46,15 @@ struct CharacterPickerEntry: Identifiable, Equatable {
     }
 }
 
-// MARK: - CharacterPicker
+// MARK: - CharacterSelector
 
-/// Full-screen "Select Your Game Partner" character picker.
+/// Full-screen "Select Your Game Partner" character selector.
 ///
 /// Renders a 2-column grid of selectable character cards over a black backdrop and a
-/// "Launch Game" button that activates once a character is chosen. On launch it fires
-/// `onLaunch` with the selected character — the picker does not launch a game itself;
-/// the host wires the character into the minigame flow.
+/// "Launch Game" button that activates once a character is chosen. On confirm it fires
+/// `onCharacterSelected` with the selected character — the selector does not launch a
+/// game itself; the host wires the character into the minigame flow. `onCharacterPreview`
+/// fires earlier, the moment a card is previewed (selected in the grid).
 ///
 /// Characters come from the `/character-selector` endpoint, with an instant fallback
 /// to bundled placeholders so the grid never shows a spinner or empty state. Pass
@@ -66,37 +67,40 @@ struct CharacterPickerEntry: Identifiable, Equatable {
 ///
 /// Usage:
 /// ```swift
-/// CharacterPicker(
-///     isOpen: showPicker,
-///     onClose: { showPicker = false },
-///     onLaunch: { character in showPicker = false; /* launch a game with `character` */ }
+/// CharacterSelector(
+///     isOpen: showSelector,
+///     onClose: { showSelector = false },
+///     onCharacterSelected: { character in showSelector = false; /* launch a game with `character` */ }
 /// )
 /// ```
-public struct CharacterPicker: View {
+public struct CharacterSelector: View {
     // MARK: Props
 
     var isOpen: Bool
     let onClose: () -> Void
-    let onLaunch: (CharacterData) -> Void
+    let onCharacterSelected: (CharacterData) -> Void
+    let onCharacterPreview: ((CharacterData) -> Void)?
     var title: String
-    var launchText: String
+    var ctaText: String
     var characters: [CharacterData]?
     var theme: CharacterPickerTheme
 
     public init(
         isOpen: Bool,
         onClose: @escaping () -> Void,
-        onLaunch: @escaping (CharacterData) -> Void,
+        onCharacterSelected: @escaping (CharacterData) -> Void,
+        onCharacterPreview: ((CharacterData) -> Void)? = nil,
         title: String = "Select Your Game Partner",
-        launchText: String = "🚀 Launch Game",
+        ctaText: String = "🚀 Launch Game",
         characters: [CharacterData]? = nil,
         theme: CharacterPickerTheme = CharacterPickerTheme()
     ) {
         self.isOpen = isOpen
         self.onClose = onClose
-        self.onLaunch = onLaunch
+        self.onCharacterSelected = onCharacterSelected
+        self.onCharacterPreview = onCharacterPreview
         self.title = title
-        self.launchText = launchText
+        self.ctaText = ctaText
         self.characters = characters
         self.theme = theme
         // Seed instantly so the grid is never empty: host cards render for real, the gap
@@ -104,7 +108,7 @@ public struct CharacterPicker: View {
         // the fetch comes back empty) — never the placeholder characters mid-load.
         let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
         let fill = maxCharacters - host.count
-        self._entries = State(initialValue: host + CharacterPicker.loadingEntries(fill))
+        self._entries = State(initialValue: host + CharacterSelector.loadingEntries(fill))
     }
 
     // MARK: State
@@ -223,7 +227,13 @@ public struct CharacterPicker: View {
                 selected: entry.data.id == selectedId,
                 selectionMade: selectedId != nil,
                 theme: theme,
-                onTap: { if selectedId != entry.data.id { selectedId = entry.data.id } }
+                onTap: {
+                    if selectedId != entry.data.id {
+                        selectedId = entry.data.id
+                        // Preview fires the moment a card is selected, before the CTA confirm.
+                        onCharacterPreview?(entry.data)
+                    }
+                }
             )
         }
     }
@@ -231,7 +241,7 @@ public struct CharacterPicker: View {
     private var launchButton: some View {
         let selectedColor = Color(hex: theme.resolvedSelectedColor)
         return Button(action: launch) {
-            Text(launchText)
+            Text(ctaText)
                 .font(fontForFamily(theme.resolvedFontFamily, size: 14, weight: .bold))
                 .foregroundColor(active ? Color(hex: theme.resolvedLaunchTextColor) : Color.white.opacity(0.55))
                 .frame(maxWidth: .infinity)
@@ -260,7 +270,7 @@ public struct CharacterPicker: View {
         selectedId = nil
         let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
         let fill = maxCharacters - host.count
-        entries = host + CharacterPicker.loadingEntries(fill) // back to the loading state
+        entries = host + CharacterSelector.loadingEntries(fill) // back to the loading state
         guard fill > 0 else { return }
         // Backfill the gap from /character-selector (needs the publisher apiKey + a
         // session). Resolve the loading state either way: real results when we got any,
@@ -273,7 +283,7 @@ public struct CharacterPicker: View {
                 fetched = await api.fetchCharacters(apiKey: provider.apiKey, sessionId: sessionId, fill: fill)
                     .map { CharacterPickerEntry(data: $0) }
             }
-            entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterPicker.fallbackEntries)
+            entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterSelector.fallbackEntries)
         }
     }
 
@@ -281,7 +291,7 @@ public struct CharacterPicker: View {
         guard let id = selectedId,
               let chosen = entries.first(where: { $0.data.id == id })?.data else { return }
         closedInternally = true
-        onLaunch(chosen)
+        onCharacterSelected(chosen)
     }
 
     private func handleClose() {
@@ -292,23 +302,28 @@ public struct CharacterPicker: View {
 
 // MARK: - Fallback placeholders
 
-extension CharacterPicker {
+extension CharacterSelector {
     /// Skeleton slots for the gap while the backend roster is fetched. Synthetic ids
     /// keep them distinct in the grid; they are never selectable.
     static func loadingEntries(_ count: Int) -> [CharacterPickerEntry] {
         guard count > 0 else { return [] }
         return (0..<count).map {
-            CharacterPickerEntry(data: CharacterData(id: "loading-\($0)", name: "", image: ""), loading: true)
+            CharacterPickerEntry(data: CharacterData(id: "loading-\($0)", name: "", imageUrl: "", description: ""), loading: true)
         }
     }
 
     /// Bundled placeholder characters shown when the backend returns no roster.
-    /// Images ship in `Resources/` (registered in `Package.swift`).
+    /// Images ship in `Resources/` (registered in `Package.swift`) and render instantly via
+    /// `bundledImageName`; `CharacterData.imageUrl` carries the hosted URL handed back by
+    /// `onCharacterSelected`.
+    ///
+    /// TODO(A4): populate `imageUrl` with the canonical hosted URLs so a selected default
+    /// hands back a usable URL downstream (pending the 4 URLs from the publisher).
     static let fallbackEntries: [CharacterPickerEntry] = [
-        CharacterPickerEntry(data: CharacterData(id: "superman", name: "Superman", image: ""), bundledImageName: "char_superman"),
-        CharacterPickerEntry(data: CharacterData(id: "hammy", name: "Hammy", image: ""), bundledImageName: "char_hammy"),
-        CharacterPickerEntry(data: CharacterData(id: "maya", name: "Maya", image: ""), bundledImageName: "char_maya"),
-        CharacterPickerEntry(data: CharacterData(id: "charles", name: "Charles", image: ""), bundledImageName: "char_charles"),
+        CharacterPickerEntry(data: CharacterData(id: "superman", name: "Superman", imageUrl: "", description: "Faster than a speeding bullet."), bundledImageName: "char_superman"),
+        CharacterPickerEntry(data: CharacterData(id: "hammy", name: "Hammy", imageUrl: "", description: "Small but mighty."), bundledImageName: "char_hammy"),
+        CharacterPickerEntry(data: CharacterData(id: "maya", name: "Maya", imageUrl: "", description: "Clever and quick-witted."), bundledImageName: "char_maya"),
+        CharacterPickerEntry(data: CharacterData(id: "charles", name: "Charles", imageUrl: "", description: "A calm and steady strategist."), bundledImageName: "char_charles"),
     ]
 }
 

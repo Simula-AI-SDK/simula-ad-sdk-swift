@@ -29,7 +29,8 @@ final class RewardedPresenter {
         impressionId: String,
         apiKey: String,
         iframeUrl: String,
-        durationSeconds: Int,
+        renderedHtml: String = "",
+        close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
@@ -53,7 +54,8 @@ final class RewardedPresenter {
             impressionId: impressionId,
             apiKey: apiKey,
             iframeUrl: iframeUrl,
-            durationSeconds: durationSeconds,
+            renderedHtml: renderedHtml,
+            close: close,
             storePrompt: storePrompt,
             trackingUrl: trackingUrl,
             destination: destination,
@@ -68,13 +70,15 @@ final class RewardedPresenter {
         )
 
         let hosting = OrientationLockingHostingController(rootView: root)
-        hosting.view.backgroundColor = .clear
+        // Opaque black (not clear) so the host app never shows through during the
+        // present/dismiss opacity fade — matches Android's blank-screen transition.
+        hosting.view.backgroundColor = .black
 
         originalKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
         window.windowLevel = .normal + 1
-        window.backgroundColor = .clear
+        window.backgroundColor = .black
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
@@ -84,16 +88,26 @@ final class RewardedPresenter {
         return true
     }
 
-    /// Tears down the presentation window and fires the close callback once.
+    /// Fires the close callback, then tears down the presentation window — in that order, so the
+    /// callback can bring up the post-close fallback ad window (from a background prefetch, ready
+    /// synchronously) on top of this still-visible window before it's hidden. Tearing down first
+    /// flashed the app behind during the handoff.
     private func dismiss(earned: Bool, elapsedPlayTime: Double) {
-        window?.isHidden = true
-        window?.rootViewController = nil
+        // Capture the window refs and clear `self`'s references BEFORE invoking the callback: the
+        // callback nils the owner's reference to this presenter, so `self` may be deallocated by
+        // the time it returns. Operate on the locals afterwards instead of touching `self`.
+        let win = window
+        let hostKeyWindow = originalKeyWindow
         window = nil
-        originalKeyWindow?.makeKey()
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
         callback?(earned, elapsedPlayTime)
+        win?.isHidden = true
+        win?.rootViewController = nil
+        // Restore the host's key window so it regains focus. A fallback window presented in the
+        // callback stays visible on top and still receives touches via hit-testing.
+        hostKeyWindow?.makeKey()
     }
 
     /// Finds a foreground window scene to attach the overlay window to.
@@ -110,7 +124,7 @@ final class RewardedPresenter {
 
 /// Full-screen playable minigame: the creative iframe in a pooled `WKWebView`, a
 /// bottom-left close button (always available) and a bottom-right status pill
-/// counting down the remaining play time. The reward is earned once `durationSeconds` of play
+/// counting down the remaining play time. The reward is earned once `gateSeconds` of play
 /// elapse; closing earlier prompts an exit confirmation so the user doesn't lose the
 /// reward by accident. On a qualifying close, `onFinish(earned, elapsedPlayTime)`
 /// fires after the dismiss fade.
@@ -119,7 +133,12 @@ private struct RewardedGameView: View {
     let impressionId: String
     let apiKey: String
     let iframeUrl: String
-    let durationSeconds: Int
+    /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty.
+    let renderedHtml: String
+    /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
+    /// label) — rendered by the shared `CloseButtonView`, gated on play-to-earn. `nil` → default.
+    /// Its `delaySeconds` is also the play-to-earn gate length (see `gateSeconds`).
+    let close: CloseBehavior?
     // Mid-ad store prompt config + tap routing. `storePrompt == nil` → no badge.
     let storePrompt: StorePrompt?
     let trackingUrl: String?
@@ -146,8 +165,17 @@ private struct RewardedGameView: View {
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
+    /// Play-to-earn gate length, in seconds — sourced from `ad_behavior.close.delay_seconds` (the
+    /// same value that ungates the close button). `nil` close → 0 → instantly earned.
+    private var gateSeconds: Int { close?.delaySeconds ?? 0 }
+
     private var secondsLeft: Int {
-        max(0, durationSeconds - Int(elapsedPlayTime))
+        max(0, gateSeconds - Int(elapsedPlayTime))
+    }
+
+    /// 0→1 fill for the close treatment (progress bar / countdown ring), from play-to-earn progress.
+    private var closeProgress: Double {
+        gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
     }
 
     var body: some View {
@@ -157,28 +185,46 @@ private struct RewardedGameView: View {
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
                 WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
+            } else if !renderedHtml.isEmpty {
+                // Prefer the server-rendered HTML (parity with the interstitial, which fills the
+                // surface); fall back to the iframe URL.
+                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
                 WebViewRepresentable(url: url, bridge: bridge)
             }
 
-            // Top-right reward/close pill: a "Play to earn" countdown while the reward is being
-            // earned (display-only — there is no early exit), which becomes the close button
-            // ("✕ Reward unlocked") the moment the reward is earned. The whole pill then dismisses.
-            rewardClosePill
-                .padding(8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .animation(.default, value: rewardEarned)
+            // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
+            // progress bar / reward-or-close label) exactly like the interstitial, but gated on the
+            // play-to-earn progress: the ✕ unlocks only once the reward is earned.
+            CloseButtonView(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position,
+                progressBarColor: (close ?? CloseBehavior()).progressBarColor,
+                isRewardCopy: true,
+                enabled: rewardEarned,
+                remaining: secondsLeft,
+                progress: closeProgress,
+                onClose: { finish(earned: true) }
+            )
+            .animation(.default, value: rewardEarned)
 
-            // Mid-ad store prompt — appears at half the play-to-earn duration and is removed the
-            // instant the reward unlocks (the reward/close pill takes over). Rendered at the
-            // server-resolved corner (verbatim); a tap routes to the advertised store.
+            // Mid-ad store prompt — appears at half the play-to-earn gate and is removed the instant
+            // the reward unlocks (the reward/close pill takes over). Pinned to the corner opposite the
+            // reward/close pill (the SDK mirrors the close position); a tap routes to the advertised store.
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
-                // Match the reward/close pill's 8pt inset so both share the same top baseline.
-                StorePromptBadge(prompt: prompt, edgePadding: 8, onTap: { handleStorePromptTap() })
+                // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
+                // touch-target band so the two share one centerline (parity with the interstitial).
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
-            AdInfoReportOverlay(adId: impressionId, apiKey: apiKey)
+            AdInfoReportOverlay(
+                adId: impressionId,
+                apiKey: apiKey,
+                // A genuine bottom-left ✕ shares the bottom-left corner with the "i" (shrink its hit area);
+                // a progress_bar bottom ✕ relocates to top-right, leaving the "i" its full hit area.
+                closeAtBottomLeft: (close ?? CloseBehavior()).position == .bottomLeft && !closeBarAtBottom((close ?? CloseBehavior()).treatment, (close ?? CloseBehavior()).position)
+            )
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a
@@ -228,51 +274,26 @@ private struct RewardedGameView: View {
         fireAutoStoreRedirect()
     }
 
-    @ViewBuilder
-    private var rewardClosePill: some View {
-        if rewardEarned {
-            // Earned: a compact circular X close button (AppLovin-style); tapping it dismisses.
-            Button(action: { finish(earned: true) }) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 16, height: 16)
-                    .background(Circle().fill(Color.black.opacity(0.5)))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Close")
-        } else {
-            // Still earning: a small display-only status — no close affordance yet.
-            Text("Play to earn: \(secondsLeft)s")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.white)
-                .padding(.vertical, 5)
-                .padding(.horizontal, 10)
-                .background(Capsule().fill(Color.black.opacity(0.6)))
-        }
-    }
 
     // MARK: Timer
 
     private func startTimer() {
         guard timerTask == nil else { return }
-        // A zero/negative duration is earned immediately (no gate).
-        guard durationSeconds > 0 else {
+        // A zero/negative gate is earned immediately (no gate).
+        guard gateSeconds > 0 else {
             rewardEarned = true
             return
         }
         timerTask = Task { @MainActor in
-            while elapsedPlayTime < Double(durationSeconds) && !Task.isCancelled {
+            while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
                 elapsedPlayTime += 1
                 // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-                if elapsedPlayTime >= Double(durationSeconds) / 2 {
+                if elapsedPlayTime >= Double(gateSeconds) / 2 {
                     withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
                 }
-                if elapsedPlayTime >= Double(durationSeconds) {
+                if elapsedPlayTime >= Double(gateSeconds) {
                     rewardEarned = true
                 }
             }

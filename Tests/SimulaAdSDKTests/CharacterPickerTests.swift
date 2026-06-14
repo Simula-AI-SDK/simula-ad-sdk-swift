@@ -31,9 +31,9 @@ final class CharacterPickerTests: XCTestCase {
         XCTAssertEqual(chars.count, 2)
         XCTAssertEqual(chars[0].id, "superman")
         XCTAssertEqual(chars[0].name, "Superman")
-        XCTAssertEqual(chars[0].image, "https://x/c1.png") // imageUrl
+        XCTAssertEqual(chars[0].imageUrl,"https://x/c1.png") // imageUrl
         XCTAssertEqual(chars[0].description, "hero")
-        XCTAssertEqual(chars[1].image, "https://x/c3.png")
+        XCTAssertEqual(chars[1].imageUrl,"https://x/c3.png")
     }
 
     func testDropsItemsMissingNameDescriptionOrImageButToleratesBlankId() {
@@ -61,12 +61,12 @@ final class CharacterPickerTests: XCTestCase {
         """
         let chars = parseCharacters(data(legacy))
         XCTAssertEqual(chars.count, 2)
-        XCTAssertEqual(chars[0].image, "u1") // images_1_1[0]
-        XCTAssertEqual(chars[1].image, "u2") // avatar_url fallback
+        XCTAssertEqual(chars[0].imageUrl,"u1") // images_1_1[0]
+        XCTAssertEqual(chars[1].imageUrl,"u2") // avatar_url fallback
 
         let wrapped = parseCharacters(data(#"{"data":[{"id":"c","name":"C","image":"u3","description":"dc"}]}"#))
         XCTAssertEqual(wrapped.count, 1)
-        XCTAssertEqual(wrapped[0].image, "u3")
+        XCTAssertEqual(wrapped[0].imageUrl,"u3")
     }
 
     func testReturnsEmptyForUnexpectedShapesInsteadOfThrowing() {
@@ -77,7 +77,7 @@ final class CharacterPickerTests: XCTestCase {
     // MARK: - mergeRoster
 
     private func entry(_ id: String) -> CharacterPickerEntry {
-        CharacterPickerEntry(data: CharacterData(id: id, name: id, image: ""))
+        CharacterPickerEntry(data: CharacterData(id: id, name: id, imageUrl: "", description: ""))
     }
     private var fallback: [CharacterPickerEntry] {
         [entry("f1"), entry("f2"), entry("f3"), entry("f4")]
@@ -132,10 +132,10 @@ final class CharacterPickerTests: XCTestCase {
     }
 
     func testLoadingEntriesProducesDistinctLoadingSlots() {
-        let loading = CharacterPicker.loadingEntries(3)
+        let loading = CharacterSelector.loadingEntries(3)
         XCTAssertEqual(loading.count, 3)
         XCTAssertTrue(loading.allSatisfy { $0.loading })
         XCTAssertEqual(Set(loading.map { $0.id }).count, 3) // distinct ids
-        XCTAssertTrue(CharacterPicker.loadingEntries(0).isEmpty)
+        XCTAssertTrue(CharacterSelector.loadingEntries(0).isEmpty)
     }
 }

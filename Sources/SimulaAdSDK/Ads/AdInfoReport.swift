@@ -62,29 +62,85 @@ struct AdInfoReportOverlay: View {
     }
 }
 
+// MARK: - NativeAdInfoOverlay
+
+/// Native-ad info affordance: a transparent hit area over the creative's top-left "AD" badge that
+/// opens the same `AdReportSheet` (Interested / Not interested / Report / About) the full-screen ads
+/// use. The creative draws the visible "AD" badge; this just makes it tap-to-open the SDK's standard
+/// AdChoices menu. The sheet is anchored top-left (below the badge) and confined to the ad card.
+///
+/// Drop it into the native ad's `ZStack` (last, so the sheet covers the creative).
+struct NativeAdInfoOverlay: View {
+    let adId: String
+    var apiKey: String?
+
+    @State private var sheetVisible = false
+    private let api = SimulaAPI()
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            // Transparent hit area over the creative's "AD" badge (top:12 / left:12).
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { sheetVisible = true } }) {
+                Color.clear.frame(width: 52, height: 52).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Ad info and report")
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            if sheetVisible {
+                AdReportSheet(
+                    onReport: { flag in submit(flag: flag) },
+                    onClose: { withAnimation(.easeInOut(duration: 0.2)) { sheetVisible = false } },
+                    alignment: .topLeading,
+                    confined: true
+                )
+                .transition(.opacity)
+            }
+        }
+    }
+
+    private func submit(flag: String) {
+        let api = self.api
+        let adId = self.adId
+        let apiKey = self.apiKey ?? SimulaAds.shared?.apiKey ?? ""
+        Task { await api.reportAd(adId: adId, flag: flag, note: nil, apiKey: apiKey) }
+    }
+}
+
 // MARK: - AdReportSheet
 
-/// AppLovin-style ad-feedback menu shown when the "i" is tapped: Interested / Not interested /
-/// Report (which expands to reason codes), plus a separate "About Simula Ads" link to simula.ad.
-/// `onReport` posts the chosen flag; `onClose` dismisses.
-private struct AdReportSheet: View {
+/// AppLovin-style ad-feedback menu shown when the "i" / AD badge is tapped: Interested / Not
+/// interested / Report (which expands to reason codes), plus a separate "About Simula Ads" link to
+/// simula.ad. `onReport` posts the chosen flag; `onClose` dismisses.
+///
+/// `alignment` places the menu — `.bottomLeading` (full-screen ads) or `.topLeading` (inline native
+/// card, below the AD badge). `confined` keeps the scrim inside the ad card instead of the screen.
+struct AdReportSheet: View {
     let onReport: (String) -> Void
     let onClose: () -> Void
+    var alignment: Alignment = .bottomLeading
+    var confined: Bool = false
 
     @Environment(\.openURL) private var openURL
     private enum Phase { case menu, reasons, done }
     @State private var phase: Phase = .menu
 
     /// Where "About Simula Ads" sends the user.
-    private let aboutURL = URL(string: "https://simula.ad")
+    private let aboutURL = URL(string: "https://www.simula.ad/privacy-policy")
     private let cardColor = Color(hex: "#2C2C2E")
     private let reportTint = Color(hex: "#FF453A")
 
     var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            Color.black.opacity(0.6)
-                .ignoresSafeArea()
-                .onTapGesture { onClose() }
+        ZStack(alignment: alignment) {
+            // Scrim: full-screen for the imperative ads, confined to the card for the inline native ad.
+            Group {
+                if confined {
+                    Color.black.opacity(0.6)
+                } else {
+                    Color.black.opacity(0.6).ignoresSafeArea()
+                }
+            }
+            .onTapGesture { onClose() }
 
             VStack(alignment: .leading, spacing: 10) {
                 card
@@ -100,7 +156,8 @@ private struct AdReportSheet: View {
             // Size the menu to its widest row (+ padding), left-aligned, rather than the full width.
             .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 12)
-            .padding(.bottom, 12)
+            // Inline card: drop below the badge. Full-screen: sit above the bottom safe area.
+            .padding(alignment == .topLeading ? .top : .bottom, alignment == .topLeading ? 52 : 12)
             .animation(.easeInOut(duration: 0.15), value: phase)
         }
     }

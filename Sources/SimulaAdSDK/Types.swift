@@ -79,26 +79,26 @@ public struct GameData: Codable, Identifiable, Sendable, Equatable {
 
 // MARK: - CharacterData
 
-/// A selectable character in `CharacterPicker`. `image` is a 1:1 portrait URL.
+/// A selectable character in `CharacterSelector`. `imageUrl` is a 1:1 portrait URL.
 /// Maps to the backend `PublicCharacter` (`character_id`→id, `character_name`→name,
-/// `images_1_1[0]`/`avatar_url`→image, `description`→description).
+/// `images_1_1[0]`/`avatar_url`→imageUrl, `description`→description).
 public struct CharacterData: Identifiable, Sendable, Equatable {
     public let id: String
     public let name: String
-    public let image: String
-    public let description: String?
+    public let imageUrl: String
+    public let description: String
 
-    public init(id: String, name: String, image: String, description: String? = nil) {
+    public init(id: String, name: String, imageUrl: String, description: String) {
         self.id = id
         self.name = name
-        self.image = image
+        self.imageUrl = imageUrl
         self.description = description
     }
 }
 
 // MARK: - CharacterPickerTheme
 
-/// Theme for `CharacterPicker`. Colors are CSS strings (hex/rgba); a nil field falls
+/// Theme for `CharacterSelector`. Colors are CSS strings (hex/rgba); a nil field falls
 /// back to a `resolved*` value mirroring the reference HTML. Sizes are in points.
 public struct CharacterPickerTheme: Sendable, Equatable {
     public var backgroundColor: String?
@@ -630,8 +630,9 @@ public enum StorePromptPlatform: Sendable, Equatable {
 }
 
 /// Mid-ad store prompt (`store_prompt` node): a tappable store badge shown at the 50% playable
-/// mark, independent of the close button and SKOverlay. `position` is resolved server-side
-/// (opposite the close button) — the SDK renders it verbatim and never recomputes collisions.
+/// mark, independent of the close button and SKOverlay. `position` is still decoded from the wire
+/// but no longer drives layout: the SDK renders the badge in the horizontal mirror of the close
+/// button's corner (the opposite side), so the two affordances never share an edge.
 public struct StorePrompt: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let trigger: String
@@ -925,4 +926,181 @@ public enum AdReportReason: String, CaseIterable, Sendable {
         case .other: return "Other"
         }
     }
+}
+
+// MARK: - Native Ad (POST /load/native)
+
+/// Provider-level targeting context for native ads. Set once on `SimulaProviderView` (or via
+/// `SimulaAds.updateContext`) and attached automatically to every `POST /load/native` — a
+/// `NativeAdSlot` never passes context itself (PRD).
+///
+/// Encodes directly as the backend `NativeContext` wire object: its property names are already the
+/// camelCase keys the API expects, so the synthesized `Encodable` needs no `CodingKeys`. Updates
+/// replace the context in full (not a merge); ads already preloaded under the old context are
+/// unaffected. Mirrors the Kotlin SDK's `SimulaAdContext`.
+public struct SimulaAdContext: Encodable, Equatable, Sendable {
+    /// Current search / query term in the feed.
+    public var searchTerm: String?
+    /// Content tags (the backend keeps at most 10).
+    public var tags: [String]?
+    /// Feed category.
+    public var category: String?
+    /// Title of the surrounding feed item.
+    public var title: String?
+    /// Description of the surrounding feed item.
+    public var description: String?
+    /// Opaque user-profile signal.
+    public var userProfile: String?
+    /// User email, if available.
+    public var userEmail: String?
+    /// Arbitrary string key-values (the backend keeps at most 10 entries).
+    public var customContext: [String: String]?
+    /// Whether the surrounding content is NSFW. Defaults to false.
+    public var nsfw: Bool
+
+    public init(
+        searchTerm: String? = nil,
+        tags: [String]? = nil,
+        category: String? = nil,
+        title: String? = nil,
+        description: String? = nil,
+        userProfile: String? = nil,
+        userEmail: String? = nil,
+        customContext: [String: String]? = nil,
+        nsfw: Bool = false
+    ) {
+        self.searchTerm = searchTerm
+        self.tags = tags
+        self.category = category
+        self.title = title
+        self.description = description
+        self.userProfile = userProfile
+        self.userEmail = userEmail
+        self.customContext = customContext
+        self.nsfw = nsfw
+    }
+}
+
+/// Body for `POST /load/native` (backend `CaiNativeRequest`). `position` + `sessionId` are required;
+/// everything else is optional. The native surface has no `char_image` (unlike the interstitial).
+/// `width` is accepted but ignored by the API — the card always renders at 100%.
+public struct NativeAdRequest: Encodable, Sendable {
+    public let position: Int
+    public let sessionId: String
+    public let adUnitId: String?
+    public let context: SimulaAdContext?
+    /// Sent as a string (the backend accepts number | string); reserved — sizing is client-side.
+    public let width: String?
+    public let charId: String?
+    public let charName: String?
+    public let charDesc: String?
+
+    enum CodingKeys: String, CodingKey {
+        case position
+        case sessionId = "session_id"
+        case adUnitId = "ad_unit_id"
+        case context
+        case width
+        case charId = "char_id"
+        case charName = "char_name"
+        case charDesc = "char_desc"
+    }
+
+    public init(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil
+    ) {
+        self.position = position
+        self.sessionId = sessionId
+        self.adUnitId = adUnitId
+        self.context = context
+        self.width = width
+        self.charId = charId
+        self.charName = charName
+        self.charDesc = charDesc
+    }
+}
+
+/// Response for `POST /load/native` (backend `CaiNativeResponse`). Tolerant decode (missing keys →
+/// safe defaults). `adResponse` is camelCase (the one exception in the snake_case envelope) and is
+/// `{}` on a no-fill.
+public struct NativeAdResponse: Decodable, Sendable {
+    public let impressionId: String?
+    public let adInserted: Bool
+    public let adFormat: String
+    public let adResponse: NativeAdCreative
+
+    enum CodingKeys: String, CodingKey {
+        case impressionId = "impression_id"
+        case adInserted = "ad_inserted"
+        case adFormat = "ad_format"
+        case adResponse
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        impressionId = try c.decodeIfPresent(String.self, forKey: .impressionId)
+        adInserted = (try c.decodeIfPresent(Bool.self, forKey: .adInserted)) ?? false
+        adFormat = (try c.decodeIfPresent(String.self, forKey: .adFormat)) ?? ""
+        adResponse = (try c.decodeIfPresent(NativeAdCreative.self, forKey: .adResponse)) ?? NativeAdCreative()
+    }
+
+    /// Direct construction (used for the slot's debug/QA preview path).
+    public init(impressionId: String?, adInserted: Bool, adFormat: String, adResponse: NativeAdCreative) {
+        self.impressionId = impressionId
+        self.adInserted = adInserted
+        self.adFormat = adFormat
+        self.adResponse = adResponse
+    }
+
+    /// The creative URL to mount, preferring `iframe_url` (URL mount is preferred for security);
+    /// nil on a no-fill.
+    public var iframeURL: String? {
+        adResponse.iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    /// The `<iframe srcdoc=…>` wrapper to mount inline when no URL is available; nil otherwise.
+    public var renderedHTML: String? {
+        adResponse.renderedHtml?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    /// True when there's a mountable creative to render.
+    public var hasCreative: Bool { adInserted && (iframeURL != nil || renderedHTML != nil) }
+}
+
+public struct NativeAdCreative: Decodable, Sendable {
+    public let iframeUrl: String?
+    public let renderedHtml: String?
+
+    enum CodingKeys: String, CodingKey {
+        case iframeUrl = "iframe_url"
+        case renderedHtml = "rendered_html"
+    }
+
+    public init(iframeUrl: String? = nil, renderedHtml: String? = nil) {
+        self.iframeUrl = iframeUrl
+        self.renderedHtml = renderedHtml
+    }
+}
+
+/// Payload handed to `NativeAdSlot`'s `onImpression` when the OMID-shaped viewability threshold is
+/// met (≥50% visible for ≥1 continuous second). Mirrors the PRD's `AdData`.
+public struct NativeAdData: Sendable {
+    /// Serve UUID from the backend (`impression_id`).
+    public let impressionId: String
+    /// Always `"character_ad"` on a fill.
+    public let adFormat: String
+    /// Echo of the slot's `adUnitId` (nil when none was set).
+    public let adUnitId: String?
+}
+
+private extension String {
+    /// nil when blank, else self — for trimming optional creative strings.
+    var nonEmpty: String? { isEmpty ? nil : self }
 }
