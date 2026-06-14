@@ -15,25 +15,42 @@ import UIKit
 /// this slot is hosted within (PRD). Must be used inside a `SimulaProviderView`.
 public struct NativeAdSlot: View {
     @EnvironmentObject private var provider: SimulaProvider
+    @Environment(\.colorScheme) private var colorScheme
 
     private let adUnitId: String?
     private let position: Int
     private let preloadedAdId: String?
     private let previewHTML: String?
+    private let dimension: ParsedDimension
+    private let theme: String?
     private let onImpression: (NativeAdData) -> Void
     private let onError: (SimulaAdError) -> Void
 
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
+    /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
+    @State private var measuredParentWidth: CGFloat = 0
 
     /// Height the slot holds while the creative is measuring, so it never collapses to a sliver
     /// between "filled" and "first height reported" (which would jolt the surrounding feed).
     static let provisionalHeight: CGFloat = 160
 
+    /// Minimum rendered width. A narrower fixed/percentage `width` is raised to this (a sliver-wide
+    /// ad card renders unusably).
+    static let minWidthPt: CGFloat = 300
+
     /// - Parameters:
     ///   - adUnitId: Simula ad unit id (measurement + targeting). Optional.
     ///   - position: Index position of the slot in the feed (sent to the backend).
+    ///   - width: Rendered width of the card. Client-side only — never sent to the backend. Accepts
+    ///     flexible input: `nil` / `""` / `"auto"` fill the parent (the default); `"80%"` is 80% of
+    ///     the parent; `"320px"` (case-insensitive) / `"300"` / `300` are a fixed point value; a
+    ///     fraction `0 < n < 1` (e.g. `0.8`) is a percentage. Anything invalid (negative, zero,
+    ///     out-of-range %, bool, array, garbage) falls back to fill. A fixed/percentage width below
+    ///     `minWidthPt` (300pt) is raised to it. Mirrors the Android SDK's `width`.
+    ///   - theme: Creative color theme — `"dark"`, `"light"`, `"system"`, or `nil`. `"system"` resolves
+    ///     to dark/light from the view's `colorScheme`; `nil` is omitted (backend defaults to light).
     ///   - preloadedAdId: An id from `SimulaAds.preloadNativeAd`; renders that cached ad instead of a
     ///     live request. An expired/unknown id falls back to a live call with no error surfaced.
     ///   - onImpression: Fired once when the viewability threshold is met (co-fired with the server
@@ -45,6 +62,8 @@ public struct NativeAdSlot: View {
     public init(
         adUnitId: String? = nil,
         position: Int = 0,
+        width: Any? = nil,
+        theme: String? = nil,
         preloadedAdId: String? = nil,
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
         onError: @escaping (SimulaAdError) -> Void = { _ in },
@@ -52,6 +71,8 @@ public struct NativeAdSlot: View {
     ) {
         self.adUnitId = adUnitId
         self.position = position
+        self.dimension = parseDimension(width).clampMinWidth(Self.minWidthPt)
+        self.theme = theme
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
@@ -71,48 +92,89 @@ public struct NativeAdSlot: View {
     }
 
     public var body: some View {
-        Group {
-            switch phase {
-            case .filled(let response):
-                let impressionId = response.impressionId ?? ""
-                ZStack {
-                    WebViewRepresentable(
-                        url: response.iframeURL.flatMap { URL(string: $0) },
-                        htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
-                        onMessageReceived: { handleMessage($0, impressionId: impressionId) },
-                        onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
-                        externalClickOnly: true,
-                        reportsContentHeight: true
-                    )
-                    // Hold a provisional height while the creative measures (never collapse), then grow.
-                    .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
-                    .trackNativeAdViewability(enabled: heightPt > 0) {
-                        fireImpression(impressionId: impressionId, adFormat: response.adFormat)
-                    }
+        sizedSlot
+            .task(id: taskKey) { await load() }
+    }
 
-                    // Keep the shimmer over the slot until the creative reports its height. Without
-                    // this the slot would collapse between "filled" and "measured" and jolt the feed
-                    // below up then back down (it "looks broken").
-                    if heightPt <= 0 {
-                        NativeAdShimmer()
-                    }
-
-                    // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
-                    // Not interested / Report / About) — the SDK's standard dialog, once the ad shows.
-                    if heightPt > 0 {
-                        NativeAdInfoOverlay(adId: impressionId, apiKey: provider.apiKey)
-                    }
+    /// The ad content for the current phase, before any width sizing.
+    @ViewBuilder
+    private var slotContent: some View {
+        switch phase {
+        case .filled(let response):
+            let impressionId = response.impressionId ?? ""
+            ZStack {
+                WebViewRepresentable(
+                    url: response.iframeURL.flatMap { URL(string: $0) },
+                    htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
+                    onMessageReceived: { handleMessage($0, impressionId: impressionId) },
+                    onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
+                    externalClickOnly: true,
+                    reportsContentHeight: true
+                )
+                // Hold a provisional height while the creative measures (never collapse), then grow.
+                .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
+                .trackNativeAdViewability(enabled: heightPt > 0) {
+                    fireImpression(impressionId: impressionId, adFormat: response.adFormat)
                 }
-                .clipped()
-            case .loading:
-                // While the request is in flight, show a shimmer placeholder.
-                NativeAdShimmer()
-            case .empty:
-                // No-fill / error → hide the card (zero height, no placeholder).
-                Color.clear.frame(height: 0)
+
+                // Keep the shimmer over the slot until the creative reports its height. Without
+                // this the slot would collapse between "filled" and "measured" and jolt the feed
+                // below up then back down (it "looks broken").
+                if heightPt <= 0 {
+                    NativeAdShimmer()
+                }
+
+                // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
+                // Not interested / Report / About) — the SDK's standard dialog, once the ad shows.
+                if heightPt > 0 {
+                    NativeAdInfoOverlay(adId: impressionId, apiKey: provider.apiKey)
+                }
             }
+            .clipped()
+        case .loading:
+            // While the request is in flight, show a shimmer placeholder.
+            NativeAdShimmer()
+        case .empty:
+            // No-fill / error → hide the card (zero height, no placeholder).
+            Color.clear.frame(height: 0)
         }
-        .task(id: taskKey) { await load() }
+    }
+
+    /// Applies the parsed `width` to `slotContent`.
+    ///
+    /// `.fill` is a true no-op — the slot renders exactly as it did before `width` existed (critical:
+    /// any always-on wrapper here breaks the `WKWebView` rows inside a `LazyVStack`). `.pixels` pins a
+    /// fixed width; a `LazyVStack`/`VStack` centers the narrower card automatically. `.percentage`
+    /// measures the parent width once and pins a clamped fraction of it.
+    @ViewBuilder
+    private var sizedSlot: some View {
+        switch dimension {
+        case .fill:
+            slotContent
+        case .pixels(let pt):
+            slotContent.frame(width: pt)
+        case .percentage(let fraction):
+            slotContent
+                .frame(width: percentageWidth(fraction))
+                .frame(maxWidth: .infinity, alignment: .center)
+                // Measure the parent: the maxWidth:.infinity frame fills it, so its background
+                // reports the parent's width (not the constrained card's) — no shrink loop.
+                .background(
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { measuredParentWidth = geo.size.width }
+                            .onChange(of: geo.size.width) { newValue in measuredParentWidth = newValue }
+                    }
+                )
+        }
+    }
+
+    /// `nil` until the parent is measured (slot fills until then), then `parentWidth * fraction`
+    /// clamped to the minimum — the clamp lives here, at layout time, since SwiftUI's `.frame(minWidth:)`
+    /// can't override a fixed `.frame(width:)`.
+    private func percentageWidth(_ fraction: Float) -> CGFloat? {
+        guard measuredParentWidth > 0 else { return nil }
+        return max(measuredParentWidth * CGFloat(fraction), Self.minWidthPt)
     }
 
     private var taskKey: String { "\(adUnitId ?? "")|\(position)|\(preloadedAdId ?? "")|\(previewHTML != nil)" }
@@ -151,7 +213,12 @@ public struct NativeAdSlot: View {
         // 3. Live request.
         phase = .loading
         do {
-            apply(try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position))
+            apply(try await NativeAdController.load(
+                provider: provider,
+                adUnitId: adUnitId,
+                position: position,
+                theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark)
+            ))
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
