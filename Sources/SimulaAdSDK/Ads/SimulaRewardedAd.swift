@@ -312,12 +312,15 @@ public final class SimulaRewardedAd {
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
-                self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
                 self.delegate?.rewardedDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
+                //
+                // Reward verification is deferred to `onAllClosed` — the reward is contingent on the
+                // user completing the WHOLE ad unit (playable + every fallback screen), not just
+                // closing the playable. With no fallback screens it fires immediately on close.
                 self.presentFallbackAds(
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
@@ -327,6 +330,9 @@ public final class SimulaRewardedAd {
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
                             attribution: response.adBehavior?.attribution
                         )
+                    },
+                    onAllClosed: { [weak self] in
+                        self?.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                     }
                 )
                 // Preload the next ad after close, reusing the last character context.
@@ -575,7 +581,8 @@ public final class SimulaRewardedAd {
     /// before the prefetch finished. Empty → nothing shown.
     private func presentFallbackAds(
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
         let ready = prefetchedFallbacks
@@ -583,13 +590,20 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             Task { [weak self] in
                 let ads = await prefetch.value
-                self?.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+                guard let self else { onAllClosed(); return }
+                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
+        } else {
+            // No prefetch ran (e.g. empty impression id) — nothing to show, so the ad unit is
+            // already fully closed; verify immediately.
+            onAllClosed()
         }
+        #else
+        onAllClosed()
         #endif
     }
 
@@ -597,10 +611,12 @@ public final class SimulaRewardedAd {
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
-        guard !ads.isEmpty else { return }
+        // No fallback screens → the playable was the whole ad unit; it's already fully closed.
+        guard !ads.isEmpty else { onAllClosed(); return }
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
@@ -608,8 +624,15 @@ public final class SimulaRewardedAd {
             onAutoStoreRedirect: onAutoStoreRedirect
         ) { [weak self] in
             self?.fallbackPresenter = nil
+            onAllClosed()
         }
-        if didPresent { self.fallbackPresenter = presenter }
+        if didPresent {
+            self.fallbackPresenter = presenter
+        } else {
+            // Couldn't present the fallback window (no scene) — don't strand the reward; treat the
+            // unit as fully closed so verification still runs.
+            onAllClosed()
+        }
         #endif
     }
 }

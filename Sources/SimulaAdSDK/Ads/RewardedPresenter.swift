@@ -163,6 +163,10 @@ private struct RewardedGameView: View {
     @State private var storeSheetPresented = false
 
     @State private var elapsedPlayTime: Double = 0
+    /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
+    /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
+    /// per 1 s accrual tick — `closeProgress` below is the instantaneous truth used to anchor it.
+    @State private var closeProgressAnim: Double = 0
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
     @State private var visible = true
@@ -181,7 +185,9 @@ private struct RewardedGameView: View {
         max(0, gateSeconds - Int(elapsedPlayTime))
     }
 
-    /// 0→1 fill for the close treatment (progress bar / countdown ring), from play-to-earn progress.
+    /// Instantaneous 0→1 play-to-earn fraction (whole-second granularity). Not rendered directly —
+    /// `closeProgressAnim` glides between these values; this is the anchor the animation snaps to on
+    /// pause/resume.
     private var closeProgress: Double {
         gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
     }
@@ -211,7 +217,7 @@ private struct RewardedGameView: View {
                 isRewardCopy: true,
                 enabled: rewardEarned,
                 remaining: secondsLeft,
-                progress: closeProgress,
+                progress: closeProgressAnim,
                 onClose: { finish(earned: true) }
             )
             .animation(.default, value: rewardEarned)
@@ -310,6 +316,14 @@ private struct RewardedGameView: View {
             rewardEarned = true
             return
         }
+        // Glide the bar/ring fill linearly to full over the remaining gate (resuming from the
+        // fraction already elapsed). The 1 s accrual loop below only drives gate / store-prompt /
+        // reward logic — the indicator is animated, not stepped, so it no longer looks laggy.
+        let remaining = Double(gateSeconds) - elapsedPlayTime
+        closeProgressAnim = closeProgress
+        if remaining > 0 {
+            withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
+        }
         timerTask = Task { @MainActor in
             while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -334,6 +348,10 @@ private struct RewardedGameView: View {
         } else {
             timerTask?.cancel()
             timerTask = nil
+            // Freeze the animated fill at the true elapsed fraction so it stops gliding while paused
+            // (disable the implicit animation so it doesn't tween toward the frozen value).
+            var tx = Transaction(); tx.disablesAnimations = true
+            withTransaction(tx) { closeProgressAnim = closeProgress }
         }
     }
 
