@@ -79,6 +79,7 @@ public struct NativeAdSlot: View {
                     WebViewRepresentable(
                         url: response.iframeURL.flatMap { URL(string: $0) },
                         htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
+                        onNavigationFailed: { _ in handleLoadFailure() },
                         onMessageReceived: { handleMessage($0, impressionId: impressionId) },
                         onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
                         externalClickOnly: true,
@@ -187,6 +188,19 @@ public struct NativeAdSlot: View {
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         let apiKey = provider.apiKey
         Task { await SimulaAPI().trackImpression(adId: impressionId, apiKey: apiKey) }
+    }
+
+    /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into
+    /// view — including a recycled row whose height was restored from cache, so we must NOT gate on
+    /// height here). Collapse the slot instead of leaving a blank/failed creative on screen; surface
+    /// as a load error. The fill stays cached (not invalidated), so a remount retries once
+    /// connectivity returns.
+    @MainActor
+    private func handleLoadFailure() {
+        guard case .filled = phase else { return }
+        heightPt = 0
+        phase = .empty
+        onError(.network(.invalidResponse))
     }
 
     private func handleMessage(_ raw: String, impressionId: String) {
