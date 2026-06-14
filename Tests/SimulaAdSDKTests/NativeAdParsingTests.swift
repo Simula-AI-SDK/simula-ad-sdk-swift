@@ -22,13 +22,35 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertNil(obj["char_image"])
     }
 
+    func testThemeEncodesTopLevelWhenSet() throws {
+        let body = try JSONEncoder().encode(
+            NativeAdRequest(position: 0, sessionId: "s", theme: "dark")
+        )
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        // theme is a top-level sibling of position / session_id, not nested.
+        XCTAssertEqual(obj["theme"] as? String, "dark")
+    }
+
+    func testThemeOmittedWhenNil() throws {
+        let body = try JSONEncoder().encode(NativeAdRequest(position: 0, sessionId: "s"))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertNil(obj["theme"]) // omitted entirely → backend defaults to light
+    }
+
     func testContextEncodesCamelCaseWireKeys() throws {
         let ctx = SimulaAdContext(
             searchTerm: "fantasy rpg",
             tags: ["adventure", "magic"],
             category: "roleplay",
             userEmail: "a@b.com",
-            customContext: ["recent": "Frieren"],
+            customContext: [
+                "recent": "Frieren",
+                "episodes": 28,
+                "rating": 4.7,
+                "watching": true,
+                "genres": ["fantasy", "adventure"],
+                "meta": ["subbed": true],
+            ],
             nsfw: false
         )
         let body = try JSONEncoder().encode(
@@ -40,11 +62,82 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertEqual(context["searchTerm"] as? String, "fantasy rpg")
         XCTAssertEqual(context["userEmail"] as? String, "a@b.com")
         XCTAssertEqual(context["category"] as? String, "roleplay")
-        XCTAssertEqual((context["customContext"] as? [String: Any])?["recent"] as? String, "Frieren")
+        // customContext carries arbitrary JSON, not just strings.
+        let custom = try XCTUnwrap(context["customContext"] as? [String: Any])
+        XCTAssertEqual(custom["recent"] as? String, "Frieren")
+        XCTAssertEqual(custom["episodes"] as? Int, 28)
+        XCTAssertEqual(custom["rating"] as? Double, 4.7)
+        XCTAssertEqual(custom["watching"] as? Bool, true)
+        XCTAssertEqual(custom["genres"] as? [String], ["fantasy", "adventure"])
+        XCTAssertEqual((custom["meta"] as? [String: Any])?["subbed"] as? Bool, true)
         XCTAssertEqual(context["nsfw"] as? Bool, false)
         // No snake_case leakage.
         XCTAssertNil(context["search_term"])
         XCTAssertNil(context["user_email"])
+    }
+
+    func testCustomContextSupportsNestedMaps() throws {
+        // Maps inside maps inside maps — JSONValue.object nests to any depth.
+        let ctx = SimulaAdContext(customContext: [
+            "profile": [
+                "prefs": [
+                    "theme": "dark",
+                    "limits": ["maxAds": 3],
+                ],
+                "tags": ["a", "b"],
+            ],
+        ])
+        let body = try JSONEncoder().encode(
+            NativeAdRequest(position: 0, sessionId: "s", context: ctx)
+        )
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let custom = try XCTUnwrap((obj["context"] as? [String: Any])?["customContext"] as? [String: Any])
+        let profile = try XCTUnwrap(custom["profile"] as? [String: Any])
+        let prefs = try XCTUnwrap(profile["prefs"] as? [String: Any])
+        XCTAssertEqual(prefs["theme"] as? String, "dark")
+        XCTAssertEqual((prefs["limits"] as? [String: Any])?["maxAds"] as? Int, 3)
+        XCTAssertEqual(profile["tags"] as? [String], ["a", "b"])
+    }
+
+    func testCustomContextStringValuesAreWireCompatible() throws {
+        // Back-compat guard: a string-valued entry must encode to the exact same bytes it did when
+        // customContext was [String: String] — plain {"key":"value"}, no enum-case wrapper leakage.
+        let ctx = SimulaAdContext(customContext: ["recent": "Frieren", "mood": "calm"])
+        let body = try JSONEncoder().encode(ctx)
+        let custom = try XCTUnwrap(
+            (JSONSerialization.jsonObject(with: body) as? [String: Any])?["customContext"] as? [String: Any]
+        )
+        XCTAssertEqual(custom as? [String: String], ["recent": "Frieren", "mood": "calm"])
+        // Raw substring check: no ".string"/"_0"/case-name artifacts in the JSON text.
+        let text = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(text.contains("\"recent\":\"Frieren\""))
+        XCTAssertFalse(text.contains("string"))
+        XCTAssertFalse(text.contains("_0"))
+    }
+
+    func testCustomContextOmittedWhenNil() throws {
+        // nil customContext must be omitted entirely, not sent as "customContext":null.
+        let ctx = SimulaAdContext(searchTerm: "x")
+        let text = String(decoding: try JSONEncoder().encode(ctx), as: UTF8.self)
+        XCTAssertFalse(text.contains("customContext"))
+    }
+
+    func testJSONValueRoundTripsThroughDecode() throws {
+        // JSONValue is public Codable; verify decode disambiguates types (esp. Bool vs Int).
+        let original: [String: JSONValue] = [
+            "s": "txt", "i": 7, "d": 1.5, "b": true, "z": 0,
+            "arr": [1, "two", false], "obj": ["k": "v"], "nil": nil,
+        ]
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode([String: JSONValue].self, from: data)
+        XCTAssertEqual(decoded["s"], .string("txt"))
+        XCTAssertEqual(decoded["i"], .int(7))
+        XCTAssertEqual(decoded["d"], .double(1.5))
+        XCTAssertEqual(decoded["b"], .bool(true))   // not .int(1)
+        XCTAssertEqual(decoded["z"], .int(0))       // not .bool(false)
+        XCTAssertEqual(decoded["arr"], .array([.int(1), .string("two"), .bool(false)]))
+        XCTAssertEqual(decoded["obj"], .object(["k": .string("v")]))
+        XCTAssertEqual(decoded["nil"], JSONValue.null)
     }
 
     // MARK: - Response

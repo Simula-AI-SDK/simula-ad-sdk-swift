@@ -24,7 +24,7 @@ final class Telemetry: @unchecked Sendable {
     /// Install the telemetry pipeline. Called once from `SimulaProvider.init` (the choke point
     /// both the imperative and declarative entry points funnel through). First call wins, so the
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
-    /// doesn't churn the buffer. `primaryUserID` is gated dynamically by the live consent snapshot.
+    /// doesn't churn the buffer.
     func initialize(apiKey: String, devMode: Bool, enabled: Bool, primaryUserID: String?) {
         lock.lock()
         if initialized { lock.unlock(); return }
@@ -47,9 +47,7 @@ final class Telemetry: @unchecked Sendable {
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            // Re-gate on every flush: ppid only with consent (& not under COPPA); the advertising
-            // id is already nil'd by the snapshot when not collectible.
-            primaryUserIdProvider: { SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID ? primaryUserID : nil },
+            primaryUserIdProvider: { primaryUserID },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             debugLog: consoleLog
         )

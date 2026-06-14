@@ -230,7 +230,7 @@ func parseCatalog(_ data: Data) throws -> CatalogResponse {
     return CatalogResponse(menuId: "", games: items.items.map { $0.toGameData() })
 }
 
-// MARK: - Character Picker Models
+// MARK: - Character Selector Models
 
 /// One character as returned by `/character-selector`. `name`, `description`, and the
 /// image are required (a card needs all three to render — an entry missing any is
@@ -345,7 +345,7 @@ struct CharacterSelectorRequest: Encodable {
 /// Decodes a `/character-selector` payload into `[CharacterData]`. Pure and testable;
 /// tolerant of the shapes the server may return (a bare array — what the endpoint sends
 /// — or an object with `characters`/`characters.data`/`data`) and lossy per character.
-/// Returns `[]` for any unexpected shape so the picker silently falls back to its
+/// Returns `[]` for any unexpected shape so the selector silently falls back to its
 /// bundled placeholders.
 func parseCharacters(_ data: Data) -> [CharacterData] {
     let decoder = JSONDecoder()
@@ -927,9 +927,9 @@ public final class SimulaAPI: @unchecked Sendable {
         return components.url
     }
 
-    // MARK: - Fetch Characters (Character Picker)
+    // MARK: - Fetch Characters (Character Selector)
 
-    /// Fetches characters for the Character Picker from `POST /character-selector`.
+    /// Fetches characters for the Character Selector from `POST /character-selector`.
     /// Best-effort and **never throws**: returns an empty list on any failure so the
     /// caller falls back to its bundled placeholder characters.
     ///
@@ -1014,6 +1014,7 @@ public final class SimulaAPI: @unchecked Sendable {
         sessionId: String,
         adUnitId: String? = nil,
         context: SimulaAdContext? = nil,
+        theme: String? = nil,
         width: String? = nil,
         charId: String? = nil,
         charName: String? = nil,
@@ -1032,6 +1033,7 @@ public final class SimulaAPI: @unchecked Sendable {
                 sessionId: sessionId,
                 adUnitId: adUnitId,
                 context: context,
+                theme: theme,
                 width: width,
                 charId: charId,
                 charName: charName,

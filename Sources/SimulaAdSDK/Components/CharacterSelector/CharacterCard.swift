@@ -6,10 +6,10 @@ import SwiftUI
 /// HTML's layered/pulsing glow, selection highlight, and grayscale of unselected cards
 /// once a choice is made. Counterpart of `CharacterCard.kt`.
 struct CharacterCard: View {
-    let entry: CharacterPickerEntry
+    let entry: CharacterSelectorEntry
     let selected: Bool
     let selectionMade: Bool
-    let theme: CharacterPickerTheme
+    let theme: CharacterSelectorTheme
     let onTap: () -> Void
 
     /// Idle pulse phase (0…1), animated forever on appear; ignored once a selection exists.
@@ -20,18 +20,18 @@ struct CharacterCard: View {
     private let glowBluish = Color(red: 130 / 255, green: 150 / 255, blue: 170 / 255)
 
     private var cornerRadius: CGFloat { theme.resolvedCardCornerRadius }
-    private var selectedColor: Color { Color(hex: theme.resolvedSelectedColor) }
+    private var accentColor: Color { Color(hex: theme.resolvedAccentColor) }
     private var borderColor: Color { Color(hex: theme.resolvedCardBorderColor) }
     private var grayscale: Bool { selectionMade && !selected }
 
     private var ringColor: Color {
-        if selected { return selectedColor.opacity(0.55) }
+        if selected { return accentColor.opacity(0.55) }
         if selectionMade { return ringBluish.opacity(0.24) }
         return ringBluish.opacity(0.22 + 0.16 * pulsePhase)
     }
 
     private var glowColor: Color {
-        if selected { return selectedColor.opacity(0.32) }
+        if selected { return accentColor.opacity(0.32) }
         if selectionMade { return glowBluish.opacity(0.16) }
         return glowBluish.opacity(0.14 + 0.12 * pulsePhase)
     }
@@ -53,7 +53,7 @@ struct CharacterCard: View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(selected ? selectedColor : borderColor, lineWidth: 2)
+                .stroke(selected ? accentColor : borderColor, lineWidth: 2)
         )
         // Whole-card grayscale of the non-selected cards (HTML: filter saturate(0)).
         .saturation(grayscale ? 0 : 1)
@@ -81,8 +81,8 @@ struct CharacterCard: View {
 
     // Image wrap — a 1:1 square. `Color.clear` (no intrinsic size) is the size driver, so the
     // square is always width×width; the image lives in an `.overlay` and `scaledToFill`s into it.
-    // (Putting the image directly in the sized layer let its intrinsic ratio — portrait vs square
-    // across the placeholders — leak into the layout and make some cards taller.)
+    // (Putting the image directly in the sized layer let its intrinsic ratio leak into the
+    // layout and make some cards taller.)
     private var imageWrap: some View {
         Color.clear
             .frame(maxWidth: .infinity)
@@ -95,19 +95,12 @@ struct CharacterCard: View {
                         endPoint: .bottom
                     )
 
-                    if let name = entry.bundledImageName,
-                       let img = BundledImageCache.image(named: name) {
-                        Image(platformImage: img)
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        CachedAsyncImage(url: URL(string: entry.data.imageUrl)) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            default:
-                                Color.clear
-                            }
+                    CachedAsyncImage(url: URL(string: entry.data.imageUrl)) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        default:
+                            Color.clear
                         }
                     }
                 }
@@ -119,7 +112,7 @@ struct CharacterCard: View {
     private var nameBar: some View {
         Text(entry.data.name)
             .font(fontForFamily(theme.resolvedFontFamily, size: 14, weight: .bold))
-            .foregroundColor(Color(hex: theme.resolvedNameColor))
+            .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity)
@@ -141,7 +134,7 @@ struct CharacterCard: View {
 /// footprint as `CharacterCard` (1:1 image area + name bar) with a horizontal shimmer,
 /// so swapping in the real card doesn't shift the layout. Not selectable.
 struct CharacterSkeletonCard: View {
-    let theme: CharacterPickerTheme
+    let theme: CharacterSelectorTheme
 
     /// 0…1 sweep phase, animated forever on appear.
     @State private var phase: CGFloat = 0

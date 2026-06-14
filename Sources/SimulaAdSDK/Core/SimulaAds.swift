@@ -138,10 +138,14 @@ public enum SimulaAds {
     /// network call). The entry is evicted once consumed; release any unconsumed id with
     /// `destroyPreloadedAd`. At most 5 ads are kept (excess is dropped with an internal warning).
     /// Returns `nil` before `initialize` or when the cap is reached.
+    ///
+    /// `theme` is `"dark"`, `"light"`, `"system"`, or `nil`. `"system"` resolves to dark/light from
+    /// the current `UITraitCollection` (no SwiftUI environment in the imperative path); `nil` is
+    /// omitted from the request (backend defaults to light).
     @discardableResult
-    public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0) async -> String? {
+    public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0, theme: String? = nil) async -> String? {
         guard let provider = shared else { return nil }
-        return NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position)
+        return NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position, theme: theme)
     }
 
     /// Release a preloaded native ad that was never consumed, cancelling its request if in flight.

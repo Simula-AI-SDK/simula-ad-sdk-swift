@@ -96,67 +96,61 @@ public struct CharacterData: Identifiable, Sendable, Equatable {
     }
 }
 
-// MARK: - CharacterPickerTheme
+// MARK: - CharacterSelectorTheme
 
 /// Theme for `CharacterSelector`. Colors are CSS strings (hex/rgba); a nil field falls
 /// back to a `resolved*` value mirroring the reference HTML. Sizes are in points.
-public struct CharacterPickerTheme: Sendable, Equatable {
+public struct CharacterSelectorTheme: Sendable, Equatable {
+    /// Sheet/page background. Default `#000000`.
     public var backgroundColor: String?
-    public var titleColor: String?
-    public var titleFontSize: CGFloat?
+    /// Title heading color. Default `#FFFFFF`.
+    public var titleFontColor: String?
+    /// Character name label color. Default `#FFFFFF`.
+    public var secondaryFontColor: String?
+    /// Selected-card border, active CTA bg + border, and glow. Default `#3D9A66`.
+    public var accentColor: String?
+    /// CTA button text (active). Default `#FFFFFF`.
+    public var ctaFontColor: String?
+    /// Card fill. Default `#14161A`.
     public var cardBackgroundColor: String?
+    /// Default card border. Default `#343A42`.
     public var cardBorderColor: String?
+    /// Card corner radius in points. Default `18`.
     public var cardCornerRadius: CGFloat?
-    /// Selected-card border / active launch-button color. Default `#3d9a66`.
-    public var selectedColor: String?
-    public var nameColor: String?
-    public var launchTextColor: String?
-    /// Disabled launch-button background. Default `#3a3a3a`.
-    public var launchDisabledColor: String?
-    public var launchCornerRadius: CGFloat?
     /// Font family name (e.g. "Inter"). Default: system font.
     public var fontFamily: String?
 
     public init(
         backgroundColor: String? = nil,
-        titleColor: String? = nil,
-        titleFontSize: CGFloat? = nil,
+        titleFontColor: String? = nil,
+        secondaryFontColor: String? = nil,
+        accentColor: String? = nil,
+        ctaFontColor: String? = nil,
         cardBackgroundColor: String? = nil,
         cardBorderColor: String? = nil,
         cardCornerRadius: CGFloat? = nil,
-        selectedColor: String? = nil,
-        nameColor: String? = nil,
-        launchTextColor: String? = nil,
-        launchDisabledColor: String? = nil,
-        launchCornerRadius: CGFloat? = nil,
         fontFamily: String? = nil
     ) {
         self.backgroundColor = backgroundColor
-        self.titleColor = titleColor
-        self.titleFontSize = titleFontSize
+        self.titleFontColor = titleFontColor
+        self.secondaryFontColor = secondaryFontColor
+        self.accentColor = accentColor
+        self.ctaFontColor = ctaFontColor
         self.cardBackgroundColor = cardBackgroundColor
         self.cardBorderColor = cardBorderColor
         self.cardCornerRadius = cardCornerRadius
-        self.selectedColor = selectedColor
-        self.nameColor = nameColor
-        self.launchTextColor = launchTextColor
-        self.launchDisabledColor = launchDisabledColor
-        self.launchCornerRadius = launchCornerRadius
         self.fontFamily = fontFamily
     }
 
     // Resolved defaults mirror the reference "Select Your Game Partner" HTML.
     public var resolvedBackgroundColor: String { backgroundColor ?? "#000000" }
-    public var resolvedTitleColor: String { titleColor ?? "#ffffff" }
-    public var resolvedTitleFontSize: CGFloat { titleFontSize ?? 26 }
-    public var resolvedCardBackgroundColor: String { cardBackgroundColor ?? "#14161a" }
-    public var resolvedCardBorderColor: String { cardBorderColor ?? "#343a42" }
+    public var resolvedTitleFontColor: String { titleFontColor ?? "#FFFFFF" }
+    public var resolvedSecondaryFontColor: String { secondaryFontColor ?? "#FFFFFF" }
+    public var resolvedAccentColor: String { accentColor ?? "#3D9A66" }
+    public var resolvedCtaFontColor: String { ctaFontColor ?? "#FFFFFF" }
+    public var resolvedCardBackgroundColor: String { cardBackgroundColor ?? "#14161A" }
+    public var resolvedCardBorderColor: String { cardBorderColor ?? "#343A42" }
     public var resolvedCardCornerRadius: CGFloat { cardCornerRadius ?? 18 }
-    public var resolvedSelectedColor: String { selectedColor ?? "#3d9a66" }
-    public var resolvedNameColor: String { nameColor ?? "#ffffff" }
-    public var resolvedLaunchTextColor: String { launchTextColor ?? "#ffffff" }
-    public var resolvedLaunchDisabledColor: String { launchDisabledColor ?? "#3a3a3a" }
-    public var resolvedLaunchCornerRadius: CGFloat { launchCornerRadius ?? 14 }
     /// nil → system font (matches the HTML's `-apple-system` stack).
     public var resolvedFontFamily: String? { fontFamily }
 }
@@ -930,6 +924,98 @@ public enum AdReportReason: String, CaseIterable, Sendable {
 
 // MARK: - Native Ad (POST /load/native)
 
+/// A JSON value of any shape — string, number, bool, null, array, or nested object.
+///
+/// Backs ``SimulaAdContext/customContext`` so each entry can carry arbitrary JSON rather than only a
+/// string. Swift's `Any` isn't `Encodable`/`Equatable`/`Sendable`, so this type-erased enum stands in
+/// for it. Literal conformances keep call sites terse — values are inferred from the literal:
+/// ```swift
+/// customContext: [
+///     "recent": "Frieren",                 // .string
+///     "episodes": 28,                      // .int
+///     "rating": 4.7,                       // .double
+///     "watching": true,                    // .bool
+///     "genres": ["fantasy", "adventure"],  // .array
+///     "meta": ["subbed": true],            // .object
+/// ]
+/// ```
+public enum JSONValue: Codable, Equatable, Sendable {
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+    case array([JSONValue])
+    case object([String: JSONValue])
+    case null
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .int(let value): try container.encode(value)
+        case .double(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .int(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .double(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else if let value = try? container.decode([String: JSONValue].self) {
+            self = .object(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON value"
+            )
+        }
+    }
+}
+
+extension JSONValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .string(value) }
+}
+
+extension JSONValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int) { self = .int(value) }
+}
+
+extension JSONValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .double(value) }
+}
+
+extension JSONValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+}
+
+extension JSONValue: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: JSONValue...) { self = .array(elements) }
+}
+
+extension JSONValue: ExpressibleByDictionaryLiteral {
+    public init(dictionaryLiteral elements: (String, JSONValue)...) {
+        self = .object(Dictionary(uniqueKeysWithValues: elements))
+    }
+}
+
+extension JSONValue: ExpressibleByNilLiteral {
+    public init(nilLiteral: ()) { self = .null }
+}
+
 /// Provider-level targeting context for native ads. Set once on `SimulaProviderView` (or via
 /// `SimulaAds.updateContext`) and attached automatically to every `POST /load/native` — a
 /// `NativeAdSlot` never passes context itself (PRD).
@@ -953,8 +1039,8 @@ public struct SimulaAdContext: Encodable, Equatable, Sendable {
     public var userProfile: String?
     /// User email, if available.
     public var userEmail: String?
-    /// Arbitrary string key-values (the backend keeps at most 10 entries).
-    public var customContext: [String: String]?
+    /// Arbitrary key-values of any JSON shape (the backend keeps at most 10 entries).
+    public var customContext: [String: JSONValue]?
     /// Whether the surrounding content is NSFW. Defaults to false.
     public var nsfw: Bool
 
@@ -966,7 +1052,7 @@ public struct SimulaAdContext: Encodable, Equatable, Sendable {
         description: String? = nil,
         userProfile: String? = nil,
         userEmail: String? = nil,
-        customContext: [String: String]? = nil,
+        customContext: [String: JSONValue]? = nil,
         nsfw: Bool = false
     ) {
         self.searchTerm = searchTerm
@@ -989,6 +1075,7 @@ public struct NativeAdRequest: Encodable, Sendable {
     public let sessionId: String
     public let adUnitId: String?
     public let context: SimulaAdContext?
+    public let theme: String?
     /// Sent as a string (the backend accepts number | string); reserved — sizing is client-side.
     public let width: String?
     public let charId: String?
@@ -1000,6 +1087,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         case sessionId = "session_id"
         case adUnitId = "ad_unit_id"
         case context
+        case theme
         case width
         case charId = "char_id"
         case charName = "char_name"
@@ -1011,6 +1099,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         sessionId: String,
         adUnitId: String? = nil,
         context: SimulaAdContext? = nil,
+        theme: String? = nil,
         width: String? = nil,
         charId: String? = nil,
         charName: String? = nil,
@@ -1020,6 +1109,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         self.sessionId = sessionId
         self.adUnitId = adUnitId
         self.context = context
+        self.theme = theme
         self.width = width
         self.charId = charId
         self.charName = charName
