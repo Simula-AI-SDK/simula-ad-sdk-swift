@@ -1270,6 +1270,23 @@ public final class SimulaAPI: @unchecked Sendable {
         _ = try? await session.data(for: request)
     }
 
+    // MARK: - Track Click
+
+    /// Tracks a user-initiated click on the impression (`POST /impressions/{adId}/click`).
+    /// Increments the click counter; the endpoint takes no body. Fired when the mid-store prompt is
+    /// tapped. `adId` is the serve handle for rewarded/interstitial and the ad id for native; the
+    /// backend resolves either. Best-effort, silent-fail.
+    public func trackClick(adId: String, apiKey: String) async {
+        guard !adId.isEmpty else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/click") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+
+        _ = try? await session.data(for: request)
+    }
+
     // MARK: - Report Ad
 
     /// Submits a user-initiated ad report against the impression (`POST /impressions/{adId}/report`).

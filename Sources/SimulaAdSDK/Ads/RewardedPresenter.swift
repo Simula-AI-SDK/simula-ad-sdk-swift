@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import Combine
 
 // MARK: - RewardedPresenter
 
@@ -154,6 +155,13 @@ private struct RewardedGameView: View {
     let bridge: CreativeBridge
     let onFinish: (Bool, Double) -> Void
 
+    /// The timer runs only while the app is foregrounded AND no in-app store/Safari sheet covers the
+    /// playable — tracked separately and reconciled in `reconcileTimer()`. The playable lives in a
+    /// stand-alone `UIWindow`, where SwiftUI's `\.scenePhase` does NOT track the app lifecycle, so
+    /// foreground state is driven by `UIApplication` background/foreground notifications instead.
+    @State private var appForegrounded = true
+    @State private var storeSheetPresented = false
+
     @State private var elapsedPlayTime: Double = 0
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
@@ -214,7 +222,7 @@ private struct RewardedGameView: View {
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
                 // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
                 // touch-target band so the two share one centerline (parity with the interstitial).
-                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { trackStorePromptClick(); handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
@@ -240,6 +248,24 @@ private struct RewardedGameView: View {
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
+        }
+        // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
+        // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            appForegrounded = false
+            reconcileTimer()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            appForegrounded = true
+            reconcileTimer()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
+            storeSheetPresented = true
+            reconcileTimer()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
+            storeSheetPresented = false
+            reconcileTimer()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
         // reward and reveal the close button immediately, bypassing the play timer.
@@ -300,9 +326,28 @@ private struct RewardedGameView: View {
         }
     }
 
+    /// Runs the play-to-earn timer only while foreground-active and no in-app store sheet covers the
+    /// playable.
+    private func reconcileTimer() {
+        if appForegrounded && !storeSheetPresented {
+            if !rewardEarned { startTimer() }
+        } else {
+            timerTask?.cancel()
+            timerTask = nil
+        }
+    }
+
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     private func handleStorePromptTap() {
         CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, attribution: attribution)
+    }
+
+    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
+    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
+    private func trackStorePromptClick() {
+        let adId = impressionId
+        let apiKey = self.apiKey
+        Task { await SimulaAPI().trackClick(adId: adId, apiKey: apiKey) }
     }
 
     // MARK: Close
