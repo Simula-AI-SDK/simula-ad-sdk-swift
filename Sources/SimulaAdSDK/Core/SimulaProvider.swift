@@ -167,15 +167,13 @@ public final class SimulaProvider: ObservableObject {
         if let sessionId, !sessionId.isEmpty { return sessionId }
         if let sessionTask { return await sessionTask.value }
 
-        // `ppid` is suppressed without consent and additionally under COPPA.
         let snapshot = SimulaPrivacy.shared.currentSnapshot
-        let effectiveUserID = snapshot.allowsPrimaryUserID ? primaryUserID : nil
-        let task = Task<String?, Never> { [api, apiKey, devMode] in
+        let task = Task<String?, Never> { [api, apiKey, devMode, primaryUserID] in
             do {
                 let id = try await api.createSession(
                     apiKey: apiKey,
                     devMode: devMode,
-                    primaryUserID: effectiveUserID,
+                    primaryUserID: primaryUserID,
                     privacy: snapshot
                 )
                 return (id?.isEmpty == false) ? id : nil
