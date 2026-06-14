@@ -1252,24 +1252,18 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Track Impression
 
-    /// Tracks an ad impression. When the load response carried an `experiment` node, its
-    /// assignment metadata rides along so impressions can be attributed to the A/B variant.
-    /// Translates `trackImpression()` from api.ts
-    public func trackImpression(adId: String, apiKey: String, experiment: Experiment? = nil) async {
-        // An empty `adId` would POST to `.../impression/` (no id) — skip it.
+    /// Tracks an ad impression as seen (`POST /impressions/{adId}/seen`). The endpoint takes no
+    /// body — A/B attribution is stamped on the serve doc at load time, not on this beacon.
+    /// `adId` is the serve handle for rewarded/interstitial and the ad id for native; the backend
+    /// resolves either. Best-effort, silent-fail.
+    public func trackImpression(adId: String, apiKey: String) async {
+        // An empty id would POST to `.../impressions//seen` (no id) — skip it.
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/track/impression/\(adId)") else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/seen") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        var body: [String: Any] = [:]
-        if let experiment {
-            if let id = experiment.experimentId { body["experiment_id"] = id }
-            if let variant = experiment.variantId { body["variant_id"] = variant }
-            if let layer = experiment.layer { body["layer"] = layer }
-        }
-        request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
 
         _ = try? await session.data(for: request)
     }
@@ -1290,6 +1284,25 @@ public final class SimulaAPI: @unchecked Sendable {
         var body: [String: Any] = ["flag": flag]
         if let note, !note.isEmpty { body["note"] = note }
         request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
+
+        _ = try? await session.data(for: request)
+    }
+
+    // MARK: - Record Interest
+
+    /// Records a user-initiated interest signal against the impression
+    /// (`PATCH /impressions/{adId}/interest?interest=1|-1`). `interest` is `+1` for "Interested"
+    /// and `-1` for "Not interested"; the value rides in the query string and the endpoint takes
+    /// no body. Best-effort, silent-fail — feedback must never disrupt the ad experience.
+    public func recordInterest(adId: String, interest: Int, apiKey: String) async {
+        guard !adId.isEmpty else { return }
+        guard var components = URLComponents(string: "\(API_BASE_URL)/impressions/\(adId)/interest") else { return }
+        components.queryItems = [URLQueryItem(name: "interest", value: String(interest))]
+        guard let url = components.url else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         _ = try? await session.data(for: request)
     }

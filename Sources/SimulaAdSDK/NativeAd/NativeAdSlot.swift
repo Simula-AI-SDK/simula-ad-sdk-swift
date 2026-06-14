@@ -211,13 +211,20 @@ public struct NativeAdSlot: View {
         }
     }
 
-    /// The AD badge menu's feedback (PRD design reference): interested/not_interested/report POST to
-    /// `reportAd`; "about" opens https://simula.ad in the external browser.
+    /// The AD badge menu's feedback (PRD design reference): interested/not_interested record an
+    /// interest signal (+1 / -1); "report" posts to `reportAd`; "about" opens https://simula.ad in
+    /// the external browser.
     private func handleFeedback(_ value: String, impressionId: String) {
         switch value {
         case "about":
             if let url = URL(string: "https://www.simula.ad/privacy-policy") { UIApplication.shared.open(url) }
-        case "interested", "not_interested", "report":
+        case "interested":
+            let apiKey = provider.apiKey
+            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
+        case "not_interested":
+            let apiKey = provider.apiKey
+            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
+        case "report":
             let apiKey = provider.apiKey
             Task { await SimulaAPI().reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
         default:

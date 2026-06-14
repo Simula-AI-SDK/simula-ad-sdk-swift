@@ -46,6 +46,7 @@ struct AdInfoReportOverlay: View {
             if sheetVisible {
                 AdReportSheet(
                     onReport: { flag in submit(flag: flag) },
+                    onInterest: { value in submitInterest(value) },
                     onClose: { withAnimation(.easeInOut(duration: 0.2)) { sheetVisible = false } }
                 )
                 .transition(.opacity)
@@ -59,6 +60,14 @@ struct AdInfoReportOverlay: View {
         let adId = self.adId
         let apiKey = self.apiKey ?? SimulaAds.shared?.apiKey ?? ""
         Task { await api.reportAd(adId: adId, flag: flag, note: nil, apiKey: apiKey) }
+    }
+
+    /// Best-effort interest signal (silent-fail): +1 interested / -1 not interested.
+    private func submitInterest(_ interest: Int) {
+        let api = self.api
+        let adId = self.adId
+        let apiKey = self.apiKey ?? SimulaAds.shared?.apiKey ?? ""
+        Task { await api.recordInterest(adId: adId, interest: interest, apiKey: apiKey) }
     }
 }
 
@@ -90,6 +99,7 @@ struct NativeAdInfoOverlay: View {
             if sheetVisible {
                 AdReportSheet(
                     onReport: { flag in submit(flag: flag) },
+                    onInterest: { value in submitInterest(value) },
                     onClose: { withAnimation(.easeInOut(duration: 0.2)) { sheetVisible = false } },
                     alignment: .topLeading,
                     confined: true
@@ -105,18 +115,27 @@ struct NativeAdInfoOverlay: View {
         let apiKey = self.apiKey ?? SimulaAds.shared?.apiKey ?? ""
         Task { await api.reportAd(adId: adId, flag: flag, note: nil, apiKey: apiKey) }
     }
+
+    private func submitInterest(_ interest: Int) {
+        let api = self.api
+        let adId = self.adId
+        let apiKey = self.apiKey ?? SimulaAds.shared?.apiKey ?? ""
+        Task { await api.recordInterest(adId: adId, interest: interest, apiKey: apiKey) }
+    }
 }
 
 // MARK: - AdReportSheet
 
 /// AppLovin-style ad-feedback menu shown when the "i" / AD badge is tapped: Interested / Not
 /// interested / Report (which expands to reason codes), plus a separate "About Simula Ads" link to
-/// simula.ad. `onReport` posts the chosen flag; `onClose` dismisses.
+/// simula.ad. `onInterest` records the interest signal (`+1` interested / `-1` not interested);
+/// `onReport` posts a Report-flow flag; `onClose` dismisses.
 ///
 /// `alignment` places the menu — `.bottomLeading` (full-screen ads) or `.topLeading` (inline native
 /// card, below the AD badge). `confined` keeps the scrim inside the ad card instead of the screen.
 struct AdReportSheet: View {
     let onReport: (String) -> Void
+    let onInterest: (Int) -> Void
     let onClose: () -> Void
     var alignment: Alignment = .bottomLeading
     var confined: Bool = false
@@ -168,12 +187,11 @@ struct AdReportSheet: View {
         case .menu:
             VStack(alignment: .leading, spacing: 0) {
                 menuRow(icon: "checkmark", text: "Interested") {
-                    onReport("interested"); phase = .done
+                    onInterest(1); phase = .done
                 }
                 divider
                 menuRow(icon: "xmark", text: "Not interested") {
-                    // "Not interested" maps to the existing `dislike` flag (BE adds `interested` later).
-                    onReport("dislike"); phase = .done
+                    onInterest(-1); phase = .done
                 }
                 divider
                 menuRow(icon: "flag.fill", text: "Report", tint: reportTint) {
