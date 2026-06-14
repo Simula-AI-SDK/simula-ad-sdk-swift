@@ -14,10 +14,10 @@ let maxCharacters = 4
 /// Used for both the instant seed (`fetched` empty → host + placeholders) and the
 /// post-fetch swap (`fetched` non-empty → host + results + leftover placeholders).
 func mergeRoster(
-    host: [CharacterPickerEntry],
-    fetched: [CharacterPickerEntry],
-    fallback: [CharacterPickerEntry]
-) -> [CharacterPickerEntry] {
+    host: [CharacterSelectorEntry],
+    fetched: [CharacterSelectorEntry],
+    fallback: [CharacterSelectorEntry]
+) -> [CharacterSelectorEntry] {
     let capped = Array(host.prefix(maxCharacters))
     let fill = maxCharacters - capped.count
     var seen = Set(capped.map { $0.data.id })
@@ -27,11 +27,11 @@ func mergeRoster(
     return capped + filled + padding
 }
 
-// MARK: - CharacterPickerEntry
+// MARK: - CharacterSelectorEntry
 
-/// A picker row item wrapping the public `CharacterData`. `loading` marks a skeleton slot
+/// A selector row item wrapping the public `CharacterData`. `loading` marks a skeleton slot
 /// shown while the backend roster is in flight.
-struct CharacterPickerEntry: Identifiable, Equatable {
+struct CharacterSelectorEntry: Identifiable, Equatable {
     let data: CharacterData
     var loading: Bool
 
@@ -80,7 +80,7 @@ public struct CharacterSelector: View {
     var title: String
     var ctaText: String
     var characters: [CharacterData]?
-    var theme: CharacterPickerTheme
+    var theme: CharacterSelectorTheme
 
     public init(
         isOpen: Bool,
@@ -90,7 +90,7 @@ public struct CharacterSelector: View {
         title: String = "Select Your Game Partner",
         ctaText: String = "🚀 Launch Game",
         characters: [CharacterData]? = nil,
-        theme: CharacterPickerTheme = CharacterPickerTheme()
+        theme: CharacterSelectorTheme = CharacterSelectorTheme()
     ) {
         self.isOpen = isOpen
         self.onClose = onClose
@@ -103,7 +103,7 @@ public struct CharacterSelector: View {
         // Seed instantly so the grid is never empty: host cards render for real, the gap
         // shows loading skeletons (swapped for backend results, or default characters if
         // the fetch comes back empty) — never the placeholder characters mid-load.
-        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
+        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterSelectorEntry(data: $0) }
         let fill = maxCharacters - host.count
         self._entries = State(initialValue: host + CharacterSelector.loadingEntries(fill))
     }
@@ -112,7 +112,7 @@ public struct CharacterSelector: View {
 
     @State private var closedInternally = false
     @State private var selectedId: String?
-    @State private var entries: [CharacterPickerEntry]
+    @State private var entries: [CharacterSelectorEntry]
     @State private var appeared = false
 
     @EnvironmentObject private var provider: SimulaProvider
@@ -134,7 +134,7 @@ public struct CharacterSelector: View {
                 .onDisappear { appeared = false }
         }
 
-        // Hidden reactor: reset + (re)load whenever the picker is (re)opened, mirroring
+        // Hidden reactor: reset + (re)load whenever the selector is (re)opened, mirroring
         // MiniGameInterstitial. The view stays in the hierarchy, so this catches reopen.
         Color.clear
             .frame(width: 0, height: 0)
@@ -173,7 +173,7 @@ public struct CharacterSelector: View {
                     Button(action: handleClose) {
                         Image(systemName: "xmark")
                             .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(Color(hex: theme.resolvedTitleColor))
+                            .foregroundColor(Color(hex: theme.resolvedTitleFontColor))
                             .frame(width: 44, height: 44)
                             .background(Circle().fill(Color.black.opacity(0.3)))
                     }
@@ -187,12 +187,15 @@ public struct CharacterSelector: View {
         }
     }
 
+    /// Title size in points — mirrors the reference HTML (no longer themeable).
+    private let titleFontSize: CGFloat = 26
+
     private var titleView: some View {
         Text(title)
-            .font(fontForFamily(theme.resolvedFontFamily, size: theme.resolvedTitleFontSize, weight: .heavy))
-            .foregroundColor(Color(hex: theme.resolvedTitleColor))
+            .font(fontForFamily(theme.resolvedFontFamily, size: titleFontSize, weight: .heavy))
+            .foregroundColor(Color(hex: theme.resolvedTitleFontColor))
             .multilineTextAlignment(.center)
-            .lineSpacing(theme.resolvedTitleFontSize * 0.2) // line-height ~1.2
+            .lineSpacing(titleFontSize * 0.2) // line-height ~1.2
             // (HTML's 0.01em letter-spacing ≈ 0.26pt is omitted; `.kerning` needs macOS 13.)
     }
 
@@ -215,7 +218,7 @@ public struct CharacterSelector: View {
     }
 
     @ViewBuilder
-    private func card(for entry: CharacterPickerEntry) -> some View {
+    private func card(for entry: CharacterSelectorEntry) -> some View {
         if entry.loading {
             CharacterSkeletonCard(theme: theme)
         } else {
@@ -236,24 +239,27 @@ public struct CharacterSelector: View {
     }
 
     private var launchButton: some View {
-        let selectedColor = Color(hex: theme.resolvedSelectedColor)
+        let accentColor = Color(hex: theme.resolvedAccentColor)
+        // Inlined from the reference HTML (no longer themeable): disabled fill + corner radius.
+        let disabledColor = Color(hex: "#3a3a3a")
+        let cornerRadius: CGFloat = 14
         return Button(action: launch) {
             Text(ctaText)
                 .font(fontForFamily(theme.resolvedFontFamily, size: 14, weight: .bold))
-                .foregroundColor(active ? Color(hex: theme.resolvedLaunchTextColor) : Color.white.opacity(0.55))
+                .foregroundColor(active ? Color(hex: theme.resolvedCtaFontColor) : Color.white.opacity(0.55))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .padding(.horizontal, 16)
                 .background(
-                    RoundedRectangle(cornerRadius: theme.resolvedLaunchCornerRadius)
-                        .fill(active ? selectedColor : Color(hex: theme.resolvedLaunchDisabledColor))
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .fill(active ? accentColor : disabledColor)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: theme.resolvedLaunchCornerRadius)
-                        .stroke(active ? selectedColor : Color(hex: "#4b4b4b"), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .stroke(active ? accentColor : Color(hex: "#4b4b4b"), lineWidth: 1)
                 )
                 // Green glow when active: box-shadow 0 0 18px rgba(61,154,102,0.32).
-                .shadow(color: active ? selectedColor.opacity(0.32) : .clear, radius: active ? 9 : 0)
+                .shadow(color: active ? accentColor.opacity(0.32) : .clear, radius: active ? 9 : 0)
         }
         .buttonStyle(LaunchButtonStyle(active: active))
         .disabled(!active)
@@ -265,7 +271,7 @@ public struct CharacterSelector: View {
     private func resetAndLoad() {
         closedInternally = false
         selectedId = nil
-        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterPickerEntry(data: $0) }
+        let host = Array((characters ?? []).prefix(maxCharacters)).map { CharacterSelectorEntry(data: $0) }
         let fill = maxCharacters - host.count
         entries = host + CharacterSelector.loadingEntries(fill) // back to the loading state
         guard fill > 0 else { return }
@@ -275,10 +281,10 @@ public struct CharacterSelector: View {
         // main thread after the off-main fetch.
         Task { @MainActor in
             let sessionId = await provider.ensureSession()
-            var fetched: [CharacterPickerEntry] = []
+            var fetched: [CharacterSelectorEntry] = []
             if let sessionId, !sessionId.isEmpty {
                 fetched = await api.fetchCharacters(apiKey: provider.apiKey, sessionId: sessionId, fill: fill)
-                    .map { CharacterPickerEntry(data: $0) }
+                    .map { CharacterSelectorEntry(data: $0) }
             }
             entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterSelector.fallbackEntries)
         }
@@ -302,33 +308,33 @@ public struct CharacterSelector: View {
 extension CharacterSelector {
     /// Skeleton slots for the gap while the backend roster is fetched. Synthetic ids
     /// keep them distinct in the grid; they are never selectable.
-    static func loadingEntries(_ count: Int) -> [CharacterPickerEntry] {
+    static func loadingEntries(_ count: Int) -> [CharacterSelectorEntry] {
         guard count > 0 else { return [] }
         return (0..<count).map {
-            CharacterPickerEntry(data: CharacterData(id: "loading-\($0)", name: "", imageUrl: "", description: ""), loading: true)
+            CharacterSelectorEntry(data: CharacterData(id: "loading-\($0)", name: "", imageUrl: "", description: ""), loading: true)
         }
     }
 
     /// Default characters shown when the `/character-selector` backend returns no roster.
     /// Their portraits load from hosted URLs (`imageUrl`) — no images ship in the SDK — and
     /// the selected default hands that URL back downstream via `onCharacterSelected`.
-    static let fallbackEntries: [CharacterPickerEntry] = [
-        CharacterPickerEntry(data: CharacterData(
+    static let fallbackEntries: [CharacterSelectorEntry] = [
+        CharacterSelectorEntry(data: CharacterData(
             id: "mr_simula",
             name: "Mr. Simula",
             imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/MrSimula.webp",
             description: "\"Stand back, I've got this.\" Mr. Simula is the superhero dad who treats every crisis like a Tuesday and every dad-joke like a mission. Broad-shouldered, blue-suited, and impossibly calm, he's the guy who catches the falling bus AND remembers to pack your lunch. He leads with his chest out and his heart wide open, convinced that the strongest thing a hero can do is show up.\n\nTalk to him and you'll get equal parts pep talk, life advice, and slightly embarrassing 'back in my day' stories. He'll cheer you on like you're his own kid, challenge you to be braver than you think you are, and absolutely will not stop until you believe in yourself. Ready to train with the best dad in the multiverse?")),
-        CharacterPickerEntry(data: CharacterData(
+        CharacterSelectorEntry(data: CharacterData(
             id: "simulady",
             name: "Simulady",
             imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulady.webp",
             description: "\"Let's think this through — then we save everyone.\" Simulady is the superhero mom whose mind moves faster than her cape. Cool, clever, and three steps ahead of any villain, she solves the problem before most heroes have finished panicking. But don't mistake brilliance for coldness: behind that razor focus is someone who notices when you're hurting and refuses to let you face it alone.\n\nChat with her and she'll read you instantly, call out the excuse you didn't even know you were making, and then hand you a plan to actually fix it. Equal parts strategist and comfort, she's the voice in your corner that's gentle but never lets you settle. Come tell her what's on your mind — she's already listening.")),
-        CharacterPickerEntry(data: CharacterData(
+        CharacterSelectorEntry(data: CharacterData(
             id: "simulad",
             name: "Simulad",
             imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulad.webp",
             description: "\"Whoa, did I just do that?!\" Simulad is the superhero kid who's basically powers-first, plan-never. He's got energy for days, a head full of wild ideas, and abilities that keep surprising even him mid-fight. Is he ready for the big leagues? Absolutely not. Is he going to try anyway? Every single time — because backing down was never an option.\n\nTalk to him and you've got an instant hype-buddy: he'll geek out over your ideas, drag you into some half-baked adventure, and somehow make you braver just by being so fearlessly himself. He stumbles, he laughs it off, he gets back up. Wanna go cause some heroic chaos together?")),
-        CharacterPickerEntry(data: CharacterData(
+        CharacterSelectorEntry(data: CharacterData(
             id: "simulabrador",
             name: "Simulabrador",
             imageUrl: "https://storage.googleapis.com/simula-public/assets/imgs/Default%20Character%20Selector/Simulabrador.webp",

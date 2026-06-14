@@ -2,8 +2,8 @@ import XCTest
 @testable import SimulaAdSDK
 
 /// Covers the `/character-selector` request body and the tolerant character parsing
-/// the Character Picker relies on. Pure — no network.
-final class CharacterPickerTests: XCTestCase {
+/// the Character Selector relies on. Pure — no network.
+final class CharacterSelectorTests: XCTestCase {
 
     private func data(_ s: String) -> Data { Data(s.utf8) }
 
@@ -76,10 +76,10 @@ final class CharacterPickerTests: XCTestCase {
 
     // MARK: - mergeRoster
 
-    private func entry(_ id: String) -> CharacterPickerEntry {
-        CharacterPickerEntry(data: CharacterData(id: id, name: id, imageUrl: "", description: ""))
+    private func entry(_ id: String) -> CharacterSelectorEntry {
+        CharacterSelectorEntry(data: CharacterData(id: id, name: id, imageUrl: "", description: ""))
     }
-    private var fallback: [CharacterPickerEntry] {
+    private var fallback: [CharacterSelectorEntry] {
         [entry("f1"), entry("f2"), entry("f3"), entry("f4")]
     }
 

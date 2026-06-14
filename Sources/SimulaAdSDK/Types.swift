@@ -96,67 +96,61 @@ public struct CharacterData: Identifiable, Sendable, Equatable {
     }
 }
 
-// MARK: - CharacterPickerTheme
+// MARK: - CharacterSelectorTheme
 
 /// Theme for `CharacterSelector`. Colors are CSS strings (hex/rgba); a nil field falls
 /// back to a `resolved*` value mirroring the reference HTML. Sizes are in points.
-public struct CharacterPickerTheme: Sendable, Equatable {
+public struct CharacterSelectorTheme: Sendable, Equatable {
+    /// Sheet/page background. Default `#000000`.
     public var backgroundColor: String?
-    public var titleColor: String?
-    public var titleFontSize: CGFloat?
+    /// Title heading color. Default `#FFFFFF`.
+    public var titleFontColor: String?
+    /// Character name label color. Default `#FFFFFF`.
+    public var secondaryFontColor: String?
+    /// Selected-card border, active CTA bg + border, and glow. Default `#3D9A66`.
+    public var accentColor: String?
+    /// CTA button text (active). Default `#FFFFFF`.
+    public var ctaFontColor: String?
+    /// Card fill. Default `#14161A`.
     public var cardBackgroundColor: String?
+    /// Default card border. Default `#343A42`.
     public var cardBorderColor: String?
+    /// Card corner radius in points. Default `18`.
     public var cardCornerRadius: CGFloat?
-    /// Selected-card border / active launch-button color. Default `#3d9a66`.
-    public var selectedColor: String?
-    public var nameColor: String?
-    public var launchTextColor: String?
-    /// Disabled launch-button background. Default `#3a3a3a`.
-    public var launchDisabledColor: String?
-    public var launchCornerRadius: CGFloat?
     /// Font family name (e.g. "Inter"). Default: system font.
     public var fontFamily: String?
 
     public init(
         backgroundColor: String? = nil,
-        titleColor: String? = nil,
-        titleFontSize: CGFloat? = nil,
+        titleFontColor: String? = nil,
+        secondaryFontColor: String? = nil,
+        accentColor: String? = nil,
+        ctaFontColor: String? = nil,
         cardBackgroundColor: String? = nil,
         cardBorderColor: String? = nil,
         cardCornerRadius: CGFloat? = nil,
-        selectedColor: String? = nil,
-        nameColor: String? = nil,
-        launchTextColor: String? = nil,
-        launchDisabledColor: String? = nil,
-        launchCornerRadius: CGFloat? = nil,
         fontFamily: String? = nil
     ) {
         self.backgroundColor = backgroundColor
-        self.titleColor = titleColor
-        self.titleFontSize = titleFontSize
+        self.titleFontColor = titleFontColor
+        self.secondaryFontColor = secondaryFontColor
+        self.accentColor = accentColor
+        self.ctaFontColor = ctaFontColor
         self.cardBackgroundColor = cardBackgroundColor
         self.cardBorderColor = cardBorderColor
         self.cardCornerRadius = cardCornerRadius
-        self.selectedColor = selectedColor
-        self.nameColor = nameColor
-        self.launchTextColor = launchTextColor
-        self.launchDisabledColor = launchDisabledColor
-        self.launchCornerRadius = launchCornerRadius
         self.fontFamily = fontFamily
     }
 
     // Resolved defaults mirror the reference "Select Your Game Partner" HTML.
     public var resolvedBackgroundColor: String { backgroundColor ?? "#000000" }
-    public var resolvedTitleColor: String { titleColor ?? "#ffffff" }
-    public var resolvedTitleFontSize: CGFloat { titleFontSize ?? 26 }
-    public var resolvedCardBackgroundColor: String { cardBackgroundColor ?? "#14161a" }
-    public var resolvedCardBorderColor: String { cardBorderColor ?? "#343a42" }
+    public var resolvedTitleFontColor: String { titleFontColor ?? "#FFFFFF" }
+    public var resolvedSecondaryFontColor: String { secondaryFontColor ?? "#FFFFFF" }
+    public var resolvedAccentColor: String { accentColor ?? "#3D9A66" }
+    public var resolvedCtaFontColor: String { ctaFontColor ?? "#FFFFFF" }
+    public var resolvedCardBackgroundColor: String { cardBackgroundColor ?? "#14161A" }
+    public var resolvedCardBorderColor: String { cardBorderColor ?? "#343A42" }
     public var resolvedCardCornerRadius: CGFloat { cardCornerRadius ?? 18 }
-    public var resolvedSelectedColor: String { selectedColor ?? "#3d9a66" }
-    public var resolvedNameColor: String { nameColor ?? "#ffffff" }
-    public var resolvedLaunchTextColor: String { launchTextColor ?? "#ffffff" }
-    public var resolvedLaunchDisabledColor: String { launchDisabledColor ?? "#3a3a3a" }
-    public var resolvedLaunchCornerRadius: CGFloat { launchCornerRadius ?? 14 }
     /// nil → system font (matches the HTML's `-apple-system` stack).
     public var resolvedFontFamily: String? { fontFamily }
 }
