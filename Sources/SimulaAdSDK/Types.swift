@@ -930,6 +930,98 @@ public enum AdReportReason: String, CaseIterable, Sendable {
 
 // MARK: - Native Ad (POST /load/native)
 
+/// A JSON value of any shape — string, number, bool, null, array, or nested object.
+///
+/// Backs ``SimulaAdContext/customContext`` so each entry can carry arbitrary JSON rather than only a
+/// string. Swift's `Any` isn't `Encodable`/`Equatable`/`Sendable`, so this type-erased enum stands in
+/// for it. Literal conformances keep call sites terse — values are inferred from the literal:
+/// ```swift
+/// customContext: [
+///     "recent": "Frieren",                 // .string
+///     "episodes": 28,                      // .int
+///     "rating": 4.7,                       // .double
+///     "watching": true,                    // .bool
+///     "genres": ["fantasy", "adventure"],  // .array
+///     "meta": ["subbed": true],            // .object
+/// ]
+/// ```
+public enum JSONValue: Codable, Equatable, Sendable {
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+    case array([JSONValue])
+    case object([String: JSONValue])
+    case null
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .int(let value): try container.encode(value)
+        case .double(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .int(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .double(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else if let value = try? container.decode([String: JSONValue].self) {
+            self = .object(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON value"
+            )
+        }
+    }
+}
+
+extension JSONValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .string(value) }
+}
+
+extension JSONValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int) { self = .int(value) }
+}
+
+extension JSONValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .double(value) }
+}
+
+extension JSONValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+}
+
+extension JSONValue: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: JSONValue...) { self = .array(elements) }
+}
+
+extension JSONValue: ExpressibleByDictionaryLiteral {
+    public init(dictionaryLiteral elements: (String, JSONValue)...) {
+        self = .object(Dictionary(uniqueKeysWithValues: elements))
+    }
+}
+
+extension JSONValue: ExpressibleByNilLiteral {
+    public init(nilLiteral: ()) { self = .null }
+}
+
 /// Provider-level targeting context for native ads. Set once on `SimulaProviderView` (or via
 /// `SimulaAds.updateContext`) and attached automatically to every `POST /load/native` — a
 /// `NativeAdSlot` never passes context itself (PRD).
@@ -953,8 +1045,8 @@ public struct SimulaAdContext: Encodable, Equatable, Sendable {
     public var userProfile: String?
     /// User email, if available.
     public var userEmail: String?
-    /// Arbitrary string key-values (the backend keeps at most 10 entries).
-    public var customContext: [String: String]?
+    /// Arbitrary key-values of any JSON shape (the backend keeps at most 10 entries).
+    public var customContext: [String: JSONValue]?
     /// Whether the surrounding content is NSFW. Defaults to false.
     public var nsfw: Bool
 
@@ -966,7 +1058,7 @@ public struct SimulaAdContext: Encodable, Equatable, Sendable {
         description: String? = nil,
         userProfile: String? = nil,
         userEmail: String? = nil,
-        customContext: [String: String]? = nil,
+        customContext: [String: JSONValue]? = nil,
         nsfw: Bool = false
     ) {
         self.searchTerm = searchTerm
