@@ -251,8 +251,12 @@ public struct NativeAdSlot: View {
         impressionFired = true
         // Remember it on the cache entry so a remount of the same serve never re-fires.
         NativeAdCache.shared.get(adUnitId, position)?.impressionFired = true
-        // Co-fire the callback and the server impression off the one viewability event (PRD).
+        // Dedup by impression id too, so the same served ad fires at most one impression process-wide
+        // (e.g. shown in two slots, or re-composed). The callback + server beacon co-fire together; a
+        // preview (empty id) always fires the callback but never a beacon.
+        guard impressionId.isEmpty || NativeAdCache.shared.markImpressionFired(impressionId) else { return }
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
+        guard !impressionId.isEmpty else { return }
         let apiKey = provider.apiKey
         Task { await SimulaAPI().trackImpression(adId: impressionId, apiKey: apiKey) }
     }
