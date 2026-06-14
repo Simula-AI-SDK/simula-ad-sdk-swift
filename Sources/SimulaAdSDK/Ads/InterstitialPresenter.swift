@@ -221,7 +221,9 @@ private struct CreativeInterstitialView: View {
             AdInfoReportOverlay(
                 adId: response.impressionId,
                 apiKey: apiKey,
-                closeAtBottomLeft: closeConfig.position == .bottomLeft
+                // A genuine bottom-left ✕ shares the bottom-left corner with the "i" (shrink its hit area);
+                // a progress_bar bottom ✕ relocates to top-right, leaving the "i" its full hit area.
+                closeAtBottomLeft: closeConfig.position == .bottomLeft && !closeBarAtBottom(closeConfig.treatment, closeConfig.position)
             )
         }
         .opacity(visible ? 1 : 0)
@@ -462,6 +464,20 @@ private struct CreativeInterstitialView: View {
 
 // MARK: - CloseButtonView
 
+/// Height of the `progressBar` gate bar.
+let closeProgressBarHeight: CGFloat = 4
+/// When the gate bar sits at the bottom (progressBar at bottomLeft), raise it this far above the safe
+/// edge so it clears the bottom-left info "i" (a 16pt circle inset 6pt from the corner ≈ 22pt tall).
+let closeBottomBarLift: CGFloat = 26
+
+/// True for the `progressBar` treatment pinned to `bottomLeft`: the gate bar then spans the bottom,
+/// so the ✕ moves up to the top-right (it can't sit on the bar) and the bar itself is raised to sit
+/// just above the info "i" (which keeps its corner spot). For every OTHER bottomLeft close the ✕ stays
+/// bottom-left. (The store prompt sits top-right for any bottomLeft close — see `StorePromptBadge`.)
+func closeBarAtBottom(_ treatment: CloseTreatment, _ position: ClosePosition) -> Bool {
+    treatment == .progressBar && position == .bottomLeft
+}
+
 /// The `ad_behavior`-driven close button. Renders the assigned `treatment` at the configured
 /// corner: `hidden` shows nothing until the gate unlocks, `countdownCircle` draws a ring,
 /// `progressBar` a top-edge bar, `rewardOrCloseLabel` a counting-down text pill. `progressBarColor`
@@ -491,8 +507,13 @@ struct CloseButtonView: View {
     /// Fill tint for the ring / bar. Validated upstream, so `Color(hex:)` always gets clean input.
     private var tint: Color { Color(hex: progressBarColor) }
 
-    /// SwiftUI alignment for the configured corner.
+    /// For the progress_bar treatment, the gate bar takes the bottom edge when pinned bottom_left.
+    private var barAtBottom: Bool { closeBarAtBottom(treatment, position) }
+
+    /// The ✕ honors its configured corner, EXCEPT progress_bar at bottom_left: the gate bar takes the
+    /// bottom edge there, so the ✕ moves up to the top-right.
     private var cornerAlignment: Alignment {
+        if barAtBottom { return .topTrailing }
         switch position {
         case .topRight: return .topTrailing
         case .topLeft: return .topLeading
@@ -502,8 +523,8 @@ struct CloseButtonView: View {
 
     var body: some View {
         ZStack {
-            // `progress_bar` treatment: a full-width bar pinned to the very top edge of the screen
-            // (inside the status-bar region), shown during the delay and tinted by color.
+            // `progress_bar` treatment: a full-width bar, shown during the delay and tinted by color.
+            // Pinned to the top edge by default; at bottom_left it sits on the bottom edge instead.
             if !enabled && treatment == .progressBar {
                 progressBar
             }
@@ -518,16 +539,16 @@ struct CloseButtonView: View {
                 // unlocked ✕ share one centerline (and line up with the store badge).
                 .frame(height: touchSize)
                 .padding(8)
-                // When pinned bottom-left, nudge right just enough to clear the always-present info
-                // "i" that sits tight in that corner (the "i" stays closest to the edge), so the two
-                // sit snug side by side. (Tuned for the 16pt circles inside the 44pt touch frame.)
-                .padding(.leading, position == .bottomLeft ? 4 : 0)
+                // A genuine bottom-left ✕ nudges right to clear the info "i" beside it; the relocated
+                // (top-right) ✕ of the progress_bar bottom layout doesn't need it.
+                .padding(.leading, (position == .bottomLeft && !barAtBottom) ? 4 : 0)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
         }
     }
 
-    /// The full-width progress bar for the `progress_bar` treatment — pinned just below the top
-    /// safe-area inset (so it clears the notch / status-bar region) and spanning edge-to-edge.
+    /// The full-width progress bar for the `progress_bar` treatment — spanning edge-to-edge, pinned
+    /// just inside the top safe-area inset (clearing the notch); at bottom_left it sits near the
+    /// bottom, raised just above the info "i" so the two don't overlap (the "i" keeps its corner spot).
     private var progressBar: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -536,8 +557,9 @@ struct CloseButtonView: View {
                     .frame(width: max(0, geo.size.width * progress))
             }
         }
-        .frame(height: 4)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(height: closeProgressBarHeight)
+        .padding(.bottom, barAtBottom ? closeBottomBarLift : 0)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: barAtBottom ? .bottom : .top)
     }
 
     @ViewBuilder
@@ -602,8 +624,10 @@ struct CloseButtonView: View {
 /// (`RewardedPresenter`).
 struct StorePromptBadge: View {
     let prompt: StorePrompt
-    /// The close button's corner. The badge renders in its horizontal mirror (the opposite side) so
-    /// the two never share an edge; the server's `store_prompt.position` is not used for layout.
+    /// The close button's CONFIG corner. The badge sits top-right for a bottom_left close (diagonally
+    /// opposite a bottom-left ✕, or sharing the corner with a progress_bar bottom ✕ that relocated
+    /// there), and in the horizontal mirror of the close corner otherwise (top-right ↔ top-left). The
+    /// server's `store_prompt.position` is not used for layout.
     let closePosition: ClosePosition
     /// Inset from the safe-area edge. Both the interstitial and the rewarded minigame use 8 so the
     /// badge shares its close affordance's baseline.
@@ -616,12 +640,11 @@ struct StorePromptBadge: View {
     private var label: String {
         prompt.platform == .android ? "Google Play" : "App Store"
     }
-    /// Horizontal mirror of the close corner: top-right ↔ top-left, bottom-left → bottom-right.
     private var cornerAlignment: Alignment {
         switch closePosition {
-        case .topRight: return .topLeading
-        case .topLeft: return .topTrailing
-        case .bottomLeft: return .bottomTrailing
+        case .topRight: return .topLeading               // mirror of a top-right close
+        // top_left mirrors to top-right; bottom_left relocates to top-right (same corner as the ✕).
+        case .topLeft, .bottomLeft: return .topTrailing
         }
     }
 

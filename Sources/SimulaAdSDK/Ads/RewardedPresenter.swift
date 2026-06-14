@@ -218,7 +218,13 @@ private struct RewardedGameView: View {
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
-            AdInfoReportOverlay(adId: impressionId, apiKey: apiKey)
+            AdInfoReportOverlay(
+                adId: impressionId,
+                apiKey: apiKey,
+                // A genuine bottom-left ✕ shares the bottom-left corner with the "i" (shrink its hit area);
+                // a progress_bar bottom ✕ relocates to top-right, leaving the "i" its full hit area.
+                closeAtBottomLeft: (close ?? CloseBehavior()).position == .bottomLeft && !closeBarAtBottom((close ?? CloseBehavior()).treatment, (close ?? CloseBehavior()).position)
+            )
         }
         .opacity(visible ? 1 : 0)
         // Opacity 0 does not stop hit-testing during the fade; disable touches so a
