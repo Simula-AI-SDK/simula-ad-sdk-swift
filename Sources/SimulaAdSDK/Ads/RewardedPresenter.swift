@@ -29,7 +29,7 @@ final class RewardedPresenter {
         impressionId: String,
         apiKey: String,
         iframeUrl: String,
-        durationSeconds: Int,
+        renderedHtml: String = "",
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
         trackingUrl: String? = nil,
@@ -54,7 +54,7 @@ final class RewardedPresenter {
             impressionId: impressionId,
             apiKey: apiKey,
             iframeUrl: iframeUrl,
-            durationSeconds: durationSeconds,
+            renderedHtml: renderedHtml,
             close: close,
             storePrompt: storePrompt,
             trackingUrl: trackingUrl,
@@ -124,7 +124,7 @@ final class RewardedPresenter {
 
 /// Full-screen playable minigame: the creative iframe in a pooled `WKWebView`, a
 /// bottom-left close button (always available) and a bottom-right status pill
-/// counting down the remaining play time. The reward is earned once `durationSeconds` of play
+/// counting down the remaining play time. The reward is earned once `gateSeconds` of play
 /// elapse; closing earlier prompts an exit confirmation so the user doesn't lose the
 /// reward by accident. On a qualifying close, `onFinish(earned, elapsedPlayTime)`
 /// fires after the dismiss fade.
@@ -133,9 +133,11 @@ private struct RewardedGameView: View {
     let impressionId: String
     let apiKey: String
     let iframeUrl: String
-    let durationSeconds: Int
+    /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty.
+    let renderedHtml: String
     /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
     /// label) — rendered by the shared `CloseButtonView`, gated on play-to-earn. `nil` → default.
+    /// Its `delaySeconds` is also the play-to-earn gate length (see `gateSeconds`).
     let close: CloseBehavior?
     // Mid-ad store prompt config + tap routing. `storePrompt == nil` → no badge.
     let storePrompt: StorePrompt?
@@ -163,13 +165,17 @@ private struct RewardedGameView: View {
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
+    /// Play-to-earn gate length, in seconds — sourced from `ad_behavior.close.delay_seconds` (the
+    /// same value that ungates the close button). `nil` close → 0 → instantly earned.
+    private var gateSeconds: Int { close?.delaySeconds ?? 0 }
+
     private var secondsLeft: Int {
-        max(0, durationSeconds - Int(elapsedPlayTime))
+        max(0, gateSeconds - Int(elapsedPlayTime))
     }
 
     /// 0→1 fill for the close treatment (progress bar / countdown ring), from play-to-earn progress.
     private var closeProgress: Double {
-        durationSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(durationSeconds))) : 1.0
+        gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
     }
 
     var body: some View {
@@ -179,6 +185,10 @@ private struct RewardedGameView: View {
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
                 WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
+            } else if !renderedHtml.isEmpty {
+                // Prefer the server-rendered HTML (parity with the interstitial, which fills the
+                // surface); fall back to the iframe URL.
+                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge)
             } else if let url = URL(string: iframeUrl) {
                 WebViewRepresentable(url: url, bridge: bridge)
             }
@@ -198,12 +208,13 @@ private struct RewardedGameView: View {
             )
             .animation(.default, value: rewardEarned)
 
-            // Mid-ad store prompt — appears at half the play-to-earn duration and is removed the
-            // instant the reward unlocks (the reward/close pill takes over). Rendered at the
-            // server-resolved corner (verbatim); a tap routes to the advertised store.
+            // Mid-ad store prompt — appears at half the play-to-earn gate and is removed the instant
+            // the reward unlocks (the reward/close pill takes over). Pinned to the corner opposite the
+            // reward/close pill (the SDK mirrors the close position); a tap routes to the advertised store.
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
-                // Match the reward/close pill's 8pt inset so both share the same top baseline.
-                StorePromptBadge(prompt: prompt, edgePadding: 8, onTap: { handleStorePromptTap() })
+                // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
+                // touch-target band so the two share one centerline (parity with the interstitial).
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
@@ -262,21 +273,21 @@ private struct RewardedGameView: View {
 
     private func startTimer() {
         guard timerTask == nil else { return }
-        // A zero/negative duration is earned immediately (no gate).
-        guard durationSeconds > 0 else {
+        // A zero/negative gate is earned immediately (no gate).
+        guard gateSeconds > 0 else {
             rewardEarned = true
             return
         }
         timerTask = Task { @MainActor in
-            while elapsedPlayTime < Double(durationSeconds) && !Task.isCancelled {
+            while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
                 elapsedPlayTime += 1
                 // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-                if elapsedPlayTime >= Double(durationSeconds) / 2 {
+                if elapsedPlayTime >= Double(gateSeconds) / 2 {
                     withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
                 }
-                if elapsedPlayTime >= Double(durationSeconds) {
+                if elapsedPlayTime >= Double(gateSeconds) {
                     rewardEarned = true
                 }
             }

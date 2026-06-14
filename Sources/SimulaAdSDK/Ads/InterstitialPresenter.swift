@@ -207,12 +207,13 @@ private struct CreativeInterstitialView: View {
                 onClose: { handleClose() }
             )
 
-            // Mid-ad store prompt — independent of the close button and SKOverlay. Shown at the
-            // server-resolved position (never recomputed) during the [closeTime/2, closeTime)
-            // window; `!closeEnabled` removes it the instant the real close button appears.
+            // Mid-ad store prompt — independent of the close button and SKOverlay. Pinned to the
+            // corner opposite the close button (the SDK mirrors the close position horizontally)
+            // during the [closeTime/2, closeTime) window; `!closeEnabled` removes it the instant
+            // the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 // Center the badge in the same 44pt touch-target band as the close button (so they line up).
-                StorePromptBadge(prompt: prompt, rowHeight: 44, onTap: { handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -601,6 +602,9 @@ struct CloseButtonView: View {
 /// (`RewardedPresenter`).
 struct StorePromptBadge: View {
     let prompt: StorePrompt
+    /// The close button's corner. The badge renders in its horizontal mirror (the opposite side) so
+    /// the two never share an edge; the server's `store_prompt.position` is not used for layout.
+    let closePosition: ClosePosition
     /// Inset from the safe-area edge. Both the interstitial and the rewarded minigame use 8 so the
     /// badge shares its close affordance's baseline.
     var edgePadding: CGFloat = 8
@@ -612,11 +616,12 @@ struct StorePromptBadge: View {
     private var label: String {
         prompt.platform == .android ? "Google Play" : "App Store"
     }
+    /// Horizontal mirror of the close corner: top-right ↔ top-left, bottom-left → bottom-right.
     private var cornerAlignment: Alignment {
-        switch prompt.position {
-        case .topRight: return .topTrailing
-        case .topLeft: return .topLeading
-        case .bottomLeft: return .bottomLeading
+        switch closePosition {
+        case .topRight: return .topLeading
+        case .topLeft: return .topTrailing
+        case .bottomLeft: return .bottomTrailing
         }
     }
 

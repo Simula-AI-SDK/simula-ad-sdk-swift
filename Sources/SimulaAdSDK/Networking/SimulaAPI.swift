@@ -589,7 +589,7 @@ public struct AdLoadResponse: Decodable, Sendable {
 
 /// Request body for POST /minigames/init/rewarded — the rewarded `.load()` call.
 /// `minPlayThreshold` (seconds) is optional; when omitted the server decides the
-/// required play duration and returns it as `duration_seconds`.
+/// required play duration and returns it as `ad_behavior.close.delay_seconds`.
 public struct RewardedInitRequest: Encodable, Sendable {
     public let adUnitId: String
     public let sessionId: String
@@ -631,17 +631,20 @@ public struct RewardedInitRequest: Encodable, Sendable {
 }
 
 /// Payload from POST /load/rewarded. The SDK renders `iframeUrl` in a
-/// WebView and enforces `durationSeconds` before the reward can be earned. Decoding
-/// is tolerant: missing fields fall back to defaults so a partial payload can't fail
-/// the whole decode (malformed JSON still throws).
+/// WebView and enforces `adBehavior.close.delaySeconds` (the play-to-earn gate) before the
+/// reward can be earned. Decoding is tolerant: missing fields fall back to defaults so a
+/// partial payload can't fail the whole decode (malformed JSON still throws).
 public struct RewardedInitResponse: Decodable, Sendable {
     /// The impression id — replaces the old `serve_id`/`ad_id` pair as the single handle
     /// for verify-reward, fallbacks, tracking and reporting.
     public let impressionId: String
     public let iframeUrl: String
-    public let durationSeconds: Int
-    // Mirrors the interstitial response: drives the mid-ad store prompt + its tap routing.
-    // `adBehavior` is nil when the payload omits `ad_behavior` → no store prompt.
+    /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty (parity with the
+    /// interstitial), so the playable fills the surface the same way.
+    public let renderedHtml: String
+    // Mirrors the interstitial response: the play-to-earn gate (`close.delaySeconds`) plus the
+    // mid-ad store prompt + its tap routing. `adBehavior` is nil when the payload omits
+    // `ad_behavior` → no gate (instantly earned) and no store prompt.
     public let destination: String
     public let trackingUrl: String?
     public let adBehavior: AdBehavior?
@@ -654,7 +657,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case iframeUrl = "iframe_url"
-        case durationSeconds = "duration_seconds"
+        case renderedHtml = "rendered_html"
         case destination
         case trackingUrl = "tracking_url"
         case adBehavior = "ad_behavior"
@@ -664,7 +667,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.impressionId = (try? c.decode(String.self, forKey: .impressionId)) ?? ""
         self.iframeUrl = (try? c.decode(String.self, forKey: .iframeUrl)) ?? ""
-        self.durationSeconds = (try? c.decode(Int.self, forKey: .durationSeconds)) ?? 0
+        self.renderedHtml = (try? c.decode(String.self, forKey: .renderedHtml)) ?? ""
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
@@ -674,14 +677,14 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public init(
         impressionId: String,
         iframeUrl: String,
-        durationSeconds: Int,
+        renderedHtml: String = "",
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
         adBehavior: AdBehavior? = nil
     ) {
         self.impressionId = impressionId
         self.iframeUrl = iframeUrl
-        self.durationSeconds = durationSeconds
+        self.renderedHtml = renderedHtml
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.adBehavior = adBehavior
@@ -1052,7 +1055,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
     /// Initializes a rewarded minigame via POST /minigames/init/rewarded. Returns the
     /// iframe URL, the `serve_id` that ties the play to its later verification, and the
-    /// `duration_seconds` the SDK must enforce before a reward can be earned.
+    /// `ad_behavior` whose `close.delay_seconds` the SDK enforces before a reward.
     public func loadRewarded(
         adUnitId: String,
         sessionId: String = "",

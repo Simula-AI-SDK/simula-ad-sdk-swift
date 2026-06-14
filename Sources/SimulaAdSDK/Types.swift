@@ -630,8 +630,9 @@ public enum StorePromptPlatform: Sendable, Equatable {
 }
 
 /// Mid-ad store prompt (`store_prompt` node): a tappable store badge shown at the 50% playable
-/// mark, independent of the close button and SKOverlay. `position` is resolved server-side
-/// (opposite the close button) — the SDK renders it verbatim and never recomputes collisions.
+/// mark, independent of the close button and SKOverlay. `position` is still decoded from the wire
+/// but no longer drives layout: the SDK renders the badge in the horizontal mirror of the close
+/// button's corner (the opposite side), so the two affordances never share an edge.
 public struct StorePrompt: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let trigger: String

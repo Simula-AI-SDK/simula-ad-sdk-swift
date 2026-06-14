@@ -21,8 +21,8 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// `DISPLAY_FAILED` — `show()` could not present the ad.
     func rewardedDidFailToDisplay(_ ad: SimulaRewardedAd, error: SimulaAdError)
 
-    /// `EARNED_REWARD` — the user played for at least `duration_seconds` before
-    /// dismissing. Fires on close, before server verification completes.
+    /// `EARNED_REWARD` — the user played for at least `ad_behavior.close.delay_seconds`
+    /// before dismissing. Fires on close, before server verification completes.
     func rewardedDidEarnReward(_ ad: SimulaRewardedAd)
 
     /// `REWARD_VERIFIED` — the server verified the play and fired the publisher's
@@ -55,8 +55,8 @@ public extension SimulaRewardedAdDelegate {
 ///
 /// Lifecycle mirrors `SimulaInterstitialAd`: configure once, `load()` to preload,
 /// then `show()` to present. `show()` renders the playable minigame iframe full
-/// screen. The reward is earned by playing for at least `duration_seconds` (returned
-/// by the server at load); the close button is available throughout, and an exit
+/// screen. The reward is earned by playing for at least `ad_behavior.close.delay_seconds`
+/// (returned by the server at load), the same gate that ungates the close button; an exit
 /// confirmation appears if the user tries to leave before the threshold.
 ///
 /// On a qualifying dismiss, `EARNED_REWARD` fires and the SDK verifies the play
@@ -80,8 +80,8 @@ public final class SimulaRewardedAd {
     public let adUnitId: String
 
     /// Optional minimum play time (seconds) requested from the server. When `> 0`
-    /// it is sent as `min_play_threshold`; the server's returned `duration_seconds`
-    /// is what the SDK actually enforces.
+    /// it is sent as `min_play_threshold`; the server's returned
+    /// `ad_behavior.close.delay_seconds` is what the SDK actually enforces.
     public var minPlayThreshold: TimeInterval
 
     /// Receives lifecycle events.
@@ -300,7 +300,7 @@ public final class SimulaRewardedAd {
             impressionId: response.impressionId,
             apiKey: provider.apiKey,
             iframeUrl: response.iframeUrl,
-            durationSeconds: response.durationSeconds,
+            renderedHtml: response.renderedHtml,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,
             trackingUrl: response.trackingUrl,
@@ -416,6 +416,7 @@ public final class SimulaRewardedAd {
         let prompt = storePrompt
             ? StorePrompt(enabled: true, position: .topLeft, platform: storePromptPlatform)
             : nil
+        // The play-to-earn gate now lives on `ad_behavior.close.delay_seconds`; preview drives it directly.
         let duration = max(0, durationSeconds)
 
         let presenter = RewardedPresenter()
@@ -423,7 +424,7 @@ public final class SimulaRewardedAd {
             impressionId: "", // empty → no impression is ever tracked for a preview
             apiKey: provider.apiKey,
             iframeUrl: "",
-            durationSeconds: duration,
+            close: CloseBehavior(delaySeconds: duration),
             storePrompt: prompt,
             trackingUrl: Self.previewTrackingURL,
             destination: .appstore,
@@ -444,7 +445,7 @@ public final class SimulaRewardedAd {
             return
         }
         // Track a synthetic showing state so a second showPreview is a no-op.
-        state = .showing(RewardedInitResponse(impressionId: "", iframeUrl: "", durationSeconds: duration))
+        state = .showing(RewardedInitResponse(impressionId: "", iframeUrl: ""))
         self.presenter = presenter
         delegate?.rewardedDidDisplay(self)
         // Preview is local-only: deliberately no `trackImpression`.
