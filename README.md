@@ -1,313 +1,45 @@
-# Simula MiniGame SDK for Swift
+# Simula Ad SDK for iOS
 
-A native Swift SDK for integrating sponsored mini-games into iOS and macOS applications built with SwiftUI.
+AI-powered native ads, interstitial ads, and rewarded ads for iOS apps using SwiftUI.
 
-## Key Features
+Simula delivers ads that feel native to AI chat and character-driven applications. The SDK handles ad rendering, contextual targeting, privacy compliance, and server-side reward verification out of the box.
 
-- Sponsored mini-games that users can play with AI characters
-- Native SwiftUI components with smooth animations
-- Privacy-first — contextual by default, with opt-in IDFA attribution and IAB consent (GDPR / CCPA / GPP / COPPA) support
-- iOS App Store compliant with bundled Privacy Manifest
-- SKAdNetwork support for privacy-preserving ad attribution
+## Ad Formats
+
+| Format | Description |
+|---|---|
+| **NativeAdSlot** | Inline ad card that fits naturally into SwiftUI layouts |
+| **Interstitial Ad** | Full-screen ad with preload/show lifecycle |
+| **Rewarded Ad** | Play-to-earn ad with server-side reward verification |
 
 ## Requirements
 
-- iOS 15.0+ / macOS 12.0+
+- iOS 15.0+
 - Swift 5.9+
-- Xcode 15.0+
+- Xcode 15+
 
-## Installation
+## Getting Started
 
-### Swift Package Manager
+Full integration guides, API references, and examples are available at:
 
-Add the package to your `Package.swift`:
+**[docs.simula.ad/swift-sdk](https://docs.simula.ad/swift-sdk/quick-start)**
 
-```swift
-dependencies: [
-    .package(url: "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift.git", from: "1.0.1")
-]
-```
-
-Or in Xcode: **File → Add Package Dependencies** and enter the repository URL.
-
-## Quick Start
-
-### 1. Provider Setup
-
-Wrap your app (or the relevant view hierarchy) with `SimulaProviderView`:
-
-```swift
-import SimulaAdSDK
-
-@main
-struct MyApp: App {
-    var body: some Scene {
-        WindowGroup {
-            SimulaProviderView(apiKey: "YOUR_API_KEY", devMode: true) {
-                ContentView()
-            }
-        }
-    }
-}
-```
-
-### 2. MiniGame Menu Integration
-
-Add the mini-game menu to your view:
-
-```swift
-import SimulaAdSDK
-
-struct ChatView: View {
-    @State private var showGames = false
-
-    var body: some View {
-        VStack {
-            Button("Play Games") { showGames = true }
-
-            MiniGameMenu(
-                isOpen: $showGames,
-                onClose: { showGames = false },
-                charName: "Luna",
-                charID: "char_123",
-                charImage: "https://example.com/avatar.png",
-                messages: messages
-            )
-        }
-    }
-}
-```
-
-### 3. Invitation Components
-
-The SDK provides three declarative invite components for triggering the game menu:
-
-```swift
-// CTA Button with pulsating animation
-MiniGameButton(onClick: { showGames = true })
-
-// Top banner invitation card
-MiniGameInvitation(
-    charImage: "https://example.com/avatar.png",
-    isOpen: showInvitation,
-    onClick: { showGames = true },
-    onClose: { showInvitation = false }
-)
-
-// Full-screen invitation overlay (character image + CTA over a background)
-MiniGameInterstitial(
-    charImage: "https://example.com/avatar.png",
-    invitationText: "Want to play a game?",
-    isOpen: showInterstitial,
-    onClick: { showGames = true },
-    onClose: { showInterstitial = false }
-)
-```
-
-These are also grouped under `MiniGameInviteKit` (`.Button`, `.Invitation`,
-`.Interstitial`). Note that the declarative `MiniGameInterstitial` (a mini-game
-*invite* overlay) is distinct from the imperative native interstitial **ad**,
-`SimulaInterstitialAd` (see §4).
-
-### 4. Interstitial Ad (Imperative)
-
-The interstitial is a preloadable full-screen ad with a standard load/show
-lifecycle. Initialize the SDK once, preload with `load()`, then present with
-`show()` — no arguments. Showing presents a native full-screen creative
-(`DISPLAYED`): the server-rendered HTML creative in a web view, which owns its own
-CTA. A user-initiated link tap inside the creative (`CLICKED`) opens the
-advertiser's destination — the App Store (in-app store sheet) or a web page (in-app Safari).
-
-```swift
-import SimulaAdSDK
-
-// 1. Initialize once at launch (does not require SimulaProviderView).
-SimulaAds.initialize(apiKey: "YOUR_API_KEY", devMode: true)
-
-// 2. Create, configure, and preload.
-final class GameAds: SimulaInterstitialAdDelegate {
-    let interstitial = SimulaInterstitialAd(adUnitId: "your_placement_id")
-
-    init() {
-        interstitial.delegate = self
-        interstitial.load()
-    }
-
-    func showAd() {
-        interstitial.show()
-    }
-
-    // 3. Lifecycle events (all optional):
-    func interstitialDidLoad(_ ad: SimulaInterstitialAd) { /* ready to show */ }
-    func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
-    func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
-    func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
-    func interstitialDidClick(_ ad: SimulaInterstitialAd) { /* creative link tapped → opens advertiser destination */ }
-    func interstitialDidClose(_ ad: SimulaInterstitialAd) { /* next ad auto-preloads */ }
-}
-```
-
-**Character context**
-
-The interstitial sends optional character context (`charId`, `charName`, `charImage`,
-`charDesc`) on the `/load/interstitial` request so the backend can target the
-creative. Pass it on each `load(...)` call — there is no global character state. To
-switch characters, just `load(...)` with the new values:
-
-```swift
-ad.load(
-    charId: "char_123",
-    charName: "Luna",
-    charImage: "https://example.com/avatar.png",
-    charDesc: "a witty companion"
-)
-
-// Later, when the active character changes, load with the new values:
-ad.load(charId: "char_456", charName: "Sage")
-```
-
-**Lifecycle notes**
-
-- A single load is in flight per instance; the next ad is preloaded automatically
-  after `CLOSED`.
-- `load()` fails fast with `.notInitialized` if `SimulaAds.initialize` was not called,
-  or `.noFill` when the payload carries no `rendered_html` creative.
-- A loaded ad is cached and **expires after 1 hour** — `show()` then fires
-  `DISPLAY_FAILED` with `.stale` (`"The loaded ad has expired (1 hour limit) and can
-  no longer be shown. Call load() to request a new ad."`); just `load()` again. Loads
-  are **deduplicated** by (ad unit id, character id, character name, session id):
-  while a matching ad is already loaded or in flight, a re-load of the same key
-  within 5 minutes fires `LOAD_FAILED` with `.duplicateRequest` — when the matching
-  ad is ready, `retryInSeconds` carries the time left in the window; while it is
-  still loading, it is `nil`. A different ad unit or character supersedes the
-  pending/ready ad.
-- The creative is the server-rendered HTML; it owns its own CTA, so there is no
-  SDK-drawn button to configure. The interstitial is dismissed via the close button,
-  not by the click-through. `CLICKED` fires on a user-initiated link tap regardless
-  of whether the store/web open succeeds.
-- Imperative presentation is iOS-only; on other platforms `show()` reports
-  `DISPLAY_FAILED(.unsupportedPlatform)`.
-
-| Event | Delegate method |
-|-------|-----------------|
-| LOADED | `interstitialDidLoad(_:)` |
-| LOAD_FAILED | `interstitialDidFailToLoad(_:error:)` |
-| DISPLAYED | `interstitialDidDisplay(_:)` |
-| DISPLAY_FAILED | `interstitialDidFailToDisplay(_:error:)` |
-| CLICKED | `interstitialDidClick(_:)` |
-| CLOSED | `interstitialDidClose(_:)` |
-
-## Components
-
-| Component | Description |
-|-----------|-------------|
-| `SimulaProviderView` | Required wrapper that manages API session and state |
-| `MiniGameMenu` | Modal game catalog with search, pagination, and ad display. Requires `onClose` callback. |
-| `MiniGameButton` | Animated CTA button to launch the game menu |
-| `MiniGameInvitation` | Slide-in banner card with character image |
-| `MiniGameInterstitial` | Declarative full-screen mini-game invite overlay (distinct from the imperative ad) |
-| `SimulaAds` | Global entry point — `initialize(apiKey:)` for the imperative API |
-| `SimulaInterstitialAd` | Imperative preloadable full-screen interstitial ad |
-
-## Theming
-
-All components accept theme objects for customization:
-
-```swift
-let menuTheme = MiniGameTheme(
-    backgroundColor: "#1a1a2e",
-    headerColor: "#16213e",
-    titleFontColor: "#ffffff",
-    accentColor: "#e94560"
-)
-
-MiniGameMenu(
-    isOpen: $showGames,
-    onClose: { showGames = false },
-    charName: "Luna",
-    charID: "char_123",
-    charImage: "https://example.com/avatar.png",
-    theme: menuTheme
-)
-```
-
-See `MiniGameTheme`, `MiniGameInvitationTheme`, `MiniGameButtonTheme`, and `MiniGameInterstitialTheme` for all available properties. The imperative `SimulaInterstitialAd` renders the advertiser's server-rendered HTML creative directly (which owns its own CTA), so it has no SDK-level presentation customization.
+- [Quick Start](https://docs.simula.ad/swift-sdk/quick-start) -- installation, provider setup, privacy, ATT, and error handling
+- [NativeAdSlot](https://docs.simula.ad/swift-sdk/native-ad-slot) -- inline ad view
+- [Interstitial Ad](https://docs.simula.ad/swift-sdk/interstitial-ad) -- full-screen ad
+- [Rewarded Ad](https://docs.simula.ad/swift-sdk/rewarded-ad) -- rewarded ad with server-side verification
 
 ## Privacy & App Store Compliance
 
-This SDK is designed to be App Store compliant out of the box.
+The SDK bundles a `PrivacyInfo.xcprivacy` manifest and supports IAB consent frameworks (TCF, CCPA, GPP), COPPA, and App Tracking Transparency. See the [Quick Start guide](https://docs.simula.ad/swift-sdk/quick-start#privacy-att) for details.
 
-### What's Included
+## Dashboard
 
-| File | Purpose |
-|------|---------|
-| `PrivacyInfo.xcprivacy` | iOS 17+ Privacy Manifest (bundled automatically via SPM) |
-| `docs/SKAdNetworkItems.plist` | SKAdNetwork identifiers for `Info.plist` |
-| `docs/IOS_APP_PRIVACY.md` | Complete App Store privacy label guide |
-
-### Privacy Manifest (Automatic)
-
-The `PrivacyInfo.xcprivacy` is bundled as a package resource and automatically included when you add the SDK via Swift Package Manager. No manual setup required.
-
-### SKAdNetwork Setup
-
-Copy the SKAdNetwork identifiers from `docs/SKAdNetworkItems.plist` into your app's `Info.plist` to enable privacy-preserving ad attribution. See [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) for detailed instructions.
-
-### Consent & Attribution
-
-The SDK is **contextual by default** and *consumes* IAB consent — it does not gather it. Either pass signals via `SimulaPrivacyConfig`, or let the SDK auto-read the standard `IABTCF_*` / `IABUSPrivacy_String` / `IABGPP_*` keys your CMP writes:
-
-```swift
-SimulaProviderView(
-    apiKey: "YOUR_API_KEY",
-    privacy: SimulaPrivacyConfig(
-        tcString: tc, uspString: usp, gppString: gpp, coppaApplies: false
-    )
-) { ContentView() }
-```
-
-Refresh at runtime when your CMP updates (from a child view via `@EnvironmentObject var simula: SimulaProvider`):
-
-```swift
-simula.updateConsent(tcString: newTC, gppString: newGPP)
-```
-
-**Opt-in IDFA attribution** (off by default): set `enableAdvertisingId: true`, call `await simula.requestTrackingAuthorization()`, add `NSUserTrackingUsageDescription` to your `Info.plist`, and declare tracking in your **app-level** privacy manifest. Full steps: [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md) §4.
-
-### Data Practices Summary
-
-| Practice | Status |
-|----------|--------|
-| Cross-app tracking | **No** by default (only if you opt in to IDFA) |
-| IDFA collection | **Opt-in** (off by default) |
-| User-linked data | **No** |
-| Privacy Manifest | **Included** |
-| Contextual targeting | **Yes** (content-based, not user-based) |
-
-### Data Collected
-
-- Conversation context (messages) for contextual ad targeting
-- Ad interaction events (impressions, clicks)
-- Temporary session identifiers (not linked to identity)
-- Device type and screen dimensions
-
-### Data NOT Collected
-
-- Apple Advertising Identifier (IDFA) — *unless you opt in; see Consent & Attribution*
-- Location data
-- Personal information (name, email, phone)
-- Contacts, photos, or browsing history
-
-For the full App Store privacy guide, see [docs/IOS_APP_PRIVACY.md](docs/IOS_APP_PRIVACY.md).
-
-## Documentation
-
-For complete documentation including all props, theming options, and advanced usage, visit:
-
-[Full Documentation](https://simula-ad.notion.site/Simula-x-Dippy-Swift-Mini-Games-SDK-Overview-321af70f6f0d801ea116d754424f10dd?pvs=73)
+Create and manage ad units, view analytics, and configure server-side verification at [publisher.simula.ad](https://publisher.simula.ad).
 
 ## Support
 
+- Documentation: [docs.simula.ad](https://docs.simula.ad)
 - Email: admin@simula.ad
 - Website: [simula.ad](https://simula.ad)
 
