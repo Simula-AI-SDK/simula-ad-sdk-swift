@@ -16,6 +16,9 @@ enum NativeAdController {
         position: Int,
         theme: String? = nil
     ) async throws -> NativeAdResponse {
+        // Distinguish "SDK never initialized" from "session creation failed" — both leave the session
+        // nil, but the publisher's fix differs (call initialize() vs. check key/network).
+        guard SimulaAds.isInitialized else { throw SimulaAdError.notInitialized }
         let sessionId = await provider.ensureSession()
         guard let sessionId, !sessionId.isEmpty else { throw SimulaAdError.noSession }
 

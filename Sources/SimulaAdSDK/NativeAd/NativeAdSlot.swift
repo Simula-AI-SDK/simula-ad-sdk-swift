@@ -9,7 +9,8 @@ import UIKit
 /// call), mounts the creative in a content-sized `WKWebView`, and reports an impression only when
 /// ≥50% of the creative is visible for ≥1 continuous second (the OMID-shaped
 /// `trackNativeAdViewability` seam). A no-fill or any error collapses the slot to **zero height**
-/// with no placeholder; an error additionally surfaces via `onError` (a no-fill does not — PRD).
+/// with no placeholder, and additionally surfaces via `onError` as a ``NativeAdError`` (including a
+/// no-fill, so the publisher can show fallback content).
 ///
 /// Targeting context is not a parameter here: it is read automatically from the `SimulaProvider`
 /// this slot is hosted within (PRD). Must be used inside a `SimulaProviderView`.
@@ -24,7 +25,7 @@ public struct NativeAdSlot: View {
     private let dimension: ParsedDimension
     private let theme: String?
     private let onImpression: (NativeAdData) -> Void
-    private let onError: (SimulaAdError) -> Void
+    private let onError: (NativeAdError) -> Void
 
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
@@ -55,7 +56,9 @@ public struct NativeAdSlot: View {
     ///     live request. An expired/unknown id falls back to a live call with no error surfaced.
     ///   - onImpression: Fired once when the viewability threshold is met (co-fired with the server
     ///     impression).
-    ///   - onError: Fired on a load/render failure (network, bad session). Not fired on a no-fill.
+    ///   - onError: Fired with a ``NativeAdError`` on a load/render failure (not-initialized, no
+    ///     session, network) and on a no-fill (`.noFill`). A cached outcome replayed on a recycled row
+    ///     does not re-fire (one report per served slot).
     ///   - previewHTML: Debug/QA only — render this HTML through the full pipeline (WebView + height
     ///     sizing + viewability + AD-badge feedback bridge) with no network call. Mirrors the
     ///     imperative ads' `showPreview`.
@@ -66,7 +69,7 @@ public struct NativeAdSlot: View {
         theme: String? = nil,
         preloadedAdId: String? = nil,
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
-        onError: @escaping (SimulaAdError) -> Void = { _ in },
+        onError: @escaping (NativeAdError) -> Void = { _ in },
         previewHTML: String? = nil
     ) {
         self.adUnitId = adUnitId
@@ -224,10 +227,10 @@ public struct NativeAdSlot: View {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
             phase = .empty // error → hide; not cached so it can retry next time
-            onError(error)
+            reportError(NativeAdError(error))
         } catch {
             phase = .empty
-            onError(.network(.invalidResponse))
+            reportError(.network)
         }
     }
 
@@ -240,10 +243,19 @@ public struct NativeAdSlot: View {
             impressionFired = false
             phase = .filled(response)
         } else {
-            // No-fill collapses silently (no onError). PRD.
+            // No-fill: collapse the slot AND surface noFill so the publisher can react (fallback).
             NativeAdCache.shared.putNoFill(adUnitId, position)
             phase = .empty
+            reportError(.noFill)
         }
+    }
+
+    /// Surface a native failure to the publisher and record it for telemetry (errorCode parity with the
+    /// imperative ads). Reused by the load, no-fill, and creative-render-failure paths.
+    @MainActor
+    private func reportError(_ error: NativeAdError) {
+        Telemetry.shared.recordError(signature: "native:load", errorCode: error.telemetryCode, breadcrumb: "NativeAdSlot")
+        onError(error)
     }
 
     private func fireImpression(impressionId: String, adFormat: String) {
@@ -271,7 +283,7 @@ public struct NativeAdSlot: View {
         guard case .filled = phase else { return }
         heightPt = 0
         phase = .empty
-        onError(.network(.invalidResponse))
+        reportError(.network)
     }
 
     private func handleMessage(_ raw: String, impressionId: String) {
