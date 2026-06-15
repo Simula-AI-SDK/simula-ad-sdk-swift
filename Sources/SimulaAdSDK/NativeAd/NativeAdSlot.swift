@@ -106,6 +106,7 @@ public struct NativeAdSlot: View {
                 WebViewRepresentable(
                     url: response.iframeURL.flatMap { URL(string: $0) },
                     htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
+                    onNavigationFailed: { _ in handleLoadFailure() },
                     onMessageReceived: { handleMessage($0, impressionId: impressionId) },
                     onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
                     externalClickOnly: true,
@@ -250,10 +251,27 @@ public struct NativeAdSlot: View {
         impressionFired = true
         // Remember it on the cache entry so a remount of the same serve never re-fires.
         NativeAdCache.shared.get(adUnitId, position)?.impressionFired = true
-        // Co-fire the callback and the server impression off the one viewability event (PRD).
+        // Dedup by impression id too, so the same served ad fires at most one impression process-wide
+        // (e.g. shown in two slots, or re-composed). The callback + server beacon co-fire together; a
+        // preview (empty id) always fires the callback but never a beacon.
+        guard impressionId.isEmpty || NativeAdCache.shared.markImpressionFired(impressionId) else { return }
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
+        guard !impressionId.isEmpty else { return }
         let apiKey = provider.apiKey
         Task { await SimulaAPI().trackImpression(adId: impressionId, apiKey: apiKey) }
+    }
+
+    /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into
+    /// view — including a recycled row whose height was restored from cache, so we must NOT gate on
+    /// height here). Collapse the slot instead of leaving a blank/failed creative on screen; surface
+    /// as a load error. The fill stays cached (not invalidated), so a remount retries once
+    /// connectivity returns.
+    @MainActor
+    private func handleLoadFailure() {
+        guard case .filled = phase else { return }
+        heightPt = 0
+        phase = .empty
+        onError(.network(.invalidResponse))
     }
 
     private func handleMessage(_ raw: String, impressionId: String) {
@@ -278,13 +296,20 @@ public struct NativeAdSlot: View {
         }
     }
 
-    /// The AD badge menu's feedback (PRD design reference): interested/not_interested/report POST to
-    /// `reportAd`; "about" opens https://simula.ad in the external browser.
+    /// The AD badge menu's feedback (PRD design reference): interested/not_interested record an
+    /// interest signal (+1 / -1); "report" posts to `reportAd`; "about" opens https://simula.ad in
+    /// the external browser.
     private func handleFeedback(_ value: String, impressionId: String) {
         switch value {
         case "about":
             if let url = URL(string: "https://www.simula.ad/privacy-policy") { UIApplication.shared.open(url) }
-        case "interested", "not_interested", "report":
+        case "interested":
+            let apiKey = provider.apiKey
+            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
+        case "not_interested":
+            let apiKey = provider.apiKey
+            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
+        case "report":
             let apiKey = provider.apiKey
             Task { await SimulaAPI().reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
         default:

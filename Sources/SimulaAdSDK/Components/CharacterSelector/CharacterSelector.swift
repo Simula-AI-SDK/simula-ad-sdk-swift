@@ -178,7 +178,10 @@ public struct CharacterSelector: View {
                             .background(Circle().fill(Color.black.opacity(0.3)))
                     }
                     .buttonStyle(.plain)
-                    .padding(.top, 16)
+                    // `content` ignores the safe area (and the status bar is hidden), so pad
+                    // the button below the physical top inset (notch / Dynamic Island) — else
+                    // it sits under the notch on iOS. Mirrors Android's `systemBarsPadding()`.
+                    .padding(.top, 16 + simulaTopSafeAreaInset())
                     .padding(.trailing, 16)
                     .accessibilityLabel("Close")
                 }

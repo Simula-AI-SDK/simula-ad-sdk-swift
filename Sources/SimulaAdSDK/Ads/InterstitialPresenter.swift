@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import Combine
 
 // MARK: - InterstitialPresenter
 
@@ -123,6 +124,13 @@ private struct CreativeInterstitialView: View {
     let onClick: () -> Void
     let onRequestDismiss: () -> Void
 
+    /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
+    /// the ad — tracked separately and reconciled in `reconcileGate()`. The ad lives in a stand-alone
+    /// `UIWindow`, where SwiftUI's `\.scenePhase` does NOT track the app lifecycle, so foreground
+    /// state is driven by `UIApplication` background/foreground notifications instead.
+    @State private var appForegrounded = true
+    @State private var storeSheetPresented = false
+
     @State private var visible = true
 
     /// Whether the close button may be shown/tapped. Starts `false` when a close delay
@@ -138,6 +146,11 @@ private struct CreativeInterstitialView: View {
     /// Monotonic anchor (`systemUptime`) for the gate, so a re-`onAppear` resumes the countdown
     /// from where it was instead of restarting it. `nil` until first set.
     @State private var gateStartedAt: TimeInterval?
+    /// Total time the gate spent paused (app not foreground-active), excluded from the dwell so
+    /// leaving the app pauses the countdown instead of letting it elapse in the background.
+    @State private var gatePausedTotal: TimeInterval = 0
+    /// `systemUptime` when the current pause began; `nil` while running.
+    @State private var gatePausedAt: TimeInterval?
 
     // Mid-ad store prompt (`store_prompt`) — a tappable badge shown from `closeTime / 2` until the
     // real close button appears.
@@ -213,7 +226,7 @@ private struct CreativeInterstitialView: View {
             // the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 // Center the badge in the same 44pt touch-target band as the close button (so they line up).
-                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { trackStorePromptClick(); handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -251,6 +264,24 @@ private struct CreativeInterstitialView: View {
             if skOverlayPresented, #available(iOS 14.0, *) {
                 SKOverlayPresenter.dismiss()
             }
+        }
+        // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
+        // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            appForegrounded = false
+            reconcileGate()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            appForegrounded = true
+            reconcileGate()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
+            storeSheetPresented = true
+            reconcileGate()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
+            storeSheetPresented = false
+            reconcileGate()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
         // immediately, cancelling the close-delay gate.
@@ -325,6 +356,8 @@ private struct CreativeInterstitialView: View {
     /// `progress_bar` fill `closeProgress`, `reward_or_close_label` ticks `closeRemaining`,
     /// `hidden` shows nothing until it unlocks.
     private func startGate() {
+        // Don't double-start: a running gate is paused via `pauseGate()` (which nils `gateTask`).
+        guard gateTask == nil else { return }
         guard let close = response.adBehavior?.close else { return }
         let treatment = close.treatment
         let total = TimeInterval(close.delaySeconds)
@@ -365,6 +398,36 @@ private struct CreativeInterstitialView: View {
         }
     }
 
+    /// Pauses the close-delay countdown when the app leaves the foreground: stops accruing dwell and
+    /// freezes the in-flight ring/bar fill so it can't elapse while backgrounded.
+    private func pauseGate() {
+        guard let close = response.adBehavior?.close, close.delaySeconds > 0, !closeEnabled else { return }
+        gateTask?.cancel()
+        gateTask = nil
+        if gatePausedAt == nil { gatePausedAt = ProcessInfo.processInfo.systemUptime }
+        if close.treatment == .countdownCircle || close.treatment == .progressBar {
+            let total = TimeInterval(close.delaySeconds)
+            let fraction = min(1, max(0, (total - remainingGateTime(total: total)) / total))
+            var tx = Transaction(); tx.disablesAnimations = true
+            withTransaction(tx) { closeProgress = fraction }
+        }
+    }
+
+    /// Resumes the countdown when the app returns to the foreground: folds the paused interval into
+    /// the excluded total and restarts from where it left off.
+    private func resumeGate() {
+        if let pausedAt = gatePausedAt {
+            gatePausedTotal += ProcessInfo.processInfo.systemUptime - pausedAt
+            gatePausedAt = nil
+        }
+        startGate()
+    }
+
+    /// Runs the gate only while the app is foregrounded and no in-app store sheet covers the ad.
+    private func reconcileGate() {
+        if appForegrounded && !storeSheetPresented { resumeGate() } else { pauseGate() }
+    }
+
     // MARK: Store prompt (mid-ad)
 
     /// Schedules the mid-ad store prompt at the halfway point to the close button (`closeTime / 2`,
@@ -399,6 +462,14 @@ private struct CreativeInterstitialView: View {
             storeOpen: storeOpen,
             attribution: response.adBehavior?.attribution
         )
+    }
+
+    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
+    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
+    private func trackStorePromptClick() {
+        let adId = response.impressionId
+        let apiKey = self.apiKey
+        Task { await SimulaAPI().trackClick(adId: adId, apiKey: apiKey) }
     }
 
     // MARK: SKOverlay (install banner)
@@ -458,7 +529,9 @@ private struct CreativeInterstitialView: View {
         let now = ProcessInfo.processInfo.systemUptime
         let startedAt = gateStartedAt ?? now
         if gateStartedAt == nil { gateStartedAt = startedAt }
-        return total - (now - startedAt)
+        // Subtract time spent paused (app backgrounded / not foreground-active) so the dwell only
+        // counts foreground time — leaving the app pauses the countdown.
+        return total - (now - startedAt - gatePausedTotal)
     }
 }
 

@@ -4,6 +4,17 @@ import StoreKit
 import SafariServices
 import ObjectiveC.runtime
 
+// MARK: - External-sheet lifecycle notifications
+
+extension Notification.Name {
+    /// Posted when an in-app store (`SKStoreProductViewController`) or `SFSafariViewController` sheet
+    /// is presented over an ad. The app stays foreground-active behind it, so the ad's countdown
+    /// timers pause on this and resume on `simulaAdExternalSheetDidDismiss`.
+    static let simulaAdExternalSheetWillPresent = Notification.Name("SimulaAdExternalSheetWillPresent")
+    /// Posted when that in-app sheet is dismissed and the ad is interactive again.
+    static let simulaAdExternalSheetDidDismiss = Notification.Name("SimulaAdExternalSheetDidDismiss")
+}
+
 // MARK: - CreativeCTARouter
 
 /// Routes a creative's CTA tap to its advertiser destination.
@@ -181,6 +192,7 @@ enum CreativeCTARouter {
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
             isPresentingExternal = false
+            NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         storeVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
@@ -193,6 +205,7 @@ enum CreativeCTARouter {
         // guard would stick true forever on a no-window early-return.
         if presentViewController(storeVC) {
             isPresentingExternal = true
+            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }
 
@@ -257,6 +270,7 @@ enum CreativeCTARouter {
         let safariVC = SFSafariViewController(url: url)
         let delegate = SafariDelegate {
             isPresentingExternal = false
+            NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         safariVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet).
@@ -266,6 +280,7 @@ enum CreativeCTARouter {
         // Only mark "presenting" once the present actually succeeds.
         if presentViewController(safariVC) {
             isPresentingExternal = true
+            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }
 

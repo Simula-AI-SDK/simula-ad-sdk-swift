@@ -1,4 +1,8 @@
 import SwiftUI
+import Combine
+#if os(iOS)
+import UIKit
+#endif
 
 // MARK: - AdOverlayView
 
@@ -31,6 +35,14 @@ public struct AdOverlayView: View {
     /// The running countdown ticker. Held so it starts once and is cancelled on disappear, so it
     /// can't outlive the overlay (or be double-started by a re-`onAppear`).
     @State private var countdownTask: Task<Void, Never>?
+    /// Foreground time accrued toward the 5s gate, in ms. The countdown advances only while running,
+    /// and resumes from this on return so backgrounded / store-sheet time is never counted.
+    @State private var accumulatedMs: Double = 0
+    /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
+    /// the ad. This overlay lives in a stand-alone `UIWindow` where SwiftUI's `\.scenePhase` doesn't
+    /// track the app lifecycle, so foreground state comes from `UIApplication` notifications.
+    @State private var appForegrounded = true
+    @State private var storeSheetPresented = false
     /// Top safe-area inset captured once on appear (full-screen only), so the content insets below
     /// the status bar / notch without re-reading the window on every body pass.
     @State private var topSafeInset: CGFloat = 0
@@ -179,30 +191,79 @@ public struct AdOverlayView: View {
             countdownTask?.cancel()
             countdownTask = nil
         }
+        // Pause the countdown while the app is backgrounded OR an in-app store/Safari sheet covers the
+        // ad; resume only when both clear, so it can't elapse off-screen. (iOS-only; no-op elsewhere.)
+        .modifier(AdCountdownLifecycle(
+            onBackground: { appForegrounded = false; reconcileCountdown() },
+            onForeground: { appForegrounded = true; reconcileCountdown() },
+            onSheetPresent: { storeSheetPresented = true; reconcileCountdown() },
+            onSheetDismiss: { storeSheetPresented = false; reconcileCountdown() }
+        ))
     }
 
     // MARK: - Countdown
 
+    /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
+    private func reconcileCountdown() {
+        if appForegrounded && !storeSheetPresented {
+            startCountdown()
+        } else {
+            countdownTask?.cancel()
+            countdownTask = nil
+        }
+    }
+
     private func startCountdown() {
-        // Start exactly once; a re-`onAppear` (or a SwiftUI double-fire) must not restart it.
+        // Start exactly once; a re-`onAppear`, resume, or a SwiftUI double-fire must not restart it.
         guard countdownTask == nil else { return }
-
-        let total = adCountdown
-
-        // Fill the ring linearly over the countdown (matching Kotlin's tween).
-        withAnimation(.linear(duration: Double(total))) {
+        let totalMs: Double = 5_000
+        guard accumulatedMs < totalMs else {
+            adCountdown = 0
+            ringProgress = 1
+            return
+        }
+        // Accrue only foreground time: a 50ms ticker driven by the monotonic clock, re-anchored each
+        // (re)start so a backgrounded / store-sheet gap is never counted. The ring is snapped per tick
+        // so it freezes on pause and resumes from where it left off. Cancelled on background / dismiss.
+        countdownTask = Task { @MainActor in
+            var lastTick = ProcessInfo.processInfo.systemUptime
+            while accumulatedMs < totalMs {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                if Task.isCancelled { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                accumulatedMs += (now - lastTick) * 1000
+                lastTick = now
+                ringProgress = min(1, max(0, CGFloat(accumulatedMs / totalMs)))
+                adCountdown = Int(ceil(max(0, totalMs - accumulatedMs) / 1000))
+            }
+            adCountdown = 0
             ringProgress = 1
         }
+    }
+}
 
-        // Tick once per second on the main actor. A cancellable Task (vs. fire-and-forget
-        // asyncAfter) means a dismiss stops it cleanly and it can't be silently dropped.
-        countdownTask = Task { @MainActor in
-            for remaining in stride(from: total - 1, through: 0, by: -1) {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if Task.isCancelled { return }
-                adCountdown = remaining
-            }
-        }
+// MARK: - AdCountdownLifecycle
+
+/// Pauses an ad overlay's countdown while the app is backgrounded or an in-app store/Safari sheet
+/// covers it, resuming when both clear. iOS-only — a no-op on other platforms. The overlay lives in a
+/// stand-alone `UIWindow`, where SwiftUI's `\.scenePhase` doesn't track the app lifecycle, so this
+/// observes `UIApplication` background/foreground + the store-sheet notifications directly.
+private struct AdCountdownLifecycle: ViewModifier {
+    let onBackground: () -> Void
+    let onForeground: () -> Void
+    let onSheetPresent: () -> Void
+    let onSheetDismiss: () -> Void
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in onBackground() }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in onForeground() }
+            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in onSheetPresent() }
+            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in onSheetDismiss() }
+        #else
+        content
+        #endif
     }
 }
 
