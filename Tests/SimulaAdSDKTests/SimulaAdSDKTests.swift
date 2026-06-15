@@ -819,17 +819,10 @@ final class SimulaAdSDKTests: XCTestCase {
     // MARK: - Rewarded request encoding (snake_case)
 
     func testRewardedInitRequestEncodesSnakeCaseKeys() throws {
-        let body = RewardedInitRequest(adUnitId: "unit_1", sessionId: "sess_9", minPlayThreshold: 15)
+        let body = RewardedInitRequest(adUnitId: "unit_1", sessionId: "sess_9")
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
         XCTAssertEqual(obj?["ad_unit_id"] as? String, "unit_1")
         XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
-        XCTAssertEqual(obj?["min_play_threshold"] as? Int, 15)
-    }
-
-    func testRewardedInitRequestOmitsThresholdWhenNil() throws {
-        let body = RewardedInitRequest(adUnitId: "unit_1", sessionId: "s")
-        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
-        XCTAssertNil(obj?["min_play_threshold"], "nil threshold must be omitted, not sent as null")
     }
 
     func testVerifyRewardRequestEncodesSnakeCaseKeys() throws {
@@ -856,7 +849,6 @@ final class SimulaAdSDKTests: XCTestCase {
     func testRewardedDefaultConfiguration() {
         let ad = SimulaRewardedAd(adUnitId: "u")
         XCTAssertEqual(ad.adUnitId, "u")
-        XCTAssertEqual(ad.minPlayThreshold, 0)
     }
 
     @MainActor

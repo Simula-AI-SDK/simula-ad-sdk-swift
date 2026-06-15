@@ -69,6 +69,51 @@ extension View {
     }
 }
 
+// MARK: - App-level status bar (host-independent fallback)
+
+/// Hides the status bar via the app-level API, ref-counted across overlapping presenters.
+///
+/// The view-controller-based `hideStatusBar(_:)` overlay above only takes effect when the host
+/// keeps `UIViewControllerBasedStatusBarAppearance` enabled (the iOS default). React Native's
+/// template sets it to `NO`, which makes ALL view-controller-based status-bar control a no-op —
+/// so a full-screen ad presented in its own window can't hide the bar that way and shows it.
+///
+/// This bridges that gap: when (and only when) the host has opted out of VC-based appearance, the
+/// full-screen ad presenters drive the app-level status bar instead. It is gated on that Info.plist
+/// flag so native hosts (VC-based = YES) are left entirely to the overlay mechanism — calling this
+/// there is a pure no-op, so it can't regress them. Ref-counting keeps the bar hidden across the
+/// interstitial→fallback handoff (two presenter windows briefly overlap) and restores the host's
+/// original state only once the last presenter ends. Mirrors React Native's own StatusBar module.
+@MainActor
+enum SimulaAppStatusBar {
+    /// True only when the host disabled view-controller-based status-bar appearance, so the
+    /// VC-based overlay can't work and we must fall back to the app-level API.
+    private static let usesAppLevelStatusBar: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool) == false
+
+    private static var depth = 0
+    private static var baselineHidden = false
+
+    /// Hide the status bar for the duration of a full-screen presentation (balanced by `restore()`).
+    static func hide() {
+        guard usesAppLevelStatusBar else { return }
+        if depth == 0 {
+            baselineHidden = UIApplication.shared.isStatusBarHidden
+            UIApplication.shared.setStatusBarHidden(true, with: .fade)
+        }
+        depth += 1
+    }
+
+    /// Release one `hide()`; restores the host's original status-bar state when the last one ends.
+    static func restore() {
+        guard usesAppLevelStatusBar, depth > 0 else { return }
+        depth -= 1
+        if depth == 0 {
+            UIApplication.shared.setStatusBarHidden(baselineHidden, with: .fade)
+        }
+    }
+}
+
 #else
 
 extension View {

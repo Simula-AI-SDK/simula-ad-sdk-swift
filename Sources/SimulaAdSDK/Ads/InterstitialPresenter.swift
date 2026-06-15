@@ -68,6 +68,9 @@ final class InterstitialPresenter {
         // Give the bridge the orientation host + window now that they exist.
         bridge.orientationHost = hosting
         bridge.window = window
+        // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
+        // where `.hideStatusBar(true)` in the creative view is a no-op. No-op in native hosts.
+        SimulaAppStatusBar.hide()
         return true
     }
 
@@ -87,6 +90,9 @@ final class InterstitialPresenter {
         let callback = onClose
         onClose = nil
         callback?()
+        // Balanced with the present-time hide() (after the callback so a fallback presented in it
+        // keeps the bar hidden across the handoff via the ref count).
+        SimulaAppStatusBar.restore()
         win?.isHidden = true
         win?.rootViewController = nil
         // Restore the host's key window so it regains focus. A fallback window presented in the

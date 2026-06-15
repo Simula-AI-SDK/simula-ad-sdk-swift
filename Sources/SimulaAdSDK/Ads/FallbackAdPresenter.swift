@@ -55,6 +55,9 @@ final class FallbackAdPresenter {
         window.rootViewController = hostingController(for: ads[0])
         window.makeKeyAndVisible()
         self.window = window
+        // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
+        // where `.hideStatusBar` in the end-screen view is a no-op. No-op in native hosts.
+        SimulaAppStatusBar.hide()
         fireAutoStoreRedirectIfMatching(index: 0)
         return true
     }
@@ -102,6 +105,9 @@ final class FallbackAdPresenter {
         let callback = onClose
         onClose = nil
         callback?()
+        // Balanced with the present-time hide(); ref count keeps the bar hidden if the close
+        // callback opens another presenter, restoring the host only when the last one ends.
+        SimulaAppStatusBar.restore()
     }
 
     private static func activeWindowScene() -> UIWindowScene? {

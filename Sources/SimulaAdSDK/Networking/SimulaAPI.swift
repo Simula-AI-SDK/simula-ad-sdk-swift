@@ -588,12 +588,11 @@ public struct AdLoadResponse: Decodable, Sendable {
 // MARK: - Rewarded Minigame Models
 
 /// Request body for POST /minigames/init/rewarded — the rewarded `.load()` call.
-/// `minPlayThreshold` (seconds) is optional; when omitted the server decides the
-/// required play duration and returns it as `ad_behavior.close.delay_seconds`.
+/// The server decides the required play duration and returns it as
+/// `ad_behavior.close.delay_seconds`.
 public struct RewardedInitRequest: Encodable, Sendable {
     public let adUnitId: String
     public let sessionId: String
-    public let minPlayThreshold: Int?
     /// Optional character context the backend can use to target the minigame.
     /// Encoded only when non-nil (synthesized `encodeIfPresent`).
     public let charId: String?
@@ -604,7 +603,6 @@ public struct RewardedInitRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
         case sessionId = "session_id"
-        case minPlayThreshold = "min_play_threshold"
         case charId = "char_id"
         case charName = "char_name"
         case charImage = "char_image"
@@ -614,7 +612,6 @@ public struct RewardedInitRequest: Encodable, Sendable {
     public init(
         adUnitId: String,
         sessionId: String = "",
-        minPlayThreshold: Int? = nil,
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
@@ -622,7 +619,6 @@ public struct RewardedInitRequest: Encodable, Sendable {
     ) {
         self.adUnitId = adUnitId
         self.sessionId = sessionId
-        self.minPlayThreshold = minPlayThreshold
         self.charId = charId
         self.charName = charName
         self.charImage = charImage
@@ -1061,7 +1057,6 @@ public final class SimulaAPI: @unchecked Sendable {
     public func loadRewarded(
         adUnitId: String,
         sessionId: String = "",
-        minPlayThreshold: Int? = nil,
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
@@ -1078,7 +1073,6 @@ public final class SimulaAPI: @unchecked Sendable {
             RewardedInitRequest(
                 adUnitId: adUnitId,
                 sessionId: sessionId,
-                minPlayThreshold: minPlayThreshold,
                 charId: charId,
                 charName: charName,
                 charImage: charImage,
