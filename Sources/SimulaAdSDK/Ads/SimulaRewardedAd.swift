@@ -79,11 +79,6 @@ public final class SimulaRewardedAd {
     /// The placement identifier for this ad instance.
     public let adUnitId: String
 
-    /// Optional minimum play time (seconds) requested from the server. When `> 0`
-    /// it is sent as `min_play_threshold`; the server's returned
-    /// `ad_behavior.close.delay_seconds` is what the SDK actually enforces.
-    public var minPlayThreshold: TimeInterval
-
     /// Receives lifecycle events.
     public weak var delegate: SimulaRewardedAdDelegate?
 
@@ -141,9 +136,8 @@ public final class SimulaRewardedAd {
 
     // MARK: - Init
 
-    public init(adUnitId: String, minPlayThreshold: TimeInterval = 0) {
+    public init(adUnitId: String) {
         self.adUnitId = adUnitId
-        self.minPlayThreshold = minPlayThreshold
     }
 
     // MARK: - Load
@@ -219,11 +213,9 @@ public final class SimulaRewardedAd {
             self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
 
             do {
-                let threshold = self.minPlayThreshold > 0 ? Int(self.minPlayThreshold) : nil
                 let response = try await self.api.loadRewarded(
                     adUnitId: self.adUnitId,
                     sessionId: sessionId,
-                    minPlayThreshold: threshold,
                     charId: charId,
                     charName: charName,
                     charImage: charImage,

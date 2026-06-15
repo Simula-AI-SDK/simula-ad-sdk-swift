@@ -152,7 +152,10 @@ public struct CharacterSelector: View {
 
             // `justify-content: space-around`: equal Spacers (edge = 1 unit, gap = 2 units).
             VStack(spacing: 0) {
-                Spacer(minLength: 0)
+                // Floor the leading gap at the close-button height so the title can never
+                // ride up under the top-right close button (which the grid's height would
+                // otherwise let it do as the `space-around` Spacers collapse).
+                Spacer(minLength: 44)
                 titleView
                 Spacer(minLength: 0)
                 Spacer(minLength: 0)
@@ -163,7 +166,10 @@ public struct CharacterSelector: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 16)
-            .padding(.top, 20)
+            // Inset the content below the physical top inset (notch / Dynamic Island), the
+            // same way the close button is — `content` ignores the safe area, so without this
+            // the title rides up under the notch and ends up *above* the inset close button.
+            .padding(.top, 20 + simulaTopSafeAreaInset())
             .padding(.bottom, 18)
 
             // Close button — the HTML page has none, but a modal needs an escape.
