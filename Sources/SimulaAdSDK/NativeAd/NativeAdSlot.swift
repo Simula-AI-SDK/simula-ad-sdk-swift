@@ -122,7 +122,7 @@ public struct NativeAdSlot: View {
                 // this the slot would collapse between "filled" and "measured" and jolt the feed
                 // below up then back down (it "looks broken").
                 if heightPt <= 0 {
-                    NativeAdShimmer()
+                    NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) == "dark")
                 }
 
                 // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
@@ -134,7 +134,7 @@ public struct NativeAdSlot: View {
             .clipped()
         case .loading:
             // While the request is in flight, show a shimmer placeholder.
-            NativeAdShimmer()
+            NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) == "dark")
         case .empty:
             // No-fill / error → hide the card (zero height, no placeholder).
             Color.clear.frame(height: 0)
@@ -326,17 +326,30 @@ public struct NativeAdSlot: View {
 
 /// Animated shimmer shown while a native ad request is in flight. Replaced by the creative on a
 /// fill, or collapsed to nothing on a no-fill / error.
+///
+/// `isDark` matches the shimmer to the creative that's about to render (the resolved ad theme), so a
+/// light-themed ad in a light app shows a light skeleton rather than a dark block that then flips.
 private struct NativeAdShimmer: View {
+    let isDark: Bool
     @State private var animate = false
+
+    private var base: Color {
+        isDark ? Color(red: 0.14, green: 0.14, blue: 0.17) : Color(red: 0.89, green: 0.89, blue: 0.91)
+    }
+
+    /// White sweep band — needs more opacity to read against the light base.
+    private var highlight: Color {
+        isDark ? Color.white.opacity(0.10) : Color.white.opacity(0.55)
+    }
 
     var body: some View {
         RoundedRectangle(cornerRadius: 16)
-            .fill(Color(red: 0.14, green: 0.14, blue: 0.17))
+            .fill(base)
             .frame(height: NativeAdSlot.provisionalHeight)
             .overlay(
                 GeometryReader { geo in
                     LinearGradient(
-                        colors: [.clear, Color.white.opacity(0.10), .clear],
+                        colors: [.clear, highlight, .clear],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
