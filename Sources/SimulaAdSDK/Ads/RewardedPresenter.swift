@@ -78,7 +78,12 @@ final class RewardedPresenter {
         originalKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
-        window.windowLevel = .normal + 1
+        // Above the status-bar window (not just `.normal + 1`) so the opaque full-screen ad
+        // covers the status bar — edge-to-edge even in hosts that disable view-controller-based
+        // status-bar control. React Native sets `UIViewControllerBasedStatusBarAppearance = NO`,
+        // which no-ops `.hideStatusBar(true)`; raising the level hides the bar by pure z-order.
+        // Stays below `.alert` so system alerts / store / Safari sheets still surface above the ad.
+        window.windowLevel = .statusBar + 1
         window.backgroundColor = .black
         window.rootViewController = hosting
         window.makeKeyAndVisible()

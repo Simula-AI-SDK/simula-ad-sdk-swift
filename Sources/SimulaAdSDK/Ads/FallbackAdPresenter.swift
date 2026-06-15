@@ -48,7 +48,11 @@ final class FallbackAdPresenter {
         originalKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
-        window.windowLevel = .normal + 1
+        // Above the status-bar window (matches InterstitialPresenter) so the opaque end screens
+        // cover the status bar — keeping the post-close fallback flow edge-to-edge even in hosts
+        // that disable view-controller-based status-bar control (e.g. React Native). Below
+        // `.alert` so system alerts / store / Safari sheets still surface above the ad.
+        window.windowLevel = .statusBar + 1
         // Opaque black (not clear) so the host app never shows through — both behind the
         // end screen's safe area and during the rootViewController swap between screens.
         window.backgroundColor = .black
