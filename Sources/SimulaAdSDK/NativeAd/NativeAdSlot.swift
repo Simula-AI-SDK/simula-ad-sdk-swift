@@ -125,7 +125,7 @@ public struct NativeAdSlot: View {
                 // this the slot would collapse between "filled" and "measured" and jolt the feed
                 // below up then back down (it "looks broken").
                 if heightPt <= 0 {
-                    NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) == "dark")
+                    NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) != "light")
                 }
 
                 // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
@@ -137,7 +137,7 @@ public struct NativeAdSlot: View {
             .clipped()
         case .loading:
             // While the request is in flight, show a shimmer placeholder.
-            NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) == "dark")
+            NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) != "light")
         case .empty:
             // No-fill / error → hide the card (zero height, no placeholder).
             Color.clear.frame(height: 0)
@@ -339,10 +339,11 @@ public struct NativeAdSlot: View {
 /// Animated shimmer shown while a native ad request is in flight. Replaced by the creative on a
 /// fill, or collapsed to nothing on a no-fill / error.
 ///
-/// `isDark` matches the shimmer to the creative that's about to render (the resolved ad theme), so a
-/// light-themed ad in a light app shows a light skeleton rather than a dark block that then flips.
+/// `isDark` matches the shimmer to the creative that's about to render. Defaults to dark; the skeleton
+/// is light only for an explicitly light (or system-light) creative, so an unspecified theme shows a
+/// dark block rather than a light one that then flips.
 private struct NativeAdShimmer: View {
-    let isDark: Bool
+    var isDark: Bool = true
     @State private var animate = false
 
     private var base: Color {
