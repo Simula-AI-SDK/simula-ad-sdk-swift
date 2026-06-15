@@ -78,12 +78,7 @@ final class RewardedPresenter {
         originalKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
-        // Above the status-bar window (not just `.normal + 1`) so the opaque full-screen ad
-        // covers the status bar — edge-to-edge even in hosts that disable view-controller-based
-        // status-bar control. React Native sets `UIViewControllerBasedStatusBarAppearance = NO`,
-        // which no-ops `.hideStatusBar(true)`; raising the level hides the bar by pure z-order.
-        // Stays below `.alert` so system alerts / store / Safari sheets still surface above the ad.
-        window.windowLevel = .statusBar + 1
+        window.windowLevel = .normal + 1
         window.backgroundColor = .black
         window.rootViewController = hosting
         window.makeKeyAndVisible()
@@ -91,6 +86,9 @@ final class RewardedPresenter {
         // Give the bridge the orientation host + window now that they exist.
         bridge.orientationHost = hosting
         bridge.window = window
+        // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
+        // where `.hideStatusBar(true)` in the creative view is a no-op. No-op in native hosts.
+        SimulaAppStatusBar.hide()
         return true
     }
 
@@ -109,6 +107,9 @@ final class RewardedPresenter {
         let callback = onClose
         onClose = nil
         callback?(earned, elapsedPlayTime)
+        // Balanced with the present-time hide() (after the callback so a fallback presented in it
+        // keeps the bar hidden across the handoff via the ref count).
+        SimulaAppStatusBar.restore()
         win?.isHidden = true
         win?.rootViewController = nil
         // Restore the host's key window so it regains focus. A fallback window presented in the
