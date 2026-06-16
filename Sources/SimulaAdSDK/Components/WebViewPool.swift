@@ -1,5 +1,6 @@
 #if os(iOS)
 import WebKit
+import UIKit
 
 // MARK: - MessageForwarder
 
@@ -66,7 +67,18 @@ final class WebViewPool {
     /// shown sequentially, so a small buffer is enough; `acquire` refills.
     private let maxIdle = 2
 
-    private init() {}
+    private init() {
+        // Each idle web view keeps a Web Content process resident. Under memory pressure, drop the
+        // warm buffer so the SDK isn't holding a tens-of-MB floor in the host (a cold `acquire` simply
+        // rebuilds one). `active` views are on screen, so they're deliberately left untouched.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.clear() }
+        }
+    }
 
     /// Forwards `window.postMessage` payloads to the native message handler.
     /// Installed once per web view at creation time.
