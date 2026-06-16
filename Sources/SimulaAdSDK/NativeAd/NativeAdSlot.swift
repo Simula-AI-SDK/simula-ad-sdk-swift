@@ -289,7 +289,12 @@ public struct NativeAdSlot: View {
     private func handleMessage(_ raw: String, impressionId: String) {
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = obj["type"] as? String else { return }
+              let type = obj["type"] as? String else {
+            // Malformed / non-object message from the creative bridge — dropped, but counted so a
+            // broken or hostile creative is visible rather than silent (aggregated by signature).
+            Telemetry.shared.recordError(signature: "native:bridge_parse_failed", breadcrumb: "NativeAdSlot.handleMessage")
+            return
+        }
         switch type {
         case "SIMULA_AD_HEIGHT", "AD_RESIZE":
             if let h = (obj["height"] as? NSNumber)?.doubleValue, h > 0 {
