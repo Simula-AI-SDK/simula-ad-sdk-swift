@@ -569,7 +569,7 @@ struct WebViewRepresentable: NSViewRepresentable {
                 return
             }
 
-            if navigationAction.targetFrame == nil || !navigationAction.targetFrame!.isMainFrame {
+            if navigationAction.targetFrame.map(\.isMainFrame) != true {
                 if scheme == "http" || scheme == "https" {
                     if url == currentURL {
                         decisionHandler(.allow)

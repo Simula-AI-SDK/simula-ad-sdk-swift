@@ -233,8 +233,11 @@ public struct AdOverlayView: View {
                 let now = ProcessInfo.processInfo.systemUptime
                 accumulatedMs += (now - lastTick) * 1000
                 lastTick = now
-                ringProgress = min(1, max(0, CGFloat(accumulatedMs / totalMs)))
-                adCountdown = Int(ceil(max(0, totalMs - accumulatedMs) / 1000))
+                let progress = accumulatedMs / totalMs
+                ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
+                // Int(nonFinite) traps; clamp before converting.
+                let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
+                adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
             }
             adCountdown = 0
             ringProgress = 1

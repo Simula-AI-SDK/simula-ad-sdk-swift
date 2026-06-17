@@ -22,7 +22,7 @@ struct AdInfoReportOverlay: View {
     var cornerInset: CGFloat = 6
 
     @State private var sheetVisible = false
-    private let api = SimulaAPI()
+    private let api = SimulaAPI.shared
 
     var body: some View {
         ZStack {
@@ -84,7 +84,7 @@ struct NativeAdInfoOverlay: View {
     var apiKey: String?
 
     @State private var sheetVisible = false
-    private let api = SimulaAPI()
+    private let api = SimulaAPI.shared
 
     var body: some View {
         ZStack(alignment: .topLeading) {

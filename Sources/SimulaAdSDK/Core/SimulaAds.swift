@@ -25,7 +25,12 @@ import Foundation
 ///
 /// Main-actor isolated: the shared mutable state (`shared`) is only ever touched
 /// on the main thread, which keeps it free of data races under strict concurrency.
-/// Call `initialize` from the main thread (app launch is already on it).
+///
+/// IMPORTANT: every member here — including `initialize` — is `@MainActor`-isolated, so it MUST be
+/// called on the main thread. App launch (`application(_:didFinishLaunching…)`, SwiftUI `App.init`)
+/// already runs on the main actor, so the common path needs nothing extra. Under Swift 6 strict
+/// concurrency a background-thread call is a compile error; from an older/back-thread context, hop
+/// first: `await MainActor.run { SimulaAds.initialize(...) }`.
 @MainActor
 public enum SimulaAds {
     /// The shared provider built by `initialize`. `nil` until initialization.

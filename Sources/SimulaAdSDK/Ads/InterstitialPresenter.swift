@@ -397,7 +397,11 @@ private struct CreativeInterstitialView: View {
                     closeRemaining = left
                 }
             } else {
-                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
+                let sleepNs = remaining * 1_000_000_000
+                if sleepNs.isFinite, sleepNs > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(sleepNs))
+                }
             }
             if Task.isCancelled { return }
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
@@ -475,7 +479,7 @@ private struct CreativeInterstitialView: View {
     private func trackStorePromptClick() {
         let adId = response.impressionId
         let apiKey = self.apiKey
-        Task { await SimulaAPI().trackClick(adId: adId, apiKey: apiKey) }
+        Task { await SimulaAPI.shared.trackClick(adId: adId, apiKey: apiKey) }
     }
 
     // MARK: SKOverlay (install banner)

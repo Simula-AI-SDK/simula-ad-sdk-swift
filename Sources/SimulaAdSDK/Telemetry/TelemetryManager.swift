@@ -248,13 +248,24 @@ final class TelemetryManager: @unchecked Sendable {
         return s
     }
 
+    // Precompiled once (each `.regularExpression` call compiled the pattern fresh on every error).
+    private static let redactQueryRegex = try? NSRegularExpression(pattern: "\\?\\S*")
+    private static let redactBearerRegex = try? NSRegularExpression(pattern: "(?i)bearer\\s+\\S+")
+    private static let redactSecretRegex = try? NSRegularExpression(pattern: "(?i)(api[_-]?key|token|secret|password)([=:])\\S+")
+
+    private static func apply(_ regex: NSRegularExpression?, to s: String, template: String) -> String {
+        guard let regex else { return s }
+        return regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+
     /// Strips likely secrets from free-text (URL query strings, bearer tokens, key/secret
     /// assignments) and caps length. Applied to error messages before they're stored or logged.
     private func redact(_ message: String?) -> String? {
-        guard var r = message else { return nil }
-        r = r.replacingOccurrences(of: "\\?\\S*", with: "?…", options: .regularExpression)
-        r = r.replacingOccurrences(of: "(?i)bearer\\s+\\S+", with: "Bearer ***", options: .regularExpression)
-        r = r.replacingOccurrences(of: "(?i)(api[_-]?key|token|secret|password)([=:])\\S+", with: "$1$2***", options: .regularExpression)
+        guard let message else { return nil }
+        var r = message
+        r = Self.apply(Self.redactQueryRegex, to: r, template: "?…")
+        r = Self.apply(Self.redactBearerRegex, to: r, template: "Bearer ***")
+        r = Self.apply(Self.redactSecretRegex, to: r, template: "$1$2***")
         return String(r.prefix(maxMessageLen))
     }
 

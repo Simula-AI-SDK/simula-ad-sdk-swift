@@ -806,6 +806,11 @@ public final class SimulaAPI: @unchecked Sendable {
         self.session = session ?? SimulaAPI.defaultSession
     }
 
+    /// Shared instance for the per-event tracking calls (impressions, clicks, interest, reportAd,
+    /// native loads) so they don't allocate a client on every fire. Safe to share: the only stored
+    /// state is the immutable `session` (the tuned `defaultSession`); every method is stateless.
+    public static let shared = SimulaAPI()
+
     // MARK: - Common Headers
 
     private func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {

@@ -270,7 +270,7 @@ public struct NativeAdSlot: View {
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         guard !impressionId.isEmpty else { return }
         let apiKey = provider.apiKey
-        Task { await SimulaAPI().trackImpression(adId: impressionId, apiKey: apiKey) }
+        Task { await SimulaAPI.shared.trackImpression(adId: impressionId, apiKey: apiKey) }
     }
 
     /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into
@@ -322,13 +322,13 @@ public struct NativeAdSlot: View {
             if let url = URL(string: "https://www.simula.ad/privacy-policy") { UIApplication.shared.open(url) }
         case "interested":
             let apiKey = provider.apiKey
-            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
+            Task { await SimulaAPI.shared.recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
         case "not_interested":
             let apiKey = provider.apiKey
-            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
+            Task { await SimulaAPI.shared.recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
         case "report":
             let apiKey = provider.apiKey
-            Task { await SimulaAPI().reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
+            Task { await SimulaAPI.shared.reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
         default:
             break
         }

@@ -213,7 +213,10 @@ private struct MobileCarouselView: View {
 
             ZStack {
                 if n > 0 {
-                    let centerIndex = Int(animator.scrollPosition.rounded())
+                    // Guard the Double→Int conversion: Int(nonFinite) traps. scrollPosition is
+                    // spring-driven, so a future change to that math must not be able to crash here.
+                    let roundedPosition = animator.scrollPosition.rounded()
+                    let centerIndex = roundedPosition.isFinite ? Int(roundedPosition) : 0
                     let visibleIndices = (-2...2).map { centerIndex + $0 }
 
                     ForEach(visibleIndices, id: \.self) { rawIndex in

@@ -12,9 +12,16 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
 
     private let lock = NSLock()
     private var metricsByTask: [Int: URLSessionTaskMetrics] = [:]
+    /// Bound the stash so an entry whose `didCompleteWithError` never fires (it's removed there) can't
+    /// accumulate for the process lifetime. Entries are normally consumed within one request.
+    private let maxTrackedTasks = 256
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        lock.lock(); metricsByTask[task.taskIdentifier] = metrics; lock.unlock()
+        lock.lock()
+        // Drop stale orphans wholesale if we somehow accumulate past the cap (cheap; this rarely trips).
+        if metricsByTask.count >= maxTrackedTasks { metricsByTask.removeAll(keepingCapacity: true) }
+        metricsByTask[task.taskIdentifier] = metrics
+        lock.unlock()
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
