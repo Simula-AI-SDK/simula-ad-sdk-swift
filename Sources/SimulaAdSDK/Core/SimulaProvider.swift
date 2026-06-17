@@ -30,8 +30,10 @@ public final class SimulaProvider: ObservableObject {
     /// Whether the SDK is in development mode
     public let devMode: Bool
 
-    /// Optional primary user identifier
-    public let primaryUserID: String?
+    /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
+    /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
+    public var primaryUserID: String? { ppidStore.current }
+    private let ppidStore: PPIDStore
 
     /// Legacy coarse consent flag. When false, suppresses collection of PII.
     /// Retained as a convenience alias for `privacyConfig.hasPrivacyConsent`.
@@ -99,7 +101,7 @@ public final class SimulaProvider: ObservableObject {
 
         self.apiKey = apiKey
         self.devMode = devMode
-        self.primaryUserID = primaryUserID
+        self.ppidStore = PPIDStore(primaryUserID)
         self.hasPrivacyConsent = hasPrivacyConsent
         self.adContext = adContext
 
@@ -118,7 +120,8 @@ public final class SimulaProvider: ObservableObject {
             apiKey: apiKey,
             devMode: devMode,
             enabled: telemetryEnabled,
-            primaryUserID: primaryUserID
+            // Read the PPID live so a mid-session updatePrimaryUserID is honored; the box is Sendable.
+            primaryUserIDProvider: { [ppidStore = self.ppidStore] in ppidStore.current }
         )
 
         // Feed the process-wide store, then re-sync the session whenever consent
@@ -170,16 +173,27 @@ public final class SimulaProvider: ObservableObject {
         if let sessionTask { return await sessionTask.value }
 
         let snapshot = SimulaPrivacy.shared.currentSnapshot
-        let task = Task<String?, Never> { [api, apiKey, devMode, primaryUserID] in
+        let task = Task<String?, Never> { [api, apiKey, devMode, ppidStore] in
+            // Emit session_created/session_failed once per creation attempt (callers coalesce onto
+            // this single task). Best-effort telemetry; never affects session creation.
+            let startNanos = DispatchTime.now().uptimeNanoseconds
+            func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
             do {
                 let id = try await api.createSession(
                     apiKey: apiKey,
                     devMode: devMode,
-                    primaryUserID: primaryUserID,
+                    primaryUserID: ppidStore.current,
                     privacy: snapshot
                 )
-                return (id?.isEmpty == false) ? id : nil
+                let resolved = (id?.isEmpty == false) ? id : nil
+                if resolved != nil {
+                    Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
+                } else {
+                    Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
+                }
+                return resolved
             } catch {
+                Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
                 return nil
             }
         }
@@ -219,6 +233,30 @@ public final class SimulaProvider: ObservableObject {
     /// value. Ads already preloaded under the old context are unaffected.
     public func updateContext(_ context: SimulaAdContext?) {
         adContext = context
+    }
+
+    // MARK: - Primary User ID (PPID)
+
+    /// Update the primary user id (PPID) mid-session — after a login, a logout, or a first login that
+    /// happened only after the session was created. Mirrors `updateContext`. A nil/empty id clears the
+    /// PPID (logout).
+    ///
+    /// Effects: (1) the value the next `session/create` carries is updated; (2) telemetry reports the
+    /// new value; (3) when a session already exists and consent allows, the live session is PATCHed
+    /// server-side. Clearing (nil) updates local + telemetry state only — the backend's
+    /// `PATCH …/ppid/{ppid}` path can't express an empty id. The network call is best-effort.
+    @MainActor
+    public func updatePrimaryUserID(_ id: String?) {
+        let normalized = (id?.isEmpty == false) ? id : nil
+        ppidStore.set(normalized)
+        // With no session yet, the pending/next createSession carries the new value, so no PATCH is
+        // needed. Only PATCH a live session when consent permits forwarding the PPID.
+        guard let normalized,
+              SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID,
+              let sid = sessionId, !sid.isEmpty else { return }
+        Task { [api, apiKey] in
+            await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
+        }
     }
 
     /// Merge a partial consent update at runtime. Only the supplied fields change.
@@ -336,6 +374,18 @@ extension EnvironmentValues {
         get { self[SimulaProviderKey.self] }
         set { self[SimulaProviderKey.self] = newValue }
     }
+}
+
+// MARK: - PPIDStore
+
+/// Thread-safe holder for the mutable PPID. `Sendable` so the telemetry flush closure and the
+/// session-create task read the live value off the main thread without a data race.
+final class PPIDStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    init(_ initial: String?) { value = initial }
+    var current: String? { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ newValue: String?) { lock.lock(); value = newValue; lock.unlock() }
 }
 
 // MARK: - BoundedStore

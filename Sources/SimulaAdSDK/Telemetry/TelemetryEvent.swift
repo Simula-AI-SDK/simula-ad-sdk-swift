@@ -43,6 +43,12 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var breadcrumb: String?
     var cacheHit: Bool?
     var retryCount: Int?
+    /// Store-exit click type for store_opened/returned/abandoned: cta | store_prompt | auto_redirect.
+    var trigger: String?
+    /// Native load source for load_success: preload | cache | network.
+    var cacheSource: String?
+    /// Wall-clock staleness, stamped at flush time = clock() - timestamp. Detects offline/queued events.
+    var eventAgeMs: Int?
     /// Occurrence count for a deduped error signature (mutable so repeats aggregate in place).
     var count: Int?
 
@@ -64,6 +70,9 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case message, breadcrumb
         case cacheHit = "cache_hit"
         case retryCount = "retry_count"
+        case trigger
+        case cacheSource = "cache_source"
+        case eventAgeMs = "event_age_ms"
         case count
     }
 
@@ -90,6 +99,8 @@ struct TelemetryEnvelope: Codable {
     // Consent-gated: only populated when the resolved ConsentSnapshot allows.
     var primaryUserId: String?
     var advertisingId: String?
+    // Resolved at flush time: wifi | cellular | none | unknown. Best-effort; never blocks.
+    var connectionType: String?
     let events: [TelemetryEvent]
 
     enum CodingKeys: String, CodingKey {
@@ -102,6 +113,7 @@ struct TelemetryEnvelope: Codable {
         case sessionId = "session_id"
         case primaryUserId = "primary_user_id"
         case advertisingId = "advertising_id"
+        case connectionType = "connection_type"
         case events
     }
 }

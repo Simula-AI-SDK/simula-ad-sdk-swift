@@ -149,6 +149,8 @@ private struct CreativeInterstitialView: View {
     /// state is driven by `UIApplication` background/foreground notifications instead.
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
+    /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
+    @State private var storeExit: StoreExitTracker?
 
     @State private var visible = true
 
@@ -252,7 +254,7 @@ private struct CreativeInterstitialView: View {
             // the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 // Center the badge in the same 44pt touch-target band as the close button (so they line up).
-                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { trackStorePromptClick(); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -273,6 +275,7 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            if storeExit == nil { storeExit = StoreExitTracker(adId: response.impressionId, adFormat: "interstitial") }
             startGate()
             startImpressionTimer()
             startStorePromptTrigger()
@@ -293,23 +296,28 @@ private struct CreativeInterstitialView: View {
             if skOverlayPresented, #available(iOS 14.0, *) {
                 SKOverlayPresenter.dismiss()
             }
+            storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             appForegrounded = false
+            storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
+            storeExit?.onReturn() // returned from an .external store/browser jump
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
+            storeExit?.onAway() // an in-app store/Safari sheet covered the ad
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
+            storeExit?.onReturn() // the in-app sheet was dismissed
             reconcileGate()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
@@ -332,6 +340,7 @@ private struct CreativeInterstitialView: View {
     private func fireAutoStoreRedirect() {
         guard !autoRedirectFired else { return }
         autoRedirectFired = true
+        storeExit?.recordStoreOpen("auto_redirect")
         handleStorePromptTap()
     }
 
@@ -369,6 +378,7 @@ private struct CreativeInterstitialView: View {
     /// would destroy the just-presented sheet. Dismissal is driven by the close button.
     private func handleHtmlClick() {
         onClick() // CLICKED
+        storeExit?.recordStoreOpen("cta") // the creative CTA opens the advertiser store
         presentSKOverlayOnClickIfNeeded()
     }
 
@@ -527,9 +537,8 @@ private struct CreativeInterstitialView: View {
     /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
     /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
     private func trackStorePromptClick() {
-        let adId = response.impressionId
-        let apiKey = self.apiKey
-        Task { await SimulaAPI.shared.trackClick(adId: adId, apiKey: apiKey) }
+        // Durable click beacon (was a fire-and-forget trackClick).
+        AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "click", adFormat: "interstitial")
     }
 
     // MARK: SKOverlay (install banner)

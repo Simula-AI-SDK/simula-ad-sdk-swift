@@ -31,6 +31,8 @@ final class TelemetryManager: @unchecked Sendable {
     private let sender: TelemetrySending
     private let primaryUserIdProvider: @Sendable () -> String?
     private let advertisingIdProvider: @Sendable () -> String?
+    // Resolved fresh on each flush (off the UI path). Must be best-effort/non-throwing.
+    private let connectionTypeProvider: @Sendable () -> String?
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
@@ -65,6 +67,7 @@ final class TelemetryManager: @unchecked Sendable {
         sender: TelemetrySending,
         primaryUserIdProvider: @escaping @Sendable () -> String?,
         advertisingIdProvider: @escaping @Sendable () -> String?,
+        connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
         enabled: Bool = true,
         sampleRate: Double = 1.0,
         // Epoch milliseconds, matching the Kotlin SDK's `System.currentTimeMillis()` timestamps.
@@ -82,6 +85,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.sender = sender
         self.primaryUserIdProvider = primaryUserIdProvider
         self.advertisingIdProvider = advertisingIdProvider
+        self.connectionTypeProvider = connectionTypeProvider
         self.now = now
         self.random = random
         self.backoff = backoff
@@ -148,10 +152,12 @@ final class TelemetryManager: @unchecked Sendable {
         enqueuePerf(e)
     }
 
-    func recordOperation(name: String, durationMs: Int, success: Bool) {
+    func recordOperation(name: String, durationMs: Int, success: Bool, failureClass: String? = nil, breadcrumb: String? = nil) {
         var e = newEvent(type: TelemetryType.operation, name: name)
         e.durationMs = durationMs
         e.success = success
+        e.failureClass = failureClass
+        e.breadcrumb = breadcrumb
         enqueuePerf(e)
     }
 
@@ -162,7 +168,9 @@ final class TelemetryManager: @unchecked Sendable {
         adId: String?,
         serveId: String?,
         durationMs: Int?,
-        errorCode: String?
+        errorCode: String?,
+        trigger: String? = nil,
+        cacheSource: String? = nil
     ) {
         var e = newEvent(type: TelemetryType.lifecycle, name: stage)
         e.adFormat = adFormat
@@ -171,6 +179,8 @@ final class TelemetryManager: @unchecked Sendable {
         e.serveId = serveId
         e.durationMs = durationMs
         e.errorCode = errorCode
+        e.trigger = trigger
+        e.cacheSource = cacheSource
         enqueuePerf(e)
     }
 
@@ -327,6 +337,14 @@ final class TelemetryManager: @unchecked Sendable {
             meta.count = droppedSnap
             events.append(meta)
         }
+        // Stamp wall-clock staleness per event at flush time (copies leave buffered originals intact).
+        let stampClock = now()
+        events = events.map { e in
+            guard e.eventAgeMs == nil else { return e }
+            var c = e
+            c.eventAgeMs = Int(stampClock - e.timestamp)
+            return c
+        }
         let body = (try? JSONEncoder().encode(envelopeLocked(events: events))) ?? Data()
         return FlushBatch(body: body, pendingBuffer: pendingBuffer, pendingErrors: pendingErrors, droppedSnap: droppedSnap)
     }
@@ -375,6 +393,7 @@ final class TelemetryManager: @unchecked Sendable {
         // Providers are already consent-gated by the facade (re-checked at send time).
         env.primaryUserId = primaryUserIdProvider()
         env.advertisingId = advertisingIdProvider()
+        env.connectionType = connectionTypeProvider()
         return env
     }
 

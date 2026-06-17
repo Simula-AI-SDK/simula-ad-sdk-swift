@@ -124,7 +124,13 @@ public struct NativeAdSlot: View {
                     htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
                     onNavigationFailed: { _ in handleLoadFailure() },
                     onMessageReceived: { handleMessage($0, impressionId: impressionId) },
-                    onAdClick: { /* CLICKED — reserved for a future click callback / telemetry hook. */ },
+                    onAdClick: {
+                        // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
+                        Telemetry.shared.recordLifecycle(
+                            stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
+                            adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+                        )
+                    },
                     externalClickOnly: true,
                     reportsContentHeight: true
                 )
@@ -211,7 +217,7 @@ public struct NativeAdSlot: View {
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
         if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
-            apply(preloaded)
+            apply(preloaded, source: "preload")
             return
         }
 
@@ -221,6 +227,7 @@ public struct NativeAdSlot: View {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
                 phase = .filled(response)
+                reportLoadSuccess(response, source: "cache")
             } else {
                 phase = .empty
             }
@@ -235,13 +242,16 @@ public struct NativeAdSlot: View {
             phase = .empty
             return
         }
+        let loadStartNanos = DispatchTime.now().uptimeNanoseconds
         do {
-            apply(try await NativeAdController.load(
+            let response = try await NativeAdController.load(
                 provider: provider,
                 adUnitId: adUnitId,
                 position: position,
                 theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark)
-            ))
+            )
+            let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
+            apply(response, source: "network", durationMs: ms)
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
@@ -255,12 +265,13 @@ public struct NativeAdSlot: View {
 
     /// Caches the outcome so the next remount of this slot reuses it (no duplicate serve).
     @MainActor
-    private func apply(_ response: NativeAdResponse) {
+    private func apply(_ response: NativeAdResponse, source: String, durationMs: Int? = nil) {
         if response.hasCreative {
             NativeAdCache.shared.putFill(adUnitId, position, response)
             heightPt = 0
             impressionFired = false
             phase = .filled(response)
+            reportLoadSuccess(response, source: source, durationMs: durationMs)
         } else {
             // No-fill: collapse the slot AND surface noFill so the publisher can react (fallback).
             NativeAdCache.shared.putNoFill(adUnitId, position)
@@ -274,7 +285,22 @@ public struct NativeAdSlot: View {
     @MainActor
     private func reportError(_ error: NativeAdError) {
         Telemetry.shared.recordError(signature: "native:load", errorCode: error.telemetryCode, breadcrumb: "NativeAdSlot")
+        // load_fail lifecycle parity with interstitial/rewarded (native previously emitted error only).
+        Telemetry.shared.recordLifecycle(
+            stage: "load_fail", adFormat: "character_ad", adUnitId: adUnitId, adId: nil,
+            serveId: nil, durationMs: nil, errorCode: error.telemetryCode
+        )
         onError(error)
+    }
+
+    /// load_success lifecycle parity, tagged with where the fill came from (preload | cache | network).
+    @MainActor
+    private func reportLoadSuccess(_ response: NativeAdResponse, source: String, durationMs: Int? = nil) {
+        Telemetry.shared.recordLifecycle(
+            stage: "load_success", adFormat: response.adFormat, adUnitId: adUnitId,
+            adId: (response.impressionId?.isEmpty == false) ? response.impressionId : nil,
+            serveId: nil, durationMs: durationMs, errorCode: nil, cacheSource: source
+        )
     }
 
     private func fireImpression(impressionId: String, adFormat: String, adValue: AdValue) {
@@ -286,13 +312,17 @@ public struct NativeAdSlot: View {
         // (e.g. shown in two slots, or re-composed). The callback + server beacon co-fire together; a
         // preview (empty id) always fires the callback but never a beacon.
         guard impressionId.isEmpty || NativeAdCache.shared.markImpressionFired(impressionId) else { return }
+        // displayed lifecycle parity — fires once per served impression (same dedup gate).
+        Telemetry.shared.recordLifecycle(
+            stage: "displayed", adFormat: adFormat, adUnitId: adUnitId,
+            adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+        )
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         // PAID — co-fired with the impression (PRD "co-fire, do not decouple"). The estimate is already
         // on-device from load; no network round-trip.
         onPaid(adValue)
-        guard !impressionId.isEmpty else { return }
-        let apiKey = resolvedProvider?.apiKey ?? ""
-        Task { await SimulaAPI.shared.trackImpression(adId: impressionId, apiKey: apiKey) }
+        // Durable impression beacon (was a fire-and-forget trackImpression).
+        AdBeaconManager.shared.enqueue(impressionId: impressionId, action: "seen", adFormat: adFormat, adUnitId: adUnitId)
     }
 
     /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into

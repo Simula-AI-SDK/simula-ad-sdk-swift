@@ -401,10 +401,8 @@ public final class SimulaInterstitialAd {
                 Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidRecordImpression(self)
                 self.delegate?.interstitialDidPay(self, value: response.adValue)
-                let api = self.api
-                let apiKey = provider.apiKey
-                let impressionId = response.impressionId
-                Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
+                // Durable billable-impression beacon (was a fire-and-forget trackImpression).
+                AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "seen", adFormat: Self.adFormat, adUnitId: self.adUnitId)
             },
             onClose: { [weak self] in
                 guard let self else { return }
@@ -458,10 +456,8 @@ public final class SimulaInterstitialAd {
         delegate?.interstitialDidDisplay(self)
         // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
-        let api = self.api
-        let apiKey = provider.apiKey
-        let impressionId = response.impressionId
-        Task { await api.trackShown(adId: impressionId, apiKey: apiKey) }
+        // Durable beacon (was a fire-and-forget trackShown).
+        AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: adUnitId)
         #else
         failDisplay(.unsupportedPlatform)
         #endif

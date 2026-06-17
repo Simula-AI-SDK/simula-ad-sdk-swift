@@ -97,6 +97,9 @@ public enum SimulaAds {
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else { return }
 
+        // Monotonic start marker for the sdk_init telemetry duration (emitted once setup completes).
+        let startNanos = DispatchTime.now().uptimeNanoseconds
+
         // Construct the custom User-Agent + device id at init. They're lazy `static let`s, so
         // touching them here forces them before the shared SimulaAPI session reads them for
         // httpAdditionalHeaders.
@@ -126,6 +129,19 @@ public enum SimulaAds {
         // without waiting for the next rewarded play. This kicks off its own Task, so a
         // slow/failed session create can't delay or skip recovery.
         RewardVerificationManager.shared.triggerProcessQueue()
+
+        // Durable impression/click beacon queue: configure it and drain any beacons a prior process
+        // left undelivered (offline/killed). Off the telemetry pipeline; off the critical path.
+        AdBeaconManager.shared.configure(apiKey: apiKey)
+        AdBeaconManager.shared.triggerProcessQueue()
+
+        // SDK-init beacon, now that telemetry is installed (no-op when telemetry is disabled). Only the
+        // first valid initialize reaches here. Best-effort; the config summary carries no PII.
+        let initMs = Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
+        let snap = SimulaPrivacy.shared.currentSnapshot
+        let configSummary = "dev=\(devMode) tel=\(telemetryEnabled) consent=\(snap.hasPrivacyConsent) " +
+            "coppa=\(snap.coppaApplies) adid=\(snap.advertisingId != nil) ctx=\(adContext != nil)"
+        Telemetry.shared.recordOperation(name: "sdk_init", durationMs: initMs, success: true, breadcrumb: configSummary)
     }
 
     // MARK: - Native ad targeting context + preloading
@@ -134,6 +150,14 @@ public enum SimulaAds {
     /// A full replacement, not a merge (PRD). No-op before `initialize`.
     public static func updateContext(_ context: SimulaAdContext?) {
         shared?.updateContext(context)
+    }
+
+    /// Update the primary user id (PPID) mid-session — e.g. after a login, a logout, or a first login
+    /// that happened only after the session was created. Mirrors `updateContext`. A nil/empty id clears
+    /// the PPID (logout). No-op before `initialize`. The next `session/create` carries the new value,
+    /// telemetry reports it, and a live session is PATCHed server-side when consent allows.
+    public static func updatePrimaryUserID(_ id: String?) {
+        shared?.updatePrimaryUserID(id)
     }
 
     #if os(iOS)

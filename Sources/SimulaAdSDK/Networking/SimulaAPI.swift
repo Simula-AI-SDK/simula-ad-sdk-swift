@@ -922,6 +922,32 @@ public final class SimulaAPI: @unchecked Sendable {
         return nil
     }
 
+    // MARK: - Update PPID
+
+    /// Updates the PPID on an existing session: `PATCH /session/{sessionId}/ppid/{ppid}` (Bearer-authed).
+    /// Returns `true` on a 2xx. Best-effort and non-throwing — the SDK's local PPID is the source of
+    /// truth for the next `session/create`, so a transient failure here is harmless (last-write-wins
+    /// server-side). The `TelemetryURLSessionDelegate` skips this path so the PPID never lands in a
+    /// telemetry network event.
+    @discardableResult
+    public func updatePpid(apiKey: String, sessionId: String, ppid: String) async -> Bool {
+        guard !sessionId.isEmpty, !ppid.isEmpty else { return false }
+        let encSession = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
+        let encPpid = ppid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ppid
+        guard let url = URL(string: "\(API_BASE_URL)/session/\(encSession)/ppid/\(encPpid)") else { return false }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        do {
+            let (_, response) = try await session.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            return (200...299).contains(code)
+        } catch {
+            return false
+        }
+    }
+
     // MARK: - Fetch Catalog
 
     /// Fetches the game catalog.
@@ -1379,6 +1405,24 @@ public final class SimulaAPI: @unchecked Sendable {
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
         _ = try? await session.data(for: request)
+    }
+
+    // MARK: - Durable beacon
+
+    /// Sends a no-body impression-action beacon (`POST /impressions/{adId}/{action}`, where `action`
+    /// is `shown` / `seen` / `click`) and returns the HTTP status. Unlike the best-effort `track*`
+    /// helpers, this surfaces the outcome — connectivity failures propagate — so the durable
+    /// `AdBeaconQueue` can decide retry vs. drop. Not for direct call-site use; ad surfaces enqueue
+    /// via `AdBeaconManager`.
+    func sendImpressionBeacon(adId: String, action: String, apiKey: String) async throws -> Int {
+        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/\(action)") else {
+            throw SimulaAPIError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        let (_, response) = try await session.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode ?? -1
     }
 
     // MARK: - Telemetry
