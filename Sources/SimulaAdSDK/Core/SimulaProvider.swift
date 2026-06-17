@@ -319,6 +319,25 @@ public final class SimulaProvider: ObservableObject {
     }
 }
 
+// MARK: - Non-observing provider environment key
+
+/// Carries the `SimulaProvider` down the view tree WITHOUT subscribing readers to its
+/// `objectWillChange`. `NativeAdSlot` reads this (via `@Environment(\.simulaProvider)`) instead of
+/// `@EnvironmentObject`, so a `@Published` change on the provider — e.g. `sessionId` after session
+/// create/refresh — doesn't invalidate and re-render every ad slot in a feed at once. Injected by
+/// `SimulaProviderView` alongside the existing `.environmentObject(provider)` (which the menu
+/// components still use).
+private struct SimulaProviderKey: EnvironmentKey {
+    static let defaultValue: SimulaProvider? = nil
+}
+
+extension EnvironmentValues {
+    var simulaProvider: SimulaProvider? {
+        get { self[SimulaProviderKey.self] }
+        set { self[SimulaProviderKey.self] = newValue }
+    }
+}
+
 // MARK: - BoundedStore
 
 /// A tiny insertion-ordered, size-capped key→value store backing the legacy host-facing ad caches.
@@ -420,6 +439,9 @@ public struct SimulaProviderView<Content: View>: View {
     public var body: some View {
         content()
             .environmentObject(provider)
+            // Also expose it non-observingly so NativeAdSlot can read it without re-rendering on
+            // every @Published change (see EnvironmentValues.simulaProvider).
+            .environment(\.simulaProvider, provider)
             .task {
                 await provider.createSession()
             }
