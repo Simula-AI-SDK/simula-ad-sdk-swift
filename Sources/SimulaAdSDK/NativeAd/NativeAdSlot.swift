@@ -15,7 +15,15 @@ import UIKit
 /// Targeting context is not a parameter here: it is read automatically from the `SimulaProvider`
 /// this slot is hosted within (PRD). Must be used inside a `SimulaProviderView`.
 public struct NativeAdSlot: View {
-    @EnvironmentObject private var provider: SimulaProvider
+    // Non-observing provider injection (see EnvironmentValues.simulaProvider). Reading it via
+    // @Environment — instead of @EnvironmentObject — means a @Published change on the provider
+    // (e.g. sessionId after session create/refresh) does NOT re-render every NativeAdSlot in a feed.
+    @Environment(\.simulaProvider) private var providerEnv: SimulaProvider?
+
+    /// The provider for this slot, resolved without observing it. Falls back to the imperative
+    /// `SimulaAds.shared`, then nil — a nil provider renders the slot empty rather than crashing the
+    /// host (matching the provider-less robustness the Android SDK has).
+    @MainActor private var resolvedProvider: SimulaProvider? { providerEnv ?? SimulaAds.shared }
     @Environment(\.colorScheme) private var colorScheme
 
     private let adUnitId: String?
@@ -131,7 +139,7 @@ public struct NativeAdSlot: View {
                 // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
                 // Not interested / Report / About) — the SDK's standard dialog, once the ad shows.
                 if heightPt > 0 {
-                    NativeAdInfoOverlay(adId: impressionId, apiKey: provider.apiKey)
+                    NativeAdInfoOverlay(adId: impressionId, apiKey: resolvedProvider?.apiKey ?? "")
                 }
             }
             .clipped()
@@ -216,6 +224,12 @@ public struct NativeAdSlot: View {
 
         // 3. Live request.
         phase = .loading
+        guard let provider = resolvedProvider else {
+            // No SimulaProvider in the environment and no imperative SimulaAds.initialize() — render
+            // empty instead of crashing the host (mirrors Android's provider-less fallback).
+            phase = .empty
+            return
+        }
         do {
             apply(try await NativeAdController.load(
                 provider: provider,
@@ -269,8 +283,8 @@ public struct NativeAdSlot: View {
         guard impressionId.isEmpty || NativeAdCache.shared.markImpressionFired(impressionId) else { return }
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         guard !impressionId.isEmpty else { return }
-        let apiKey = provider.apiKey
-        Task { await SimulaAPI().trackImpression(adId: impressionId, apiKey: apiKey) }
+        let apiKey = resolvedProvider?.apiKey ?? ""
+        Task { await SimulaAPI.shared.trackImpression(adId: impressionId, apiKey: apiKey) }
     }
 
     /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into
@@ -289,7 +303,12 @@ public struct NativeAdSlot: View {
     private func handleMessage(_ raw: String, impressionId: String) {
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = obj["type"] as? String else { return }
+              let type = obj["type"] as? String else {
+            // Malformed / non-object message from the creative bridge — dropped, but counted so a
+            // broken or hostile creative is visible rather than silent (aggregated by signature).
+            Telemetry.shared.recordError(signature: "native:bridge_parse_failed", breadcrumb: "NativeAdSlot.handleMessage")
+            return
+        }
         switch type {
         case "SIMULA_AD_HEIGHT", "AD_RESIZE":
             if let h = (obj["height"] as? NSNumber)?.doubleValue, h > 0 {
@@ -316,14 +335,14 @@ public struct NativeAdSlot: View {
         case "about":
             if let url = URL(string: "https://www.simula.ad/privacy-policy") { UIApplication.shared.open(url) }
         case "interested":
-            let apiKey = provider.apiKey
-            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
+            let apiKey = resolvedProvider?.apiKey ?? ""
+            Task { await SimulaAPI.shared.recordInterest(adId: impressionId, interest: 1, apiKey: apiKey) }
         case "not_interested":
-            let apiKey = provider.apiKey
-            Task { await SimulaAPI().recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
+            let apiKey = resolvedProvider?.apiKey ?? ""
+            Task { await SimulaAPI.shared.recordInterest(adId: impressionId, interest: -1, apiKey: apiKey) }
         case "report":
-            let apiKey = provider.apiKey
-            Task { await SimulaAPI().reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
+            let apiKey = resolvedProvider?.apiKey ?? ""
+            Task { await SimulaAPI.shared.reportAd(adId: impressionId, flag: value, apiKey: apiKey) }
         default:
             break
         }

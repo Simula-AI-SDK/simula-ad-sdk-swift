@@ -3,9 +3,50 @@ import SwiftUI
 extension Color {
     /// Initialize a Color from a hex string like "#FF5733", "FF5733", "#RRGGBBAA", or "rgba(r,g,b,a)".
     /// Supports 3-char (RGB), 6-char (RRGGBB), and 8-char (RRGGBBAA) hex formats.
+    ///
+    /// The parse (lowercasing + `replacingOccurrences` + `Scanner`) is cached by the raw input string,
+    /// because this is called from animated SwiftUI bodies that re-evaluate the same theme colors many
+    /// times per second. The cache stores the resolved sRGB components, so the produced `Color` is
+    /// byte-identical to parsing fresh — it just skips the repeated string work.
     public init(hex: String) {
-        // Handle rgba() format: "rgba(0, 0, 0, 0.08)"
-        if hex.lowercased().hasPrefix("rgba(") {
+        let c = Color.rgbaComponents(for: hex)
+        self.init(.sRGB, red: c.r, green: c.g, blue: c.b, opacity: c.a)
+    }
+
+    // MARK: - Cached parse
+
+    private typealias RGBA = (r: Double, g: Double, b: Double, a: Double)
+
+    private static let hexCacheLock = NSLock()
+    private static var hexCache: [String: RGBA] = [:]
+    /// Bound the cache so adversarial/unbounded distinct inputs can't grow it without limit.
+    private static let hexCacheMax = 256
+
+    private static func rgbaComponents(for hex: String) -> RGBA {
+        hexCacheLock.lock()
+        if let cached = hexCache[hex] {
+            hexCacheLock.unlock()
+            return cached
+        }
+        hexCacheLock.unlock()
+
+        let parsed = parseHex(hex)
+
+        hexCacheLock.lock()
+        // Simplest safe bound: drop everything once full (theme palettes are tiny, so this rarely trips).
+        if hexCache.count >= hexCacheMax { hexCache.removeAll(keepingCapacity: true) }
+        hexCache[hex] = parsed
+        hexCacheLock.unlock()
+        return parsed
+    }
+
+    /// Pure parse of a hex / rgb(a) / "transparent" string into sRGB components in 0...1.
+    /// Identical logic (and fallbacks) to the original initializer.
+    private static func parseHex(_ hex: String) -> RGBA {
+        let lower = hex.lowercased()
+
+        // rgba(0, 0, 0, 0.08)
+        if lower.hasPrefix("rgba(") {
             let inner = hex
                 .replacingOccurrences(of: "rgba(", with: "")
                 .replacingOccurrences(of: ")", with: "")
@@ -15,13 +56,12 @@ extension Color {
                let g = Double(components[1]),
                let b = Double(components[2]),
                let a = Double(components[3]) {
-                self.init(.sRGB, red: r / 255.0, green: g / 255.0, blue: b / 255.0, opacity: a)
-                return
+                return (r / 255.0, g / 255.0, b / 255.0, a)
             }
         }
 
-        // Handle rgb() format: "rgb(0, 0, 0)"
-        if hex.lowercased().hasPrefix("rgb(") {
+        // rgb(0, 0, 0)
+        if lower.hasPrefix("rgb(") {
             let inner = hex
                 .replacingOccurrences(of: "rgb(", with: "")
                 .replacingOccurrences(of: ")", with: "")
@@ -30,15 +70,13 @@ extension Color {
                let r = Double(components[0]),
                let g = Double(components[1]),
                let b = Double(components[2]) {
-                self.init(.sRGB, red: r / 255.0, green: g / 255.0, blue: b / 255.0, opacity: 1.0)
-                return
+                return (r / 255.0, g / 255.0, b / 255.0, 1.0)
             }
         }
 
-        // Handle "transparent"
-        if hex.lowercased() == "transparent" {
-            self.init(.sRGB, red: 0, green: 0, blue: 0, opacity: 0)
-            return
+        // "transparent"
+        if lower == "transparent" {
+            return (0, 0, 0, 0)
         }
 
         // Strip # prefix and any non-hex chars
@@ -58,12 +96,6 @@ extension Color {
             (a, r, g, b) = (255, 0, 0, 0)
         }
 
-        self.init(
-            .sRGB,
-            red: Double(r) / 255.0,
-            green: Double(g) / 255.0,
-            blue: Double(b) / 255.0,
-            opacity: Double(a) / 255.0
-        )
+        return (Double(r) / 255.0, Double(g) / 255.0, Double(b) / 255.0, Double(a) / 255.0)
     }
 }

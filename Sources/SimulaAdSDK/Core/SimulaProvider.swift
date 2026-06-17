@@ -59,15 +59,17 @@ public final class SimulaProvider: ObservableObject {
     private var sessionTask: Task<String?, Never>?
 
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
+    // Host-facing legacy cache API (getCachedAd/cacheAd/…). No internal callers, but a host using it
+    // across many distinct slots would grow these without bound — so each is a size-capped store.
 
     /// Cache of fetched ads keyed by "slot:position"
-    private var adCache: [String: AdData] = [:]
+    private var adCache = BoundedStore<AdData>(maxEntries: 64)
 
     /// Cache of measured heights keyed by "slot:position"
-    private var heightCache: [String: CGFloat] = [:]
+    private var heightCache = BoundedStore<CGFloat>(maxEntries: 64)
 
-    /// Set of "slot:position" keys that returned no-fill
-    private var noFillSet: Set<String> = []
+    /// "slot:position" keys that returned no-fill
+    private var noFillCache = BoundedStore<Bool>(maxEntries: 64)
 
     // MARK: - Internal
 
@@ -308,13 +310,65 @@ public final class SimulaProvider: ObservableObject {
 
     /// Check if a slot/position has no fill (translates `hasNoFill`)
     public func hasNoFill(slot: String, position: Int) -> Bool {
-        noFillSet.contains(cacheKey(slot: slot, position: position))
+        noFillCache.contains(cacheKey(slot: slot, position: position))
     }
 
     /// Mark a slot/position as having no fill (translates `markNoFill`)
     public func markNoFill(slot: String, position: Int) {
-        noFillSet.insert(cacheKey(slot: slot, position: position))
+        noFillCache[cacheKey(slot: slot, position: position)] = true
     }
+}
+
+// MARK: - Non-observing provider environment key
+
+/// Carries the `SimulaProvider` down the view tree WITHOUT subscribing readers to its
+/// `objectWillChange`. `NativeAdSlot` reads this (via `@Environment(\.simulaProvider)`) instead of
+/// `@EnvironmentObject`, so a `@Published` change on the provider — e.g. `sessionId` after session
+/// create/refresh — doesn't invalidate and re-render every ad slot in a feed at once. Injected by
+/// `SimulaProviderView` alongside the existing `.environmentObject(provider)` (which the menu
+/// components still use).
+private struct SimulaProviderKey: EnvironmentKey {
+    static let defaultValue: SimulaProvider? = nil
+}
+
+extension EnvironmentValues {
+    var simulaProvider: SimulaProvider? {
+        get { self[SimulaProviderKey.self] }
+        set { self[SimulaProviderKey.self] = newValue }
+    }
+}
+
+// MARK: - BoundedStore
+
+/// A tiny insertion-ordered, size-capped key→value store backing the legacy host-facing ad caches.
+/// Evicts the oldest entry once past `maxEntries`. Not internally synchronized — used exactly where
+/// the raw dictionaries were (the public cache methods), so it inherits their single-threaded contract.
+private struct BoundedStore<Value> {
+    private let maxEntries: Int
+    private var storage: [String: Value] = [:]
+    private var order: [String] = []
+
+    init(maxEntries: Int) { self.maxEntries = maxEntries }
+
+    subscript(key: String) -> Value? {
+        get { storage[key] }
+        set {
+            guard let newValue else {
+                if storage.removeValue(forKey: key) != nil, let i = order.firstIndex(of: key) {
+                    order.remove(at: i)
+                }
+                return
+            }
+            if storage[key] == nil { order.append(key) }
+            storage[key] = newValue
+            while storage.count > maxEntries, let oldest = order.first {
+                order.removeFirst()
+                storage.removeValue(forKey: oldest)
+            }
+        }
+    }
+
+    func contains(_ key: String) -> Bool { storage[key] != nil }
 }
 
 // MARK: - SimulaProviderView
@@ -385,6 +439,9 @@ public struct SimulaProviderView<Content: View>: View {
     public var body: some View {
         content()
             .environmentObject(provider)
+            // Also expose it non-observingly so NativeAdSlot can read it without re-rendering on
+            // every @Published change (see EnvironmentValues.simulaProvider).
+            .environment(\.simulaProvider, provider)
             .task {
                 await provider.createSession()
             }

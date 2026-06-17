@@ -89,10 +89,13 @@ enum CreativeCTARouter {
     /// - itms-apps://itunes.apple.com/app/id123456789
     // Precompiled once — `range(of:options:.regularExpression)` would compile
     // the pattern on every navigation. Group 1 captures the numeric ID.
-    nonisolated private static let appStoreIDRegex = try! NSRegularExpression(pattern: #"id(\d+)"#)
-    nonisolated private static let appStorePathIDRegex = try! NSRegularExpression(pattern: #"/id(\d+)"#)
+    // `try?` (not `try!`) so a malformed pattern could never trap — the patterns are constant string
+    // literals so this is always non-nil in practice, but it removes the only trap-on-error construct.
+    nonisolated private static let appStoreIDRegex = try? NSRegularExpression(pattern: #"id(\d+)"#)
+    nonisolated private static let appStorePathIDRegex = try? NSRegularExpression(pattern: #"/id(\d+)"#)
 
-    nonisolated private static func capturedID(_ regex: NSRegularExpression, in string: String) -> String? {
+    nonisolated private static func capturedID(_ regex: NSRegularExpression?, in string: String) -> String? {
+        guard let regex else { return nil }
         let range = NSRange(string.startIndex..., in: string)
         guard let match = regex.firstMatch(in: string, range: range),
               match.numberOfRanges >= 2,

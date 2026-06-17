@@ -30,6 +30,11 @@ enum SimulaUserAgent {
     static func sessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.httpAdditionalHeaders = standardHeaders()
+        // Bound these ancillary CTA / redirect-tracker sessions like SimulaAPI's main session, so a
+        // connection that stalls can't keep the resolver (and its captured session/delegate) alive for
+        // the 7-day system default — the resource timeout guarantees didCompleteWithError fires.
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 20
         return config
     }
 

@@ -15,6 +15,20 @@ private class StatusBarOverlayWindow {
 
     private var overlayWindow: UIWindow?
 
+    private init() {
+        // Don't keep the extra UIWindow resident for the app's lifetime: under memory pressure drop it
+        // when it isn't currently hiding the bar (it's lazily rebuilt on the next setHidden(true)).
+        // Guarded on isHidden so a memory warning during a full-screen ad can't reveal the status bar.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.overlayWindow?.isHidden == true else { return }
+            self.overlayWindow = nil
+        }
+    }
+
     func setHidden(_ hidden: Bool, in scene: UIWindowScene) {
         if hidden {
             if overlayWindow == nil {
