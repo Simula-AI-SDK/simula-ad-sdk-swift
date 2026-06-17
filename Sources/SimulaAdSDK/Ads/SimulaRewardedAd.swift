@@ -15,8 +15,19 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func rewardedDidFailToLoad(_ ad: SimulaRewardedAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the rewarded surface was presented full-screen.
+    /// `DISPLAYED` — the rewarded surface was presented full-screen (AdMob's "shown").
     func rewardedDidDisplay(_ ad: SimulaRewardedAd)
+
+    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// ~2 seconds after the playable begins to render, independent of the reward gate. Distinct from
+    /// `DISPLAYED`; followed immediately by `PAID`.
+    func rewardedDidRecordImpression(_ ad: SimulaRewardedAd)
+
+    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired together
+    /// with `IMPRESSION`; `value` is already on-device from load time (no network round-trip). Use it
+    /// for your own analytics — the backend's impression confirmation remains the source of truth for
+    /// billing.
+    func rewardedDidPay(_ ad: SimulaRewardedAd, value: AdValue)
 
     /// `DISPLAY_FAILED` — `show()` could not present the ad.
     func rewardedDidFailToDisplay(_ ad: SimulaRewardedAd, error: SimulaAdError)
@@ -42,6 +53,8 @@ public extension SimulaRewardedAdDelegate {
     func rewardedDidLoad(_ ad: SimulaRewardedAd) {}
     func rewardedDidFailToLoad(_ ad: SimulaRewardedAd, error: SimulaAdError) {}
     func rewardedDidDisplay(_ ad: SimulaRewardedAd) {}
+    func rewardedDidRecordImpression(_ ad: SimulaRewardedAd) {}
+    func rewardedDidPay(_ ad: SimulaRewardedAd, value: AdValue) {}
     func rewardedDidFailToDisplay(_ ad: SimulaRewardedAd, error: SimulaAdError) {}
     func rewardedDidEarnReward(_ ad: SimulaRewardedAd) {}
     func rewardedDidVerifyReward(_ ad: SimulaRewardedAd, token: String?) {}
@@ -219,7 +232,10 @@ public final class SimulaRewardedAd {
                     charId: charId,
                     charName: charName,
                     charImage: charImage,
-                    charDesc: charDesc
+                    charDesc: charDesc,
+                    // AdContext (contextual targeting) now rides on the rewarded request too, read from
+                    // the same provider-level store the native surface uses.
+                    context: provider.adContext
                 )
                 if Task.isCancelled { return }
                 // A rewarded ad with no iframe to render is a no-fill.
@@ -300,6 +316,22 @@ public final class SimulaRewardedAd {
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             attribution: response.adBehavior?.attribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+            onImpression: { [weak self] in
+                guard let self else { return }
+                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // after begin-to-render by the presenter (foreground-aware), independent of the reward
+                // gate. The `/seen` beacon is the billing source of truth; `didPay` is local analytics.
+                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                self.delegate?.rewardedDidRecordImpression(self)
+                self.delegate?.rewardedDidPay(self, value: response.adValue)
+                if !response.impressionId.isEmpty {
+                    let api = self.api
+                    let apiKey = provider.apiKey
+                    let impressionId = response.impressionId
+                    Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
+                }
+            },
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
                 self.presenter = nil
@@ -356,12 +388,13 @@ public final class SimulaRewardedAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.rewardedDidDisplay(self)
-        // Fire the impression once, only after the present succeeded.
+        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         if !response.impressionId.isEmpty {
             let api = self.api
             let apiKey = provider.apiKey
             let impressionId = response.impressionId
-            Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
+            Task { await api.trackShown(adId: impressionId, apiKey: apiKey) }
         }
         #else
         failDisplay(.unsupportedPlatform)
@@ -428,6 +461,12 @@ public final class SimulaRewardedAd {
             destination: .appstore,
             storeOpen: .skstoreproduct,
             previewHTML: Self.previewMinigameHTML,
+            onImpression: { [weak self] in
+                guard let self else { return }
+                // Preview is local-only: surface the callbacks (with a $0 estimate) but no beacon.
+                self.delegate?.rewardedDidRecordImpression(self)
+                self.delegate?.rewardedDidPay(self, value: AdValue.fromBidCpm(0))
+            },
             onClose: { [weak self] earned, _ in
                 guard let self else { return }
                 self.presenter = nil

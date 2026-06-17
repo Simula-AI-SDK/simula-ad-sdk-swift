@@ -453,6 +453,10 @@ public struct AdLoadRequest: Encodable, Sendable {
     public let charName: String?
     public let charImage: String?
     public let charDesc: String?
+    /// Contextual targeting signals (category, tags, customContext, …) — the same `NativeContext` the
+    /// native surface sends, now extended to the full-screen formats so they get character-aware
+    /// targeting too. Encoded only when non-nil.
+    public let context: SimulaAdContext?
     /// Device capability snapshot so the backend never assigns an unsupported variant.
     public let capabilities: DeviceCapabilities
 
@@ -463,6 +467,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         case charName = "char_name"
         case charImage = "char_image"
         case charDesc = "char_desc"
+        case context
         case capabilities
     }
 
@@ -473,6 +478,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         charName: String? = nil,
         charImage: String? = nil,
         charDesc: String? = nil,
+        context: SimulaAdContext? = nil,
         capabilities: DeviceCapabilities = .current
     ) {
         self.adUnitId = adUnitId
@@ -481,6 +487,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         self.charName = charName
         self.charImage = charImage
         self.charDesc = charDesc
+        self.context = context
         self.capabilities = capabilities
     }
 }
@@ -509,11 +516,18 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let creative: Creative?
     /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
     public let experiment: Experiment?
+    /// Cleared bid (the estimated CPM) for this serve, backend-provided. Drives ``adValue``; defaults
+    /// to 0 → a $0 estimate when absent (e.g. a no-fill).
+    public let bidAmt: Double
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
         AdDestination(rawValue: destination) ?? .appstore
     }
+
+    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
+    /// surfaced on the paid event when the impression fires (no network round-trip).
+    public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
     /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
     /// value means the payload carries no renderable creative (no-fill).
@@ -541,6 +555,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case adBehavior = "ad_behavior"
         case creative
         case experiment
+        case bidAmt = "bid_amt"
     }
 
     public init(from decoder: Decoder) throws {
@@ -557,6 +572,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
+        self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
 
     /// Member-wise init for internal construction and tests.
@@ -570,7 +586,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
         creative: Creative? = nil,
-        experiment: Experiment? = nil
+        experiment: Experiment? = nil,
+        bidAmt: Double = 0
     ) {
         self.impressionId = impressionId
         self.adInserted = adInserted
@@ -582,6 +599,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.adBehavior = adBehavior
         self.creative = creative
         self.experiment = experiment
+        self.bidAmt = bidAmt
     }
 }
 
@@ -599,6 +617,9 @@ public struct RewardedInitRequest: Encodable, Sendable {
     public let charName: String?
     public let charImage: String?
     public let charDesc: String?
+    /// Contextual targeting signals — see ``AdLoadRequest/context``. Extended to rewarded so the
+    /// full-screen formats target the same way native does. Encoded only when non-nil.
+    public let context: SimulaAdContext?
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -607,6 +628,7 @@ public struct RewardedInitRequest: Encodable, Sendable {
         case charName = "char_name"
         case charImage = "char_image"
         case charDesc = "char_desc"
+        case context
     }
 
     public init(
@@ -615,7 +637,8 @@ public struct RewardedInitRequest: Encodable, Sendable {
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
-        charDesc: String? = nil
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil
     ) {
         self.adUnitId = adUnitId
         self.sessionId = sessionId
@@ -623,6 +646,7 @@ public struct RewardedInitRequest: Encodable, Sendable {
         self.charName = charName
         self.charImage = charImage
         self.charDesc = charDesc
+        self.context = context
     }
 }
 
@@ -644,11 +668,17 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public let destination: String
     public let trackingUrl: String?
     public let adBehavior: AdBehavior?
+    /// Cleared bid (estimated CPM) for this serve — see ``AdLoadResponse/bidAmt``. Drives ``adValue``.
+    public let bidAmt: Double
 
     /// The advertiser destination kind (App Store vs web); defaults to `.appstore`.
     public var destinationKind: AdDestination {
         AdDestination(rawValue: destination) ?? .appstore
     }
+
+    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
+    /// when the impression fires (no network round-trip).
+    public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
@@ -657,6 +687,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case destination
         case trackingUrl = "tracking_url"
         case adBehavior = "ad_behavior"
+        case bidAmt = "bid_amt"
     }
 
     public init(from decoder: Decoder) throws {
@@ -667,6 +698,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
 
     /// Member-wise init for internal construction and tests.
@@ -676,7 +708,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
         renderedHtml: String = "",
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
-        adBehavior: AdBehavior? = nil
+        adBehavior: AdBehavior? = nil,
+        bidAmt: Double = 0
     ) {
         self.impressionId = impressionId
         self.iframeUrl = iframeUrl
@@ -684,6 +717,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.adBehavior = adBehavior
+        self.bidAmt = bidAmt
     }
 }
 
@@ -971,7 +1005,8 @@ public final class SimulaAPI: @unchecked Sendable {
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
-        charDesc: String? = nil
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil
     ) async throws -> AdLoadResponse {
         guard let url = URL(string: "\(API_BASE_URL)/load/interstitial") else {
             throw SimulaAPIError.invalidURL
@@ -987,7 +1022,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 charId: charId,
                 charName: charName,
                 charImage: charImage,
-                charDesc: charDesc
+                charDesc: charDesc,
+                context: context
             )
         )
 
@@ -1065,7 +1101,8 @@ public final class SimulaAPI: @unchecked Sendable {
         charId: String? = nil,
         charName: String? = nil,
         charImage: String? = nil,
-        charDesc: String? = nil
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil
     ) async throws -> RewardedInitResponse {
         guard let url = URL(string: "\(API_BASE_URL)/load/rewarded") else {
             throw SimulaAPIError.invalidURL
@@ -1081,7 +1118,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 charId: charId,
                 charName: charName,
                 charImage: charImage,
-                charDesc: charDesc
+                charDesc: charDesc,
+                context: context
             )
         )
 
@@ -1251,12 +1289,30 @@ public final class SimulaAPI: @unchecked Sendable {
         _ = try? await session.data(for: request)
     }
 
+    // MARK: - Track Shown
+
+    /// Tracks a full-screen ad as shown (`POST /impressions/{adId}/shown`) — AdMob's "shown" signal
+    /// (`onAdShowedFullScreenContent`), fired when the creative first renders. Distinct from the
+    /// billable impression beacon (``trackImpression(adId:apiKey:)`` → `/seen`), which fires later at
+    /// begin-to-render + 2s. The endpoint takes no body. Best-effort, silent-fail.
+    public func trackShown(adId: String, apiKey: String) async {
+        guard !adId.isEmpty else { return }
+        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/shown") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+
+        _ = try? await session.data(for: request)
+    }
+
     // MARK: - Track Impression
 
     /// Tracks an ad impression as seen (`POST /impressions/{adId}/seen`). The endpoint takes no
     /// body — A/B attribution is stamped on the serve doc at load time, not on this beacon.
     /// `adId` is the serve handle for rewarded/interstitial and the ad id for native; the backend
-    /// resolves either. Best-effort, silent-fail.
+    /// resolves either. For full-screen ads this is the **billable impression**, fired at
+    /// begin-to-render + 2s (after ``trackShown(adId:apiKey:)``). Best-effort, silent-fail.
     public func trackImpression(adId: String, apiKey: String) async {
         // An empty id would POST to `.../impressions//seen` (no id) — skip it.
         guard !adId.isEmpty else { return }

@@ -33,6 +33,7 @@ public struct NativeAdSlot: View {
     private let dimension: ParsedDimension
     private let theme: String?
     private let onImpression: (NativeAdData) -> Void
+    private let onPaid: (AdValue) -> Void
     private let onError: (NativeAdError) -> Void
 
     @State private var phase: Phase = .loading
@@ -64,6 +65,8 @@ public struct NativeAdSlot: View {
     ///     live request. An expired/unknown id falls back to a live call with no error surfaced.
     ///   - onImpression: Fired once when the viewability threshold is met (co-fired with the server
     ///     impression).
+    ///   - onPaid: AdMob's paid event — the estimated revenue (``AdValue``) for this impression, fired
+    ///     together with `onImpression` (co-fired, not decoupled). Native has no "shown" event, matching AdMob.
     ///   - onError: Fired with a ``NativeAdError`` on a load/render failure (not-initialized, no
     ///     session, network) and on a no-fill (`.noFill`). A cached outcome replayed on a recycled row
     ///     does not re-fire (one report per served slot).
@@ -77,6 +80,7 @@ public struct NativeAdSlot: View {
         theme: String? = nil,
         preloadedAdId: String? = nil,
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
+        onPaid: @escaping (AdValue) -> Void = { _ in },
         onError: @escaping (NativeAdError) -> Void = { _ in },
         previewHTML: String? = nil
     ) {
@@ -87,6 +91,7 @@ public struct NativeAdSlot: View {
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
+        self.onPaid = onPaid
         self.onError = onError
 
         // Seed the initial state from the per-slot cache so a recycled row paints the SAME ad on its
@@ -126,7 +131,7 @@ public struct NativeAdSlot: View {
                 // Hold a provisional height while the creative measures (never collapse), then grow.
                 .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
                 .trackNativeAdViewability(enabled: heightPt > 0) {
-                    fireImpression(impressionId: impressionId, adFormat: response.adFormat)
+                    fireImpression(impressionId: impressionId, adFormat: response.adFormat, adValue: response.adValue)
                 }
 
                 // Keep the shimmer over the slot until the creative reports its height. Without
@@ -272,7 +277,7 @@ public struct NativeAdSlot: View {
         onError(error)
     }
 
-    private func fireImpression(impressionId: String, adFormat: String) {
+    private func fireImpression(impressionId: String, adFormat: String, adValue: AdValue) {
         guard !impressionFired else { return }
         impressionFired = true
         // Remember it on the cache entry so a remount of the same serve never re-fires.
@@ -282,6 +287,9 @@ public struct NativeAdSlot: View {
         // preview (empty id) always fires the callback but never a beacon.
         guard impressionId.isEmpty || NativeAdCache.shared.markImpressionFired(impressionId) else { return }
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
+        // PAID — co-fired with the impression (PRD "co-fire, do not decouple"). The estimate is already
+        // on-device from load; no network round-trip.
+        onPaid(adValue)
         guard !impressionId.isEmpty else { return }
         let apiKey = resolvedProvider?.apiKey ?? ""
         Task { await SimulaAPI.shared.trackImpression(adId: impressionId, apiKey: apiKey) }
