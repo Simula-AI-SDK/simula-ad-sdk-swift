@@ -59,15 +59,17 @@ public final class SimulaProvider: ObservableObject {
     private var sessionTask: Task<String?, Never>?
 
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
+    // Host-facing legacy cache API (getCachedAd/cacheAd/…). No internal callers, but a host using it
+    // across many distinct slots would grow these without bound — so each is a size-capped store.
 
     /// Cache of fetched ads keyed by "slot:position"
-    private var adCache: [String: AdData] = [:]
+    private var adCache = BoundedStore<AdData>(maxEntries: 64)
 
     /// Cache of measured heights keyed by "slot:position"
-    private var heightCache: [String: CGFloat] = [:]
+    private var heightCache = BoundedStore<CGFloat>(maxEntries: 64)
 
-    /// Set of "slot:position" keys that returned no-fill
-    private var noFillSet: Set<String> = []
+    /// "slot:position" keys that returned no-fill
+    private var noFillCache = BoundedStore<Bool>(maxEntries: 64)
 
     // MARK: - Internal
 
@@ -308,13 +310,46 @@ public final class SimulaProvider: ObservableObject {
 
     /// Check if a slot/position has no fill (translates `hasNoFill`)
     public func hasNoFill(slot: String, position: Int) -> Bool {
-        noFillSet.contains(cacheKey(slot: slot, position: position))
+        noFillCache.contains(cacheKey(slot: slot, position: position))
     }
 
     /// Mark a slot/position as having no fill (translates `markNoFill`)
     public func markNoFill(slot: String, position: Int) {
-        noFillSet.insert(cacheKey(slot: slot, position: position))
+        noFillCache[cacheKey(slot: slot, position: position)] = true
     }
+}
+
+// MARK: - BoundedStore
+
+/// A tiny insertion-ordered, size-capped key→value store backing the legacy host-facing ad caches.
+/// Evicts the oldest entry once past `maxEntries`. Not internally synchronized — used exactly where
+/// the raw dictionaries were (the public cache methods), so it inherits their single-threaded contract.
+private struct BoundedStore<Value> {
+    private let maxEntries: Int
+    private var storage: [String: Value] = [:]
+    private var order: [String] = []
+
+    init(maxEntries: Int) { self.maxEntries = maxEntries }
+
+    subscript(key: String) -> Value? {
+        get { storage[key] }
+        set {
+            guard let newValue else {
+                if storage.removeValue(forKey: key) != nil, let i = order.firstIndex(of: key) {
+                    order.remove(at: i)
+                }
+                return
+            }
+            if storage[key] == nil { order.append(key) }
+            storage[key] = newValue
+            while storage.count > maxEntries, let oldest = order.first {
+                order.removeFirst()
+                storage.removeValue(forKey: oldest)
+            }
+        }
+    }
+
+    func contains(_ key: String) -> Bool { storage[key] != nil }
 }
 
 // MARK: - SimulaProviderView
