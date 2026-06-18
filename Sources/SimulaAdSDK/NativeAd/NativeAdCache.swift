@@ -24,10 +24,17 @@ final class NativeAdCache: @unchecked Sendable {
     /// A cached entry: `response != nil` is a fill (with its measured height + whether its impression
     /// already fired); `response == nil` is a no-fill. A reference type so the slot can update its
     /// height / fired flag in place.
+    ///
+    /// `@unchecked Sendable` is sound by **confinement, not synchronization**: `response` is immutable,
+    /// and the two mutable fields are only ever written from the main actor — `heightPt` by SwiftUI's
+    /// layout pass and `impressionFired` by `NativeAdSlot.fireImpression` (a `@MainActor` method). The
+    /// cross-slot, process-wide impression dedupe is handled separately by the lock-guarded
+    /// `firedImpressions` set (`markImpressionFired`), not by this per-entry flag. Do not write these
+    /// fields off the main actor.
     final class Entry: @unchecked Sendable {
         let response: NativeAdResponse?
-        var heightPt: CGFloat = 0
-        var impressionFired = false
+        var heightPt: CGFloat = 0 // main-actor only
+        var impressionFired = false // main-actor only
         init(response: NativeAdResponse?) { self.response = response }
     }
 

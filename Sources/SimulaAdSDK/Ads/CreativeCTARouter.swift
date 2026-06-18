@@ -200,6 +200,8 @@ enum CreativeCTARouter {
         storeVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
         // global slot — multiple sheets can be presented/dismissed independently.
+        // NOTE for host/dependency auditors: this is a scoped associated object on an SDK-owned VC —
+        // NOT method swizzling and NOT host global-state mutation; its lifetime ends with the sheet.
         objc_setAssociatedObject(
             storeVC, &storeDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )

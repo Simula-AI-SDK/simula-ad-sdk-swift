@@ -425,7 +425,12 @@ final class TelemetryManager: @unchecked Sendable {
     /// Reconciles the buffer with the send outcome under `lock`; returns whether to re-drain
     /// immediately (accepted) or schedule a backoff retry (transient failure).
     private func completeFlush(ack: TelemetryAck, batch: FlushBatch) -> (reFlush: Bool, needRetry: Bool) {
-        lock.lock(); defer { lock.unlock() }
+        // Reconcile + snapshot under the lock, then RELEASE before persisting: persistSync blocks on
+        // the serial persist queue, and holding the NSLock across that dispatch can stall any thread
+        // doing recordError/recordOperation (e.g. under an error storm). Mirrors persistNow().
+        lock.lock()
+        let snapshot: [TelemetryEvent]
+        let result: (reFlush: Bool, needRetry: Bool)
         switch ack {
         case .accepted, .drop:
             let ids = Set(batch.pendingBuffer.map { $0.eventId })
@@ -438,17 +443,20 @@ final class TelemetryManager: @unchecked Sendable {
             }
             droppedCount = max(0, droppedCount - batch.droppedSnap)
             retryCount = 0
-            persistSync(snapshotLocked())
+            snapshot = snapshotLocked()
             isFlushing = false
             // Re-drain leftovers that arrived mid-send: perf once it re-hits the threshold,
             // errors promptly (low-volume, valuable).
-            return (buffer.count >= flushThreshold || !errorAgg.isEmpty, false)
+            result = (buffer.count >= flushThreshold || !errorAgg.isEmpty, false)
         case .retry:
-            persistSync(snapshotLocked())
+            snapshot = snapshotLocked()
             retryCount += 1
             isFlushing = false
-            return (false, true)
+            result = (false, true)
         }
+        lock.unlock()
+        persistSync(snapshot)
+        return result
     }
 
     /// Caller holds `lock` (reads `sessionId`).

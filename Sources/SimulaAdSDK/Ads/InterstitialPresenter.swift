@@ -512,7 +512,12 @@ private struct CreativeInterstitialView: View {
         guard closeDelay > 0 else { return }
         storePromptScheduled = true
         storePromptTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(Double(closeDelay) / 2 * 1_000_000_000))
+            // Guard the Double→UInt64 conversion (an extreme server `closeDelay` would otherwise
+            // overflow and trap) — same pattern as the close-delay gate above.
+            let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
+            if sleepNs.isFinite, sleepNs > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(sleepNs))
+            }
             if Task.isCancelled { return }
             showStorePrompt()
         }

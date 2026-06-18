@@ -68,7 +68,10 @@ final class CoverImageCache: @unchecked Sendable {
     /// catalog preload and a visible card requesting the same cover) share one
     /// network request + decode instead of duplicating them.
     private final class InFlight {
-        var task: Task<CoverImage, Never>!
+        // Optional, not an IUO: it's assigned right after the box is created (both under `lock`,
+        // before `inFlight[url]` is published), so readers never observe nil — but a safe unwrap
+        // means a future refactor can't turn this into a trap.
+        var task: Task<CoverImage, Never>?
         var waiters: Int
         init(waiters: Int) { self.waiters = waiters }
     }
@@ -128,9 +131,9 @@ final class CoverImageCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        if let existing = inFlight[url] {
+        if let existing = inFlight[url], let task = existing.task {
             existing.waiters += 1
-            return existing.task
+            return task
         }
 
         let box = InFlight(waiters: 1)
@@ -164,7 +167,7 @@ final class CoverImageCache: @unchecked Sendable {
         box.waiters -= 1
         if box.waiters <= 0 {
             inFlight[url] = nil
-            box.task.cancel()
+            box.task?.cancel()
         }
     }
 
