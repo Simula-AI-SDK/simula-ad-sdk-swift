@@ -1124,12 +1124,20 @@ public struct NativeAdResponse: Decodable, Sendable {
     public let impressionId: String?
     public let adInserted: Bool
     public let adFormat: String
+    /// Cleared bid (estimated CPM) for this serve, backend-provided. Drives ``adValue``. Defaults to
+    /// 0 → a $0 estimate when the field is absent (e.g. a no-fill).
+    public let bidAmt: Double
     public let adResponse: NativeAdCreative
+
+    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the native paid
+    /// event, co-fired with the impression.
+    public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case adInserted = "ad_inserted"
         case adFormat = "ad_format"
+        case bidAmt = "bid_amt"
         case adResponse
     }
 
@@ -1138,14 +1146,16 @@ public struct NativeAdResponse: Decodable, Sendable {
         impressionId = try c.decodeIfPresent(String.self, forKey: .impressionId)
         adInserted = (try c.decodeIfPresent(Bool.self, forKey: .adInserted)) ?? false
         adFormat = (try c.decodeIfPresent(String.self, forKey: .adFormat)) ?? ""
+        bidAmt = (try c.decodeIfPresent(Double.self, forKey: .bidAmt)) ?? 0
         adResponse = (try c.decodeIfPresent(NativeAdCreative.self, forKey: .adResponse)) ?? NativeAdCreative()
     }
 
     /// Direct construction (used for the slot's debug/QA preview path).
-    public init(impressionId: String?, adInserted: Bool, adFormat: String, adResponse: NativeAdCreative) {
+    public init(impressionId: String?, adInserted: Bool, adFormat: String, adResponse: NativeAdCreative, bidAmt: Double = 0) {
         self.impressionId = impressionId
         self.adInserted = adInserted
         self.adFormat = adFormat
+        self.bidAmt = bidAmt
         self.adResponse = adResponse
     }
 
@@ -1176,6 +1186,60 @@ public struct NativeAdCreative: Decodable, Sendable {
     public init(iframeUrl: String? = nil, renderedHtml: String? = nil) {
         self.iframeUrl = iframeUrl
         self.renderedHtml = renderedHtml
+    }
+}
+
+/// Estimated per-impression revenue for a served ad, in AdMob's `AdValue` shape so it's a drop-in for
+/// a publisher's existing analytics / MMP pipeline. Surfaced on the **paid** event
+/// (`interstitialDidPay` / `rewardedDidPay` / `NativeAdSlot`'s `onPaid`) at the moment the impression
+/// fires — never at load.
+///
+/// The SDK does not compute revenue from scratch: the backend ships the bid (CPM) with the ad and the
+/// SDK derives the whole block once, on-device, with no network round-trip (see ``fromBidCpm(_:currencyCode:)``).
+/// All figures are estimates known at serve time (from the floor CPM). Mirrors the Kotlin SDK's `AdValue`.
+public struct AdValue: Sendable, Equatable {
+    /// Estimate quality. Always `.estimated` for now (backend-provided).
+    public enum PrecisionType: String, Sendable, Equatable { case estimated = "ESTIMATED" }
+
+    /// Canonical estimate: per-impression revenue in micros of ``currencyCode``. `5000` = $0.005.
+    public let valueMicros: Int64
+    /// ISO-4217 currency code, e.g. `"USD"`.
+    public let currencyCode: String
+    public let precisionType: PrecisionType
+    /// Estimated CPM = ``valueMicros`` / 1_000. Convenience; derived from ``valueMicros``.
+    public let expectedCpm: Double
+    /// Estimated per-impression revenue = ``valueMicros`` / 1_000_000. Convenience; derived from ``valueMicros``.
+    public let expectedRevenue: Double
+
+    public init(
+        valueMicros: Int64,
+        currencyCode: String,
+        precisionType: PrecisionType,
+        expectedCpm: Double,
+        expectedRevenue: Double
+    ) {
+        self.valueMicros = valueMicros
+        self.currencyCode = currencyCode
+        self.precisionType = precisionType
+        self.expectedCpm = expectedCpm
+        self.expectedRevenue = expectedRevenue
+    }
+
+    /// Builds an `AdValue` from the backend-provided `bid_amt` — the estimated CPM in `currencyCode`.
+    /// The three figures are all derived from a single ``valueMicros`` so they can never disagree on
+    /// rounding (`valueMicros = round(bidCpm × 1000)`; e.g. a $5.00 CPM → 5000 → $0.005 per impression).
+    /// Tolerant: a non-finite or negative bid clamps to 0, so a missing/garbage field yields a $0
+    /// estimate rather than trapping — surfacing the paid event must never crash the host app.
+    static func fromBidCpm(_ bidCpm: Double, currencyCode: String = "USD") -> AdValue {
+        let safeBid = (bidCpm.isFinite && bidCpm > 0) ? bidCpm : 0
+        let valueMicros = Int64((safeBid * 1_000).rounded())
+        return AdValue(
+            valueMicros: valueMicros,
+            currencyCode: currencyCode,
+            precisionType: .estimated,
+            expectedCpm: Double(valueMicros) / 1_000,
+            expectedRevenue: Double(valueMicros) / 1_000_000
+        )
     }
 }
 

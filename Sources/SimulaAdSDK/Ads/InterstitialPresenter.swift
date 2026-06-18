@@ -3,6 +3,15 @@ import SwiftUI
 import UIKit
 import Combine
 
+/// Foreground on-screen time after begin-to-render before the billable IMPRESSION + PAID fire for a
+/// full-screen ad. The PRD's OMID rule: "fire IMPRESSION + PAID at begin-to-render after 2 seconds"
+/// (viewability is measured by the OM SDK, not gated by us). Shared by the interstitial and rewarded
+/// presenters.
+let fullscreenImpressionDelayMs: Double = 2_000
+/// Poll cadence for the foreground impression timer — fine enough to land the 2s mark within ~1 frame,
+/// coarse enough to stay negligible. Shared by the interstitial and rewarded presenters.
+let impressionTickNanos: UInt64 = 200_000_000
+
 // MARK: - InterstitialPresenter
 
 /// Presents the imperative interstitial full-screen in a dedicated `UIWindow`,
@@ -31,6 +40,7 @@ final class InterstitialPresenter {
         apiKey: String,
         response: AdLoadResponse,
         onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
         onClose: @escaping () -> Void
     ) -> Bool {
         guard let scene = Self.activeWindowScene() else {
@@ -48,6 +58,7 @@ final class InterstitialPresenter {
             response: response,
             bridge: bridge,
             onClick: onClick,
+            onImpression: onImpression,
             onRequestDismiss: { [weak self] in self?.dismiss() }
         )
 
@@ -128,6 +139,8 @@ private struct CreativeInterstitialView: View {
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
     let onClick: () -> Void
+    /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
+    let onImpression: () -> Void
     let onRequestDismiss: () -> Void
 
     /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
@@ -173,6 +186,11 @@ private struct CreativeInterstitialView: View {
     // configured moment.
     @State private var autoRedirectFired = false
 
+    // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
+    // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
+    @State private var impressionFired = false
+    @State private var impressionTask: Task<Void, Never>?
+
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
 
@@ -181,12 +199,14 @@ private struct CreativeInterstitialView: View {
         response: AdLoadResponse,
         bridge: CreativeBridge,
         onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
         self.apiKey = apiKey
         self.response = response
         self.bridge = bridge
         self.onClick = onClick
+        self.onImpression = onImpression
         self.onRequestDismiss = onRequestDismiss
         // Close starts enabled unless the server-driven `close.delay_seconds` gates it.
         let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
@@ -254,6 +274,7 @@ private struct CreativeInterstitialView: View {
         .hideStatusBar(true)
         .onAppear {
             startGate()
+            startImpressionTimer()
             startStorePromptTrigger()
             startSKOverlay()
             // PLAYABLE_END: if the close button is already available (delay 0), fire immediately.
@@ -262,6 +283,8 @@ private struct CreativeInterstitialView: View {
         .onDisappear {
             gateTask?.cancel()
             gateTask = nil
+            impressionTask?.cancel()
+            impressionTask = nil
             storePromptTask?.cancel()
             storePromptTask = nil
             skOverlayTask?.cancel()
@@ -354,6 +377,33 @@ private struct CreativeInterstitialView: View {
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
             onRequestDismiss()
+        }
+    }
+
+    // MARK: Impression (billable, +2s)
+
+    /// Fires the billable IMPRESSION + PAID once, after the creative has been on screen for
+    /// `fullscreenImpressionDelayMs` of FOREGROUND time from begin-to-render. OMID measures viewability
+    /// but does not gate us (PRD). Accrues only while the app is foreground-active and no store/Safari
+    /// sheet covers the ad — the same gating the close countdown uses — so a backgrounded ad can't
+    /// accrue the delay. Cancelled in `.onDisappear`.
+    private func startImpressionTimer() {
+        guard !impressionFired, impressionTask == nil else { return }
+        impressionTask = Task { @MainActor in
+            var accruedMs: Double = 0
+            var lastTick = ProcessInfo.processInfo.systemUptime
+            while accruedMs < fullscreenImpressionDelayMs {
+                try? await Task.sleep(nanoseconds: impressionTickNanos)
+                if Task.isCancelled { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                let delta = (now - lastTick) * 1000
+                lastTick = now
+                // Count only foreground, on-ad time (parity with the close gate's `reconcileGate`).
+                if appForegrounded && !storeSheetPresented { accruedMs += delta }
+            }
+            if Task.isCancelled || impressionFired { return }
+            impressionFired = true
+            onImpression()
         }
     }
 

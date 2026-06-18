@@ -17,8 +17,19 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the ad surface was presented full-screen.
+    /// `DISPLAYED` — the ad surface was presented full-screen (AdMob's "shown").
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd)
+
+    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// ~2 seconds after the creative begins to render. Distinct from `DISPLAYED`; followed
+    /// immediately by `PAID`.
+    func interstitialDidRecordImpression(_ ad: SimulaInterstitialAd)
+
+    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired
+    /// together with `IMPRESSION`; `value` is already on-device from load time (no network
+    /// round-trip). Use it for your own analytics — the backend's impression confirmation remains
+    /// the source of truth for billing.
+    func interstitialDidPay(_ ad: SimulaInterstitialAd, value: AdValue)
 
     /// `DISPLAY_FAILED` — `show()` could not present the ad.
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError)
@@ -34,6 +45,8 @@ public extension SimulaInterstitialAdDelegate {
     func interstitialDidLoad(_ ad: SimulaInterstitialAd) {}
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd) {}
+    func interstitialDidRecordImpression(_ ad: SimulaInterstitialAd) {}
+    func interstitialDidPay(_ ad: SimulaInterstitialAd, value: AdValue) {}
     func interstitialDidFailToDisplay(_ ad: SimulaInterstitialAd, error: SimulaAdError) {}
     func interstitialDidClick(_ ad: SimulaInterstitialAd) {}
     func interstitialDidClose(_ ad: SimulaInterstitialAd) {}
@@ -294,7 +307,10 @@ public final class SimulaInterstitialAd {
                     charId: charId,
                     charName: charName,
                     charImage: charImage,
-                    charDesc: charDesc
+                    charDesc: charDesc,
+                    // AdContext (contextual targeting) now rides on the full-screen request too, read
+                    // from the same provider-level store the native surface uses.
+                    context: provider.adContext
                 )
                 if Task.isCancelled { return }
                 // Fillable only when the payload carries a non-blank `rendered_html`
@@ -376,6 +392,20 @@ public final class SimulaInterstitialAd {
                 Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
                 self.delegate?.interstitialDidClick(self)
             },
+            onImpression: { [weak self] in
+                guard let self else { return }
+                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // after begin-to-render by the presenter (foreground-aware). The `/seen` beacon is the
+                // billing source of truth; `didPay` is local analytics (value already on-device).
+                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
+                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
+                self.delegate?.interstitialDidRecordImpression(self)
+                self.delegate?.interstitialDidPay(self, value: response.adValue)
+                let api = self.api
+                let apiKey = provider.apiKey
+                let impressionId = response.impressionId
+                Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
+            },
             onClose: { [weak self] in
                 guard let self else { return }
                 self.presenter = nil
@@ -426,11 +456,12 @@ public final class SimulaInterstitialAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.interstitialDidDisplay(self)
-        // Fire the impression once, only after the present succeeded.
+        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         let api = self.api
         let apiKey = provider.apiKey
         let impressionId = response.impressionId
-        Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
+        Task { await api.trackShown(adId: impressionId, apiKey: apiKey) }
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -527,6 +558,12 @@ public final class SimulaInterstitialAd {
             onClick: { [weak self] in
                 guard let self else { return }
                 self.delegate?.interstitialDidClick(self)
+            },
+            onImpression: { [weak self] in
+                guard let self else { return }
+                // Preview is local-only: surface the callbacks (with a $0 estimate) but no beacon.
+                self.delegate?.interstitialDidRecordImpression(self)
+                self.delegate?.interstitialDidPay(self, value: response.adValue)
             },
             onClose: { [weak self] in
                 guard let self else { return }

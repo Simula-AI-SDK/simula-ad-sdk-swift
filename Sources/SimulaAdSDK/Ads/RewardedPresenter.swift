@@ -39,6 +39,7 @@ final class RewardedPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
+        onImpression: @escaping () -> Void,
         onClose: @escaping (Bool, Double) -> Void
     ) -> Bool {
         guard let scene = Self.activeWindowScene() else {
@@ -65,6 +66,7 @@ final class RewardedPresenter {
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             bridge: bridge,
+            onImpression: onImpression,
             onFinish: { [weak self] earned, elapsed in
                 self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
             }
@@ -159,6 +161,8 @@ private struct RewardedGameView: View {
     let previewHTML: String?
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
+    /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
+    let onImpression: () -> Void
     let onFinish: (Bool, Double) -> Void
 
     /// The timer runs only while the app is foregrounded AND no in-app store/Safari sheet covers the
@@ -179,6 +183,11 @@ private struct RewardedGameView: View {
     @State private var timerTask: Task<Void, Never>?
     /// auto_store_redirect one-shot guard.
     @State private var autoRedirectFired = false
+
+    // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
+    // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
+    @State private var impressionFired = false
+    @State private var impressionTask: Task<Void, Never>?
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -254,12 +263,15 @@ private struct RewardedGameView: View {
         .hideStatusBar(true)
         .onAppear {
             startTimer()
+            startImpressionTimer()
             // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
             timerTask?.cancel()
             timerTask = nil
+            impressionTask?.cancel()
+            impressionTask = nil
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -343,6 +355,30 @@ private struct RewardedGameView: View {
                     rewardEarned = true
                 }
             }
+        }
+    }
+
+    /// Fires the billable IMPRESSION + PAID once, after the playable has been on screen for
+    /// `fullscreenImpressionDelayMs` of FOREGROUND time from begin-to-render — independent of the
+    /// play-to-earn gate. OMID measures viewability but does not gate us (PRD). Accrues only while
+    /// foreground-active and no store/Safari sheet covers the playable (same gating as the play timer),
+    /// so a backgrounded playable can't accrue the delay. Cancelled in `.onDisappear`.
+    private func startImpressionTimer() {
+        guard !impressionFired, impressionTask == nil else { return }
+        impressionTask = Task { @MainActor in
+            var accruedMs: Double = 0
+            var lastTick = ProcessInfo.processInfo.systemUptime
+            while accruedMs < fullscreenImpressionDelayMs {
+                try? await Task.sleep(nanoseconds: impressionTickNanos)
+                if Task.isCancelled { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                let delta = (now - lastTick) * 1000
+                lastTick = now
+                if appForegrounded && !storeSheetPresented { accruedMs += delta }
+            }
+            if Task.isCancelled || impressionFired { return }
+            impressionFired = true
+            onImpression()
         }
     }
 
