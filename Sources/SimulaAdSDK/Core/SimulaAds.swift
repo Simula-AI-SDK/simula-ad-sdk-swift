@@ -76,6 +76,11 @@ public enum SimulaAds {
     ///   - telemetryEnabled: Opt out of in-house SDK telemetry (handled-error + performance
     ///     metrics sent to Simula). Default `true`. PII in telemetry is consent-gated exactly
     ///     like ad tracking; pass `false` to disable the pipeline entirely.
+    /// - Returns: `true` if this call initialized the SDK; `false` if it was rejected (invalid API
+    ///   key) or ignored (already initialized). The result is discardable — the common call site can
+    ///   ignore it — but it lets an integrator detect a misconfiguration instead of only discovering
+    ///   it later via `.notInitialized` ad failures.
+    @discardableResult
     public static func initialize(
         apiKey: String,
         devMode: Bool = false,
@@ -84,18 +89,24 @@ public enum SimulaAds {
         privacy: SimulaPrivacyConfig? = nil,
         telemetryEnabled: Bool = true,
         adContext: SimulaAdContext? = nil
-    ) {
+    ) -> Bool {
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
         do {
             try validateSimulaProviderProps(apiKey: apiKey)
         } catch {
+            // Debug: trap loudly. Release: log + return false (was a silent no-op) so the host gets
+            // a signal at the call site rather than only via later `.notInitialized` ad failures.
             assertionFailure("[SimulaSDK] \(error.localizedDescription)")
-            return
+            print("[SimulaSDK] initialize() failed: \(error.localizedDescription). The SDK is NOT initialized — ad calls will report .notInitialized.")
+            return false
         }
 
         // First valid initialization wins so already-created ads keep their session.
-        guard shared == nil else { return }
+        guard shared == nil else {
+            print("[SimulaSDK] initialize() ignored — the SDK is already initialized; the first valid configuration wins.")
+            return false
+        }
 
         // Monotonic start marker for the sdk_init telemetry duration (emitted once setup completes).
         let startNanos = DispatchTime.now().uptimeNanoseconds
@@ -153,6 +164,7 @@ public enum SimulaAds {
         if lastVersion != SIMULA_SDK_VERSION {
             UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
         }
+        return true
     }
 
     // MARK: - Native ad targeting context + preloading

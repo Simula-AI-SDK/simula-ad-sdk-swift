@@ -148,6 +148,16 @@ final class WebViewPool {
         return Pooled(webView: webView, forwarder: forwarder, persistent: persistent)
     }
 
+    /// Fully dismantle a view we're **discarding** (not re-pooling). `WKUserContentController.add`
+    /// holds a strong reference to the forwarder; without removing the handler, the controller keeps
+    /// the forwarder (and anything it captures) alive until the system eventually reaps the dropped
+    /// `WKWebView` — a leak in long sessions. Re-pooled views deliberately keep their handler.
+    private func teardown(_ pooled: Pooled) {
+        pooled.forwarder.onMessage = nil
+        pooled.webView.configuration.userContentController
+            .removeScriptMessageHandler(forName: WebViewPool.messageHandlerName)
+    }
+
     /// Create a warm web view ahead of time, if the pool has room. Loads
     /// `about:blank` to bring up the Web Content process so the later real load
     /// starts warm. The coordinator ignores `about:blank` navigations, so this
@@ -173,6 +183,7 @@ final class WebViewPool {
         // current consent, then reuse a matching one (or build fresh).
         let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
         while let last = idle.last, last.persistent != wantPersistent {
+            teardown(last)
             idle.removeLast()
         }
         let reusedWarm = idle.last != nil
@@ -219,6 +230,9 @@ final class WebViewPool {
         let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
         if pooled.persistent == wantPersistent && idle.count < maxIdle {
             idle.append(pooled)
+        } else {
+            // Not re-pooled → discard it fully so the content controller doesn't retain the forwarder.
+            teardown(pooled)
         }
     }
 
@@ -226,6 +240,7 @@ final class WebViewPool {
     /// view is built with a data store matching the new storage policy (a
     /// prewarmed view bakes its policy in at creation time).
     func clear() {
+        idle.forEach { teardown($0) }
         idle.removeAll()
     }
 }

@@ -38,7 +38,7 @@ final class FallbackAdPresenter {
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
         onClose: @escaping () -> Void
     ) -> Bool {
-        guard !ads.isEmpty, let scene = Self.activeWindowScene() else { return false }
+        guard let firstAd = ads.first, let scene = Self.activeWindowScene() else { return false }
         self.ads = ads
         self.index = 0
         self.onClose = onClose
@@ -52,7 +52,7 @@ final class FallbackAdPresenter {
         // Opaque black (not clear) so the host app never shows through — both behind the
         // end screen's safe area and during the rootViewController swap between screens.
         window.backgroundColor = .black
-        window.rootViewController = hostingController(for: ads[0])
+        window.rootViewController = hostingController(for: firstAd)
         window.makeKeyAndVisible()
         self.window = window
         // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
