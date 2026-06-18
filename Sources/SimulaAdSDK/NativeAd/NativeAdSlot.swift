@@ -35,6 +35,7 @@ public struct NativeAdSlot: View {
     private let onImpression: (NativeAdData) -> Void
     private let onPaid: (AdValue) -> Void
     private let onError: (NativeAdError) -> Void
+    private let onClick: () -> Void
 
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
@@ -70,6 +71,9 @@ public struct NativeAdSlot: View {
     ///   - onError: Fired with a ``NativeAdError`` on a load/render failure (not-initialized, no
     ///     session, network) and on a no-fill (`.noFill`). A cached outcome replayed on a recycled row
     ///     does not re-fire (one report per served slot).
+    ///   - onClick: Fired when the user taps the creative's CTA and it navigates out — a
+    ///     gesture-initiated click only (pixels and JS auto-redirects do not fire it). Mirrors the
+    ///     interstitial's `interstitialDidClick`; co-fired with the `click` beacon.
     ///   - previewHTML: Debug/QA only — render this HTML through the full pipeline (WebView + height
     ///     sizing + viewability + AD-badge feedback bridge) with no network call. Mirrors the
     ///     imperative ads' `showPreview`.
@@ -82,6 +86,7 @@ public struct NativeAdSlot: View {
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
         onPaid: @escaping (AdValue) -> Void = { _ in },
         onError: @escaping (NativeAdError) -> Void = { _ in },
+        onClick: @escaping () -> Void = {},
         previewHTML: String? = nil
     ) {
         self.adUnitId = adUnitId
@@ -93,6 +98,7 @@ public struct NativeAdSlot: View {
         self.onImpression = onImpression
         self.onPaid = onPaid
         self.onError = onError
+        self.onClick = onClick
 
         // Seed the initial state from the per-slot cache so a recycled row paints the SAME ad on its
         // first frame (no shimmer flash, no refetch). A preview / preload resolves in `.task`.
@@ -125,6 +131,9 @@ public struct NativeAdSlot: View {
                     onNavigationFailed: { _ in handleLoadFailure() },
                     onMessageReceived: { handleMessage($0, impressionId: impressionId) },
                     onAdClick: {
+                        // Surface the click to the publisher (parity with the interstitial's
+                        // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
+                        onClick()
                         // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
                         Telemetry.shared.recordLifecycle(
                             stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
