@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
@@ -25,13 +26,19 @@ final class Telemetry: @unchecked Sendable {
     /// both the imperative and declarative entry points funnel through). First call wins, so the
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
     /// doesn't churn the buffer.
-    func initialize(apiKey: String, devMode: Bool, enabled: Bool, primaryUserID: String?) {
+    /// `primaryUserIDProvider` is read live on every flush so a mid-session `updatePrimaryUserID`
+    /// is honored, and it is additionally gated by the live consent snapshot.
+    func initialize(apiKey: String, devMode: Bool, enabled: Bool, primaryUserIDProvider: @escaping @Sendable () -> String?) {
         lock.lock()
         if initialized { lock.unlock(); return }
         initialized = true
         lock.unlock()
 
         guard enabled else { return } // host opt-out: no manager is ever created
+
+        // Start the connection-type monitor once; it caches the latest path so the flush reads it
+        // without a synchronous reachability call. Best-effort — never throws.
+        ConnectionTypeMonitor.shared.start()
 
         let ctx = TelemetryContext(
             sdkVersion: SIMULA_SDK_VERSION,
@@ -47,8 +54,11 @@ final class Telemetry: @unchecked Sendable {
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            primaryUserIdProvider: { primaryUserID },
+            // Read the PPID live so a mid-session updatePrimaryUserID is honored.
+            primaryUserIdProvider: { primaryUserIDProvider() },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
+            connectionTypeProvider: { ConnectionTypeMonitor.shared.current },
+            diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             debugLog: consoleLog
         )
         lock.lock(); manager = mgr; lock.unlock()
@@ -82,8 +92,8 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
-    func recordOperation(name: String, durationMs: Int, success: Bool) {
-        current?.recordOperation(name: name, durationMs: durationMs, success: success)
+    func recordOperation(name: String, durationMs: Int, success: Bool, failureClass: String? = nil, breadcrumb: String? = nil) {
+        current?.recordOperation(name: name, durationMs: durationMs, success: success, failureClass: failureClass, breadcrumb: breadcrumb)
     }
 
     func recordLifecycle(
@@ -93,11 +103,14 @@ final class Telemetry: @unchecked Sendable {
         adId: String? = nil,
         serveId: String? = nil,
         durationMs: Int? = nil,
-        errorCode: String? = nil
+        errorCode: String? = nil,
+        trigger: String? = nil,
+        cacheSource: String? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: serveId, durationMs: durationMs, errorCode: errorCode
+            serveId: serveId, durationMs: durationMs, errorCode: errorCode,
+            trigger: trigger, cacheSource: cacheSource
         )
     }
 
@@ -107,4 +120,67 @@ final class Telemetry: @unchecked Sendable {
 
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
+
+    /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
+    func setExperiment(experimentId: String?, variantId: String?) {
+        current?.setExperiment(experimentId: experimentId, variantId: variantId)
+    }
+
+    /// Best-effort runtime diagnostics breadcrumb for the periodic `diagnostics` event: the process
+    /// physical-memory footprint (MB). Wrapped so any failure yields nil (no event) and never throws.
+    /// (WebView-pool / image-cache counts are omitted on iOS — those collections are main-actor /
+    /// `NSCache`-isolated and can't be safely read from the background flush.)
+    static func resolveDiagnostics() -> String? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let memMb = Int(info.phys_footprint) / (1024 * 1024)
+        return "mem_used_mb=\(memMb)"
+    }
+}
+
+/// Best-effort connection-class monitor for the telemetry envelope's `connection_type`. An
+/// `NWPathMonitor` runs once and caches the latest class (`wifi` / `cellular` / `none` / `unknown`),
+/// so the flush reads a cached value rather than making a synchronous reachability call. All access
+/// is lock-guarded; failures degrade to `unknown` and never throw.
+final class ConnectionTypeMonitor: @unchecked Sendable {
+    static let shared = ConnectionTypeMonitor()
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "ad.simula.telemetry.netpath", qos: .utility)
+    private let lock = NSLock()
+    private var latest = "unknown"
+    private var started = false
+
+    private init() {}
+
+    func start() {
+        lock.lock()
+        if started { lock.unlock(); return }
+        started = true
+        lock.unlock()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let type: String
+            if path.status != .satisfied {
+                type = "none"
+            } else if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) {
+                type = "wifi"
+            } else if path.usesInterfaceType(.cellular) {
+                type = "cellular"
+            } else {
+                type = "unknown"
+            }
+            self?.set(type)
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func set(_ type: String) { lock.lock(); latest = type; lock.unlock() }
+
+    var current: String { lock.lock(); defer { lock.unlock() }; return latest }
 }

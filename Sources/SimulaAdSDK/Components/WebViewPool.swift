@@ -99,12 +99,31 @@ final class WebViewPool {
         forMainFrameOnly: false
     )
 
+    /// Forwards creative JS errors (`window.onerror`) to native via the same `simulaSDK` handler, where
+    /// the coordinator records them as telemetry. Document-start so early errors are caught too.
+    private static let errorCaptureScript = WKUserScript(
+        source: """
+        window.addEventListener('error', function(e) {
+            try {
+                window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify({
+                    type: 'SIMULA_JS_ERROR',
+                    message: (e && e.message) ? String(e.message) : 'error',
+                    line: (e && e.lineno) ? e.lineno : 0
+                }));
+            } catch (_) {}
+        });
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
     private func makePooled() -> Pooled {
         let forwarder = WebViewMessageForwarder()
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
         controller.addUserScript(WebViewPool.postMessageScript)
+        controller.addUserScript(WebViewPool.errorCaptureScript)
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true

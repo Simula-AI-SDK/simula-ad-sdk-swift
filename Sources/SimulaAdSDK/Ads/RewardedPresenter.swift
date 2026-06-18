@@ -171,6 +171,8 @@ private struct RewardedGameView: View {
     /// foreground state is driven by `UIApplication` background/foreground notifications instead.
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
+    /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
+    @State private var storeExit: StoreExitTracker?
 
     @State private var elapsedPlayTime: Double = 0
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
@@ -213,13 +215,13 @@ private struct RewardedGameView: View {
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
+                WebViewRepresentable(htmlString: previewHTML, bridge: bridge, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL.
-                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge)
+                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, bridge: bridge)
+                WebViewRepresentable(url: url, bridge: bridge, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -243,7 +245,7 @@ private struct RewardedGameView: View {
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
                 // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
                 // touch-target band so the two share one centerline (parity with the interstitial).
-                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { trackStorePromptClick(); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
@@ -262,6 +264,7 @@ private struct RewardedGameView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             startTimer()
             startImpressionTimer()
             // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
@@ -272,23 +275,31 @@ private struct RewardedGameView: View {
             timerTask = nil
             impressionTask?.cancel()
             impressionTask = nil
+            storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             appForegrounded = false
+            storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
+            storeExit?.onReturn()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
+            // A store/Safari sheet only appears from a CTA tap — handled inside the playable's web
+            // view, so the trigger isn't known here. Tag it as a CTA open if nothing else claimed it.
+            storeExit?.recordStoreOpenIfUntracked("cta")
+            storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
+            storeExit?.onReturn()
             reconcileTimer()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
@@ -312,6 +323,7 @@ private struct RewardedGameView: View {
     private func fireAutoStoreRedirect() {
         guard !autoRedirectFired else { return }
         autoRedirectFired = true
+        storeExit?.recordStoreOpen("auto_redirect")
         handleStorePromptTap()
     }
 
@@ -405,9 +417,8 @@ private struct RewardedGameView: View {
     /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
     /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
     private func trackStorePromptClick() {
-        let adId = impressionId
-        let apiKey = self.apiKey
-        Task { await SimulaAPI().trackClick(adId: adId, apiKey: apiKey) }
+        // Durable click beacon (was a fire-and-forget trackClick).
+        AdBeaconManager.shared.enqueue(impressionId: impressionId, action: "click", adFormat: "rewarded")
     }
 
     // MARK: Close

@@ -32,6 +32,8 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
         guard let url = task.originalRequest?.url else { return }
         // Recursion guard: never record the telemetry delivery request itself.
         if url.path.hasPrefix("/v1/telemetry") { return }
+        // Never record the ppid-update request — its path embeds the PPID (consent-gated PII).
+        if url.path.contains("/ppid/") { return }
 
         let method = task.originalRequest?.httpMethod ?? "GET"
         let status = (task.response as? HTTPURLResponse)?.statusCode

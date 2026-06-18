@@ -325,12 +325,8 @@ public final class SimulaRewardedAd {
                 Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
                 self.delegate?.rewardedDidRecordImpression(self)
                 self.delegate?.rewardedDidPay(self, value: response.adValue)
-                if !response.impressionId.isEmpty {
-                    let api = self.api
-                    let apiKey = provider.apiKey
-                    let impressionId = response.impressionId
-                    Task { await api.trackImpression(adId: impressionId, apiKey: apiKey) }
-                }
+                // Durable billable-impression beacon (was a fire-and-forget trackImpression).
+                AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "seen", adFormat: Self.adFormat, adUnitId: self.adUnitId)
             },
             onClose: { [weak self] earned, elapsedPlayTime in
                 guard let self else { return }
@@ -390,12 +386,8 @@ public final class SimulaRewardedAd {
         delegate?.rewardedDidDisplay(self)
         // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
-        if !response.impressionId.isEmpty {
-            let api = self.api
-            let apiKey = provider.apiKey
-            let impressionId = response.impressionId
-            Task { await api.trackShown(adId: impressionId, apiKey: apiKey) }
-        }
+        // Durable beacon (was a fire-and-forget trackShown).
+        AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: self.adUnitId)
         #else
         failDisplay(.unsupportedPlatform)
         #endif
