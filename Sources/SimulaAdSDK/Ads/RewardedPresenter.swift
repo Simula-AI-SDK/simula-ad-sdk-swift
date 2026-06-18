@@ -215,13 +215,13 @@ private struct RewardedGameView: View {
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, bridge: bridge)
+                WebViewRepresentable(htmlString: previewHTML, bridge: bridge, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL.
-                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge)
+                WebViewRepresentable(htmlString: renderedHtml, bridge: bridge, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, bridge: bridge)
+                WebViewRepresentable(url: url, bridge: bridge, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /

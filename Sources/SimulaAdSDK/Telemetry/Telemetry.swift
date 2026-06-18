@@ -54,13 +54,11 @@ final class Telemetry: @unchecked Sendable {
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            // Read the PPID live (honors updatePrimaryUserID) and gate it on the current consent
-            // snapshot — suppressed without consent and additionally under COPPA.
-            primaryUserIdProvider: {
-                SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID ? primaryUserIDProvider() : nil
-            },
+            // Read the PPID live so a mid-session updatePrimaryUserID is honored.
+            primaryUserIdProvider: { primaryUserIDProvider() },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             connectionTypeProvider: { ConnectionTypeMonitor.shared.current },
+            diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             debugLog: consoleLog
         )
         lock.lock(); manager = mgr; lock.unlock()
@@ -122,6 +120,28 @@ final class Telemetry: @unchecked Sendable {
 
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
+
+    /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
+    func setExperiment(experimentId: String?, variantId: String?) {
+        current?.setExperiment(experimentId: experimentId, variantId: variantId)
+    }
+
+    /// Best-effort runtime diagnostics breadcrumb for the periodic `diagnostics` event: the process
+    /// physical-memory footprint (MB). Wrapped so any failure yields nil (no event) and never throws.
+    /// (WebView-pool / image-cache counts are omitted on iOS — those collections are main-actor /
+    /// `NSCache`-isolated and can't be safely read from the background flush.)
+    static func resolveDiagnostics() -> String? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let memMb = Int(info.phys_footprint) / (1024 * 1024)
+        return "mem_used_mb=\(memMb)"
+    }
 }
 
 /// Best-effort connection-class monitor for the telemetry envelope's `connection_type`. An

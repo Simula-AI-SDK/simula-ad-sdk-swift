@@ -362,7 +362,8 @@ private struct CreativeInterstitialView: View {
             htmlString: html,
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
-            attribution: response.adBehavior?.attribution
+            attribution: response.adBehavior?.attribution,
+            telemetryAdFormat: "interstitial"
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)

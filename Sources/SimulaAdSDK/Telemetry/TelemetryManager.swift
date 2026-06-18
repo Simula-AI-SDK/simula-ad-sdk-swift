@@ -33,6 +33,8 @@ final class TelemetryManager: @unchecked Sendable {
     private let advertisingIdProvider: @Sendable () -> String?
     // Resolved fresh on each flush (off the UI path). Must be best-effort/non-throwing.
     private let connectionTypeProvider: @Sendable () -> String?
+    // Compact diagnostics breadcrumb (memory etc.), sampled on flush. Best-effort.
+    private let diagnosticsProvider: @Sendable () -> String?
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
@@ -61,6 +63,14 @@ final class TelemetryManager: @unchecked Sendable {
     private var perfSampledIn: Bool
     private var sessionId: String?
 
+    // Aux session state for the funnel / time-to-first-ad / experiment, guarded by `lock`.
+    private let createdAtMs: TimeInterval
+    private var firstAdRecorded = false
+    // Per-format funnel counters: [filled, nofill, failed, impressions, clicks]. Reset on emit (deltas).
+    private var funnel: [String: [Int]] = [:]
+    private var experimentId: String?
+    private var variantId: String?
+
     init(
         ctx: TelemetryContext,
         store: TelemetryStoring,
@@ -68,6 +78,7 @@ final class TelemetryManager: @unchecked Sendable {
         primaryUserIdProvider: @escaping @Sendable () -> String?,
         advertisingIdProvider: @escaping @Sendable () -> String?,
         connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
+        diagnosticsProvider: @escaping @Sendable () -> String? = { nil },
         enabled: Bool = true,
         sampleRate: Double = 1.0,
         // Epoch milliseconds, matching the Kotlin SDK's `System.currentTimeMillis()` timestamps.
@@ -86,7 +97,9 @@ final class TelemetryManager: @unchecked Sendable {
         self.primaryUserIdProvider = primaryUserIdProvider
         self.advertisingIdProvider = advertisingIdProvider
         self.connectionTypeProvider = connectionTypeProvider
+        self.diagnosticsProvider = diagnosticsProvider
         self.now = now
+        self.createdAtMs = now()
         self.random = random
         self.backoff = backoff
         self.debugLog = debugLog
@@ -181,7 +194,39 @@ final class TelemetryManager: @unchecked Sendable {
         e.errorCode = errorCode
         e.trigger = trigger
         e.cacheSource = cacheSource
+        accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
         enqueuePerf(e)
+    }
+
+    /// Set the session experiment assignment for the envelope (last assignment wins).
+    func setExperiment(experimentId: String?, variantId: String?) {
+        if (experimentId?.isEmpty ?? true) && (variantId?.isEmpty ?? true) { return }
+        lock.lock()
+        self.experimentId = experimentId
+        self.variantId = variantId
+        lock.unlock()
+    }
+
+    /// Fold a lifecycle event into the per-format funnel and detect the first ad load. Unconditional
+    /// (not perf-sampled) so the funnel reflects real activity. Cache re-renders are excluded from
+    /// `filled`. `recordOperation` for time-to-first-ad is called OFF the lock (NSLock isn't reentrant).
+    private func accumulate(stage: String, adFormat: String?, cacheSource: String?, errorCode: String?) {
+        guard let fmt = adFormat else { return }
+        lock.lock()
+        var c = funnel[fmt] ?? [0, 0, 0, 0, 0]
+        switch stage {
+        case "load_success": if cacheSource != "cache" { c[0] += 1 }
+        case "load_fail": if errorCode == "no_fill" { c[1] += 1 } else { c[2] += 1 }
+        case "displayed": c[3] += 1
+        case "click": c[4] += 1
+        default: break
+        }
+        funnel[fmt] = c
+        let firstAd = stage == "load_success" && !firstAdRecorded
+        if firstAd { firstAdRecorded = true }
+        let created = createdAtMs
+        lock.unlock()
+        if firstAd { recordOperation(name: "time_to_first_ad", durationMs: Int(now() - created), success: true) }
     }
 
     /// Record a handled error. `signature` is the dedup key (e.g. `domain:code`); identical
@@ -220,8 +265,36 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Persist + attempt a flush now (e.g. app background).
     func flushNow() {
+        // Emit the session funnel deltas + a diagnostics sample as part of this (background) flush.
+        emitFunnelSummary()
+        emitDiagnostics()
         persistNow()
         Task { [weak self] in await self?.flush() }
+    }
+
+    /// Emit one `funnel_summary` operation per active format (cumulative since the last emit), then
+    /// reset — so the backend can sum deltas without double-counting across backgrounds.
+    private func emitFunnelSummary() {
+        lock.lock()
+        let snapshot = funnel
+        funnel = [:]
+        lock.unlock()
+        for (fmt, c) in snapshot {
+            let requested = c[0] + c[1] + c[2]
+            recordOperation(
+                name: "funnel_summary",
+                durationMs: 0,
+                success: true,
+                breadcrumb: "fmt=\(fmt);req=\(requested);fill=\(c[0]);nofill=\(c[1]);fail=\(c[2]);imp=\(c[3]);clk=\(c[4])"
+            )
+        }
+    }
+
+    /// Sample best-effort runtime diagnostics (memory) onto a meta-ish operation event. No-op when
+    /// the provider yields nothing.
+    private func emitDiagnostics() {
+        guard let line = diagnosticsProvider() else { return }
+        recordOperation(name: "diagnostics", durationMs: 0, success: true, breadcrumb: line)
     }
 
     private func persistNow() {
@@ -394,6 +467,9 @@ final class TelemetryManager: @unchecked Sendable {
         env.primaryUserId = primaryUserIdProvider()
         env.advertisingId = advertisingIdProvider()
         env.connectionType = connectionTypeProvider()
+        // Aux state guarded by the same `lock` already held by beginFlush's caller.
+        env.experimentId = experimentId
+        env.variantId = variantId
         return env
     }
 

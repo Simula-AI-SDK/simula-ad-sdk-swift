@@ -242,18 +242,16 @@ public final class SimulaProvider: ObservableObject {
     /// PPID (logout).
     ///
     /// Effects: (1) the value the next `session/create` carries is updated; (2) telemetry reports the
-    /// new value; (3) when a session already exists and consent allows, the live session is PATCHed
-    /// server-side. Clearing (nil) updates local + telemetry state only — the backend's
-    /// `PATCH …/ppid/{ppid}` path can't express an empty id. The network call is best-effort.
+    /// new value; (3) when a session already exists, the live session is PATCHed server-side. Clearing
+    /// (nil) updates local + telemetry state only — the backend's `PATCH …/ppid/{ppid}` path can't
+    /// express an empty id. The network call is best-effort.
     @MainActor
     public func updatePrimaryUserID(_ id: String?) {
         let normalized = (id?.isEmpty == false) ? id : nil
         ppidStore.set(normalized)
         // With no session yet, the pending/next createSession carries the new value, so no PATCH is
-        // needed. Only PATCH a live session when consent permits forwarding the PPID.
-        guard let normalized,
-              SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID,
-              let sid = sessionId, !sid.isEmpty else { return }
+        // needed. PATCH a live session to push the new value server-side.
+        guard let normalized, let sid = sessionId, !sid.isEmpty else { return }
         Task { [api, apiKey] in
             await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
         }

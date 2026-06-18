@@ -101,6 +101,9 @@ struct TelemetryEnvelope: Codable {
     var advertisingId: String?
     // Resolved at flush time: wifi | cellular | none | unknown. Best-effort; never blocks.
     var connectionType: String?
+    // Experiment assignment for per-variant conversion analysis (server-driven). Session-scoped.
+    var experimentId: String?
+    var variantId: String?
     let events: [TelemetryEvent]
 
     enum CodingKeys: String, CodingKey {
@@ -114,6 +117,8 @@ struct TelemetryEnvelope: Codable {
         case primaryUserId = "primary_user_id"
         case advertisingId = "advertising_id"
         case connectionType = "connection_type"
+        case experimentId = "experiment_id"
+        case variantId = "variant_id"
         case events
     }
 }

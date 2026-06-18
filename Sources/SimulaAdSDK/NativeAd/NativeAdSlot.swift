@@ -132,7 +132,8 @@ public struct NativeAdSlot: View {
                         )
                     },
                     externalClickOnly: true,
-                    reportsContentHeight: true
+                    reportsContentHeight: true,
+                    telemetryAdFormat: response.adFormat
                 )
                 // Hold a provisional height while the creative measures (never collapse), then grow.
                 .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)

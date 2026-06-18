@@ -142,6 +142,17 @@ public enum SimulaAds {
         let configSummary = "dev=\(devMode) tel=\(telemetryEnabled) consent=\(snap.hasPrivacyConsent) " +
             "coppa=\(snap.coppaApplies) adid=\(snap.advertisingId != nil) ctx=\(adContext != nil)"
         Telemetry.shared.recordOperation(name: "sdk_init", durationMs: initMs, success: true, breadcrumb: configSummary)
+
+        // SDK-upgrade beacon: compare the last-seen version to the current one. A first install just
+        // records the version (no event); a changed version emits sdk_upgrade. Best-effort.
+        let versionKey = "simula_sdk_last_version"
+        let lastVersion = UserDefaults.standard.string(forKey: versionKey)
+        if let lastVersion, lastVersion != SIMULA_SDK_VERSION {
+            Telemetry.shared.recordOperation(name: "sdk_upgrade", durationMs: 0, success: true, breadcrumb: "from=\(lastVersion);to=\(SIMULA_SDK_VERSION)")
+        }
+        if lastVersion != SIMULA_SDK_VERSION {
+            UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
+        }
     }
 
     // MARK: - Native ad targeting context + preloading

@@ -54,6 +54,10 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
     var reportsContentHeight: Bool
 
+    /// Optional ad-format tag for WebView telemetry (page-load timing, render crash, JS errors).
+    /// `nil` → untagged.
+    var telemetryAdFormat: String?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
@@ -64,7 +68,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
-        reportsContentHeight: Bool = false
+        reportsContentHeight: Bool = false,
+        telemetryAdFormat: String? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -76,6 +81,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.attribution = attribution
         self.externalClickOnly = externalClickOnly
         self.reportsContentHeight = reportsContentHeight
+        self.telemetryAdFormat = telemetryAdFormat
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -134,7 +140,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
-            reportsContentHeight: reportsContentHeight
+            reportsContentHeight: reportsContentHeight,
+            telemetryAdFormat: telemetryAdFormat
         )
     }
 
@@ -155,6 +162,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// Native-ad mode: route user clicks to the external browser; report content height.
         var externalClickOnly: Bool
         var reportsContentHeight: Bool
+        /// Ad-format tag for WebView telemetry; nil → untagged.
+        var telemetryAdFormat: String?
+        /// Monotonic page-load start (set on provisional navigation start) for `webview_page_load`.
+        private var pageStartUptime: TimeInterval?
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -180,7 +191,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: CreativeBridge? = nil,
             attribution: AdAttribution? = nil,
             externalClickOnly: Bool = false,
-            reportsContentHeight: Bool = false
+            reportsContentHeight: Bool = false,
+            telemetryAdFormat: String? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
@@ -190,12 +202,27 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.attribution = attribution
             self.externalClickOnly = externalClickOnly
             self.reportsContentHeight = reportsContentHeight
+            self.telemetryAdFormat = telemetryAdFormat
         }
 
         /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
         /// when one is attached — which posts `GET_*` replies back via this web view — else to
         /// the legacy `onMessageReceived` callback (game iframe).
         func handleMessage(_ body: String) {
+            // Intercept creative JS errors (window.onerror → simulaSDK) before normal routing, so they
+            // are captured for ALL modes (bridge + native). Recorded as deduped, redacted telemetry.
+            if body.contains("SIMULA_JS_ERROR"),
+               let data = body.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (obj["type"] as? String) == "SIMULA_JS_ERROR" {
+                Telemetry.shared.recordError(
+                    signature: "creative:js_error",
+                    errorCode: telemetryAdFormat,
+                    message: obj["message"] as? String,
+                    breadcrumb: "line=\(obj["line"] ?? 0)"
+                )
+                return
+            }
             if let bridge {
                 bridge.handle(body) { [weak self] js in
                     self?.webView?.evaluateJavaScript(js, completionHandler: nil)
@@ -207,14 +234,38 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         // MARK: - WKNavigationDelegate
 
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            // Start the page-load timer for the real content load (ignore the prewarm about:blank).
+            if webView.url?.absoluteString == "about:blank" { return }
+            pageStartUptime = ProcessInfo.processInfo.systemUptime
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Ignore the pool's prewarm load — only the real content load counts.
             if webView.url?.absoluteString == "about:blank" { return }
+            // webview_page_load timing (best-effort; Tier 3 diagnostics).
+            if let start = pageStartUptime {
+                pageStartUptime = nil
+                Telemetry.shared.recordLifecycle(
+                    stage: "webview_page_load", adFormat: telemetryAdFormat, adUnitId: nil, adId: nil,
+                    serveId: nil, durationMs: Int((ProcessInfo.processInfo.systemUptime - start) * 1000), errorCode: nil
+                )
+            }
             onNavigationFinished?()
             // Native ad: start reporting content height so the slot can size its container.
             if reportsContentHeight {
                 webView.evaluateJavaScript(Coordinator.heightReportingScript, completionHandler: nil)
             }
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            // The creative's web-content process crashed/was jettisoned. Record it; the SDK survives
+            // (WKWebView is sandboxed, so the host app is never taken down with it).
+            Telemetry.shared.recordError(
+                signature: "webview:render_gone",
+                errorCode: "render_terminated",
+                breadcrumb: telemetryAdFormat
+            )
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
