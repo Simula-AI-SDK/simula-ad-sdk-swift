@@ -362,7 +362,7 @@ private struct CreativeInterstitialView: View {
             htmlString: html,
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
-            attribution: response.adBehavior?.attribution,
+            attribution: response.skanAttribution,
             telemetryAdFormat: "interstitial"
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -536,7 +536,7 @@ private struct CreativeInterstitialView: View {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: storeOpen,
-            attribution: response.adBehavior?.attribution
+            attribution: response.skanAttribution
         )
     }
 
@@ -589,7 +589,7 @@ private struct CreativeInterstitialView: View {
         }
         guard #available(iOS 14.0, *) else { return }
         skOverlayPresented = true
-        SKOverlayPresenter.present(appID: appID, config: config, attribution: response.adBehavior?.attribution)
+        SKOverlayPresenter.present(appID: appID, config: config, attribution: response.skanAttribution)
     }
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).

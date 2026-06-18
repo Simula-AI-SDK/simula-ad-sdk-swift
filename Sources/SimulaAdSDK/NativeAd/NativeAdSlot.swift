@@ -140,7 +140,14 @@ public struct NativeAdSlot: View {
                             adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
                         )
                     },
+                    // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an
+                    // App Store CTA routes through the in-app store sheet so the tokens ride it; absent
+                    // tokens keep today's external open (see `openNativeCTA`).
+                    attribution: response.skanAttribution,
                     externalClickOnly: true,
+                    // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).
+                    ctaTrackingUrl: response.trackingUrl,
+                    ctaDestination: response.destinationKind,
                     reportsContentHeight: true,
                     telemetryAdFormat: response.adFormat
                 )
@@ -220,7 +227,7 @@ public struct NativeAdSlot: View {
                 impressionId: nil,
                 adInserted: true,
                 adFormat: "character_ad",
-                adResponse: NativeAdCreative(renderedHtml: previewHTML)
+                renderedHtml: previewHTML
             ))
             return
         }

@@ -314,7 +314,7 @@ public final class SimulaRewardedAd {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-            attribution: response.adBehavior?.attribution,
+            attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onImpression: { [weak self] in
                 guard let self else { return }
@@ -348,7 +348,7 @@ public final class SimulaRewardedAd {
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            attribution: response.adBehavior?.attribution
+                            attribution: response.skanAttribution
                         )
                     },
                     onAllClosed: { [weak self] in

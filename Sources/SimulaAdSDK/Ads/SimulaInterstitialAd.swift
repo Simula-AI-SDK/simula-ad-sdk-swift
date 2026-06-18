@@ -421,7 +421,7 @@ public final class SimulaInterstitialAd {
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            attribution: response.adBehavior?.attribution
+                            attribution: response.skanAttribution
                         )
                     }
                 )

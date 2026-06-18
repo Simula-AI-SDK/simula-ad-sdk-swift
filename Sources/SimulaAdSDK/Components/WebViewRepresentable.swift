@@ -50,6 +50,14 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// for the interstitial HTML creative / game iframe — their behavior is unchanged.
     var externalClickOnly: Bool
 
+    /// Native-ad mode: the server's MMP click-tracking URL a CTA tap should open (preferred over the
+    /// URL the creative itself navigates to, so the click is attributed exactly like the imperative
+    /// ads), and where it routes (`.appstore` resolves the redirect chain to the App Store; `.web`
+    /// opens the link directly). A `nil`/empty tracker falls back to the in-creative URL. Ignored
+    /// unless `externalClickOnly` is set.
+    var ctaTrackingUrl: String?
+    var ctaDestination: AdDestination
+
     /// Native-ad mode: after load, inject a script that reports the creative's content height over
     /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
     var reportsContentHeight: Bool
@@ -68,6 +76,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
+        ctaTrackingUrl: String? = nil,
+        ctaDestination: AdDestination = .appstore,
         reportsContentHeight: Bool = false,
         telemetryAdFormat: String? = nil
     ) {
@@ -80,6 +90,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.bridge = bridge
         self.attribution = attribution
         self.externalClickOnly = externalClickOnly
+        self.ctaTrackingUrl = ctaTrackingUrl
+        self.ctaDestination = ctaDestination
         self.reportsContentHeight = reportsContentHeight
         self.telemetryAdFormat = telemetryAdFormat
     }
@@ -140,6 +152,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
             reportsContentHeight: reportsContentHeight,
             telemetryAdFormat: telemetryAdFormat
         )
@@ -161,6 +175,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         weak var webView: WKWebView?
         /// Native-ad mode: route user clicks to the external browser; report content height.
         var externalClickOnly: Bool
+        /// Native-ad mode: server CTA routing — the MMP tracker URL to open (preferred over the
+        /// in-creative URL) and where it routes. See `WebViewRepresentable.ctaTrackingUrl`.
+        var ctaTrackingUrl: String?
+        var ctaDestination: AdDestination
         var reportsContentHeight: Bool
         /// Ad-format tag for WebView telemetry; nil → untagged.
         var telemetryAdFormat: String?
@@ -191,6 +209,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: CreativeBridge? = nil,
             attribution: AdAttribution? = nil,
             externalClickOnly: Bool = false,
+            ctaTrackingUrl: String? = nil,
+            ctaDestination: AdDestination = .appstore,
             reportsContentHeight: Bool = false,
             telemetryAdFormat: String? = nil
         ) {
@@ -201,6 +221,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.bridge = bridge
             self.attribution = attribution
             self.externalClickOnly = externalClickOnly
+            self.ctaTrackingUrl = ctaTrackingUrl
+            self.ctaDestination = ctaDestination
             self.reportsContentHeight = reportsContentHeight
             self.telemetryAdFormat = telemetryAdFormat
         }
@@ -229,6 +251,40 @@ struct WebViewRepresentable: UIViewRepresentable {
                 }
             } else {
                 onMessageReceived?(body)
+            }
+        }
+
+        /// Native-ad CTA routing (`externalClickOnly`). Default: opens the server's MMP tracking URL
+        /// **externally** — `.appstore` resolves the click-attribution redirect chain to the App Store,
+        /// `.web` opens the link directly — falling back to `fallback` (the URL the creative itself
+        /// navigated to) when the serve carried no tracker.
+        ///
+        /// SKAN parity with interstitial/rewarded: when the serve carries usable `skan_attribution`
+        /// tokens AND the CTA is an App Store destination, the click instead routes through the **in-app**
+        /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
+        /// install postback credits the campaign (StoreKit tokens can't ride an external open). Absent /
+        /// token-less attribution, or a `.web` destination, keeps today's external behavior unchanged.
+        private func openNativeCTA(fallback: URL) {
+            let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
+            let destination = ctaDestination
+            let attribution = self.attribution
+            Task { @MainActor in
+                if destination == .appstore, attribution?.hasUsableTokens == true {
+                    // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
+                    // imperative formats). Prefers the tracker (router resolves it to the store), else
+                    // the in-creative URL.
+                    CreativeCTARouter.open(
+                        trackingUrl: (trackingURL ?? fallback).absoluteString,
+                        destination: destination,
+                        storeOpen: .skstoreproduct,
+                        attribution: attribution
+                    )
+                } else if let trackingURL {
+                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
+                } else {
+                    UIApplication.shared.open(fallback)
+                }
             }
         }
 
@@ -315,7 +371,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if navigationAction.navigationType == .linkActivated,
                    scheme == "http" || scheme == "https" || scheme == "itms-apps" || scheme == "itms" {
                     onAdClick?()
-                    Task { @MainActor in UIApplication.shared.open(url) }
+                    // Prefer the server tracking URL (attribution-preserving); fall back to the tapped URL.
+                    openNativeCTA(fallback: url)
                     decisionHandler(.cancel)
                     return
                 }
@@ -388,7 +445,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if externalClickOnly {
                     if scheme == "http" || scheme == "https" {
                         onAdClick?()
-                        Task { @MainActor in UIApplication.shared.open(url) }
+                        // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
+                        openNativeCTA(fallback: url)
                     }
                     return nil
                 }

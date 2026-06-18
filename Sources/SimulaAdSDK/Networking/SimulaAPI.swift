@@ -512,6 +512,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Server-driven render config for this impression (A/B test). `nil` when the payload
     /// omits `ad_behavior` — the renderer falls back to today's literal close button / store path.
     public let adBehavior: AdBehavior?
+    /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
+    /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
+    public let skanAttribution: AdAttribution?
     /// Creative descriptor (`creative` node). `nil` when omitted; `adUnitType` drives close copy.
     public let creative: Creative?
     /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
@@ -553,6 +556,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case trackingUrl = "tracking_url"
         case renderedHtml = "rendered_html"
         case adBehavior = "ad_behavior"
+        case skanAttribution = "skan_attribution"
         case creative
         case experiment
         case bidAmt = "bid_amt"
@@ -570,6 +574,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
         // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
@@ -585,6 +590,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         trackingUrl: String? = nil,
         renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
+        skanAttribution: AdAttribution? = nil,
         creative: Creative? = nil,
         experiment: Experiment? = nil,
         bidAmt: Double = 0
@@ -597,6 +603,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.trackingUrl = trackingUrl
         self.renderedHtml = renderedHtml
         self.adBehavior = adBehavior
+        self.skanAttribution = skanAttribution
         self.creative = creative
         self.experiment = experiment
         self.bidAmt = bidAmt
@@ -668,6 +675,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public let destination: String
     public let trackingUrl: String?
     public let adBehavior: AdBehavior?
+    /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
+    /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
+    public let skanAttribution: AdAttribution?
     /// Cleared bid (estimated CPM) for this serve — see ``AdLoadResponse/bidAmt``. Drives ``adValue``.
     public let bidAmt: Double
 
@@ -687,6 +697,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case destination
         case trackingUrl = "tracking_url"
         case adBehavior = "ad_behavior"
+        case skanAttribution = "skan_attribution"
         case bidAmt = "bid_amt"
     }
 
@@ -698,6 +709,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
 
@@ -709,6 +721,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
         adBehavior: AdBehavior? = nil,
+        skanAttribution: AdAttribution? = nil,
         bidAmt: Double = 0
     ) {
         self.impressionId = impressionId
@@ -717,6 +730,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.adBehavior = adBehavior
+        self.skanAttribution = skanAttribution
         self.bidAmt = bidAmt
     }
 }
