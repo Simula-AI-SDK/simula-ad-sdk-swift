@@ -337,6 +337,31 @@ struct WebViewRepresentable: UIViewRepresentable {
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
+            // Native ad: a terminated render leaves nothing to show, so collapse the slot to zero
+            // height (parity with a load failure) instead of holding the provisional block. Gated to
+            // the native, content-sized path — the full-screen creatives don't size to content.
+            if reportsContentHeight {
+                onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
+            }
+        }
+
+        // An HTTP error status on the creative's main-frame load (e.g. the iframe URL 404s/500s) still
+        // reports as a successful navigation on WKWebView — it renders the error body and never hits
+        // didFail. Mirror Android's onReceivedHttpError: for the native path, treat a main-frame
+        // 4xx/5xx as a load failure so the slot collapses instead of holding a blank reserved block.
+        // Allow the response (the slot tears the WebView down on collapse); gated to the native path
+        // so full-screen creatives are unaffected.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            decisionHandler(.allow)
+            guard reportsContentHeight, navigationResponse.isForMainFrame,
+                  let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
+                return
+            }
+            onNavigationFailed?(NSError(domain: "SimulaWebView", code: http.statusCode))
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

@@ -45,6 +45,11 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// still be retried in the background from the persistent queue).
     func rewardedRewardVerificationDidFail(_ ad: SimulaRewardedAd, error: Error)
 
+    /// `CLICKED` — the user tapped the playable's CTA or the mid-ad store prompt. A
+    /// gesture-initiated tap only (pixels and JS/meta auto-redirects don't fire it). Mirrors
+    /// the interstitial's `interstitialDidClick`.
+    func rewardedDidClick(_ ad: SimulaRewardedAd)
+
     /// `CLOSED` — the rewarded surface was fully dismissed.
     func rewardedDidClose(_ ad: SimulaRewardedAd)
 }
@@ -59,6 +64,7 @@ public extension SimulaRewardedAdDelegate {
     func rewardedDidEarnReward(_ ad: SimulaRewardedAd) {}
     func rewardedDidVerifyReward(_ ad: SimulaRewardedAd, token: String?) {}
     func rewardedRewardVerificationDidFail(_ ad: SimulaRewardedAd, error: Error) {}
+    func rewardedDidClick(_ ad: SimulaRewardedAd) {}
     func rewardedDidClose(_ ad: SimulaRewardedAd) {}
 }
 
@@ -316,6 +322,12 @@ public final class SimulaRewardedAd {
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+            onClick: { [weak self] in
+                guard let self else { return }
+                // CLICKED — a user-gesture CTA / store-prompt tap (parity with the interstitial).
+                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                self.delegate?.rewardedDidClick(self)
+            },
             onImpression: { [weak self] in
                 guard let self else { return }
                 // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
@@ -453,6 +465,11 @@ public final class SimulaRewardedAd {
             destination: .appstore,
             storeOpen: .skstoreproduct,
             previewHTML: Self.previewMinigameHTML,
+            onClick: { [weak self] in
+                // Preview is local-only: surface the click callback, no telemetry.
+                guard let self else { return }
+                self.delegate?.rewardedDidClick(self)
+            },
             onImpression: { [weak self] in
                 guard let self else { return }
                 // Preview is local-only: surface the callbacks (with a $0 estimate) but no beacon.

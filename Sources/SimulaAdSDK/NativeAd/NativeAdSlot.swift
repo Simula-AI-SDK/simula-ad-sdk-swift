@@ -124,6 +124,8 @@ public struct NativeAdSlot: View {
     public var body: some View {
         sizedSlot
             .task(id: taskKey) { await load() }
+            // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
+            .task(id: awaitingHeight) { await watchForMissingHeight() }
     }
 
     /// The ad content for the current phase, before any width sizing.
@@ -162,6 +164,9 @@ public struct NativeAdSlot: View {
                 )
                 // Hold a provisional height while the creative measures (never collapse), then grow.
                 .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
+                // Snap height changes (grow on first paint, collapse on error) — never animate the
+                // feed reflow, which reads as a weird "bump".
+                .animation(nil, value: heightPt)
                 .trackNativeAdViewability(
                     enabled: heightPt > 0,
                     // Forward the live visible fraction to the creative (window.onVisibility) every
@@ -382,6 +387,28 @@ public struct NativeAdSlot: View {
         heightPt = 0
         phase = .empty
         reportError(.network)
+    }
+
+    /// True while a filled creative has not yet reported a usable height — i.e. it is still holding
+    /// the provisional block. Drives the missing-height watchdog and flips false the moment a real
+    /// height arrives (`handleMessage`), the slot collapses, or it disappears.
+    private var awaitingHeight: Bool {
+        if case .filled = phase { return heightPt <= 0 }
+        return false
+    }
+
+    /// A creative can finish loading (no navigation failure, no HTTP error) yet never post a usable
+    /// `SIMULA_AD_HEIGHT` — a broken/empty creative. Without this it would hold the 160 pt provisional
+    /// block forever (reserved empty space — the "bump"). Give a genuine load a generous window to
+    /// paint; if it still hasn't, collapse the slot to zero height. SwiftUI cancels this automatically
+    /// when `awaitingHeight` flips false (height arrived, or the slot left the screen), so it only ever
+    /// fires for a creative that truly never measured.
+    @MainActor
+    private func watchForMissingHeight() async {
+        guard awaitingHeight else { return }
+        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        guard !Task.isCancelled, awaitingHeight else { return }
+        handleLoadFailure()
     }
 
     private func handleMessage(_ raw: String, impressionId: String, adFormat: String) {
