@@ -145,6 +145,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         if let html = htmlString, html != currentHTML {
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
+            context.coordinator.currentBaseURL = baseURL
             context.coordinator.realLoadStarted = true
             webView.loadHTMLString(html, baseURL: baseURL)
         } else if let url = url, url != currentURL {
@@ -220,6 +221,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// report `about:blank`. The old URL check matched that real load too and suppressed the
         /// height-reporting script, so the native slot never sized and collapsed (rendered blank).
         var realLoadStarted = false
+        /// Base URL of the current HTML load, remembered so the exact creative can be re-issued if the
+        /// web-content process is terminated (`reload()` can't restore a `loadHTMLString` load — its URL
+        /// is the baseURL, not the content).
+        var currentBaseURL: URL?
+        /// One-shot guard for the reload-after-termination recovery, so a creative that reliably crashes
+        /// the renderer can't spin in a reload loop. Reset on each successful load (`didFinish`).
+        var renderRecoveryAttempted = false
 
         /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
         /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
@@ -347,6 +355,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             // gating on the URL would also drop the native (nil-baseURL → about:blank) creative's load
             // and never inject the height-reporting script, collapsing the slot.
             guard realLoadStarted else { return }
+            // A clean load means the (possibly just-reloaded) creative is healthy — restore the
+            // one-shot render-recovery budget for any future web-content-process termination.
+            renderRecoveryAttempted = false
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
             if let start = pageStartUptime {
                 pageStartUptime = nil
@@ -363,16 +374,34 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            // The creative's web-content process crashed/was jettisoned. Record it; the SDK survives
-            // (WKWebView is sandboxed, so the host app is never taken down with it).
+            // The creative's web-content process crashed/was jettisoned (commonly an OS reclaim while
+            // backgrounded). Record it; the SDK survives (WKWebView is sandboxed, so the host app is
+            // never taken down with it).
             Telemetry.shared.recordError(
                 signature: "webview:render_gone",
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
-            // Native ad: a terminated render leaves nothing to show, so collapse the slot to zero
-            // height (parity with a load failure) instead of holding the provisional block. Gated to
-            // the native, content-sized path — the full-screen creatives don't size to content.
+            // Recover in place: a WKWebView is reusable after a termination, so re-issue the SAME
+            // creative so the slot comes back instead of collapsing. reload() can't restore a
+            // loadHTMLString load (its URL is the baseURL, not the content), so re-load the stored
+            // content. One-shot per successful load (reset in didFinish) so a creative that reliably
+            // crashes the renderer can't spin a reload loop.
+            if !renderRecoveryAttempted {
+                if let html = currentHTML {
+                    renderRecoveryAttempted = true
+                    webView.loadHTMLString(html, baseURL: currentBaseURL)
+                    return
+                }
+                if let url = currentURL {
+                    renderRecoveryAttempted = true
+                    webView.load(URLRequest(url: url))
+                    return
+                }
+            }
+            // Already retried (or nothing to reload): for the native, content-sized slot, collapse to
+            // zero height (parity with a load failure) instead of holding a blank provisional block.
+            // Gated to the native path — the full-screen creatives don't size to content.
             if reportsContentHeight {
                 onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
             }
