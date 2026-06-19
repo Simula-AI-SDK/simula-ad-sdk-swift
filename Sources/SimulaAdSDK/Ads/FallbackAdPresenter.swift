@@ -28,6 +28,8 @@ final class FallbackAdPresenter {
     private var autoStoreRedirect: AutoStoreRedirect?
     private var onAutoStoreRedirect: (@MainActor () -> Void)?
     private var autoRedirectFired = false
+    /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
+    private var onAdClick: (() -> Void)?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onClose` is then never called).
@@ -36,6 +38,7 @@ final class FallbackAdPresenter {
         ads: [FallbackAd],
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
+        onAdClick: (() -> Void)? = nil,
         onClose: @escaping () -> Void
     ) -> Bool {
         guard let firstAd = ads.first, let scene = Self.activeWindowScene() else { return false }
@@ -44,6 +47,7 @@ final class FallbackAdPresenter {
         self.onClose = onClose
         self.autoStoreRedirect = autoStoreRedirect
         self.onAutoStoreRedirect = onAutoStoreRedirect
+        self.onAdClick = onAdClick
 
         originalKeyWindow = scene.keyWindow
 
@@ -77,7 +81,9 @@ final class FallbackAdPresenter {
         let root = AdOverlayView(
             iframeUrl: ad.iframeUrl,
             onClose: { [weak self] in self?.advance() },
-            adId: ad.adId
+            adId: ad.adId,
+            html: ad.html,
+            onAdClick: { [weak self] in self?.onAdClick?() }
         )
         let hosting = UIHostingController(rootView: root)
         hosting.view.backgroundColor = .black

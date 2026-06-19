@@ -766,10 +766,12 @@ public struct RewardedInitResponse: Decodable, Sendable {
 public struct FallbackAd: Sendable {
     public let adId: String
     public let iframeUrl: String
+    public let html: String?
 
-    public init(adId: String, iframeUrl: String) {
+    public init(adId: String, iframeUrl: String, html: String? = nil) {
         self.adId = adId
         self.iframeUrl = iframeUrl
+        self.html = html
     }
 }
 
@@ -1318,8 +1320,12 @@ public final class SimulaAPI: @unchecked Sendable {
 
         let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
         return apiResponse.ads.compactMap { item in
-            guard let iframeUrl = item.iframeUrl, !iframeUrl.isEmpty else { return nil }
-            return FallbackAd(adId: item.adId ?? "", iframeUrl: iframeUrl)
+            // Prefer the inline html (rendered in AdOverlayView); keep the iframe url as the same-origin
+            // base + url fallback. Drop only when neither is present.
+            let html = (item.html?.isEmpty == false) ? item.html : nil
+            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
+            guard html != nil || url != nil else { return nil }
+            return FallbackAd(adId: item.adId ?? "", iframeUrl: url ?? "", html: html)
         }
     }
 

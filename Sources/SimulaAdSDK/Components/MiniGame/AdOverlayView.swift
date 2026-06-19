@@ -25,6 +25,11 @@ public struct AdOverlayView: View {
     var playableBorderColor: String = "#262626"
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
+    /// Inline end-screen html (preferred over `iframeUrl` when present): the `<iframe srcdoc>` blob from
+    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin so its click beacon stays same-origin.
+    var html: String? = nil
+    /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
+    var onAdClick: (() -> Void)? = nil
 
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
@@ -97,9 +102,12 @@ public struct AdOverlayView: View {
 
                     // Main content area
                     ZStack {
-                        // Ad iframe
-                        if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url)
+                        // Ad creative: prefer the inline html (rendered with the iframe origin as base
+                        // so the end screen's own click beacon stays same-origin), else load the url.
+                        if let html, !html.isEmpty {
+                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick)
+                        } else if let url = URL(string: iframeUrl) {
+                            WebViewRepresentable(url: url, onAdClick: onAdClick)
                         }
 
                         // Close button / countdown ring — top right

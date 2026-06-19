@@ -697,7 +697,8 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             ads: ads,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) }
         ) { [weak self] in
             self?.fallbackPresenter = nil
         }

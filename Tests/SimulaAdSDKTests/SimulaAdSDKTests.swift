@@ -798,6 +798,8 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(r.ads.count, 2)
         XCTAssertEqual(r.ads[0].adId, "a1")
         XCTAssertEqual(r.ads[0].iframeUrl, "https://i/1")
+        // html is the preferred creative source rendered by AdOverlayView.
+        XCTAssertEqual(r.ads[0].html, "<html>1</html>")
         XCTAssertEqual(r.ads[1].adId, "a2")
     }
 

@@ -21,6 +21,11 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// Raw HTML content to load. Mutually exclusive with `url`.
     let htmlString: String?
 
+    /// Base URL for `htmlString` loads — sets the page origin so the creative's own same-origin
+    /// requests (e.g. the end screen's click beacon) behave as if served from that origin. `nil` for
+    /// the interstitial / native html (no in-creative same-origin calls).
+    var baseURL: URL?
+
     /// Called when the web view finishes loading content
     var onNavigationFinished: (() -> Void)?
 
@@ -74,6 +79,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     init(
         url: URL? = nil,
         htmlString: String? = nil,
+        baseURL: URL? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -89,6 +95,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     ) {
         self.url = url
         self.htmlString = htmlString
+        self.baseURL = baseURL
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -135,15 +142,15 @@ struct WebViewRepresentable: UIViewRepresentable {
         let currentURL = context.coordinator.currentURL
         let currentHTML = context.coordinator.currentHTML
 
-        if let url = url, url != currentURL {
+        if let html = htmlString, html != currentHTML {
+            context.coordinator.currentHTML = html
+            context.coordinator.currentURL = nil
+            webView.loadHTMLString(html, baseURL: baseURL)
+        } else if let url = url, url != currentURL {
             context.coordinator.currentURL = url
             context.coordinator.currentHTML = nil
             let request = URLRequest(url: url)
             webView.load(request)
-        } else if let html = htmlString, html != currentHTML {
-            context.coordinator.currentHTML = html
-            context.coordinator.currentURL = nil
-            webView.loadHTMLString(html, baseURL: nil)
         }
     }
 
@@ -613,6 +620,7 @@ import WebKit
 struct WebViewRepresentable: NSViewRepresentable {
     let url: URL?
     let htmlString: String?
+    var baseURL: URL?
     var onNavigationFinished: (() -> Void)?
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
@@ -623,6 +631,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     init(
         url: URL? = nil,
         htmlString: String? = nil,
+        baseURL: URL? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -630,6 +639,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     ) {
         self.url = url
         self.htmlString = htmlString
+        self.baseURL = baseURL
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -676,7 +686,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         } else if let html = htmlString, html != currentHTML {
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
-            webView.loadHTMLString(html, baseURL: nil)
+            webView.loadHTMLString(html, baseURL: baseURL)
         }
     }
 
