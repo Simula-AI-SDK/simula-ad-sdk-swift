@@ -145,10 +145,12 @@ struct WebViewRepresentable: UIViewRepresentable {
         if let html = htmlString, html != currentHTML {
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
+            context.coordinator.realLoadStarted = true
             webView.loadHTMLString(html, baseURL: baseURL)
         } else if let url = url, url != currentURL {
             context.coordinator.currentURL = url
             context.coordinator.currentHTML = nil
+            context.coordinator.realLoadStarted = true
             let request = URLRequest(url: url)
             webView.load(request)
         }
@@ -211,6 +213,13 @@ struct WebViewRepresentable: UIViewRepresentable {
         var currentURL: URL?
         /// Tracks the currently loaded HTML to avoid redundant loads
         var currentHTML: String?
+        /// True once `updateUIView` has issued the real content load. The pool prewarms each view with
+        /// an `about:blank` load; its (late) navigation callbacks must be ignored. Gating on this flag
+        /// — rather than `webView.url == "about:blank"` — is correct even for a native creative loaded
+        /// via `loadHTMLString(_:baseURL:)` with a `nil` baseURL, which itself makes `webView.url`
+        /// report `about:blank`. The old URL check matched that real load too and suppressed the
+        /// height-reporting script, so the native slot never sized and collapsed (rendered blank).
+        var realLoadStarted = false
 
         /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
         /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
@@ -327,13 +336,17 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             // Start the page-load timer for the real content load (ignore the prewarm about:blank).
-            if webView.url?.absoluteString == "about:blank" { return }
+            // Gate on realLoadStarted, not the URL: a native creative loaded with a nil baseURL also
+            // reports webView.url == about:blank, and must NOT be skipped.
+            guard realLoadStarted else { return }
             pageStartUptime = ProcessInfo.processInfo.systemUptime
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // Ignore the pool's prewarm load — only the real content load counts.
-            if webView.url?.absoluteString == "about:blank" { return }
+            // Ignore the pool's prewarm load — only the real content load counts. See realLoadStarted:
+            // gating on the URL would also drop the native (nil-baseURL → about:blank) creative's load
+            // and never inject the height-reporting script, collapsing the slot.
+            guard realLoadStarted else { return }
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
             if let start = pageStartUptime {
                 pageStartUptime = nil
