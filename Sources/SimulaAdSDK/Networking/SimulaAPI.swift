@@ -528,7 +528,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
+    /// Estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
     /// surfaced on the paid event when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
@@ -686,7 +686,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
+    /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
     /// when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
@@ -1331,8 +1331,8 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Track Shown
 
-    /// Tracks a full-screen ad as shown (`POST /impressions/{adId}/shown`) — AdMob's "shown" signal
-    /// (`onAdShowedFullScreenContent`), fired when the creative first renders. Distinct from the
+    /// Tracks a full-screen ad as shown (`POST /impressions/{adId}/shown`) — the "shown" signal,
+    /// fired when the creative first renders. Distinct from the
     /// billable impression beacon (``trackImpression(adId:apiKey:)`` → `/seen`), which fires later at
     /// begin-to-render + 2s. The endpoint takes no body. Best-effort, silent-fail.
     public func trackShown(adId: String, apiKey: String) async {

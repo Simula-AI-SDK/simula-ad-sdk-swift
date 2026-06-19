@@ -66,6 +66,11 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// `nil` → untagged.
     var telemetryAdFormat: String?
 
+    /// Native-ad mode: forwards the slot's live visible fraction into this creative via
+    /// `window.onVisibility(ratio)` as it scrolls. Bound to this instance's WKWebView on acquire and
+    /// unbound on teardown. `nil` for the game iframe / interstitial creative (no per-frame visibility).
+    var visibilityRelay: VisibilityRelay?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
@@ -79,7 +84,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
         reportsContentHeight: Bool = false,
-        telemetryAdFormat: String? = nil
+        telemetryAdFormat: String? = nil,
+        visibilityRelay: VisibilityRelay? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -94,6 +100,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.ctaDestination = ctaDestination
         self.reportsContentHeight = reportsContentHeight
         self.telemetryAdFormat = telemetryAdFormat
+        self.visibilityRelay = visibilityRelay
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -113,6 +120,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         )
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView
+        // Point the visibility relay at this acquired view so scroll-driven `window.onVisibility`
+        // pushes reach it; held on the coordinator so dismantle can unbind. No-op when unset.
+        coordinator.visibilityRelay = visibilityRelay
+        visibilityRelay?.bind(webView)
         // A native ad sizes to content and is not scrollable (PRD); disabling the inner scroll keeps
         // it from intercepting the host feed's scroll. Set per-acquire since the pool reuses views.
         webView.scrollView.isScrollEnabled = !reportsContentHeight
@@ -140,6 +151,8 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// so the (expensive) WKWebView + its Web Content process is recycled for the
     /// next acquire instead of being deallocated.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        // Stop forwarding visibility into a view that's about to be recycled by the pool.
+        coordinator.visibilityRelay?.bind(nil)
         WebViewPool.shared.release(uiView)
     }
 
@@ -182,6 +195,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         var reportsContentHeight: Bool
         /// Ad-format tag for WebView telemetry; nil → untagged.
         var telemetryAdFormat: String?
+        /// Native-ad visibility relay (set on acquire); used to unbind on dismantle. See `VisibilityRelay`.
+        var visibilityRelay: VisibilityRelay?
         /// Monotonic page-load start (set on provisional navigation start) for `webview_page_load`.
         private var pageStartUptime: TimeInterval?
 
@@ -532,6 +547,35 @@ struct WebViewRepresentable: UIViewRepresentable {
           } catch (e) {}
         })();
         """
+    }
+}
+
+// MARK: - VisibilityRelay
+
+/// Throttling channel that forwards a native slot's live visible fraction (0..1) to the creative's
+/// `window.onVisibility`. Created per served slot by `NativeAdSlot`, bound to that slot's `WKWebView`
+/// by `WebViewRepresentable` while mounted, and fed by `NativeAdViewabilityModifier` as the slot
+/// scrolls. Rounds to ~1% and drops sub-1% changes so a high-frequency scroll can't flood the JS
+/// bridge; guards on `window.onVisibility` existence so it's a no-op until the creative defines it.
+/// All access is on the main thread (the SwiftUI viewability callbacks + representable lifecycle).
+final class VisibilityRelay {
+    private weak var webView: WKWebView?
+    private var last: CGFloat = -1
+
+    /// Point the relay at the live `WKWebView` (or `nil` to detach on teardown).
+    func bind(_ webView: WKWebView?) {
+        self.webView = webView
+        last = -1
+    }
+
+    /// Forward a 0..1 ratio to the creative, de-duped against the last forwarded value (~1%
+    /// granularity). Guarded so it's a no-op until `window.onVisibility` is defined.
+    func report(_ ratio: CGFloat) {
+        let r = min(1, max(0, ratio))
+        if last >= 0, abs(r - last) < 0.01 { return }
+        last = r
+        let s = String(format: "%.2f", r)
+        webView?.evaluateJavaScript("window.onVisibility&&window.onVisibility(\(s))", completionHandler: nil)
     }
 }
 

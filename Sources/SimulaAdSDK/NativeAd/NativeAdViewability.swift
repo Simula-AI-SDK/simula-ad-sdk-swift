@@ -23,28 +23,45 @@ struct NativeAdViewabilityModifier: ViewModifier {
     let enabled: Bool
     var thresholdFraction: CGFloat = 0.5
     var minVisibleSeconds: Double = 1.0
-    let onImpression: () -> Void
+    /// Forwards the slot's live visible fraction (0..1) on every layout/scroll frame so the creative
+    /// can react via `window.onVisibility` (driven through `VisibilityRelay`). `nil` to skip.
+    var onVisibilityRatio: ((CGFloat) -> Void)?
+    /// Fires once when the dwell threshold is met, carrying the exposure aggregate accrued up to it.
+    let onImpression: (ViewabilityStats) -> Void
 
     @State private var fired = false
     @State private var dwellTask: Task<Void, Never>?
+    // Time-integrated exposure for the once-per-impression `viewability` telemetry. A reference type in
+    // @State so it persists across re-renders and mutates in place; accessed only on the main actor.
+    @State private var accumulator = ViewabilityAccumulator()
 
     func body(content: Content) -> some View {
         content
             .background(
                 GeometryReader { geo in
                     Color.clear
-                        .onAppear { evaluate(visibleFraction(geo)) }
-                        .onChange(of: visibleFraction(geo)) { frac in evaluate(frac) }
+                        .onAppear { handle(visibleFraction(geo)) }
+                        .onChange(of: visibleFraction(geo)) { frac in handle(frac) }
                 }
             )
             .onDisappear {
                 dwellTask?.cancel()
                 dwellTask = nil
+                // Slot left the screen → tell the creative it's no longer visible (pause video, etc.).
+                onVisibilityRatio?(0)
             }
     }
 
-    private func evaluate(_ fraction: CGFloat) {
+    /// Per-frame entry: forward the live fraction to the creative (always), then feed the dwell +
+    /// exposure accumulator while still measuring.
+    private func handle(_ fraction: CGFloat) {
+        onVisibilityRatio?(fraction)
         guard enabled, !fired else { return }
+        accumulator.sample(fraction, now: ProcessInfo.processInfo.systemUptime)
+        evaluate(fraction)
+    }
+
+    private func evaluate(_ fraction: CGFloat) {
         if fraction >= thresholdFraction {
             // Already counting down? Don't restart — a sustained view must keep its timer running.
             guard dwellTask == nil else { return }
@@ -53,7 +70,7 @@ struct NativeAdViewabilityModifier: ViewModifier {
                 guard !Task.isCancelled else { return }
                 fired = true
                 dwellTask = nil
-                onImpression()
+                onImpression(accumulator.finish(now: ProcessInfo.processInfo.systemUptime))
             }
         } else {
             // Dropped below threshold before the dwell elapsed → reset the timer (PRD).
@@ -74,10 +91,77 @@ struct NativeAdViewabilityModifier: ViewModifier {
     }
 }
 
+/// Once-per-impression viewability exposure aggregate, measured over the run that led to the
+/// impression. `timeToViewableMs` is from when measurement began (first sample) to the impression
+/// fire; `peakExposure` / `avgExposure` are 0..1; `totalVisibleMs` is the cumulative time any part of
+/// the slot was on screen. The per-frame stream is far too high-volume for the batch telemetry
+/// pipeline, so this MRC-shaped summary is what's recorded instead. Mirrors the Kotlin `ViewabilityStats`.
+struct ViewabilityStats {
+    let timeToViewableMs: Int
+    let peakExposure: CGFloat
+    let avgExposure: CGFloat
+    let totalVisibleMs: Int
+}
+
+/// Integrates visible-fraction samples over wall-clock time (piecewise-constant between samples) so
+/// `avgExposure` / `totalVisibleMs` are time-weighted rather than biased by how often SwiftUI happens
+/// to re-evaluate during a scroll. Accessed only on the main actor (the SwiftUI modifier's callbacks).
+final class ViewabilityAccumulator {
+    private var startUptime: TimeInterval?
+    private var lastUptime: TimeInterval = 0
+    private var lastFraction: CGFloat = 0
+    private var peak: CGFloat = 0
+    private var weighted: Double = 0   // ∫ fraction dt (seconds)
+    private var elapsed: Double = 0    // ∫ dt (seconds)
+    private var visible: Double = 0    // ∫ [fraction > 0] dt (seconds)
+
+    /// Fold the segment since the previous sample, then record the new fraction.
+    func sample(_ fraction: CGFloat, now: TimeInterval) {
+        if startUptime == nil {
+            startUptime = now
+        } else {
+            let dt = max(0, now - lastUptime)
+            weighted += Double(lastFraction) * dt
+            elapsed += dt
+            if lastFraction > 0 { visible += dt }
+        }
+        lastUptime = now
+        lastFraction = fraction
+        if fraction > peak { peak = fraction }
+    }
+
+    /// Close the final open segment up to `now` (the fire instant) and emit the aggregate.
+    func finish(now: TimeInterval) -> ViewabilityStats {
+        guard let start = startUptime else {
+            return ViewabilityStats(timeToViewableMs: 0, peakExposure: peak, avgExposure: 0, totalVisibleMs: 0)
+        }
+        let dt = max(0, now - lastUptime)
+        weighted += Double(lastFraction) * dt
+        elapsed += dt
+        if lastFraction > 0 { visible += dt }
+        let avg = elapsed > 0 ? weighted / elapsed : Double(lastFraction)
+        return ViewabilityStats(
+            timeToViewableMs: Int((now - start) * 1000),
+            peakExposure: peak,
+            avgExposure: CGFloat(avg),
+            totalVisibleMs: Int(visible * 1000)
+        )
+    }
+}
+
 extension View {
-    /// Fire `onImpression` once when this view is ≥50% visible for ≥1 continuous second (OMID-shaped).
-    func trackNativeAdViewability(enabled: Bool, onImpression: @escaping () -> Void) -> some View {
-        modifier(NativeAdViewabilityModifier(enabled: enabled, onImpression: onImpression))
+    /// Fire `onImpression` once when this view is ≥50% visible for ≥1 continuous second (OMID-shaped),
+    /// and forward the live visible fraction to `onVisibilityRatio` on every frame.
+    func trackNativeAdViewability(
+        enabled: Bool,
+        onVisibilityRatio: ((CGFloat) -> Void)? = nil,
+        onImpression: @escaping (ViewabilityStats) -> Void
+    ) -> some View {
+        modifier(NativeAdViewabilityModifier(
+            enabled: enabled,
+            onVisibilityRatio: onVisibilityRatio,
+            onImpression: onImpression
+        ))
     }
 }
 #endif

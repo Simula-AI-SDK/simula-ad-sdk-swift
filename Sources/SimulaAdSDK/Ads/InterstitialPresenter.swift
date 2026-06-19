@@ -234,7 +234,7 @@ private struct CreativeInterstitialView: View {
                 htmlCreativeView(html)
             }
 
-            // Close button — always shown with the compact AppLovin-style chrome. Driven by
+            // Close button — always shown with the compact chrome. Driven by
             // `ad_behavior.close` when present; otherwise a default config (top-right, always
             // available) so ads with no `ad_behavior` still get the small close, not a big one.
             CloseButtonView(
@@ -641,7 +641,7 @@ struct CloseButtonView: View {
     let progress: Double
     let onClose: () -> Void
 
-    // Visible close affordance sized to match AppLovin (a compact ~22pt circle); the tappable frame
+    // Visible close affordance sized to a compact ~22pt circle; the tappable frame
     // stays at the 44pt HIG minimum (see `minTouchTarget`), close to IAB MRAID's 50×50dp close
     // region. The visible graphic and the touch target are deliberately decoupled.
     private let glyphSize: CGFloat = 10
@@ -681,7 +681,7 @@ struct CloseButtonView: View {
             // fill-and-align frame is used (NOT VStack/HStack + Spacer): the Spacer approach can
             // collapse to center when this view sits beside the `.ignoresSafeArea()` web view and
             // isn't proposed a full-size container, which made every position render at the same spot.
-            // A tight 8pt inset keeps the button close to the corner (AdMob / AppLovin-style).
+            // A tight 8pt inset keeps the button close to the corner.
             buttonOrIndicator
                 // Center every state in the touch-target band so the gated pill / ring and the
                 // unlocked ✕ share one centerline (and line up with the store badge).
@@ -742,7 +742,7 @@ struct CloseButtonView: View {
         }
     }
 
-    /// The circular "X" glyph — a gray / translucent dark circle with a white X (AdMob / AppLovin
+    /// The circular "X" glyph — a gray / translucent dark circle with a white X (compact
     /// style), rather than an opaque white circle.
     private var closeGlyph: some View {
         Image(systemName: "xmark")
@@ -805,7 +805,7 @@ struct StorePromptBadge: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: cornerAlignment)
     }
 
-    // Compact AppLovin-style pill: the filled skip-next glyph (`forward.end.fill` ≈ ▶|) then the
+    // Compact pill: the filled skip-next glyph (`forward.end.fill` ≈ ▶|) then the
     // store name, with tight padding, a fully-rounded (capsule) outline, and a small gap between
     // the two.
     private var badge: some View {

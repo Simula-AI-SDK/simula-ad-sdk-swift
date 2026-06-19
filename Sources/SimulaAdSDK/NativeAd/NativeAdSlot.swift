@@ -42,6 +42,14 @@ public struct NativeAdSlot: View {
     @State private var impressionFired = false
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
+    /// Forwards the slot's live visible fraction into the creative (`window.onVisibility`); bound to
+    /// the WKWebView by `WebViewRepresentable` and fed by the viewability modifier as the slot scrolls.
+    @State private var visibilityRelay = VisibilityRelay()
+    /// Native render time (fill→first-paint): monotonic start captured when a fresh (network/preload)
+    /// creative begins loading; the elapsed-to-first-height is recorded once. A cache re-render restores
+    /// height from cache without a real paint, so it leaves the start nil and records nothing.
+    @State private var renderStartUptime: TimeInterval?
+    @State private var renderTimeRecorded = false
 
     /// Height the slot holds while the creative is measuring, so it never collapses to a sliver
     /// between "filled" and "first height reported" (which would jolt the surrounding feed).
@@ -66,8 +74,8 @@ public struct NativeAdSlot: View {
     ///     live request. An expired/unknown id falls back to a live call with no error surfaced.
     ///   - onImpression: Fired once when the viewability threshold is met (co-fired with the server
     ///     impression).
-    ///   - onPaid: AdMob's paid event — the estimated revenue (``AdValue``) for this impression, fired
-    ///     together with `onImpression` (co-fired, not decoupled). Native has no "shown" event, matching AdMob.
+    ///   - onPaid: The paid event — the estimated revenue (``AdValue``) for this impression, fired
+    ///     together with `onImpression` (co-fired, not decoupled). Native has no "shown" event.
     ///   - onError: Fired with a ``NativeAdError`` on a load/render failure (not-initialized, no
     ///     session, network) and on a no-fill (`.noFill`). A cached outcome replayed on a recycled row
     ///     does not re-fire (one report per served slot).
@@ -129,7 +137,7 @@ public struct NativeAdSlot: View {
                     url: response.iframeURL.flatMap { URL(string: $0) },
                     htmlString: response.iframeURL == nil ? response.renderedHTML : nil,
                     onNavigationFailed: { _ in handleLoadFailure() },
-                    onMessageReceived: { handleMessage($0, impressionId: impressionId) },
+                    onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
                     onAdClick: {
                         // Surface the click to the publisher (parity with the interstitial's
                         // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
@@ -149,12 +157,18 @@ public struct NativeAdSlot: View {
                     ctaTrackingUrl: response.trackingUrl,
                     ctaDestination: response.destinationKind,
                     reportsContentHeight: true,
-                    telemetryAdFormat: response.adFormat
+                    telemetryAdFormat: response.adFormat,
+                    visibilityRelay: visibilityRelay
                 )
                 // Hold a provisional height while the creative measures (never collapse), then grow.
                 .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
-                .trackNativeAdViewability(enabled: heightPt > 0) {
-                    fireImpression(impressionId: impressionId, adFormat: response.adFormat, adValue: response.adValue)
+                .trackNativeAdViewability(
+                    enabled: heightPt > 0,
+                    // Forward the live visible fraction to the creative (window.onVisibility) every
+                    // frame so a video/animation can react; per-frame, never sent to telemetry.
+                    onVisibilityRatio: { visibilityRelay.report($0) }
+                ) { stats in
+                    fireImpression(impressionId: impressionId, adFormat: response.adFormat, adValue: response.adValue, stats: stats)
                 }
 
                 // Keep the shimmer over the slot until the creative reports its height. Without
@@ -287,6 +301,12 @@ public struct NativeAdSlot: View {
             NativeAdCache.shared.putFill(adUnitId, position, response)
             heightPt = 0
             impressionFired = false
+            // Start the native fill→first-paint render timer for a genuine load (network/preload); a
+            // cache re-render leaves it nil so it doesn't record a render time.
+            if source != "cache" {
+                renderStartUptime = ProcessInfo.processInfo.systemUptime
+                renderTimeRecorded = false
+            }
             phase = .filled(response)
             reportLoadSuccess(response, source: source, durationMs: durationMs)
         } else {
@@ -320,7 +340,7 @@ public struct NativeAdSlot: View {
         )
     }
 
-    private func fireImpression(impressionId: String, adFormat: String, adValue: AdValue) {
+    private func fireImpression(impressionId: String, adFormat: String, adValue: AdValue, stats: ViewabilityStats) {
         guard !impressionFired else { return }
         impressionFired = true
         // Remember it on the cache entry so a remount of the same serve never re-fires.
@@ -333,6 +353,15 @@ public struct NativeAdSlot: View {
         Telemetry.shared.recordLifecycle(
             stage: "displayed", adFormat: adFormat, adUnitId: adUnitId,
             adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+        )
+        // Viewability exposure aggregate — once per impression. The per-frame ratio is far too
+        // high-volume for the batch pipeline, so this records the MRC-shaped summary instead:
+        // time-to-viewable + peak/avg/total exposure. Breadcrumb format matches the Kotlin SDK.
+        Telemetry.shared.recordLifecycle(
+            stage: "viewability", adFormat: adFormat, adUnitId: adUnitId,
+            adId: impressionId.isEmpty ? nil : impressionId, serveId: nil,
+            durationMs: stats.timeToViewableMs, errorCode: nil,
+            breadcrumb: String(format: "peak=%.2f;avg=%.2f;visible_ms=%d", stats.peakExposure, stats.avgExposure, stats.totalVisibleMs)
         )
         onImpression(NativeAdData(impressionId: impressionId, adFormat: adFormat, adUnitId: adUnitId))
         // PAID — co-fired with the impression (PRD "co-fire, do not decouple"). The estimate is already
@@ -355,7 +384,7 @@ public struct NativeAdSlot: View {
         reportError(.network)
     }
 
-    private func handleMessage(_ raw: String, impressionId: String) {
+    private func handleMessage(_ raw: String, impressionId: String, adFormat: String) {
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else {
@@ -368,6 +397,17 @@ public struct NativeAdSlot: View {
         case "SIMULA_AD_HEIGHT", "AD_RESIZE":
             if let h = (obj["height"] as? NSNumber)?.doubleValue, h > 0 {
                 let newHeight = CGFloat(h)
+                // Native render time (the fill→first-paint blind spot): from load-begin to the
+                // creative's first real height report (it has laid out and is on screen). Records once
+                // per genuine load; a cache re-render left renderStartUptime nil.
+                if !renderTimeRecorded, let start = renderStartUptime {
+                    renderTimeRecorded = true
+                    Telemetry.shared.recordLifecycle(
+                        stage: "native_render", adFormat: adFormat, adUnitId: adUnitId,
+                        adId: impressionId.isEmpty ? nil : impressionId, serveId: nil,
+                        durationMs: Int((ProcessInfo.processInfo.systemUptime - start) * 1000), errorCode: nil
+                    )
+                }
                 // Threshold sub-point churn so a measuring creative can't thrash the feed below.
                 if abs(newHeight - heightPt) >= 1 {
                     heightPt = newHeight

@@ -15,15 +15,15 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func rewardedDidFailToLoad(_ ad: SimulaRewardedAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the rewarded surface was presented full-screen (AdMob's "shown").
+    /// `DISPLAYED` — the rewarded surface was presented full-screen (the "shown" signal).
     func rewardedDidDisplay(_ ad: SimulaRewardedAd)
 
-    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// `IMPRESSION` — a billable impression was recorded (the billable-impression signal), fired
     /// ~2 seconds after the playable begins to render, independent of the reward gate. Distinct from
     /// `DISPLAYED`; followed immediately by `PAID`.
     func rewardedDidRecordImpression(_ ad: SimulaRewardedAd)
 
-    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired together
+    /// `PAID` — the estimated revenue for this impression (the paid event). Fired together
     /// with `IMPRESSION`; `value` is already on-device from load time (no network round-trip). Use it
     /// for your own analytics — the backend's impression confirmation remains the source of truth for
     /// billing.
@@ -318,7 +318,7 @@ public final class SimulaRewardedAd {
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onImpression: { [weak self] in
                 guard let self else { return }
-                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
                 // after begin-to-render by the presenter (foreground-aware), independent of the reward
                 // gate. The `/seen` beacon is the billing source of truth; `didPay` is local analytics.
                 Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
@@ -384,7 +384,7 @@ public final class SimulaRewardedAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.rewardedDidDisplay(self)
-        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // SHOWN — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         // Durable beacon (was a fire-and-forget trackShown).
         AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: self.adUnitId)

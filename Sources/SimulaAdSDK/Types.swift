@@ -1143,7 +1143,7 @@ public struct NativeAdResponse: Decodable, Sendable {
     /// when omitted → the App Store CTA opens externally exactly as today (un-attributed). See `AdAttribution`.
     public let skanAttribution: AdAttribution?
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the native paid
+    /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the native paid
     /// event, co-fired with the impression.
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
@@ -1215,7 +1215,7 @@ public struct NativeAdResponse: Decodable, Sendable {
     public var hasCreative: Bool { adInserted && (iframeURL != nil || renderedHTML != nil) }
 }
 
-/// Estimated per-impression revenue for a served ad, in AdMob's `AdValue` shape so it's a drop-in for
+/// Estimated per-impression revenue for a served ad, in a standard `AdValue` shape so it's a drop-in for
 /// a publisher's existing analytics / MMP pipeline. Surfaced on the **paid** event
 /// (`interstitialDidPay` / `rewardedDidPay` / `NativeAdSlot`'s `onPaid`) at the moment the impression
 /// fires — never at load.

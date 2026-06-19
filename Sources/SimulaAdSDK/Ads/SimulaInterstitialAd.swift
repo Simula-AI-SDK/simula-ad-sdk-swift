@@ -17,15 +17,15 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the ad surface was presented full-screen (AdMob's "shown").
+    /// `DISPLAYED` — the ad surface was presented full-screen (the "shown" signal).
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd)
 
-    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// `IMPRESSION` — a billable impression was recorded (the billable-impression signal), fired
     /// ~2 seconds after the creative begins to render. Distinct from `DISPLAYED`; followed
     /// immediately by `PAID`.
     func interstitialDidRecordImpression(_ ad: SimulaInterstitialAd)
 
-    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired
+    /// `PAID` — the estimated revenue for this impression (the paid event). Fired
     /// together with `IMPRESSION`; `value` is already on-device from load time (no network
     /// round-trip). Use it for your own analytics — the backend's impression confirmation remains
     /// the source of truth for billing.
@@ -395,7 +395,7 @@ public final class SimulaInterstitialAd {
             },
             onImpression: { [weak self] in
                 guard let self else { return }
-                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
                 // after begin-to-render by the presenter (foreground-aware). The `/seen` beacon is the
                 // billing source of truth; `didPay` is local analytics (value already on-device).
                 Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
@@ -455,7 +455,7 @@ public final class SimulaInterstitialAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.interstitialDidDisplay(self)
-        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // SHOWN — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         // Durable beacon (was a fire-and-forget trackShown).
         AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: adUnitId)

@@ -183,7 +183,8 @@ final class TelemetryManager: @unchecked Sendable {
         durationMs: Int?,
         errorCode: String?,
         trigger: String? = nil,
-        cacheSource: String? = nil
+        cacheSource: String? = nil,
+        breadcrumb: String? = nil
     ) {
         var e = newEvent(type: TelemetryType.lifecycle, name: stage)
         e.adFormat = adFormat
@@ -194,6 +195,7 @@ final class TelemetryManager: @unchecked Sendable {
         e.errorCode = errorCode
         e.trigger = trigger
         e.cacheSource = cacheSource
+        e.breadcrumb = breadcrumb
         accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
         enqueuePerf(e)
     }
