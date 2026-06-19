@@ -212,6 +212,19 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// Tracks the currently loaded HTML to avoid redundant loads
         var currentHTML: String?
 
+        /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
+        /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
+        /// at most once per ~0.5s window (de-dupes the delegate double-call). See `fireAdClickOnce`.
+        private var lastAdClickUptime: TimeInterval = -1
+
+        /// Fire the publisher CLICKED callback at most once per CTA tap.
+        private func fireAdClickOnce() {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - lastAdClickUptime >= 0.5 else { return }
+            lastAdClickUptime = now
+            onAdClick?()
+        }
+
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
@@ -465,7 +478,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let currentHost = currentURL?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
-                    onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                    fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                     let attribution = self.attribution
                     Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     decisionHandler(.cancel)
@@ -491,7 +504,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // Native ad: target="_blank" / window.open → external browser (PRD).
                 if externalClickOnly {
                     if scheme == "http" || scheme == "https" {
-                        onAdClick?()
+                        fireAdClickOnce()
                         // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
                         openNativeCTA(fallback: url)
                     }
@@ -506,7 +519,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // explicitly rather than asserting isolation. `createWebViewWith`
                         // is only invoked for user-initiated new-window requests
                         // (target="_blank" / window.open), so this is a real click.
-                        onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                        fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                         let attribution = self.attribution
                         Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     } else {

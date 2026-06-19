@@ -1200,7 +1200,7 @@ public struct NativeAdResponse: Decodable, Sendable {
         self.skanAttribution = skanAttribution
     }
 
-    /// The creative URL to mount; used as the fallback when no inline html is present. nil on a no-fill.
+    /// The creative URL to mount; the fallback when no inline html is present. nil on a no-fill.
     public var iframeURL: String? {
         iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }

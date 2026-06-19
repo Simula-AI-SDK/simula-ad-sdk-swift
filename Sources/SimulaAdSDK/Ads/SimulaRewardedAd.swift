@@ -351,7 +351,6 @@ public final class SimulaRewardedAd {
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
-                self.delegate?.rewardedDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
@@ -370,7 +369,11 @@ public final class SimulaRewardedAd {
                         )
                     },
                     onAllClosed: { [weak self] in
-                        self?.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
+                        guard let self else { return }
+                        // CLOSE fires after the LAST fallback screen (not the playable close), then
+                        // reward earn/verification (handleClose) — preserving the close → complete order.
+                        self.delegate?.rewardedDidClose(self)
+                        self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                     }
                 )
                 // Preload the next ad after close, reusing the last character context.

@@ -136,8 +136,8 @@ public struct NativeAdSlot: View {
             let impressionId = response.impressionId ?? ""
             ZStack {
                 WebViewRepresentable(
-                    // Prefer the server-rendered html (the inline <iframe srcdoc>); fall back to the
-                    // iframe url when no html is present.
+                    // Prefer the server-rendered html (the inline <iframe srcdoc> creative); fall back to
+                    // the iframe url when no html is present.
                     url: response.renderedHTML == nil ? response.iframeURL.flatMap { URL(string: $0) } : nil,
                     htmlString: response.renderedHTML,
                     onNavigationFailed: { _ in handleLoadFailure() },

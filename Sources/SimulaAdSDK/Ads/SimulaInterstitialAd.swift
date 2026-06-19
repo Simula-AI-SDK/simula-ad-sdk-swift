@@ -424,10 +424,10 @@ public final class SimulaInterstitialAd {
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
-                self.delegate?.interstitialDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
+                // CLOSED fires from onAllClosed — after the LAST fallback screen, not the playable close.
                 self.presentFallbackAds(
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
@@ -437,7 +437,8 @@ public final class SimulaInterstitialAd {
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
                             attribution: response.skanAttribution
                         )
-                    }
+                    },
+                    onAllClosed: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClose(self) }
                 )
                 // Preload the next ad after close, reusing the last character context.
                 self.load(
@@ -667,7 +668,8 @@ public final class SimulaInterstitialAd {
     /// prefetch finished (rare), it awaits and presents on the next runloop. Empty → nothing shown.
     private func presentFallbackAds(
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
         let ready = prefetchedFallbacks
@@ -675,24 +677,30 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             Task { [weak self] in
                 let ads = await prefetch.value
-                self?.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+                guard let self else { onAllClosed(); return }
+                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
+        } else {
+            onAllClosed()
         }
+        #else
+        onAllClosed()
         #endif
     }
 
-    /// Presents the fallback ad window for `ads` (no-op if empty). Best-effort.
+    /// Presents the fallback ad window for `ads` (fires `onAllClosed` immediately if empty). Best-effort.
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
-        guard !ads.isEmpty else { return }
+        guard !ads.isEmpty else { onAllClosed(); return }
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
@@ -701,8 +709,11 @@ public final class SimulaInterstitialAd {
             onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) }
         ) { [weak self] in
             self?.fallbackPresenter = nil
+            onAllClosed()
         }
-        if didPresent { self.fallbackPresenter = presenter }
+        if didPresent { self.fallbackPresenter = presenter } else { onAllClosed() }
+        #else
+        onAllClosed()
         #endif
     }
 }
