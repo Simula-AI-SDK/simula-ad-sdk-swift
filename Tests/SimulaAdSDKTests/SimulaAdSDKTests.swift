@@ -369,7 +369,6 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(b.storePrompt)
         XCTAssertNil(b.skoverlay)
         XCTAssertNil(b.autoStoreRedirect)
-        XCTAssertNil(b.attribution)
     }
 
     // MARK: - Ad behavior: auto_store_redirect
@@ -435,18 +434,18 @@ final class SimulaAdSDKTests: XCTestCase {
         )
     }
 
-    // MARK: - Ad behavior: attribution tokens (SKOverlay / SKStoreProduct)
+    // MARK: - skan_attribution tokens (response-root sibling of ad_behavior; SKOverlay / SKStoreProduct)
 
-    func testAdBehaviorAttributionDecodesCampaignProviderAndSkan() throws {
+    func testSkanAttributionDecodesCampaignProviderAndSkan() throws {
         let json = """
         {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"attribution":{
+         "skan_attribution":{
            "campaign_token":"camp_tok","provider_token":"prov_tok",
            "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
              "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,
-             "attribution_signature":"sig==","source_id":1234}}}}
+             "attribution_signature":"sig==","source_id":1234}}}
         """
-        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        let a = try XCTUnwrap(try decodeAdLoad(json).skanAttribution)
         XCTAssertEqual(a.campaignToken, "camp_tok")
         XCTAssertEqual(a.providerToken, "prov_tok")
         let skan = try XCTUnwrap(a.skan)
@@ -460,23 +459,23 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(skan.campaignIdentifier)
     }
 
-    func testAdBehaviorAttributionAbsentIsNil() throws {
+    func testSkanAttributionAbsentIsNil() throws {
         let json = #"{"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,"ad_behavior":{}}"#
-        XCTAssertNil(try decodeAdLoad(json).adBehavior?.attribution)
+        XCTAssertNil(try decodeAdLoad(json).skanAttribution)
     }
 
-    func testAttributionSkanAllOrNothingDropsPartialButKeepsTokens() throws {
+    func testSkanAttributionAllOrNothingDropsPartialButKeepsTokens() throws {
         // The SKAN block is missing `attribution_signature` (a required field) → StoreKit could not
         // build a valid postback, so the whole `skan` decodes to nil. The App Analytics tokens, which
         // are independent, still decode.
         let json = """
         {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
-         "ad_behavior":{"attribution":{
+         "skan_attribution":{
            "campaign_token":"camp_tok",
            "skan":{"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
-             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,"source_id":1234}}}}
+             "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,"source_id":1234}}}
         """
-        let a = try XCTUnwrap(try decodeAdLoad(json).adBehavior?.attribution)
+        let a = try XCTUnwrap(try decodeAdLoad(json).skanAttribution)
         XCTAssertEqual(a.campaignToken, "camp_tok")
         XCTAssertNil(a.providerToken)
         XCTAssertNil(a.skan)
@@ -742,6 +741,20 @@ final class SimulaAdSDKTests: XCTestCase {
             SimulaAdError.network(.invalidResponse).errorDescription,
             "Network error while loading the ad — check the connection and call load() again."
         )
+        XCTAssertEqual(
+            SimulaAdError.adUnitNotFound.errorDescription,
+            "Ad unit id is not registered for this app — check the ad unit id in your Simula dashboard."
+        )
+    }
+
+    func testAdUnitNotFoundTelemetryCode() {
+        XCTAssertEqual(SimulaAdError.adUnitNotFound.telemetryCode, "ad_unit_not_found")
+    }
+
+    func testAPIErrorBodyDecodesAdUnitNotFoundCode() throws {
+        let json = #"{"code":"ad_unit_not_found","message":"Ad unit 'x' is not registered for this publisher."}"#
+        let body = try JSONDecoder().decode(SimulaAPIErrorBody.self, from: Data(json.utf8))
+        XCTAssertEqual(body.code, "ad_unit_not_found")
     }
 
     // MARK: - Rewarded init parsing (RewardedInitResponse decode)
@@ -785,6 +798,8 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(r.ads.count, 2)
         XCTAssertEqual(r.ads[0].adId, "a1")
         XCTAssertEqual(r.ads[0].iframeUrl, "https://i/1")
+        // html is the preferred creative source rendered by AdOverlayView.
+        XCTAssertEqual(r.ads[0].html, "<html>1</html>")
         XCTAssertEqual(r.ads[1].adId, "a2")
     }
 

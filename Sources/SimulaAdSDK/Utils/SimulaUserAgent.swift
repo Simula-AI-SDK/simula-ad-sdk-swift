@@ -1,7 +1,7 @@
 import Foundation
 
 /// Builds (once) and caches the custom User-Agent the SDK stamps on every native HTTP request
-/// (User-Agent for Apps SDK PRD). Format is AdMob-aligned:
+/// (User-Agent for Apps SDK PRD). Format is the standard ad-SDK layout:
 ///
 /// ```
 /// Simula-SDK/{sdkVersion} ({os} {osVersion}; {locale}; {deviceModel}; Build/{buildId}; {bundleId})

@@ -105,12 +105,13 @@ final class Telemetry: @unchecked Sendable {
         durationMs: Int? = nil,
         errorCode: String? = nil,
         trigger: String? = nil,
-        cacheSource: String? = nil
+        cacheSource: String? = nil,
+        breadcrumb: String? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
             serveId: serveId, durationMs: durationMs, errorCode: errorCode,
-            trigger: trigger, cacheSource: cacheSource
+            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb
         )
     }
 

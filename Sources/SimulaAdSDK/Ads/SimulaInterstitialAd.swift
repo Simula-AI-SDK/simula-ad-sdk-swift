@@ -17,15 +17,15 @@ public protocol SimulaInterstitialAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func interstitialDidFailToLoad(_ ad: SimulaInterstitialAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the ad surface was presented full-screen (AdMob's "shown").
+    /// `DISPLAYED` — the ad surface was presented full-screen (the "shown" signal).
     func interstitialDidDisplay(_ ad: SimulaInterstitialAd)
 
-    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// `IMPRESSION` — a billable impression was recorded (the billable-impression signal), fired
     /// ~2 seconds after the creative begins to render. Distinct from `DISPLAYED`; followed
     /// immediately by `PAID`.
     func interstitialDidRecordImpression(_ ad: SimulaInterstitialAd)
 
-    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired
+    /// `PAID` — the estimated revenue for this impression (the paid event). Fired
     /// together with `IMPRESSION`; `value` is already on-device from load time (no network
     /// round-trip). Use it for your own analytics — the backend's impression confirmation remains
     /// the source of truth for billing.
@@ -80,6 +80,10 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case unsupportedPlatform
     /// An underlying networking error.
     case network(SimulaAPIError)
+    /// The backend rejected the requested ad unit id — it isn't registered for this app
+    /// (wrong id, or it belongs to a different app/publisher). Non-retryable: fix the ad
+    /// unit id. Surfaced through the same `didFailToLoad` delegate callback as other failures.
+    case adUnitNotFound
 
     public var errorDescription: String? {
         switch self {
@@ -111,6 +115,9 @@ public enum SimulaAdError: LocalizedError, Sendable {
             // Shared, descriptive copy (matches the Android SDK). The underlying `SimulaAPIError`
             // stays available on the associated value for programmatic inspection / debugging.
             return "Network error while loading the ad — check the connection and call load() again."
+        case .adUnitNotFound:
+            // Public contract — shared verbatim with the Android SDK's SimulaAdError.AdUnitNotFound.
+            return "Ad unit id is not registered for this app — check the ad unit id in your Simula dashboard."
         }
     }
 }
@@ -129,6 +136,7 @@ extension SimulaAdError {
         case .noPresentationContext: return "no_presentation_context"
         case .unsupportedPlatform: return "unsupported_platform"
         case .network: return "network"
+        case .adUnitNotFound: return "ad_unit_not_found"
         }
     }
 }
@@ -334,7 +342,13 @@ public final class SimulaInterstitialAd {
                 // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
                 // lifecycle event comes from failLoad()).
                 Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
-                self.failLoad(.network(apiError))
+                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+                // own case rather than burying it in the generic .network bucket.
+                if case .adUnitNotFound = apiError {
+                    self.failLoad(.adUnitNotFound)
+                } else {
+                    self.failLoad(.network(apiError))
+                }
             } catch {
                 Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
                 self.failLoad(.network(.invalidResponse))
@@ -395,7 +409,7 @@ public final class SimulaInterstitialAd {
             },
             onImpression: { [weak self] in
                 guard let self else { return }
-                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
                 // after begin-to-render by the presenter (foreground-aware). The `/seen` beacon is the
                 // billing source of truth; `didPay` is local analytics (value already on-device).
                 Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
@@ -410,10 +424,10 @@ public final class SimulaInterstitialAd {
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
-                self.delegate?.interstitialDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
+                // CLOSED fires from onAllClosed — after the LAST fallback screen, not the playable close.
                 self.presentFallbackAds(
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
@@ -421,9 +435,10 @@ public final class SimulaInterstitialAd {
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            attribution: response.adBehavior?.attribution
+                            attribution: response.skanAttribution
                         )
-                    }
+                    },
+                    onAllClosed: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClose(self) }
                 )
                 // Preload the next ad after close, reusing the last character context.
                 self.load(
@@ -455,7 +470,7 @@ public final class SimulaInterstitialAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.interstitialDidDisplay(self)
-        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // SHOWN — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         // Durable beacon (was a fire-and-forget trackShown).
         AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: adUnitId)
@@ -653,7 +668,8 @@ public final class SimulaInterstitialAd {
     /// prefetch finished (rare), it awaits and presents on the next runloop. Empty → nothing shown.
     private func presentFallbackAds(
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
         let ready = prefetchedFallbacks
@@ -661,33 +677,43 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             Task { [weak self] in
                 let ads = await prefetch.value
-                self?.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect)
+                guard let self else { onAllClosed(); return }
+                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
+        } else {
+            onAllClosed()
         }
+        #else
+        onAllClosed()
         #endif
     }
 
-    /// Presents the fallback ad window for `ads` (no-op if empty). Best-effort.
+    /// Presents the fallback ad window for `ads` (fires `onAllClosed` immediately if empty). Best-effort.
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
-        guard !ads.isEmpty else { return }
+        guard !ads.isEmpty else { onAllClosed(); return }
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) }
         ) { [weak self] in
             self?.fallbackPresenter = nil
+            onAllClosed()
         }
-        if didPresent { self.fallbackPresenter = presenter }
+        if didPresent { self.fallbackPresenter = presenter } else { onAllClosed() }
+        #else
+        onAllClosed()
         #endif
     }
 }

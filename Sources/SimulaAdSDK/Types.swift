@@ -723,10 +723,11 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     }
 }
 
-/// Ad-network attribution tokens for the StoreKit-rendered store surfaces (`attribution` node).
-/// iOS-only: `SKOverlay` / `SKStoreProductViewController` can't navigate an MMP tracking URL, so
-/// attribution rides on these tokens instead — the App Analytics campaign/provider tokens and, when
-/// the ad network supplies a signed SKAdNetwork payload, the full `skan` set. Every field is optional;
+/// Ad-network attribution tokens for the StoreKit-rendered store surfaces (`skan_attribution` node,
+/// a sibling of `ad_behavior` at the response root — it describes who to credit, not how the ad is
+/// displayed). iOS-only: `SKOverlay` / `SKStoreProductViewController` can't navigate an MMP tracking
+/// URL, so attribution rides on these tokens instead — the App Analytics campaign/provider tokens
+/// and, when the ad network supplies a signed SKAdNetwork payload, the full `skan` set. Every field is optional;
 /// an absent or partial object means "no token wired" and the store surface falls back to today's
 /// behavior. The SDK passes these through verbatim — it never mints or signs them (the backend does).
 public struct AdAttribution: Sendable, Equatable, Decodable {
@@ -741,6 +742,13 @@ public struct AdAttribution: Sendable, Equatable, Decodable {
         self.campaignToken = campaignToken
         self.providerToken = providerToken
         self.skan = skan
+    }
+
+    /// True when at least one usable token is present (a non-empty campaign/provider token, or a signed
+    /// `skan` payload). An all-empty object — e.g. the backend sent `skan_attribution: {}` — is treated
+    /// as "no attribution wired", so callers fall back to their default un-attributed behavior.
+    public var hasUsableTokens: Bool {
+        (campaignToken?.isEmpty == false) || (providerToken?.isEmpty == false) || skan != nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -764,8 +772,8 @@ public struct AdAttribution: Sendable, Equatable, Decodable {
 /// (the store still opens, just without SKAN). `campaignIdentifier` (SKAN ≤3) and `sourceIdentifier`
 /// (SKAN 4) are the version-specific alternatives; supply whichever matches `version`.
 ///
-/// NOTE: the snake_case `CodingKeys` below are provisional — confirm them against the backend
-/// (`~/project-any-sdk-api`) `attribution.skan` contract before shipping.
+/// NOTE: the snake_case `CodingKeys` below are pinned by `docs/AD_ATTRIBUTION_BACKEND_PRD.md` —
+/// confirm them against the backend (`~/project-any-sdk-api`) `skan_attribution.skan` contract before shipping.
 public struct SKANParameters: Sendable, Equatable, Decodable {
     public let version: String
     public let adNetworkIdentifier: String
@@ -847,35 +855,31 @@ public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
 
 /// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
 /// response: an absent object means "render today's defaults". A present-but-partial object
-/// fills each missing field with its default; `store_prompt` / `skoverlay` / `auto_store_redirect` /
-/// `attribution` are nil when omitted.
+/// fills each missing field with its default; `store_prompt` / `skoverlay` / `auto_store_redirect`
+/// are nil when omitted.
 ///
-/// NOTE: `attribution` is intentionally inert today — the backend (`~/project-any-sdk-api`) does not
-/// yet emit an `attribution` node in `ad_behavior`, so it always decodes to nil and the StoreKit
-/// surfaces fall back to their default (un-attributed) behavior. The plumbing is retained so the
-/// tokens flow the moment the API ships the contract; the Android SDK deliberately doesn't model it.
+/// NOTE: attribution tokens are NOT part of `ad_behavior` (which is purely about how the ad is
+/// displayed). They live in the sibling `skan_attribution` node at the response root — see
+/// ``AdLoadResponse/skanAttribution`` / ``RewardedInitResponse/skanAttribution`` and `AdAttribution`.
 public struct AdBehavior: Sendable, Equatable, Decodable {
     public let close: CloseBehavior
     public let storeOpen: StoreOpen
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
     public let autoStoreRedirect: AutoStoreRedirect?
-    public let attribution: AdAttribution?
 
     public init(
         close: CloseBehavior = CloseBehavior(),
         storeOpen: StoreOpen = .external,
         storePrompt: StorePrompt? = nil,
         skoverlay: SKOverlayConfig? = nil,
-        autoStoreRedirect: AutoStoreRedirect? = nil,
-        attribution: AdAttribution? = nil
+        autoStoreRedirect: AutoStoreRedirect? = nil
     ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
         self.autoStoreRedirect = autoStoreRedirect
-        self.attribution = attribution
     }
 
     enum CodingKeys: String, CodingKey {
@@ -884,7 +888,6 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storePrompt = "store_prompt"
         case skoverlay
         case autoStoreRedirect = "auto_store_redirect"
-        case attribution
     }
 
     public init(from decoder: Decoder) throws {
@@ -894,7 +897,6 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
         self.autoStoreRedirect = try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect)
-        self.attribution = try? c.decode(AdAttribution.self, forKey: .attribution)
     }
 }
 
@@ -1118,8 +1120,9 @@ public struct NativeAdRequest: Encodable, Sendable {
 }
 
 /// Response for `POST /load/native` (backend `CaiNativeResponse`). Tolerant decode (missing keys →
-/// safe defaults). `adResponse` is camelCase (the one exception in the snake_case envelope) and is
-/// `{}` on a no-fill.
+/// safe defaults). A flat envelope mirroring the imperative ``AdLoadResponse``: the creative
+/// (`iframe_url` + `rendered_html`) and the click-through params (`destination`, `tracking_url`) sit
+/// at the top level — the creative was previously nested under a camelCase `adResponse`.
 public struct NativeAdResponse: Decodable, Sendable {
     public let impressionId: String?
     public let adInserted: Bool
@@ -1127,18 +1130,38 @@ public struct NativeAdResponse: Decodable, Sendable {
     /// Cleared bid (estimated CPM) for this serve, backend-provided. Drives ``adValue``. Defaults to
     /// 0 → a $0 estimate when the field is absent (e.g. a no-fill).
     public let bidAmt: Double
-    public let adResponse: NativeAdCreative
+    /// Where a CTA tap routes — `"appstore"` or `"web"`. Defaults to `"appstore"` when absent.
+    public let destination: String
+    /// MMP click-tracking URL the CTA opens (attribution-preserving); nil when the serve carries no
+    /// tracker (the SDK then falls back to the URL the creative itself navigates to).
+    public let trackingUrl: String?
+    /// Raw mountable-creative fields; use ``iframeURL`` / ``renderedHTML`` for the trimmed accessors.
+    public let iframeUrl: String?
+    public let renderedHtml: String?
+    /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
+    /// of the creative fields — parity with the interstitial/rewarded responses). `nil` (or token-less)
+    /// when omitted → the App Store CTA opens externally exactly as today (un-attributed). See `AdAttribution`.
+    public let skanAttribution: AdAttribution?
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the native paid
+    /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the native paid
     /// event, co-fired with the impression.
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
+
+    /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
+    public var destinationKind: AdDestination {
+        AdDestination(rawValue: destination) ?? .appstore
+    }
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case adInserted = "ad_inserted"
         case adFormat = "ad_format"
         case bidAmt = "bid_amt"
-        case adResponse
+        case destination
+        case trackingUrl = "tracking_url"
+        case iframeUrl = "iframe_url"
+        case renderedHtml = "rendered_html"
+        case skanAttribution = "skan_attribution"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1147,49 +1170,51 @@ public struct NativeAdResponse: Decodable, Sendable {
         adInserted = (try c.decodeIfPresent(Bool.self, forKey: .adInserted)) ?? false
         adFormat = (try c.decodeIfPresent(String.self, forKey: .adFormat)) ?? ""
         bidAmt = (try c.decodeIfPresent(Double.self, forKey: .bidAmt)) ?? 0
-        adResponse = (try c.decodeIfPresent(NativeAdCreative.self, forKey: .adResponse)) ?? NativeAdCreative()
+        destination = (try c.decodeIfPresent(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
+        trackingUrl = try c.decodeIfPresent(String.self, forKey: .trackingUrl)
+        iframeUrl = try c.decodeIfPresent(String.self, forKey: .iframeUrl)
+        renderedHtml = try c.decodeIfPresent(String.self, forKey: .renderedHtml)
+        skanAttribution = try c.decodeIfPresent(AdAttribution.self, forKey: .skanAttribution)
     }
 
     /// Direct construction (used for the slot's debug/QA preview path).
-    public init(impressionId: String?, adInserted: Bool, adFormat: String, adResponse: NativeAdCreative, bidAmt: Double = 0) {
+    public init(
+        impressionId: String?,
+        adInserted: Bool,
+        adFormat: String,
+        iframeUrl: String? = nil,
+        renderedHtml: String? = nil,
+        destination: String = "appstore",
+        trackingUrl: String? = nil,
+        bidAmt: Double = 0,
+        skanAttribution: AdAttribution? = nil
+    ) {
         self.impressionId = impressionId
         self.adInserted = adInserted
         self.adFormat = adFormat
         self.bidAmt = bidAmt
-        self.adResponse = adResponse
+        self.destination = destination
+        self.trackingUrl = trackingUrl
+        self.iframeUrl = iframeUrl
+        self.renderedHtml = renderedHtml
+        self.skanAttribution = skanAttribution
     }
 
-    /// The creative URL to mount, preferring `iframe_url` (URL mount is preferred for security);
-    /// nil on a no-fill.
+    /// The creative URL to mount; the fallback when no inline html is present. nil on a no-fill.
     public var iframeURL: String? {
-        adResponse.iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
-    /// The `<iframe srcdoc=…>` wrapper to mount inline when no URL is available; nil otherwise.
+    /// The `<iframe srcdoc=…>` wrapper to mount inline — preferred over `iframeURL` when present; nil otherwise.
     public var renderedHTML: String? {
-        adResponse.renderedHtml?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        renderedHtml?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
     /// True when there's a mountable creative to render.
     public var hasCreative: Bool { adInserted && (iframeURL != nil || renderedHTML != nil) }
 }
 
-public struct NativeAdCreative: Decodable, Sendable {
-    public let iframeUrl: String?
-    public let renderedHtml: String?
-
-    enum CodingKeys: String, CodingKey {
-        case iframeUrl = "iframe_url"
-        case renderedHtml = "rendered_html"
-    }
-
-    public init(iframeUrl: String? = nil, renderedHtml: String? = nil) {
-        self.iframeUrl = iframeUrl
-        self.renderedHtml = renderedHtml
-    }
-}
-
-/// Estimated per-impression revenue for a served ad, in AdMob's `AdValue` shape so it's a drop-in for
+/// Estimated per-impression revenue for a served ad, in a standard `AdValue` shape so it's a drop-in for
 /// a publisher's existing analytics / MMP pipeline. Surfaced on the **paid** event
 /// (`interstitialDidPay` / `rewardedDidPay` / `NativeAdSlot`'s `onPaid`) at the moment the impression
 /// fires — never at load.

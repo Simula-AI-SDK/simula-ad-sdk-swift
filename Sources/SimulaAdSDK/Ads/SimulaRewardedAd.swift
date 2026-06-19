@@ -15,15 +15,15 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// `LOAD_FAILED` — `load()` could not produce a ready ad.
     func rewardedDidFailToLoad(_ ad: SimulaRewardedAd, error: SimulaAdError)
 
-    /// `DISPLAYED` — the rewarded surface was presented full-screen (AdMob's "shown").
+    /// `DISPLAYED` — the rewarded surface was presented full-screen (the "shown" signal).
     func rewardedDidDisplay(_ ad: SimulaRewardedAd)
 
-    /// `IMPRESSION` — a billable impression was recorded (AdMob's `adDidRecordImpression`), fired
+    /// `IMPRESSION` — a billable impression was recorded (the billable-impression signal), fired
     /// ~2 seconds after the playable begins to render, independent of the reward gate. Distinct from
     /// `DISPLAYED`; followed immediately by `PAID`.
     func rewardedDidRecordImpression(_ ad: SimulaRewardedAd)
 
-    /// `PAID` — the estimated revenue for this impression (AdMob's `paidEventHandler`). Fired together
+    /// `PAID` — the estimated revenue for this impression (the paid event). Fired together
     /// with `IMPRESSION`; `value` is already on-device from load time (no network round-trip). Use it
     /// for your own analytics — the backend's impression confirmation remains the source of truth for
     /// billing.
@@ -45,6 +45,11 @@ public protocol SimulaRewardedAdDelegate: AnyObject {
     /// still be retried in the background from the persistent queue).
     func rewardedRewardVerificationDidFail(_ ad: SimulaRewardedAd, error: Error)
 
+    /// `CLICKED` — the user tapped the playable's CTA or the mid-ad store prompt. A
+    /// gesture-initiated tap only (pixels and JS/meta auto-redirects don't fire it). Mirrors
+    /// the interstitial's `interstitialDidClick`.
+    func rewardedDidClick(_ ad: SimulaRewardedAd)
+
     /// `CLOSED` — the rewarded surface was fully dismissed.
     func rewardedDidClose(_ ad: SimulaRewardedAd)
 }
@@ -59,6 +64,7 @@ public extension SimulaRewardedAdDelegate {
     func rewardedDidEarnReward(_ ad: SimulaRewardedAd) {}
     func rewardedDidVerifyReward(_ ad: SimulaRewardedAd, token: String?) {}
     func rewardedRewardVerificationDidFail(_ ad: SimulaRewardedAd, error: Error) {}
+    func rewardedDidClick(_ ad: SimulaRewardedAd) {}
     func rewardedDidClose(_ ad: SimulaRewardedAd) {}
 }
 
@@ -256,7 +262,13 @@ public final class SimulaRewardedAd {
                 self.delegate?.rewardedDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
-                self.failLoad(.network(apiError))
+                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+                // own case rather than burying it in the generic .network bucket.
+                if case .adUnitNotFound = apiError {
+                    self.failLoad(.adUnitNotFound)
+                } else {
+                    self.failLoad(.network(apiError))
+                }
             } catch {
                 Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
                 self.failLoad(.network(.invalidResponse))
@@ -314,11 +326,17 @@ public final class SimulaRewardedAd {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-            attribution: response.adBehavior?.attribution,
+            attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+            onClick: { [weak self] in
+                guard let self else { return }
+                // CLICKED — a user-gesture CTA / store-prompt tap (parity with the interstitial).
+                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                self.delegate?.rewardedDidClick(self)
+            },
             onImpression: { [weak self] in
                 guard let self else { return }
-                // IMPRESSION + PAID (AdMob's billable impression + paid event), fired together ~2s
+                // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
                 // after begin-to-render by the presenter (foreground-aware), independent of the reward
                 // gate. The `/seen` beacon is the billing source of truth; `didPay` is local analytics.
                 Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
@@ -333,7 +351,6 @@ public final class SimulaRewardedAd {
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
-                self.delegate?.rewardedDidClose(self)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
@@ -348,11 +365,15 @@ public final class SimulaRewardedAd {
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            attribution: response.adBehavior?.attribution
+                            attribution: response.skanAttribution
                         )
                     },
                     onAllClosed: { [weak self] in
-                        self?.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
+                        guard let self else { return }
+                        // CLOSE fires after the LAST fallback screen (not the playable close), then
+                        // reward earn/verification (handleClose) — preserving the close → complete order.
+                        self.delegate?.rewardedDidClose(self)
+                        self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
                     }
                 )
                 // Preload the next ad after close, reusing the last character context.
@@ -384,7 +405,7 @@ public final class SimulaRewardedAd {
             adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.rewardedDidDisplay(self)
-        // SHOWN (AdMob's onAdShowedFullScreenContent) — the `/shown` beacon, fired at present. The
+        // SHOWN — the `/shown` beacon, fired at present. The
         // billable IMPRESSION + PAID fire ~2s later via the presenter's `onImpression` (above).
         // Durable beacon (was a fire-and-forget trackShown).
         AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "shown", adFormat: Self.adFormat, adUnitId: self.adUnitId)
@@ -453,6 +474,11 @@ public final class SimulaRewardedAd {
             destination: .appstore,
             storeOpen: .skstoreproduct,
             previewHTML: Self.previewMinigameHTML,
+            onClick: { [weak self] in
+                // Preview is local-only: surface the click callback, no telemetry.
+                guard let self else { return }
+                self.delegate?.rewardedDidClick(self)
+            },
             onImpression: { [weak self] in
                 guard let self else { return }
                 // Preview is local-only: surface the callbacks (with a $0 estimate) but no beacon.
@@ -644,7 +670,8 @@ public final class SimulaRewardedAd {
         let didPresent = presenter.present(
             ads: ads,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) }
         ) { [weak self] in
             self?.fallbackPresenter = nil
             onAllClosed()

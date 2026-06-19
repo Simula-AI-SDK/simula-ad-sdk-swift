@@ -5,7 +5,7 @@ import SwiftUI
 
 /// Persistent in-ad info ("i") affordance + report sheet — required ad disclosure on every ad
 /// surface (Apple/Google expectations; advertisers expect a working report path). The small "i"
-/// sits in a corner; tapping it opens an AppLovin-style menu (Interested / Not interested / Report)
+/// sits in a corner; tapping it opens a compact menu (Interested / Not interested / Report)
 /// plus an "About Simula Ads" link. Feedback and report selections post to
 /// `POST /impressions/{adId}/report`, tagged by impression id.
 ///
@@ -126,7 +126,7 @@ struct NativeAdInfoOverlay: View {
 
 // MARK: - AdReportSheet
 
-/// AppLovin-style ad-feedback menu shown when the "i" / AD badge is tapped: Interested / Not
+/// Compact ad-feedback menu shown when the "i" / AD badge is tapped: Interested / Not
 /// interested / Report (which expands to reason codes), plus a separate "About Simula Ads" link to
 /// simula.ad. `onInterest` records the interest signal (`+1` interested / `-1` not interested);
 /// `onReport` posts a Report-flow flag; `onClose` dismisses.

@@ -142,16 +142,16 @@ final class NativeAdParsingTests: XCTestCase {
 
     // MARK: - Response
 
-    func testFillResponseDecodesCamelCaseAdResponseWrapper() throws {
+    func testFillResponseDecodesFlatCreativeAndClickThroughParams() throws {
         let json = """
         {
           "impression_id": "serve-123",
           "ad_inserted": true,
           "ad_format": "character_ad",
-          "adResponse": {
-            "iframe_url": "https://api/iframe/abc",
-            "rendered_html": "<iframe srcdoc=...></iframe>"
-          }
+          "iframe_url": "https://api/iframe/abc",
+          "rendered_html": "<iframe srcdoc=...></iframe>",
+          "destination": "web",
+          "tracking_url": "https://mmp.example/click?cid=1"
         }
         """
         let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
@@ -159,17 +159,30 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.adFormat, "character_ad")
         XCTAssertEqual(r.iframeURL, "https://api/iframe/abc")
+        XCTAssertEqual(r.destination, "web")
+        XCTAssertEqual(r.destinationKind, .web)
+        XCTAssertEqual(r.trackingUrl, "https://mmp.example/click?cid=1")
         XCTAssertTrue(r.hasCreative)
     }
 
+    func testDestinationDefaultsToAppStoreAndTrackingURLToNilWhenOmitted() throws {
+        let json = #"{"impression_id":"s","ad_inserted":true,"ad_format":"character_ad","iframe_url":"u"}"#
+        let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
+        XCTAssertEqual(r.destination, "appstore")
+        XCTAssertEqual(r.destinationKind, .appstore)
+        XCTAssertNil(r.trackingUrl)
+    }
+
     func testNoFillResponseDecodesWithNullImpressionAndEmptyCreative() throws {
-        let json = #"{"impression_id":null,"ad_inserted":false,"ad_format":"","adResponse":{}}"#
+        let json = #"{"impression_id":null,"ad_inserted":false,"ad_format":""}"#
         let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
         XCTAssertNil(r.impressionId)
         XCTAssertFalse(r.adInserted)
         XCTAssertEqual(r.adFormat, "")
         XCTAssertNil(r.iframeURL)
         XCTAssertNil(r.renderedHTML)
+        XCTAssertEqual(r.destination, "appstore")
+        XCTAssertNil(r.trackingUrl)
         XCTAssertFalse(r.hasCreative)
     }
 
@@ -178,13 +191,57 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertNil(r.impressionId)
         XCTAssertFalse(r.adInserted)
         XCTAssertEqual(r.adFormat, "")
+        XCTAssertEqual(r.destination, "appstore")
         XCTAssertFalse(r.hasCreative)
     }
 
     func testUnknownKeysAreIgnored() throws {
-        let json = #"{"ad_inserted":true,"ad_format":"character_ad","adResponse":{"iframe_url":"u"},"future":1}"#
+        let json = #"{"ad_inserted":true,"ad_format":"character_ad","iframe_url":"u","future":1}"#
         let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.iframeURL, "u")
+    }
+
+    // MARK: - skan_attribution (parity with interstitial/rewarded)
+
+    func testSkanAttributionDecodesAtResponseRoot() throws {
+        let json = """
+        {
+          "impression_id": "serve-123",
+          "ad_inserted": true,
+          "ad_format": "character_ad",
+          "iframe_url": "https://api/iframe/abc",
+          "destination": "appstore",
+          "tracking_url": "https://mmp.example/click?cid=1",
+          "skan_attribution": {
+            "campaign_token": "camp_tok", "provider_token": "prov_tok",
+            "skan": {"version":"4.0","ad_network_id":"net123.skadnetwork","source_app_store_id":987654321,
+              "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1700000000000,
+              "attribution_signature":"sig==","source_id":1234}
+          }
+        }
+        """
+        let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
+        let a = try XCTUnwrap(r.skanAttribution)
+        XCTAssertTrue(a.hasUsableTokens)
+        XCTAssertEqual(a.campaignToken, "camp_tok")
+        XCTAssertEqual(a.providerToken, "prov_tok")
+        XCTAssertEqual(a.skan?.version, "4.0")
+        XCTAssertEqual(a.skan?.sourceIdentifier, 1234)
+    }
+
+    func testSkanAttributionAbsentIsNil() throws {
+        let json = #"{"impression_id":"s","ad_inserted":true,"ad_format":"character_ad","iframe_url":"u"}"#
+        let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
+        XCTAssertNil(r.skanAttribution)
+    }
+
+    func testSkanAttributionEmptyObjectHasNoUsableTokens() throws {
+        // A present-but-empty object decodes (non-nil), but carries nothing usable → callers treat it
+        // as "absent" and keep today's external open.
+        let json = #"{"impression_id":"s","ad_inserted":true,"ad_format":"character_ad","iframe_url":"u","skan_attribution":{}}"#
+        let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
+        let a = try XCTUnwrap(r.skanAttribution)
+        XCTAssertFalse(a.hasUsableTokens)
     }
 }

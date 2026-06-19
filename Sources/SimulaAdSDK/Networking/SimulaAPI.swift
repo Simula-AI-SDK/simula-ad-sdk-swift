@@ -14,6 +14,7 @@ public enum SimulaAPIError: LocalizedError, Sendable {
     case noFill
     case invalidResponse
     case decodingError(String)
+    case adUnitNotFound
 
     public var errorDescription: String? {
         switch self {
@@ -29,8 +30,31 @@ public enum SimulaAPIError: LocalizedError, Sendable {
             return "Invalid ad response"
         case .decodingError(let message):
             return "Decoding error: \(message)"
+        case .adUnitNotFound:
+            return "Ad unit not found."
         }
     }
+}
+
+/// Structured error body the backend returns on a 4xx for the load endpoints:
+/// `{"code": "...", "message": "..."}`. The stable `code` is the SDK-facing contract
+/// (HTTP status alone is ambiguous); `ad_unit_not_found` means the publisher doesn't
+/// own the requested ad unit id.
+struct SimulaAPIErrorBody: Decodable {
+    let code: String
+    let message: String
+}
+
+/// Maps a non-2xx load response to a `SimulaAPIError`. The backend's stable contract is a
+/// `{code, message}` body; `ad_unit_not_found` means the publisher doesn't own this ad unit
+/// id, so it's surfaced distinctly (non-retryable) rather than as a generic HTTP error. Any
+/// other failure (or an unparseable body) stays `.httpError`.
+private func mapHTTPError(_ data: Data, statusCode: Int) -> SimulaAPIError {
+    if let body = try? JSONDecoder().decode(SimulaAPIErrorBody.self, from: data),
+       body.code == "ad_unit_not_found" {
+        return .adUnitNotFound
+    }
+    return .httpError(statusCode: statusCode)
 }
 
 // MARK: - API Response Models
@@ -512,6 +536,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Server-driven render config for this impression (A/B test). `nil` when the payload
     /// omits `ad_behavior` — the renderer falls back to today's literal close button / store path.
     public let adBehavior: AdBehavior?
+    /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
+    /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
+    public let skanAttribution: AdAttribution?
     /// Creative descriptor (`creative` node). `nil` when omitted; `adUnitType` drives close copy.
     public let creative: Creative?
     /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
@@ -525,7 +552,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
+    /// Estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
     /// surfaced on the paid event when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
@@ -553,6 +580,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case trackingUrl = "tracking_url"
         case renderedHtml = "rendered_html"
         case adBehavior = "ad_behavior"
+        case skanAttribution = "skan_attribution"
         case creative
         case experiment
         case bidAmt = "bid_amt"
@@ -570,6 +598,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
         // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
@@ -585,6 +614,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         trackingUrl: String? = nil,
         renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
+        skanAttribution: AdAttribution? = nil,
         creative: Creative? = nil,
         experiment: Experiment? = nil,
         bidAmt: Double = 0
@@ -597,6 +627,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.trackingUrl = trackingUrl
         self.renderedHtml = renderedHtml
         self.adBehavior = adBehavior
+        self.skanAttribution = skanAttribution
         self.creative = creative
         self.experiment = experiment
         self.bidAmt = bidAmt
@@ -668,6 +699,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public let destination: String
     public let trackingUrl: String?
     public let adBehavior: AdBehavior?
+    /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
+    /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
+    public let skanAttribution: AdAttribution?
     /// Cleared bid (estimated CPM) for this serve — see ``AdLoadResponse/bidAmt``. Drives ``adValue``.
     public let bidAmt: Double
 
@@ -676,7 +710,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         AdDestination(rawValue: destination) ?? .appstore
     }
 
-    /// AdMob-shaped estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
+    /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
     /// when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
 
@@ -687,6 +721,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case destination
         case trackingUrl = "tracking_url"
         case adBehavior = "ad_behavior"
+        case skanAttribution = "skan_attribution"
         case bidAmt = "bid_amt"
     }
 
@@ -698,6 +733,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
+        self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
 
@@ -709,6 +745,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
         adBehavior: AdBehavior? = nil,
+        skanAttribution: AdAttribution? = nil,
         bidAmt: Double = 0
     ) {
         self.impressionId = impressionId
@@ -717,6 +754,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.adBehavior = adBehavior
+        self.skanAttribution = skanAttribution
         self.bidAmt = bidAmt
     }
 }
@@ -728,10 +766,12 @@ public struct RewardedInitResponse: Decodable, Sendable {
 public struct FallbackAd: Sendable {
     public let adId: String
     public let iframeUrl: String
+    public let html: String?
 
-    public init(adId: String, iframeUrl: String) {
+    public init(adId: String, iframeUrl: String, html: String? = nil) {
         self.adId = adId
         self.iframeUrl = iframeUrl
+        self.html = html
     }
 }
 
@@ -1057,9 +1097,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(AdLoadResponse.self, from: data)
@@ -1108,9 +1146,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(NativeAdResponse.self, from: data)
@@ -1153,9 +1189,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(RewardedInitResponse.self, from: data)
@@ -1286,8 +1320,12 @@ public final class SimulaAPI: @unchecked Sendable {
 
         let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
         return apiResponse.ads.compactMap { item in
-            guard let iframeUrl = item.iframeUrl, !iframeUrl.isEmpty else { return nil }
-            return FallbackAd(adId: item.adId ?? "", iframeUrl: iframeUrl)
+            // Prefer the inline html (rendered in AdOverlayView); keep the iframe url as the same-origin
+            // base + url fallback. Drop only when neither is present.
+            let html = (item.html?.isEmpty == false) ? item.html : nil
+            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
+            guard html != nil || url != nil else { return nil }
+            return FallbackAd(adId: item.adId ?? "", iframeUrl: url ?? "", html: html)
         }
     }
 
@@ -1317,8 +1355,8 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Track Shown
 
-    /// Tracks a full-screen ad as shown (`POST /impressions/{adId}/shown`) — AdMob's "shown" signal
-    /// (`onAdShowedFullScreenContent`), fired when the creative first renders. Distinct from the
+    /// Tracks a full-screen ad as shown (`POST /impressions/{adId}/shown`) — the "shown" signal,
+    /// fired when the creative first renders. Distinct from the
     /// billable impression beacon (``trackImpression(adId:apiKey:)`` → `/seen`), which fires later at
     /// begin-to-render + 2s. The endpoint takes no body. Best-effort, silent-fail.
     public func trackShown(adId: String, apiKey: String) async {

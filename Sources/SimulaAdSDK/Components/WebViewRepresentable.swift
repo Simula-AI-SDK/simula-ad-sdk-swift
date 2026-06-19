@@ -21,6 +21,11 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// Raw HTML content to load. Mutually exclusive with `url`.
     let htmlString: String?
 
+    /// Base URL for `htmlString` loads — sets the page origin so the creative's own same-origin
+    /// requests (e.g. the end screen's click beacon) behave as if served from that origin. `nil` for
+    /// the interstitial / native html (no in-creative same-origin calls).
+    var baseURL: URL?
+
     /// Called when the web view finishes loading content
     var onNavigationFinished: (() -> Void)?
 
@@ -50,6 +55,14 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// for the interstitial HTML creative / game iframe — their behavior is unchanged.
     var externalClickOnly: Bool
 
+    /// Native-ad mode: the server's MMP click-tracking URL a CTA tap should open (preferred over the
+    /// URL the creative itself navigates to, so the click is attributed exactly like the imperative
+    /// ads), and where it routes (`.appstore` resolves the redirect chain to the App Store; `.web`
+    /// opens the link directly). A `nil`/empty tracker falls back to the in-creative URL. Ignored
+    /// unless `externalClickOnly` is set.
+    var ctaTrackingUrl: String?
+    var ctaDestination: AdDestination
+
     /// Native-ad mode: after load, inject a script that reports the creative's content height over
     /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
     var reportsContentHeight: Bool
@@ -58,9 +71,15 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// `nil` → untagged.
     var telemetryAdFormat: String?
 
+    /// Native-ad mode: forwards the slot's live visible fraction into this creative via
+    /// `window.onVisibility(ratio)` as it scrolls. Bound to this instance's WKWebView on acquire and
+    /// unbound on teardown. `nil` for the game iframe / interstitial creative (no per-frame visibility).
+    var visibilityRelay: VisibilityRelay?
+
     init(
         url: URL? = nil,
         htmlString: String? = nil,
+        baseURL: URL? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -68,11 +87,15 @@ struct WebViewRepresentable: UIViewRepresentable {
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
+        ctaTrackingUrl: String? = nil,
+        ctaDestination: AdDestination = .appstore,
         reportsContentHeight: Bool = false,
-        telemetryAdFormat: String? = nil
+        telemetryAdFormat: String? = nil,
+        visibilityRelay: VisibilityRelay? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
+        self.baseURL = baseURL
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -80,8 +103,11 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.bridge = bridge
         self.attribution = attribution
         self.externalClickOnly = externalClickOnly
+        self.ctaTrackingUrl = ctaTrackingUrl
+        self.ctaDestination = ctaDestination
         self.reportsContentHeight = reportsContentHeight
         self.telemetryAdFormat = telemetryAdFormat
+        self.visibilityRelay = visibilityRelay
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -101,6 +127,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         )
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView
+        // Point the visibility relay at this acquired view so scroll-driven `window.onVisibility`
+        // pushes reach it; held on the coordinator so dismantle can unbind. No-op when unset.
+        coordinator.visibilityRelay = visibilityRelay
+        visibilityRelay?.bind(webView)
         // A native ad sizes to content and is not scrollable (PRD); disabling the inner scroll keeps
         // it from intercepting the host feed's scroll. Set per-acquire since the pool reuses views.
         webView.scrollView.isScrollEnabled = !reportsContentHeight
@@ -112,15 +142,18 @@ struct WebViewRepresentable: UIViewRepresentable {
         let currentURL = context.coordinator.currentURL
         let currentHTML = context.coordinator.currentHTML
 
-        if let url = url, url != currentURL {
-            context.coordinator.currentURL = url
-            context.coordinator.currentHTML = nil
-            let request = URLRequest(url: url)
-            webView.load(request)
-        } else if let html = htmlString, html != currentHTML {
+        if let html = htmlString, html != currentHTML {
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
-            webView.loadHTMLString(html, baseURL: nil)
+            context.coordinator.currentBaseURL = baseURL
+            context.coordinator.realLoadStarted = true
+            webView.loadHTMLString(html, baseURL: baseURL)
+        } else if let url = url, url != currentURL {
+            context.coordinator.currentURL = url
+            context.coordinator.currentHTML = nil
+            context.coordinator.realLoadStarted = true
+            let request = URLRequest(url: url)
+            webView.load(request)
         }
     }
 
@@ -128,6 +161,8 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// so the (expensive) WKWebView + its Web Content process is recycled for the
     /// next acquire instead of being deallocated.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        // Stop forwarding visibility into a view that's about to be recycled by the pool.
+        coordinator.visibilityRelay?.bind(nil)
         WebViewPool.shared.release(uiView)
     }
 
@@ -140,6 +175,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
             reportsContentHeight: reportsContentHeight,
             telemetryAdFormat: telemetryAdFormat
         )
@@ -161,9 +198,15 @@ struct WebViewRepresentable: UIViewRepresentable {
         weak var webView: WKWebView?
         /// Native-ad mode: route user clicks to the external browser; report content height.
         var externalClickOnly: Bool
+        /// Native-ad mode: server CTA routing — the MMP tracker URL to open (preferred over the
+        /// in-creative URL) and where it routes. See `WebViewRepresentable.ctaTrackingUrl`.
+        var ctaTrackingUrl: String?
+        var ctaDestination: AdDestination
         var reportsContentHeight: Bool
         /// Ad-format tag for WebView telemetry; nil → untagged.
         var telemetryAdFormat: String?
+        /// Native-ad visibility relay (set on acquire); used to unbind on dismantle. See `VisibilityRelay`.
+        var visibilityRelay: VisibilityRelay?
         /// Monotonic page-load start (set on provisional navigation start) for `webview_page_load`.
         private var pageStartUptime: TimeInterval?
 
@@ -171,6 +214,33 @@ struct WebViewRepresentable: UIViewRepresentable {
         var currentURL: URL?
         /// Tracks the currently loaded HTML to avoid redundant loads
         var currentHTML: String?
+        /// True once `updateUIView` has issued the real content load. The pool prewarms each view with
+        /// an `about:blank` load; its (late) navigation callbacks must be ignored. Gating on this flag
+        /// — rather than `webView.url == "about:blank"` — is correct even for a native creative loaded
+        /// via `loadHTMLString(_:baseURL:)` with a `nil` baseURL, which itself makes `webView.url`
+        /// report `about:blank`. The old URL check matched that real load too and suppressed the
+        /// height-reporting script, so the native slot never sized and collapsed (rendered blank).
+        var realLoadStarted = false
+        /// Base URL of the current HTML load, remembered so the exact creative can be re-issued if the
+        /// web-content process is terminated (`reload()` can't restore a `loadHTMLString` load — its URL
+        /// is the baseURL, not the content).
+        var currentBaseURL: URL?
+        /// One-shot guard for the reload-after-termination recovery, so a creative that reliably crashes
+        /// the renderer can't spin in a reload loop. Reset on each successful load (`didFinish`).
+        var renderRecoveryAttempted = false
+
+        /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
+        /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
+        /// at most once per ~0.5s window (de-dupes the delegate double-call). See `fireAdClickOnce`.
+        private var lastAdClickUptime: TimeInterval = -1
+
+        /// Fire the publisher CLICKED callback at most once per CTA tap.
+        private func fireAdClickOnce() {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - lastAdClickUptime >= 0.5 else { return }
+            lastAdClickUptime = now
+            onAdClick?()
+        }
 
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
@@ -191,6 +261,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             bridge: CreativeBridge? = nil,
             attribution: AdAttribution? = nil,
             externalClickOnly: Bool = false,
+            ctaTrackingUrl: String? = nil,
+            ctaDestination: AdDestination = .appstore,
             reportsContentHeight: Bool = false,
             telemetryAdFormat: String? = nil
         ) {
@@ -201,6 +273,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.bridge = bridge
             self.attribution = attribution
             self.externalClickOnly = externalClickOnly
+            self.ctaTrackingUrl = ctaTrackingUrl
+            self.ctaDestination = ctaDestination
             self.reportsContentHeight = reportsContentHeight
             self.telemetryAdFormat = telemetryAdFormat
         }
@@ -232,17 +306,58 @@ struct WebViewRepresentable: UIViewRepresentable {
             }
         }
 
+        /// Native-ad CTA routing (`externalClickOnly`). Default: opens the server's MMP tracking URL
+        /// **externally** — `.appstore` resolves the click-attribution redirect chain to the App Store,
+        /// `.web` opens the link directly — falling back to `fallback` (the URL the creative itself
+        /// navigated to) when the serve carried no tracker.
+        ///
+        /// SKAN parity with interstitial/rewarded: when the serve carries usable `skan_attribution`
+        /// tokens AND the CTA is an App Store destination, the click instead routes through the **in-app**
+        /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
+        /// install postback credits the campaign (StoreKit tokens can't ride an external open). Absent /
+        /// token-less attribution, or a `.web` destination, keeps today's external behavior unchanged.
+        private func openNativeCTA(fallback: URL) {
+            let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
+            let destination = ctaDestination
+            let attribution = self.attribution
+            Task { @MainActor in
+                if destination == .appstore, attribution?.hasUsableTokens == true {
+                    // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
+                    // imperative formats). Prefers the tracker (router resolves it to the store), else
+                    // the in-creative URL.
+                    CreativeCTARouter.open(
+                        trackingUrl: (trackingURL ?? fallback).absoluteString,
+                        destination: destination,
+                        storeOpen: .skstoreproduct,
+                        attribution: attribution
+                    )
+                } else if let trackingURL {
+                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
+                } else {
+                    UIApplication.shared.open(fallback)
+                }
+            }
+        }
+
         // MARK: - WKNavigationDelegate
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             // Start the page-load timer for the real content load (ignore the prewarm about:blank).
-            if webView.url?.absoluteString == "about:blank" { return }
+            // Gate on realLoadStarted, not the URL: a native creative loaded with a nil baseURL also
+            // reports webView.url == about:blank, and must NOT be skipped.
+            guard realLoadStarted else { return }
             pageStartUptime = ProcessInfo.processInfo.systemUptime
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // Ignore the pool's prewarm load — only the real content load counts.
-            if webView.url?.absoluteString == "about:blank" { return }
+            // Ignore the pool's prewarm load — only the real content load counts. See realLoadStarted:
+            // gating on the URL would also drop the native (nil-baseURL → about:blank) creative's load
+            // and never inject the height-reporting script, collapsing the slot.
+            guard realLoadStarted else { return }
+            // A clean load means the (possibly just-reloaded) creative is healthy — restore the
+            // one-shot render-recovery budget for any future web-content-process termination.
+            renderRecoveryAttempted = false
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
             if let start = pageStartUptime {
                 pageStartUptime = nil
@@ -259,13 +374,56 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            // The creative's web-content process crashed/was jettisoned. Record it; the SDK survives
-            // (WKWebView is sandboxed, so the host app is never taken down with it).
+            // The creative's web-content process crashed/was jettisoned (commonly an OS reclaim while
+            // backgrounded). Record it; the SDK survives (WKWebView is sandboxed, so the host app is
+            // never taken down with it).
             Telemetry.shared.recordError(
                 signature: "webview:render_gone",
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
+            // Recover in place: a WKWebView is reusable after a termination, so re-issue the SAME
+            // creative so the slot comes back instead of collapsing. reload() can't restore a
+            // loadHTMLString load (its URL is the baseURL, not the content), so re-load the stored
+            // content. One-shot per successful load (reset in didFinish) so a creative that reliably
+            // crashes the renderer can't spin a reload loop.
+            if !renderRecoveryAttempted {
+                if let html = currentHTML {
+                    renderRecoveryAttempted = true
+                    webView.loadHTMLString(html, baseURL: currentBaseURL)
+                    return
+                }
+                if let url = currentURL {
+                    renderRecoveryAttempted = true
+                    webView.load(URLRequest(url: url))
+                    return
+                }
+            }
+            // Already retried (or nothing to reload): for the native, content-sized slot, collapse to
+            // zero height (parity with a load failure) instead of holding a blank provisional block.
+            // Gated to the native path — the full-screen creatives don't size to content.
+            if reportsContentHeight {
+                onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
+            }
+        }
+
+        // An HTTP error status on the creative's main-frame load (e.g. the iframe URL 404s/500s) still
+        // reports as a successful navigation on WKWebView — it renders the error body and never hits
+        // didFail. Mirror Android's onReceivedHttpError: for the native path, treat a main-frame
+        // 4xx/5xx as a load failure so the slot collapses instead of holding a blank reserved block.
+        // Allow the response (the slot tears the WebView down on collapse); gated to the native path
+        // so full-screen creatives are unaffected.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            decisionHandler(.allow)
+            guard reportsContentHeight, navigationResponse.isForMainFrame,
+                  let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
+                return
+            }
+            onNavigationFailed?(NSError(domain: "SimulaWebView", code: http.statusCode))
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -315,7 +473,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if navigationAction.navigationType == .linkActivated,
                    scheme == "http" || scheme == "https" || scheme == "itms-apps" || scheme == "itms" {
                     onAdClick?()
-                    Task { @MainActor in UIApplication.shared.open(url) }
+                    // Prefer the server tracking URL (attribution-preserving); fall back to the tapped URL.
+                    openNativeCTA(fallback: url)
                     decisionHandler(.cancel)
                     return
                 }
@@ -361,7 +520,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let currentHost = currentURL?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
-                    onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                    fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                     let attribution = self.attribution
                     Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     decisionHandler(.cancel)
@@ -387,8 +546,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // Native ad: target="_blank" / window.open → external browser (PRD).
                 if externalClickOnly {
                     if scheme == "http" || scheme == "https" {
-                        onAdClick?()
-                        Task { @MainActor in UIApplication.shared.open(url) }
+                        fireAdClickOnce()
+                        // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
+                        openNativeCTA(fallback: url)
                     }
                     return nil
                 }
@@ -401,7 +561,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // explicitly rather than asserting isolation. `createWebViewWith`
                         // is only invoked for user-initiated new-window requests
                         // (target="_blank" / window.open), so this is a real click.
-                        onAdClick?() // CLICKED (HTML creative); nil for the game iframe.
+                        fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                         let attribution = self.attribution
                         Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
                     } else {
@@ -477,6 +637,35 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 }
 
+// MARK: - VisibilityRelay
+
+/// Throttling channel that forwards a native slot's live visible fraction (0..1) to the creative's
+/// `window.onVisibility`. Created per served slot by `NativeAdSlot`, bound to that slot's `WKWebView`
+/// by `WebViewRepresentable` while mounted, and fed by `NativeAdViewabilityModifier` as the slot
+/// scrolls. Rounds to ~1% and drops sub-1% changes so a high-frequency scroll can't flood the JS
+/// bridge; guards on `window.onVisibility` existence so it's a no-op until the creative defines it.
+/// All access is on the main thread (the SwiftUI viewability callbacks + representable lifecycle).
+final class VisibilityRelay {
+    private weak var webView: WKWebView?
+    private var last: CGFloat = -1
+
+    /// Point the relay at the live `WKWebView` (or `nil` to detach on teardown).
+    func bind(_ webView: WKWebView?) {
+        self.webView = webView
+        last = -1
+    }
+
+    /// Forward a 0..1 ratio to the creative, de-duped against the last forwarded value (~1%
+    /// granularity). Guarded so it's a no-op until `window.onVisibility` is defined.
+    func report(_ ratio: CGFloat) {
+        let r = min(1, max(0, ratio))
+        if last >= 0, abs(r - last) < 0.01 { return }
+        last = r
+        let s = String(format: "%.2f", r)
+        webView?.evaluateJavaScript("window.onVisibility&&window.onVisibility(\(s))", completionHandler: nil)
+    }
+}
+
 #elseif os(macOS)
 import SwiftUI
 import WebKit
@@ -486,6 +675,7 @@ import WebKit
 struct WebViewRepresentable: NSViewRepresentable {
     let url: URL?
     let htmlString: String?
+    var baseURL: URL?
     var onNavigationFinished: (() -> Void)?
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
@@ -496,6 +686,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     init(
         url: URL? = nil,
         htmlString: String? = nil,
+        baseURL: URL? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -503,6 +694,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     ) {
         self.url = url
         self.htmlString = htmlString
+        self.baseURL = baseURL
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -549,7 +741,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         } else if let html = htmlString, html != currentHTML {
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
-            webView.loadHTMLString(html, baseURL: nil)
+            webView.loadHTMLString(html, baseURL: baseURL)
         }
     }
 
