@@ -14,6 +14,7 @@ public enum SimulaAPIError: LocalizedError, Sendable {
     case noFill
     case invalidResponse
     case decodingError(String)
+    case adUnitNotFound
 
     public var errorDescription: String? {
         switch self {
@@ -29,8 +30,31 @@ public enum SimulaAPIError: LocalizedError, Sendable {
             return "Invalid ad response"
         case .decodingError(let message):
             return "Decoding error: \(message)"
+        case .adUnitNotFound:
+            return "Ad unit not found."
         }
     }
+}
+
+/// Structured error body the backend returns on a 4xx for the load endpoints:
+/// `{"code": "...", "message": "..."}`. The stable `code` is the SDK-facing contract
+/// (HTTP status alone is ambiguous); `ad_unit_not_found` means the publisher doesn't
+/// own the requested ad unit id.
+struct SimulaAPIErrorBody: Decodable {
+    let code: String
+    let message: String
+}
+
+/// Maps a non-2xx load response to a `SimulaAPIError`. The backend's stable contract is a
+/// `{code, message}` body; `ad_unit_not_found` means the publisher doesn't own this ad unit
+/// id, so it's surfaced distinctly (non-retryable) rather than as a generic HTTP error. Any
+/// other failure (or an unparseable body) stays `.httpError`.
+private func mapHTTPError(_ data: Data, statusCode: Int) -> SimulaAPIError {
+    if let body = try? JSONDecoder().decode(SimulaAPIErrorBody.self, from: data),
+       body.code == "ad_unit_not_found" {
+        return .adUnitNotFound
+    }
+    return .httpError(statusCode: statusCode)
 }
 
 // MARK: - API Response Models
@@ -1071,9 +1095,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(AdLoadResponse.self, from: data)
@@ -1122,9 +1144,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(NativeAdResponse.self, from: data)
@@ -1167,9 +1187,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            throw SimulaAPIError.httpError(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
+            throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
         return try JSONDecoder().decode(RewardedInitResponse.self, from: data)

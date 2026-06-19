@@ -12,6 +12,7 @@ final class NativeAdErrorTests: XCTestCase {
         XCTAssertEqual(NativeAdError.noSession.telemetryCode, "no_session")
         XCTAssertEqual(NativeAdError.noFill.telemetryCode, "no_fill")
         XCTAssertEqual(NativeAdError.network.telemetryCode, "network")
+        XCTAssertEqual(NativeAdError.adUnitNotFound.telemetryCode, "ad_unit_not_found")
     }
 
     func testMapsTheFourNativeLoadPathCases() {
@@ -19,6 +20,7 @@ final class NativeAdErrorTests: XCTestCase {
         XCTAssertEqual(NativeAdError(SimulaAdError.noSession), .noSession)
         XCTAssertEqual(NativeAdError(SimulaAdError.noFill), .noFill)
         XCTAssertEqual(NativeAdError(SimulaAdError.network(.invalidResponse)), .network)
+        XCTAssertEqual(NativeAdError(SimulaAdError.adUnitNotFound), .adUnitNotFound)
     }
 
     func testMapsNonNativeCasesDefensivelyToNetwork() {

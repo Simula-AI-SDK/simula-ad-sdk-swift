@@ -262,7 +262,13 @@ public final class SimulaRewardedAd {
                 self.delegate?.rewardedDidLoad(self)
             } catch let apiError as SimulaAPIError {
                 Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
-                self.failLoad(.network(apiError))
+                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+                // own case rather than burying it in the generic .network bucket.
+                if case .adUnitNotFound = apiError {
+                    self.failLoad(.adUnitNotFound)
+                } else {
+                    self.failLoad(.network(apiError))
+                }
             } catch {
                 Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
                 self.failLoad(.network(.invalidResponse))

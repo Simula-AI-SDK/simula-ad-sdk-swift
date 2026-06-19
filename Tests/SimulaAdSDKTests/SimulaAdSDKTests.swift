@@ -741,6 +741,20 @@ final class SimulaAdSDKTests: XCTestCase {
             SimulaAdError.network(.invalidResponse).errorDescription,
             "Network error while loading the ad — check the connection and call load() again."
         )
+        XCTAssertEqual(
+            SimulaAdError.adUnitNotFound.errorDescription,
+            "Ad unit id is not registered for this app — check the ad unit id in your Simula dashboard."
+        )
+    }
+
+    func testAdUnitNotFoundTelemetryCode() {
+        XCTAssertEqual(SimulaAdError.adUnitNotFound.telemetryCode, "ad_unit_not_found")
+    }
+
+    func testAPIErrorBodyDecodesAdUnitNotFoundCode() throws {
+        let json = #"{"code":"ad_unit_not_found","message":"Ad unit 'x' is not registered for this publisher."}"#
+        let body = try JSONDecoder().decode(SimulaAPIErrorBody.self, from: Data(json.utf8))
+        XCTAssertEqual(body.code, "ad_unit_not_found")
     }
 
     // MARK: - Rewarded init parsing (RewardedInitResponse decode)

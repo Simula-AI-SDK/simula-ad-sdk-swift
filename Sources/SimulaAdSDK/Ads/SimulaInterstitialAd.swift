@@ -80,6 +80,10 @@ public enum SimulaAdError: LocalizedError, Sendable {
     case unsupportedPlatform
     /// An underlying networking error.
     case network(SimulaAPIError)
+    /// The backend rejected the requested ad unit id — it isn't registered for this app
+    /// (wrong id, or it belongs to a different app/publisher). Non-retryable: fix the ad
+    /// unit id. Surfaced through the same `didFailToLoad` delegate callback as other failures.
+    case adUnitNotFound
 
     public var errorDescription: String? {
         switch self {
@@ -111,6 +115,9 @@ public enum SimulaAdError: LocalizedError, Sendable {
             // Shared, descriptive copy (matches the Android SDK). The underlying `SimulaAPIError`
             // stays available on the associated value for programmatic inspection / debugging.
             return "Network error while loading the ad — check the connection and call load() again."
+        case .adUnitNotFound:
+            // Public contract — shared verbatim with the Android SDK's SimulaAdError.AdUnitNotFound.
+            return "Ad unit id is not registered for this app — check the ad unit id in your Simula dashboard."
         }
     }
 }
@@ -129,6 +136,7 @@ extension SimulaAdError {
         case .noPresentationContext: return "no_presentation_context"
         case .unsupportedPlatform: return "unsupported_platform"
         case .network: return "network"
+        case .adUnitNotFound: return "ad_unit_not_found"
         }
     }
 }
@@ -334,7 +342,13 @@ public final class SimulaInterstitialAd {
                 // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
                 // lifecycle event comes from failLoad()).
                 Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
-                self.failLoad(.network(apiError))
+                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+                // own case rather than burying it in the generic .network bucket.
+                if case .adUnitNotFound = apiError {
+                    self.failLoad(.adUnitNotFound)
+                } else {
+                    self.failLoad(.network(apiError))
+                }
             } catch {
                 Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
                 self.failLoad(.network(.invalidResponse))

@@ -15,6 +15,8 @@ public enum NativeAdError: Sendable {
     case noFill
     /// A network or decoding error occurred while loading the creative.
     case network
+    /// The ad unit id isn't registered for this app (wrong id / different publisher). Non-retryable.
+    case adUnitNotFound
 }
 
 extension NativeAdError {
@@ -26,6 +28,7 @@ extension NativeAdError {
         case .noSession: return "no_session"
         case .noFill: return "no_fill"
         case .network: return "network"
+        case .adUnitNotFound: return "ad_unit_not_found"
         }
     }
 
@@ -38,6 +41,7 @@ extension NativeAdError {
         case .noSession: self = .noSession
         case .noFill: self = .noFill
         case .network: self = .network
+        case .adUnitNotFound: self = .adUnitNotFound
         default: self = .network
         }
     }

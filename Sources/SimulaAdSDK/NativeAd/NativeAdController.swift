@@ -33,6 +33,9 @@ enum NativeAdController {
         } catch let SimulaAPIError.httpError(code) where code == 401 {
             // Bad/unknown session — non-retryable (PRD).
             throw SimulaAdError.noSession
+        } catch SimulaAPIError.adUnitNotFound {
+            // Wrong ad unit id — non-retryable misconfiguration; surfaced as its own case.
+            throw SimulaAdError.adUnitNotFound
         } catch let apiError as SimulaAPIError {
             throw SimulaAdError.network(apiError)
         } catch is CancellationError {
