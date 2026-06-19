@@ -124,6 +124,12 @@ public final class SimulaProvider: ObservableObject {
             primaryUserIDProvider: { [ppidStore = self.ppidStore] in ppidStore.current }
         )
 
+        // Capture uncaught SDK crashes (+ Swift traps / signals / hangs via MetricKit on iOS 14+)
+        // into telemetry. Gated by the same telemetry opt-out; chains to the host's existing
+        // exception handler and only reports crashes that involve SDK code. Installed right after the
+        // pipeline so the replay of any prior-process crash has somewhere to land.
+        SimulaCrashGuard.shared.install(enabled: telemetryEnabled)
+
         // Feed the process-wide store, then re-sync the session whenever consent
         // changes (host CMP refresh or ATT result) so the backend sees current signals.
         SimulaPrivacy.shared.apply(resolved)
