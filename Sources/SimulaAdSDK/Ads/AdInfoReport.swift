@@ -132,7 +132,8 @@ struct NativeAdInfoOverlay: View {
 /// `onReport` posts a Report-flow flag; `onClose` dismisses.
 ///
 /// `alignment` places the menu — `.bottomLeading` (full-screen ads) or `.topLeading` (inline native
-/// card, below the AD badge). `confined` keeps the scrim inside the ad card instead of the screen.
+/// card, below the AD badge). `confined` (the inline native card) drops the dim scrim — it looked bad
+/// over a light feed — using a clear tap-catcher that still dismisses, instead of dimming the screen.
 struct AdReportSheet: View {
     let onReport: (String) -> Void
     let onInterest: (Int) -> Void
@@ -151,14 +152,16 @@ struct AdReportSheet: View {
 
     var body: some View {
         ZStack(alignment: alignment) {
-            // Scrim: full-screen for the imperative ads, confined to the card for the inline native ad.
+            // Tap-catcher to dismiss. Full-screen ads dim (0.6); the inline native card uses a clear
+            // scrim — the dim looked bad over a light feed — keeping tap-to-dismiss without dimming.
             Group {
                 if confined {
-                    Color.black.opacity(0.6)
+                    Color.clear
                 } else {
                     Color.black.opacity(0.6).ignoresSafeArea()
                 }
             }
+            .contentShape(Rectangle())
             .onTapGesture { onClose() }
 
             VStack(alignment: .leading, spacing: 10) {
