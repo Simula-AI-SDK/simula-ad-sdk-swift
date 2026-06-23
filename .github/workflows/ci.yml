@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build, test (iOS) & release build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Compile (macOS slice, fail fast)
+        run: swift build -v
+
+      - name: Run all tests on iOS Simulator   # validates #if os(iOS) code
+        run: |
+          set -euo pipefail
+          # Resolve an available iPhone simulator at runtime so the gate doesn't
+          # break when the runner image ships a different device/OS set.
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -r '[.devices[][] | select(.name|test("iPhone"))][0].udid')
+          echo "Using simulator $UDID"
+          xcodebuild test \
+            -scheme SimulaAdSDK \
+            -destination "id=$UDID"
+
+      - name: Build artifact (release + iOS)
+        run: |
+          swift build -c release
+          xcodebuild build \
+            -scheme SimulaAdSDK \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator'
