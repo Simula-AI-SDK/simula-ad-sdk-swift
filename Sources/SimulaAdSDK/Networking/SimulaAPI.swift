@@ -1465,12 +1465,12 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Telemetry
 
-    /// Delivers a telemetry batch (`POST /v1/telemetry/events`), reusing the auth + consent
+    /// Delivers a telemetry batch (`POST /telemetry/events`), reusing the auth + consent
     /// headers so it inherits the same privacy posture as tracking. Returns the HTTP status
     /// (or -1 on a connectivity failure) for the caller to map to accept/drop/retry. The
     /// `TelemetryURLSessionDelegate` skips this path, so the request is never self-recorded.
     public func postTelemetry(apiKey: String, body: Data) async -> Int {
-        guard let url = URL(string: "\(API_BASE_URL)/v1/telemetry/events") else { return -1 }
+        guard let url = URL(string: "\(API_BASE_URL)/telemetry/events") else { return -1 }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

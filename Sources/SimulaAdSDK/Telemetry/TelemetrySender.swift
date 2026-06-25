@@ -15,9 +15,9 @@ protocol TelemetrySending: Sendable {
     func send(_ body: Data) async -> TelemetryAck
 }
 
-/// Production sender: posts to `POST /v1/telemetry/events` via `SimulaAPI`, reusing its
+/// Production sender: posts to `POST /telemetry/events` via `SimulaAPI`, reusing its
 /// auth + consent headers. The request is **not** self-instrumented (the URLSession
-/// telemetry delegate skips the `/v1/telemetry` path — recursion guard).
+/// telemetry delegate skips the `/telemetry` path — recursion guard).
 final class ApiTelemetrySender: TelemetrySending {
     private let apiKey: String
     private let api: SimulaAPI
