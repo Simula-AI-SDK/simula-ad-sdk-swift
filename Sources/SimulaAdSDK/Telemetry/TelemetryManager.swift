@@ -273,6 +273,8 @@ final class TelemetryManager: @unchecked Sendable {
             e.errorCode = errorCode
             e.message = redacted
             e.breadcrumb = breadcrumb
+            // Frames are structural (module.symbol / file:line) — no free text, so unlike
+            // `message` they carry no URLs/tokens/PII and need no redaction.
             e.stack = stack
             e.count = 1
             errorAgg[signature] = e

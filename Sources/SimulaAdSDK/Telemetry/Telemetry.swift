@@ -46,9 +46,10 @@ final class Telemetry: @unchecked Sendable {
         // without a synchronous reachability call. Best-effort — never throws.
         ConnectionTypeMonitor.shared.start()
         #if canImport(UIKit)
-        // Enable battery monitoring once so the flush-time provider can read level/state. We never
-        // disable it (that could break a host that reads battery itself); it's cheap once set.
-        UIDevice.current.isBatteryMonitoringEnabled = true
+        // UIDevice battery APIs are main-thread-only; the monitor enables monitoring + caches
+        // level/state on the main thread so the (background) flush reads a snapshot, never UIDevice
+        // off-main.
+        BatteryMonitor.shared.start()
         #endif
 
         let ctx = TelemetryContext(
@@ -189,12 +190,7 @@ final class Telemetry: @unchecked Sendable {
     /// when the level is unknown.
     static func resolveBattery() -> BatteryInfo? {
         #if canImport(UIKit)
-        let device = UIDevice.current
-        guard device.isBatteryMonitoringEnabled else { return nil }
-        let level = device.batteryLevel
-        guard level >= 0 else { return nil }
-        let charging = device.batteryState == .charging || device.batteryState == .full
-        return BatteryInfo(level: Double(level), charging: charging)
+        return BatteryMonitor.shared.current  // main-thread snapshot; safe to read off-main
         #else
         return nil
         #endif
@@ -280,3 +276,53 @@ final class ConnectionTypeMonitor: @unchecked Sendable {
 
     var current: String { lock.lock(); defer { lock.unlock() }; return latest }
 }
+
+#if canImport(UIKit)
+/// Caches the battery level/state, refreshed on the MAIN thread (UIDevice battery APIs are
+/// main-thread-only), so the background telemetry flush reads a snapshot instead of touching
+/// UIKit off-main. Mirrors `ConnectionTypeMonitor`. Lock-guarded; nil until the first reading.
+final class BatteryMonitor: @unchecked Sendable {
+    static let shared = BatteryMonitor()
+
+    private let lock = NSLock()
+    private var snapshot: BatteryInfo?
+    private var started = false
+
+    private init() {}
+
+    func start() {
+        // The monitoring toggle + UIDevice reads must happen on the main thread.
+        if Thread.isMainThread {
+            startOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.startOnMain() }
+        }
+    }
+
+    private func startOnMain() {
+        lock.lock()
+        if started { lock.unlock(); return }
+        started = true
+        lock.unlock()
+        UIDevice.current.isBatteryMonitoringEnabled = true  // never disabled (a host may read it too)
+        let center = NotificationCenter.default
+        let refresh: @Sendable (Notification) -> Void = { [weak self] _ in self?.refresh() }
+        center.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main, using: refresh)
+        center.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main, using: refresh)
+        refresh()
+    }
+
+    /// Always invoked on the main queue (initial call from startOnMain + observers with queue: .main).
+    private func refresh() {
+        let device = UIDevice.current
+        let level = device.batteryLevel
+        let charging = device.batteryState == .charging || device.batteryState == .full
+        let snap = level >= 0 ? BatteryInfo(level: Double(level), charging: charging) : nil
+        lock.lock(); snapshot = snap; lock.unlock()
+    }
+
+    var current: BatteryInfo? {
+        lock.lock(); defer { lock.unlock() }; return snapshot
+    }
+}
+#endif
