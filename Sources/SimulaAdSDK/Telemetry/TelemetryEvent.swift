@@ -41,6 +41,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var errorCode: String?
     var message: String?
     var breadcrumb: String?
+    /// Symbolicated SDK frames for crash/exit errors (structured, alongside the compacted message).
+    var stack: [String]?
     var cacheHit: Bool?
     var retryCount: Int?
     /// Store-exit click type for store_opened/returned/abandoned: cta | store_prompt | auto_redirect.
@@ -67,7 +69,7 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case adId = "ad_id"
         case serveId = "serve_id"
         case errorCode = "error_code"
-        case message, breadcrumb
+        case message, breadcrumb, stack
         case cacheHit = "cache_hit"
         case retryCount = "retry_count"
         case trigger
@@ -104,6 +106,16 @@ struct TelemetryEnvelope: Codable {
     // Experiment assignment for per-variant conversion analysis (server-driven). Session-scoped.
     var experimentId: String?
     var variantId: String?
+    // Device/network diagnostics — always-on (like device_model/connection_type), not consent-gated.
+    // Statics resolved at init; battery/carrier resolved best-effort at flush. Any field may be nil.
+    var manufacturer: String?
+    var locale: String?
+    var deviceRamMb: Int?
+    var batteryLevel: Double?
+    var batteryCharging: Bool?
+    var carrier: String?
+    var radio: String?
+    var buildType: String?
     let events: [TelemetryEvent]
 
     enum CodingKeys: String, CodingKey {
@@ -119,6 +131,12 @@ struct TelemetryEnvelope: Codable {
         case connectionType = "connection_type"
         case experimentId = "experiment_id"
         case variantId = "variant_id"
+        case manufacturer, locale
+        case deviceRamMb = "device_ram_mb"
+        case batteryLevel = "battery_level"
+        case batteryCharging = "battery_charging"
+        case carrier, radio
+        case buildType = "build_type"
         case events
     }
 }

@@ -8,6 +8,24 @@ struct TelemetryContext {
     let hostAppId: String
     let devMode: Bool
     var platform: String = "ios"
+    // Always-on device diagnostics, resolved once at init (constant per process).
+    var manufacturer: String?
+    var locale: String?
+    var deviceRamMb: Int?
+    var buildType: String?
+}
+
+/// Flush-time battery snapshot (level 0..1 + charging). Best-effort; nil when unavailable.
+struct BatteryInfo: Sendable {
+    let level: Double
+    let charging: Bool
+}
+
+/// Flush-time carrier/radio snapshot. On iOS `carrier` is nil (CTCarrier deprecated); `radio` is
+/// best-effort via CoreTelephony.
+struct CarrierInfo: Sendable {
+    let carrier: String?
+    let radio: String?
 }
 
 /// Batches handled-error + performance telemetry and delivers it to the Simula backend,
@@ -35,6 +53,9 @@ final class TelemetryManager: @unchecked Sendable {
     private let connectionTypeProvider: @Sendable () -> String?
     // Compact diagnostics breadcrumb (memory etc.), sampled on flush. Best-effort.
     private let diagnosticsProvider: @Sendable () -> String?
+    // Battery + carrier/radio, resolved fresh on each flush. Best-effort; nil when unavailable.
+    private let batteryProvider: @Sendable () -> BatteryInfo?
+    private let carrierProvider: @Sendable () -> CarrierInfo?
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
@@ -79,6 +100,8 @@ final class TelemetryManager: @unchecked Sendable {
         advertisingIdProvider: @escaping @Sendable () -> String?,
         connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
         diagnosticsProvider: @escaping @Sendable () -> String? = { nil },
+        batteryProvider: @escaping @Sendable () -> BatteryInfo? = { nil },
+        carrierProvider: @escaping @Sendable () -> CarrierInfo? = { nil },
         enabled: Bool = true,
         sampleRate: Double = 1.0,
         // Epoch milliseconds, matching the Kotlin SDK's `System.currentTimeMillis()` timestamps.
@@ -98,6 +121,8 @@ final class TelemetryManager: @unchecked Sendable {
         self.advertisingIdProvider = advertisingIdProvider
         self.connectionTypeProvider = connectionTypeProvider
         self.diagnosticsProvider = diagnosticsProvider
+        self.batteryProvider = batteryProvider
+        self.carrierProvider = carrierProvider
         self.now = now
         self.createdAtMs = now()
         self.random = random
@@ -234,7 +259,7 @@ final class TelemetryManager: @unchecked Sendable {
     /// Record a handled error. `signature` is the dedup key (e.g. `domain:code`); identical
     /// signatures aggregate with a count instead of flooding the buffer. `message` is truncated;
     /// never pass raw URLs/tokens/PII.
-    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil) {
+    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
         // Sanitize at the source so secrets are stripped from BOTH the dev log and the payload
         // sent to the backend (exception text can embed URLs/tokens).
         let redacted = redact(message)
@@ -248,6 +273,7 @@ final class TelemetryManager: @unchecked Sendable {
             e.errorCode = errorCode
             e.message = redacted
             e.breadcrumb = breadcrumb
+            e.stack = stack
             e.count = 1
             errorAgg[signature] = e
         } else {
@@ -480,6 +506,17 @@ final class TelemetryManager: @unchecked Sendable {
         // Aux state guarded by the same `lock` already held by beginFlush's caller.
         env.experimentId = experimentId
         env.variantId = variantId
+        // Always-on device diagnostics: statics from ctx + flush-time battery/carrier providers.
+        env.manufacturer = ctx.manufacturer
+        env.locale = ctx.locale
+        env.deviceRamMb = ctx.deviceRamMb
+        env.buildType = ctx.buildType
+        let battery = batteryProvider()
+        env.batteryLevel = battery?.level
+        env.batteryCharging = battery?.charging
+        let carrier = carrierProvider()
+        env.carrier = carrier?.carrier
+        env.radio = carrier?.radio
         return env
     }
 
