@@ -208,7 +208,13 @@ final class Telemetry: @unchecked Sendable {
     static func resolveRadio() -> String? {
         #if os(iOS)
         let info = CTTelephonyNetworkInfo()
-        guard let tech = info.serviceCurrentRadioAccessTechnology?.values.first else { return nil }
+        guard let techs = info.serviceCurrentRadioAccessTechnology, !techs.isEmpty else { return nil }
+        // On dual-SIM, report the DATA SIM's radio (the service network requests actually use);
+        // fall back to any service when the data service id is unknown. `.values.first` alone
+        // would pick an arbitrary SIM.
+        guard let tech = info.dataServiceIdentifier.flatMap({ techs[$0] }) ?? techs.values.first else {
+            return nil
+        }
         return radioLabel(tech)
         #else
         return nil
