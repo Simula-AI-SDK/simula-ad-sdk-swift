@@ -312,9 +312,10 @@ final class BatteryMonitor: @unchecked Sendable {
         lock.unlock()
         UIDevice.current.isBatteryMonitoringEnabled = true  // never disabled (a host may read it too)
         let center = NotificationCenter.default
-        let refresh: @Sendable (Notification) -> Void = { [weak self] _ in self?.refresh() }
-        center.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main, using: refresh)
-        center.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main, using: refresh)
+        // Named `onChange` (not `refresh`) so it doesn't shadow the refresh() method below.
+        let onChange: @Sendable (Notification) -> Void = { [weak self] _ in self?.refresh() }
+        center.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main, using: onChange)
+        center.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main, using: onChange)
         refresh()
     }
 
