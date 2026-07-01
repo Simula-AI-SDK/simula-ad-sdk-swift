@@ -1,5 +1,11 @@
 import Foundation
 import Network
+#if canImport(UIKit)
+import UIKit
+#endif
+#if os(iOS)
+import CoreTelephony
+#endif
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
@@ -39,13 +45,24 @@ final class Telemetry: @unchecked Sendable {
         // Start the connection-type monitor once; it caches the latest path so the flush reads it
         // without a synchronous reachability call. Best-effort — never throws.
         ConnectionTypeMonitor.shared.start()
+        #if canImport(UIKit)
+        // UIDevice battery APIs are main-thread-only; the monitor enables monitoring + caches
+        // level/state on the main thread so the (background) flush reads a snapshot, never UIDevice
+        // off-main.
+        BatteryMonitor.shared.start()
+        #endif
 
         let ctx = TelemetryContext(
             sdkVersion: SIMULA_SDK_VERSION,
             osVersion: DeviceCapabilities.current.osVersion,
             deviceModel: SimulaUserAgent.deviceModelIdentifier(),
             hostAppId: Bundle.main.bundleIdentifier ?? "unknown",
-            devMode: devMode
+            devMode: devMode,
+            // Always-on device diagnostics, resolved once (constant per process).
+            manufacturer: "Apple",
+            locale: Telemetry.resolveLocale(),
+            deviceRamMb: Telemetry.resolveRamMb(),
+            buildType: Telemetry.resolveBuildType()
         )
         // In dev mode, mirror every (redacted) event to the console for local verification.
         var consoleLog: (@Sendable (String) -> Void)?
@@ -59,6 +76,8 @@ final class Telemetry: @unchecked Sendable {
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             connectionTypeProvider: { ConnectionTypeMonitor.shared.current },
             diagnosticsProvider: { Telemetry.resolveDiagnostics() },
+            batteryProvider: { Telemetry.resolveBattery() },
+            carrierProvider: { Telemetry.resolveCarrier() },
             debugLog: consoleLog
         )
         lock.lock(); manager = mgr; lock.unlock()
@@ -115,8 +134,8 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
-    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil) {
-        current?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb)
+    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
+        current?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb, stack: stack)
     }
 
     /// Persist + attempt delivery now (e.g. app background).
@@ -143,6 +162,84 @@ final class Telemetry: @unchecked Sendable {
         let memMb = Int(info.phys_footprint) / (1024 * 1024)
         return "mem_used_mb=\(memMb)"
     }
+
+    // MARK: - Always-on device diagnostics (resolved at init/flush; best-effort, never throw)
+
+    /// Current locale as a BCP-47 tag (e.g. "en-US").
+    static func resolveLocale() -> String? {
+        let tag = Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+        return tag.isEmpty ? nil : tag
+    }
+
+    /// Total physical RAM in MB.
+    static func resolveRamMb() -> Int? {
+        let mb = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
+        return mb > 0 ? mb : nil
+    }
+
+    /// The build configuration this SDK binary was compiled with.
+    static func resolveBuildType() -> String {
+        #if DEBUG
+        return "debug"
+        #else
+        return "release"
+        #endif
+    }
+
+    /// Battery level (0..1) + charging, via UIDevice (monitoring enabled at init). nil off iOS or
+    /// when the level is unknown.
+    static func resolveBattery() -> BatteryInfo? {
+        #if canImport(UIKit)
+        return BatteryMonitor.shared.current  // main-thread snapshot; safe to read off-main
+        #else
+        return nil
+        #endif
+    }
+
+    /// Carrier name is intentionally nil on iOS (CTCarrier is deprecated and returns placeholders on
+    /// iOS 16+); only the non-deprecated radio-access type is reported.
+    static func resolveCarrier() -> CarrierInfo? {
+        guard let radio = resolveRadio() else { return nil }
+        return CarrierInfo(carrier: nil, radio: radio)
+    }
+
+    /// Coarse generation label for the current data radio (5G/LTE/3G/2G), via CoreTelephony. nil on
+    /// Wi-Fi-only, when undeterminable, or off iOS.
+    static func resolveRadio() -> String? {
+        #if os(iOS)
+        let info = CTTelephonyNetworkInfo()
+        guard let techs = info.serviceCurrentRadioAccessTechnology, !techs.isEmpty else { return nil }
+        // On dual-SIM, report the DATA SIM's radio (the service network requests actually use);
+        // fall back to any service when the data service id is unknown. `.values.first` alone
+        // would pick an arbitrary SIM.
+        guard let tech = info.dataServiceIdentifier.flatMap({ techs[$0] }) ?? techs.values.first else {
+            return nil
+        }
+        return radioLabel(tech)
+        #else
+        return nil
+        #endif
+    }
+
+    #if os(iOS)
+    private static func radioLabel(_ tech: String) -> String? {
+        if #available(iOS 14.1, *) {
+            if tech == CTRadioAccessTechnologyNR || tech == CTRadioAccessTechnologyNRNSA { return "5G" }
+        }
+        switch tech {
+        case CTRadioAccessTechnologyLTE:
+            return "LTE"
+        case CTRadioAccessTechnologyWCDMA, CTRadioAccessTechnologyHSDPA, CTRadioAccessTechnologyHSUPA,
+             CTRadioAccessTechnologyCDMAEVDORev0, CTRadioAccessTechnologyCDMAEVDORevA,
+             CTRadioAccessTechnologyCDMAEVDORevB, CTRadioAccessTechnologyeHRPD:
+            return "3G"
+        case CTRadioAccessTechnologyEdge, CTRadioAccessTechnologyGPRS, CTRadioAccessTechnologyCDMA1x:
+            return "2G"
+        default:
+            return nil
+        }
+    }
+    #endif
 }
 
 /// Best-effort connection-class monitor for the telemetry envelope's `connection_type`. An
@@ -185,3 +282,54 @@ final class ConnectionTypeMonitor: @unchecked Sendable {
 
     var current: String { lock.lock(); defer { lock.unlock() }; return latest }
 }
+
+#if canImport(UIKit)
+/// Caches the battery level/state, refreshed on the MAIN thread (UIDevice battery APIs are
+/// main-thread-only), so the background telemetry flush reads a snapshot instead of touching
+/// UIKit off-main. Mirrors `ConnectionTypeMonitor`. Lock-guarded; nil until the first reading.
+final class BatteryMonitor: @unchecked Sendable {
+    static let shared = BatteryMonitor()
+
+    private let lock = NSLock()
+    private var snapshot: BatteryInfo?
+    private var started = false
+
+    private init() {}
+
+    func start() {
+        // The monitoring toggle + UIDevice reads must happen on the main thread.
+        if Thread.isMainThread {
+            startOnMain()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.startOnMain() }
+        }
+    }
+
+    private func startOnMain() {
+        lock.lock()
+        if started { lock.unlock(); return }
+        started = true
+        lock.unlock()
+        UIDevice.current.isBatteryMonitoringEnabled = true  // never disabled (a host may read it too)
+        let center = NotificationCenter.default
+        // Named `onChange` (not `refresh`) so it doesn't shadow the refresh() method below.
+        let onChange: @Sendable (Notification) -> Void = { [weak self] _ in self?.refresh() }
+        center.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main, using: onChange)
+        center.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main, using: onChange)
+        refresh()
+    }
+
+    /// Always invoked on the main queue (initial call from startOnMain + observers with queue: .main).
+    private func refresh() {
+        let device = UIDevice.current
+        let level = device.batteryLevel
+        let charging = device.batteryState == .charging || device.batteryState == .full
+        let snap = level >= 0 ? BatteryInfo(level: Double(level), charging: charging) : nil
+        lock.lock(); snapshot = snap; lock.unlock()
+    }
+
+    var current: BatteryInfo? {
+        lock.lock(); defer { lock.unlock() }; return snapshot
+    }
+}
+#endif

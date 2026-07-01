@@ -40,16 +40,21 @@ final class TelemetryEnrichmentTests: XCTestCase {
         sender: TelemetrySending,
         clock: Clock,
         connectionType: @escaping @Sendable () -> String? = { nil },
-        diagnostics: @escaping @Sendable () -> String? = { nil }
+        diagnostics: @escaping @Sendable () -> String? = { nil },
+        battery: @escaping @Sendable () -> BatteryInfo? = { nil },
+        carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
+        ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true)
     ) -> TelemetryManager {
         TelemetryManager(
-            ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
+            ctx: ctx,
             store: store,
             sender: sender,
             primaryUserIdProvider: { nil },
             advertisingIdProvider: { nil },
             connectionTypeProvider: connectionType,
             diagnosticsProvider: diagnostics,
+            batteryProvider: battery,
+            carrierProvider: carrier,
             enabled: true,
             sampleRate: 1.0,
             now: { clock.now },
@@ -157,5 +162,45 @@ final class TelemetryEnrichmentTests: XCTestCase {
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "diagnostics" } }
 
         XCTAssertEqual(allEvents(sender.batches).first { $0.name == "diagnostics" }?.breadcrumb, "mem_used_mb=42")
+    }
+
+    func testDeviceDiagnosticsOnEnvelope() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let ctx = TelemetryContext(
+            sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test",
+            devMode: true, manufacturer: "Apple", locale: "en-US", deviceRamMb: 8192, buildType: "release"
+        )
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock,
+            battery: { BatteryInfo(level: 0.5, charging: true) },
+            carrier: { CarrierInfo(carrier: nil, radio: "5G") },
+            ctx: ctx
+        )
+
+        m.recordError(signature: "api:boom", errorCode: "boom")
+        await waitUntil { !sender.batches.isEmpty }
+
+        let env = sender.batches.first
+        XCTAssertEqual(env?.manufacturer, "Apple")
+        XCTAssertEqual(env?.locale, "en-US")
+        XCTAssertEqual(env?.deviceRamMb, 8192)
+        XCTAssertEqual(env?.batteryLevel, 0.5)
+        XCTAssertEqual(env?.batteryCharging, true)
+        XCTAssertNil(env?.carrier ?? nil)
+        XCTAssertEqual(env?.radio, "5G")
+        XCTAssertEqual(env?.buildType, "release")
+    }
+
+    func testRecordErrorCarriesStack() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.recordError(signature: "crash:Foo.bar", errorCode: "code", stack: ["Foo.bar(Foo.swift:1)", "Baz.qux(Baz.swift:2)"])
+        await waitUntil { self.allEvents(sender.batches).contains { $0.type == TelemetryType.error } }
+
+        let e = allEvents(sender.batches).first { $0.type == TelemetryType.error }
+        XCTAssertEqual(e?.stack, ["Foo.bar(Foo.swift:1)", "Baz.qux(Baz.swift:2)"])
     }
 }

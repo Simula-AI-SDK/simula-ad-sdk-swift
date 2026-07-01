@@ -22,6 +22,8 @@ private let simulaSDKMarker = "SimulaAdSDK"
 /// Identical to the Android `SimulaCrashGuard` so both SDKs share one record format.
 private let simulaFieldSep = "\u{1}"
 private let simulaNewlineEsc = "\u{2}"
+/// Separator between stack frames within the single persisted frames field.
+private let simulaFrameSep = "\u{3}"
 
 private let simulaMaxFrames = 8
 private let simulaMaxCrashFileBytes: UInt64 = 64 * 1024
@@ -108,12 +110,14 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
         let frames = exception.callStackSymbols
         // Report only crashes that involve SDK code (live-symbolicated frames carry the module name).
         guard frames.contains(where: { $0.contains(simulaSDKMarker) }) else { return }
+        let sdkFrames = frames.filter { $0.contains(simulaSDKMarker) }.prefix(simulaMaxFrames).map { cleanFrame($0) }
         let record = [
             String(Int(Date().timeIntervalSince1970 * 1000)),
             "uncaught",
             signature(fromFrames: frames),
             exception.name.rawValue,
             compactMessage(name: exception.name.rawValue, reason: exception.reason, frames: frames),
+            sdkFrames.joined(separator: simulaFrameSep),
         ]
         .map { $0.replacingOccurrences(of: simulaFieldSep, with: " ").replacingOccurrences(of: "\n", with: simulaNewlineEsc) }
         .joined(separator: simulaFieldSep)
@@ -127,11 +131,15 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
         for raw in content.split(separator: "\n") {
             let fields = String(raw).components(separatedBy: simulaFieldSep)
             guard fields.count >= 5 else { continue }
+            // 6th field (frames) is present on records written by this SDK version; older 5-field
+            // records simply carry no structured stack.
+            let stack = (fields.count >= 6 && !fields[5].isEmpty) ? fields[5].components(separatedBy: simulaFrameSep) : nil
             Telemetry.shared.recordError(
                 signature: fields[2],
                 errorCode: fields[3],
                 message: fields[4].replacingOccurrences(of: simulaNewlineEsc, with: "\n"),
-                breadcrumb: "fatal=uncaught;thread=\(fields[1])"
+                breadcrumb: "fatal=uncaught;thread=\(fields[1])",
+                stack: stack
             )
         }
     }
