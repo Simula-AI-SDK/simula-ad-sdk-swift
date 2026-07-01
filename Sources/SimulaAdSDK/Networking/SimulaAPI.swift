@@ -901,6 +901,12 @@ public final class SimulaAPI: @unchecked Sendable {
         for (key, value) in snapshot.consentHeaders() {
             headers[key] = value
         }
+        // Read live per request (never cached at init) — a session begun on Wi-Fi can hand off to
+        // cellular mid-flight, and the cache updates on that transition (see `SimulaConnectionType`).
+        // This is the single chokepoint every first-party request (including telemetry, via
+        // `postTelemetry`) funnels through; CTA / MMP redirect sessions bypass it entirely (they
+        // build their own `URLSessionConfiguration` via `SimulaUserAgent.sessionConfiguration()`).
+        headers["X-Connection-Type"] = String(SimulaConnectionType.shared.current)
         return headers
     }
 

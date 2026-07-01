@@ -1,5 +1,4 @@
 import Foundation
-import Network
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -42,9 +41,9 @@ final class Telemetry: @unchecked Sendable {
 
         guard enabled else { return } // host opt-out: no manager is ever created
 
-        // Start the connection-type monitor once; it caches the latest path so the flush reads it
-        // without a synchronous reachability call. Best-effort — never throws.
-        ConnectionTypeMonitor.shared.start()
+        // `SimulaConnectionType` is started independently (from `SimulaProvider.init`, ahead of
+        // telemetry install) since the `X-Connection-Type` header must work even when telemetry is
+        // disabled. No separate monitor here — the flush just reads its cached label below.
         #if canImport(UIKit)
         // UIDevice battery APIs are main-thread-only; the monitor enables monitoring + caches
         // level/state on the main thread so the (background) flush reads a snapshot, never UIDevice
@@ -74,7 +73,7 @@ final class Telemetry: @unchecked Sendable {
             // Read the PPID live so a mid-session updatePrimaryUserID is honored.
             primaryUserIdProvider: { primaryUserIDProvider() },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
-            connectionTypeProvider: { ConnectionTypeMonitor.shared.current },
+            connectionTypeProvider: { SimulaConnectionType.shared.label },
             diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             batteryProvider: { Telemetry.resolveBattery() },
             carrierProvider: { Telemetry.resolveCarrier() },
@@ -242,51 +241,10 @@ final class Telemetry: @unchecked Sendable {
     #endif
 }
 
-/// Best-effort connection-class monitor for the telemetry envelope's `connection_type`. An
-/// `NWPathMonitor` runs once and caches the latest class (`wifi` / `cellular` / `none` / `unknown`),
-/// so the flush reads a cached value rather than making a synchronous reachability call. All access
-/// is lock-guarded; failures degrade to `unknown` and never throw.
-final class ConnectionTypeMonitor: @unchecked Sendable {
-    static let shared = ConnectionTypeMonitor()
-
-    private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "ad.simula.telemetry.netpath", qos: .utility)
-    private let lock = NSLock()
-    private var latest = "unknown"
-    private var started = false
-
-    private init() {}
-
-    func start() {
-        lock.lock()
-        if started { lock.unlock(); return }
-        started = true
-        lock.unlock()
-        monitor.pathUpdateHandler = { [weak self] path in
-            let type: String
-            if path.status != .satisfied {
-                type = "none"
-            } else if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) {
-                type = "wifi"
-            } else if path.usesInterfaceType(.cellular) {
-                type = "cellular"
-            } else {
-                type = "unknown"
-            }
-            self?.set(type)
-        }
-        monitor.start(queue: queue)
-    }
-
-    private func set(_ type: String) { lock.lock(); latest = type; lock.unlock() }
-
-    var current: String { lock.lock(); defer { lock.unlock() }; return latest }
-}
-
 #if canImport(UIKit)
 /// Caches the battery level/state, refreshed on the MAIN thread (UIDevice battery APIs are
 /// main-thread-only), so the background telemetry flush reads a snapshot instead of touching
-/// UIKit off-main. Mirrors `ConnectionTypeMonitor`. Lock-guarded; nil until the first reading.
+/// UIKit off-main. Mirrors `SimulaConnectionType`. Lock-guarded; nil until the first reading.
 final class BatteryMonitor: @unchecked Sendable {
     static let shared = BatteryMonitor()
 

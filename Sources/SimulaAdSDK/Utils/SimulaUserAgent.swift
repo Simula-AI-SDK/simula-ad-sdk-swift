@@ -25,17 +25,41 @@ enum SimulaUserAgent {
         return headers
     }
 
-    /// A `.default` URLSession configuration carrying the standard headers, for the ancillary
-    /// sessions (CTA / tracker clicks) that don't go through `SimulaAPI`'s shared session.
+    /// A `.default` URLSession configuration for the ancillary CTA / redirect-tracker sessions
+    /// (not `SimulaAPI`'s shared session). Stamps a Safari-style mobile User-Agent instead of the
+    /// custom `Simula-SDK/...` UA — and omits `X-Device-Id` — so the click Adjust/AppsFlyer
+    /// fingerprints for probabilistic attribution reads like a genuine mobile Safari/WebView
+    /// navigation rather than an SDK request. Telemetry / first-party API sessions are unaffected;
+    /// they keep the custom UA + device id via `standardHeaders()`.
     static func sessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = standardHeaders()
+        config.httpAdditionalHeaders = ["User-Agent": safariUserAgent]
         // Bound these ancillary CTA / redirect-tracker sessions like SimulaAPI's main session, so a
         // connection that stalls can't keep the resolver (and its captured session/delegate) alive for
         // the 7-day system default — the resource timeout guarantees didCompleteWithError fires.
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 20
         return config
+    }
+
+    /// A WebKit/Safari-style mobile User-Agent, built once and cached. Used only for the CTA /
+    /// redirect-resolver click (Adjust User-Agent for Apps PRD): Adjust's probabilistic matching
+    /// pairs the click's IP + UA against the UA the Adjust SDK reports at install, and a custom
+    /// `Simula-SDK/...` UA doesn't resemble the device's standard UA, degrading match confidence.
+    ///
+    /// Format: `Mozilla/5.0 (iPhone; CPU iPhone OS {osVersion} like Mac OS X) AppleWebKit/605.1.15
+    /// (KHTML, like Gecko) Mobile/15E148` — the WebKit/Mobile build numbers are fixed shared
+    /// constants (they don't vary meaningfully across the OS versions this SDK targets), so only
+    /// the OS version is live.
+    static let safariUserAgent: String = {
+        "Mozilla/5.0 (iPhone; CPU iPhone OS \(safariOSVersionString()) like Mac OS X) " +
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }()
+
+    /// Underscore-separated OS version (`17_2`), matching Safari's UA convention (vs. the
+    /// dotted `17.2` the custom UA uses).
+    private static func safariOSVersionString() -> String {
+        osVersionString().replacingOccurrences(of: ".", with: "_")
     }
 
     /// Hardware model identifier (e.g. `iPhone16,1`) via `uname`. Shared with telemetry so the two

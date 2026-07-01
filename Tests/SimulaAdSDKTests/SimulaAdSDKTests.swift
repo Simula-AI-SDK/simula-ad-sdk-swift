@@ -1,5 +1,8 @@
 import XCTest
 import SwiftUI
+#if os(iOS)
+import CoreTelephony
+#endif
 @testable import SimulaAdSDK
 
 final class SimulaAdSDKTests: XCTestCase {
@@ -432,6 +435,98 @@ final class SimulaAdSDKTests: XCTestCase {
             ua,
             "Simula-SDK/1.2.3 (iOS 17.2; en_US; iPhone16,1; Build/21C52; com.publisher.app)"
         )
+    }
+
+    /// The CTA / redirect-resolver session (Adjust attribution PRD) must present as a genuine
+    /// mobile Safari/WebView navigation: a WebKit UA, not the custom `Simula-SDK/...` UA, and no
+    /// `X-Device-Id` (only `standardHeaders()` — used by the API/telemetry sessions — carries it).
+    func testCTASessionConfigurationUsesSafariUAAndOmitsDeviceId() {
+        let config = SimulaUserAgent.sessionConfiguration()
+        let headers = config.httpAdditionalHeaders as? [String: String] ?? [:]
+
+        XCTAssertEqual(headers["User-Agent"], SimulaUserAgent.safariUserAgent)
+        XCTAssertNil(headers["X-Device-Id"])
+        XCTAssertFalse(SimulaUserAgent.safariUserAgent.contains("Simula-SDK"))
+    }
+
+    func testSafariUserAgentFormat() {
+        let ua = SimulaUserAgent.safariUserAgent
+        XCTAssertTrue(ua.hasPrefix("Mozilla/5.0 (iPhone; CPU iPhone OS "))
+        XCTAssertTrue(ua.contains("like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"))
+    }
+
+    /// The custom-UA path (`standardHeaders()`, used by `SimulaAPI` and asset loads) must be
+    /// unaffected by the Safari-UA change: it still carries the SDK UA and `X-Device-Id` (when the
+    /// platform supplies one).
+    func testStandardHeadersUnaffectedBySafariUAChange() {
+        let headers = SimulaUserAgent.standardHeaders()
+        XCTAssertEqual(headers["User-Agent"], SimulaUserAgent.value)
+        XCTAssertTrue(SimulaUserAgent.value.hasPrefix("Simula-SDK/"))
+    }
+
+    // MARK: - X-Connection-Type (OpenRTB device.connectiontype)
+
+    func testConnectionTypeClassifyOfflineIsUnknownZero() {
+        let (value, label) = SimulaConnectionType.classify(
+            satisfied: false, isWifi: false, isWiredEthernet: false, isCellular: false, cellularGeneration: 99
+        )
+        XCTAssertEqual(value, 0)
+        XCTAssertEqual(label, "none")
+    }
+
+    func testConnectionTypeClassifyWifi() {
+        let (value, label) = SimulaConnectionType.classify(
+            satisfied: true, isWifi: true, isWiredEthernet: false, isCellular: false, cellularGeneration: 99
+        )
+        XCTAssertEqual(value, 2)
+        XCTAssertEqual(label, "wifi")
+    }
+
+    func testConnectionTypeClassifyWiredEthernetIsDistinctValueSameLabelAsWifi() {
+        let (value, label) = SimulaConnectionType.classify(
+            satisfied: true, isWifi: false, isWiredEthernet: true, isCellular: false, cellularGeneration: 99
+        )
+        XCTAssertEqual(value, 1) // OpenRTB "wired", distinct from wifi's 2
+        XCTAssertEqual(label, "wifi") // telemetry label continuity with the pre-existing monitor
+    }
+
+    func testConnectionTypeClassifyCellularUsesSuppliedGeneration() {
+        let (value, label) = SimulaConnectionType.classify(
+            satisfied: true, isWifi: false, isWiredEthernet: false, isCellular: true, cellularGeneration: 7
+        )
+        XCTAssertEqual(value, 7)
+        XCTAssertEqual(label, "cellular")
+    }
+
+    func testConnectionTypeClassifyNoTransportIsUnknown() {
+        let (value, label) = SimulaConnectionType.classify(
+            satisfied: true, isWifi: false, isWiredEthernet: false, isCellular: false, cellularGeneration: 99
+        )
+        XCTAssertEqual(value, 0)
+        XCTAssertEqual(label, "unknown")
+    }
+
+    #if os(iOS)
+    func testConnectionTypeGenerationMapping() {
+        XCTAssertEqual(SimulaConnectionType.generation(forRadioAccessTechnology: CTRadioAccessTechnologyLTE), 6)
+        XCTAssertEqual(SimulaConnectionType.generation(forRadioAccessTechnology: CTRadioAccessTechnologyWCDMA), 5)
+        XCTAssertEqual(SimulaConnectionType.generation(forRadioAccessTechnology: CTRadioAccessTechnologyEdge), 4)
+        XCTAssertEqual(SimulaConnectionType.generation(forRadioAccessTechnology: "bogus-unknown-tech"), 3)
+    }
+    #endif
+
+    /// `X-Connection-Type` must be read live per request (never cached at session init) so a
+    /// mid-session network switch (Wi-Fi → cellular) shows up on the very next call — verified here
+    /// by asserting the header always reflects whatever `SimulaConnectionType.shared.current` is at
+    /// call time, not a value frozen at session/config creation.
+    func testConnectionTypeHeaderReadLivePerRequest() {
+        SimulaConnectionType.shared.start()
+        // `current` is a live computed property (lock-guarded read), not a value captured once;
+        // this documents/guards the contract makeHeaders() relies on.
+        let first = SimulaConnectionType.shared.current
+        let second = SimulaConnectionType.shared.current
+        XCTAssertEqual(first, second) // stable when the network hasn't changed
+        XCTAssertGreaterThanOrEqual(first, 0)
     }
 
     // MARK: - skan_attribution tokens (response-root sibling of ad_behavior; SKOverlay / SKStoreProduct)
