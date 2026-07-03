@@ -113,6 +113,12 @@ public final class SimulaProvider: ObservableObject {
         self.privacyConfig = resolved
         self.api = SimulaAPI()
 
+        // Start the connection-type monitor before the first request so `X-Connection-Type` is
+        // live from `session/create` onward. Idempotent — safe if a host recreates the provider.
+        // Independent of `telemetryEnabled`: the header is a first-party-request signal, not a
+        // telemetry one.
+        SimulaConnectionType.shared.start()
+
         // Install telemetry before the first request so the /session/create call (and every
         // subsequent SDK request) is captured. First call wins, so a re-created provider
         // doesn't churn it; the facade re-gates PII on the live consent snapshot.
