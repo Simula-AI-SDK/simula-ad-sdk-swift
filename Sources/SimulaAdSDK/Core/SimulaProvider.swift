@@ -60,6 +60,12 @@ public final class SimulaProvider: ObservableObject {
     /// Touched only from `@MainActor` methods.
     private var sessionTask: Task<String?, Never>?
 
+    /// Monotonic tag bumped on every session creation. A creation task captures its generation and
+    /// only publishes its (sessionId, sessionUserID) pair if that generation is still current — so a
+    /// creation abandoned by `resyncSession` (consent change) can't clobber the newer session when it
+    /// finishes late with a now-stale privacy snapshot / ppid. Touched only on the main actor.
+    private var sessionGeneration = 0
+
     /// The PPID the current *server* session actually represents — set to the value the session was
     /// created with, and advanced only when a `PATCH …/ppid` succeeds. This can lag `primaryUserID`
     /// after a mid-session login/logout/switch (the local id updates immediately; the server session
@@ -205,6 +211,9 @@ public final class SimulaProvider: ObservableObject {
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
         // session's true identity (used to detect a stale session after a mid-session change).
         let ppidAtCreation = ppidStore.current
+        // Tag this creation; only the still-current generation may publish its result below.
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
         let task = Task<String?, Never> { @MainActor [weak self, api, apiKey, devMode] in
             // Emit session_created/session_failed once per creation attempt (callers coalesce onto
             // this single task). Best-effort telemetry; never affects session creation.
@@ -231,7 +240,9 @@ public final class SimulaProvider: ObservableObject {
             // coalesced waiters — observes a consistent (sessionId, sessionUserID) pair the moment
             // `task.value` resolves. Previously only the creator assigned it afterward, so a waiter
             // could resume first and read both as nil, dropping a session that was created fine.
-            if let self, let resolved {
+            // Guard on the generation: if a resync (or newer creation) superseded this task, its late
+            // completion must NOT overwrite the current session with this stale pair.
+            if let self, let resolved, self.sessionGeneration == generation {
                 self.sessionId = resolved
                 self.sessionUserID = ppidAtCreation
             }
@@ -255,6 +266,10 @@ public final class SimulaProvider: ObservableObject {
         // during the resync window never pairs the (now-invalidated) old id with a stale identity —
         // the recreated session sets both again atomically.
         sessionUserID = nil
+        // Cancel + abandon any in-flight creation so its late completion can't publish a session
+        // built from the now-stale consent snapshot. The generation guard in `ensureSession` is the
+        // correctness backstop (if the request already finished); cancelling just avoids wasted work.
+        sessionTask?.cancel()
         sessionTask = nil
         await ensureSession()
     }

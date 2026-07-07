@@ -206,7 +206,12 @@ public enum SimulaAds {
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
         guard let provider = shared, !adUnitId.isEmpty else { return false }
         let ppid = (primaryUserID?.isEmpty == false) ? primaryUserID : provider.primaryUserID
-        if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid) { return true }
+        // Capture the local day at the START of the check and attribute the result to it. The network
+        // round-trip can cross local midnight; stamping the cache with the completion time would file
+        // a prior-day capped result under the new day and keep hiding surfaces after the backend's
+        // daily reset. The start time is the day the result actually reflects.
+        let now = Date()
+        if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid, now: now) { return true }
 
         // Warm/ensure the session, then read its id and identity TOGETHER in one synchronous
         // main-actor step (no await between the two reads). Pairing the value returned by
@@ -224,7 +229,7 @@ public enum SimulaAds {
             ppid: ppid,
             sessionId: sessionId
         )
-        if capped { FrequencyCapCache.shared.markCapped(adUnitId: adUnitId, ppid: ppid) }
+        if capped { FrequencyCapCache.shared.markCapped(adUnitId: adUnitId, ppid: ppid, now: now) }
         return capped
     }
 
