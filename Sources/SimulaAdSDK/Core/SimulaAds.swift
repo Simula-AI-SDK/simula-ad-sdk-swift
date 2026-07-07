@@ -208,12 +208,16 @@ public enum SimulaAds {
         let ppid = (primaryUserID?.isEmpty == false) ? primaryUserID : provider.primaryUserID
         if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid) { return true }
 
-        // Warm/ensure the session, but only attach its id when it represents the same identity we're
-        // checking. After a mid-session login/logout/switch the server session can still reflect the
-        // prior user (the PATCH is async, and logout can't be pushed at all); sending that stale id
-        // could make the backend evaluate the cap for the wrong user. When it diverges we drop the id
+        // Warm/ensure the session, then read its id and identity TOGETHER in one synchronous
+        // main-actor step (no await between the two reads). Pairing the value returned by
+        // ensureSession() with a separately read sessionUserID could attach a freshly created — or a
+        // resync-invalidated — session to the wrong identity, because a coalesced waiter can observe
+        // the id before the creator sets the identity, and a consent-driven resync can clear the id
+        // after ensureSession() returned it. Reading the live provider state atomically avoids both.
+        // Only attach the id when it represents the same identity we're checking; otherwise drop it
         // and let the backend fall back to the ppid + device-id/IP signals.
-        let sessionId = consistentSessionId(await provider.ensureSession(), sessionUserID: provider.sessionUserID, ppid: ppid)
+        await provider.ensureSession()
+        let sessionId = consistentSessionId(provider.sessionId, sessionUserID: provider.sessionUserID, ppid: ppid)
         let capped = await SimulaAPI.shared.checkFrequencyCap(
             apiKey: provider.apiKey,
             adUnitId: adUnitId,

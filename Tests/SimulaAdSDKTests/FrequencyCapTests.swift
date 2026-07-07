@@ -100,4 +100,25 @@ final class FrequencyCapTests: XCTestCase {
         XCTAssertFalse(FrequencyCapCache.shared.isCapped(adUnitId: "unit_0", ppid: "user_1", now: referenceDate))
         XCTAssertTrue(FrequencyCapCache.shared.isCapped(adUnitId: "unit_64", ppid: "user_1", now: referenceDate))
     }
+
+    func testReMarkingRefreshesRecencySoAValidEntryIsNotEvictedEarly() {
+        FrequencyCapCache.shared.markCapped(adUnitId: "unit_0", ppid: "user_1", now: referenceDate)
+        for i in 1...63 { FrequencyCapCache.shared.markCapped(adUnitId: "unit_\(i)", ppid: "user_1", now: referenceDate) }
+        // Re-mark the eldest so it moves back to the tail, then overflow by one.
+        FrequencyCapCache.shared.markCapped(adUnitId: "unit_0", ppid: "user_1", now: referenceDate)
+        FrequencyCapCache.shared.markCapped(adUnitId: "unit_64", ppid: "user_1", now: referenceDate)
+        XCTAssertTrue(FrequencyCapCache.shared.isCapped(adUnitId: "unit_0", ppid: "user_1", now: referenceDate))
+        XCTAssertFalse(FrequencyCapCache.shared.isCapped(adUnitId: "unit_1", ppid: "user_1", now: referenceDate))
+    }
+
+    func testStaleEntriesDoNotEvictACurrentDayEntry() {
+        // A prior-day entry must not occupy a slot: fill the cap with fresh entries the next day and
+        // the valid ones must all survive (the stale one is pruned, not counted against the cap).
+        FrequencyCapCache.shared.markCapped(adUnitId: "stale", ppid: "user_1", now: referenceDate)
+        let nextDay = referenceDate.addingTimeInterval(oneDay)
+        for i in 0..<64 { FrequencyCapCache.shared.markCapped(adUnitId: "unit_\(i)", ppid: "user_1", now: nextDay) }
+        XCTAssertFalse(FrequencyCapCache.shared.isCapped(adUnitId: "stale", ppid: "user_1", now: nextDay))
+        XCTAssertTrue(FrequencyCapCache.shared.isCapped(adUnitId: "unit_0", ppid: "user_1", now: nextDay))
+        XCTAssertTrue(FrequencyCapCache.shared.isCapped(adUnitId: "unit_63", ppid: "user_1", now: nextDay))
+    }
 }

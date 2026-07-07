@@ -246,6 +246,10 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     private func resyncSession() async {
         sessionId = nil
+        // Clear the tracked identity together with the id it belonged to, so a frequency-cap check
+        // during the resync window never pairs the (now-invalidated) old id with a stale identity —
+        // the recreated session sets both again atomically.
+        sessionUserID = nil
         sessionTask = nil
         await ensureSession()
     }
@@ -308,12 +312,12 @@ public final class SimulaProvider: ObservableObject {
                 if target == self.sessionUserID { break }
                 let ok = await self.api.updatePpid(apiKey: self.apiKey, sessionId: sid, ppid: target)
                 if !ok { break }
-                // Accept the result only if the target is still current; otherwise loop to sync the
-                // newer value. Serialized, so the PATCH just sent is the latest to reach the server.
-                if target == self.ppidStore.current {
-                    self.sessionUserID = target
-                    break
-                }
+                // The PATCH just moved the server session to `target` (reconciles are serialized, so
+                // no other PATCH interleaves). Record that truth UNCONDITIONALLY — even if the desired
+                // identity has already moved on — so sessionUserID always reflects the server's real
+                // state and can never falsely match a newer ppid. Then loop; the top-of-loop check
+                // exits once the server has converged to the latest.
+                self.sessionUserID = target
             }
         }
     }

@@ -44,16 +44,31 @@ final class FrequencyCapCache: @unchecked Sendable {
     /// Returns `true` only if `adUnitId`/`ppid` was marked capped on the current local day.
     func isCapped(adUnitId: String, ppid: String?, now: Date = Date()) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let cachedDay = cappedDays[key(adUnitId: adUnitId, ppid: ppid)] else { return false }
-        return cachedDay == localDay(now)
+        let k = key(adUnitId: adUnitId, ppid: ppid)
+        guard let cachedDay = cappedDays[k] else { return false }
+        if cachedDay == localDay(now) { return true }
+        // Prior day: the cap has reset. Drop the stale entry so it can't occupy a slot and push out
+        // a valid current-day entry.
+        cappedDays.removeValue(forKey: k)
+        order.removeAll { $0 == k }
+        return false
     }
 
     /// Marks `adUnitId`/`ppid` as capped for the rest of the current local day.
     func markCapped(adUnitId: String, ppid: String?, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
+        let today = localDay(now)
         let k = key(adUnitId: adUnitId, ppid: ppid)
-        if cappedDays[k] == nil { order.append(k) }
-        cappedDays[k] = localDay(now)
+        cappedDays[k] = today
+        // Prune prior-day entries so stale ones never consume a slot.
+        for stale in cappedDays.filter({ $0.value != today }).map({ $0.key }) {
+            cappedDays.removeValue(forKey: stale)
+        }
+        // Rebuild recency order: keep only live keys, with this key refreshed to the tail, so a
+        // re-marked current-day entry is never the one evicted.
+        order.removeAll { cappedDays[$0] == nil || $0 == k }
+        order.append(k)
+        // Evict the eldest (least-recently marked) while over the cap.
         while cappedDays.count > maxEntries, let oldest = order.first {
             order.removeFirst()
             cappedDays.removeValue(forKey: oldest)
