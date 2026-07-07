@@ -205,7 +205,15 @@ public final class SimulaProvider: ObservableObject {
     @discardableResult
     public func ensureSession() async -> String? {
         if let sessionId, !sessionId.isEmpty { return sessionId }
-        if let sessionTask { return await sessionTask.value }
+        // Coalesce onto an in-flight creation, then return the PUBLISHED `sessionId` — not the task's
+        // raw value. The awaited task may have been superseded by a resync (its generation guard then
+        // skips publishing), in which case its return value is a stale id while the provider already
+        // points at the newer session (or nil mid-resync). Returning provider state never leaks a
+        // stale id to a coalesced caller.
+        if let sessionTask {
+            _ = await sessionTask.value
+            return sessionId
+        }
 
         let snapshot = SimulaPrivacy.shared.currentSnapshot
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
@@ -250,10 +258,11 @@ public final class SimulaProvider: ObservableObject {
         }
         sessionTask = task
 
-        // Await completion (state was assigned inside the task) and clear the in-flight handle so a
-        // failed attempt can be retried on the next call.
+        // Await completion (state was assigned inside the task). Clear the in-flight handle only if
+        // this creation is still the current one — a resync may have replaced it with a newer task
+        // whose handle must not be stomped — so a failed attempt can still be retried on the next call.
         _ = await task.value
-        sessionTask = nil
+        if sessionGeneration == generation { sessionTask = nil }
         return sessionId
     }
 
@@ -266,9 +275,11 @@ public final class SimulaProvider: ObservableObject {
         // during the resync window never pairs the (now-invalidated) old id with a stale identity —
         // the recreated session sets both again atomically.
         sessionUserID = nil
-        // Cancel + abandon any in-flight creation so its late completion can't publish a session
-        // built from the now-stale consent snapshot. The generation guard in `ensureSession` is the
-        // correctness backstop (if the request already finished); cancelling just avoids wasted work.
+        // Invalidate any in-flight creation UP FRONT (bump before cancel): a task already past its
+        // network call would otherwise still satisfy its generation guard and publish a session built
+        // from the now-stale consent snapshot. Bumping first guarantees that guard fails. Cancelling
+        // additionally aborts the wasted request; `ensureSession` below starts a fresh creation.
+        sessionGeneration &+= 1
         sessionTask?.cancel()
         sessionTask = nil
         await ensureSession()

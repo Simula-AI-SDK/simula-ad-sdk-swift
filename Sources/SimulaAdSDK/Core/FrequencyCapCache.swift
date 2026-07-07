@@ -22,42 +22,47 @@ final class FrequencyCapCache: @unchecked Sendable {
     static let shared = FrequencyCapCache()
 
     private let lock = NSLock()
-    private var currentDay: String?
+    private var currentDay = Int.min
     private var cappedKeys: Set<CacheKey> = []
-
-    /// `autoupdatingCurrent` so a mid-session time-zone change is reflected (the cap resets at the
-    /// new local midnight) rather than snapshotting the zone at first access.
-    private let calendar = Calendar.autoupdatingCurrent
 
     private struct CacheKey: Hashable {
         let adUnitId: String
         let ppid: String?
     }
 
-    /// A key that's stable for a given calendar day (in the device's current time zone) and distinct
-    /// across any different day — used only for equality, not ordering.
-    private func localDay(_ date: Date) -> String {
-        let comps = calendar.dateComponents([.era, .year, .month, .day], from: date)
-        return "\(comps.era ?? 0)-\(comps.year ?? 0)-\(comps.month ?? 0)-\(comps.day ?? 0)"
+    /// Ordered day number in the device's current time zone (days since the Unix epoch), so a later
+    /// local day is always numerically greater — required to only ever roll FORWARD. `TimeZone.current`
+    /// is read per call, so a mid-session time-zone change is reflected.
+    private func localDay(_ date: Date) -> Int {
+        let offset = TimeZone.current.secondsFromGMT(for: date)
+        return Int((date.timeIntervalSince1970 + Double(offset)) / 86_400)
     }
 
     /// Returns `true` only if `adUnitId`/`ppid` was marked capped on the current local day.
     func isCapped(adUnitId: String, ppid: String?, now: Date = Date()) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        rolloverIfNeeded(localDay(now))
-        return cappedKeys.contains(CacheKey(adUnitId: adUnitId, ppid: ppid))
+        let today = localDay(now)
+        rolloverIfNeeded(today)
+        // `today < currentDay` is a stale read (a request whose start time predates a rollover
+        // another call already advanced): that day's cap has reset, so report not-capped.
+        return today == currentDay && cappedKeys.contains(CacheKey(adUnitId: adUnitId, ppid: ppid))
     }
 
     /// Marks `adUnitId`/`ppid` as capped for the rest of the current local day.
     func markCapped(adUnitId: String, ppid: String?, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
-        rolloverIfNeeded(localDay(now))
-        cappedKeys.insert(CacheKey(adUnitId: adUnitId, ppid: ppid))
+        let today = localDay(now)
+        rolloverIfNeeded(today)
+        // Ignore a mark carrying an already-past day: it must neither resurrect a reset cap nor
+        // (via a rewind) wipe the current day's still-valid entries.
+        if today == currentDay { cappedKeys.insert(CacheKey(adUnitId: adUnitId, ppid: ppid)) }
     }
 
-    /// Clears the set whenever the local day changes, so cached caps never survive past local midnight.
-    private func rolloverIfNeeded(_ today: String) {
-        if today != currentDay {
+    /// Advances to a NEWER local day only, clearing the prior day's caps (the midnight reset). It
+    /// never rewinds: a late call carrying an older day (e.g. a check whose start time was captured
+    /// before midnight but that completes after) must not wipe the current day's valid entries.
+    private func rolloverIfNeeded(_ today: Int) {
+        if today > currentDay {
             currentDay = today
             cappedKeys.removeAll()
         }
@@ -67,6 +72,6 @@ final class FrequencyCapCache: @unchecked Sendable {
     func clear() {
         lock.lock(); defer { lock.unlock() }
         cappedKeys.removeAll()
-        currentDay = nil
+        currentDay = .min
     }
 }

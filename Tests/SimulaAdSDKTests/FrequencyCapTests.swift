@@ -109,6 +109,17 @@ final class FrequencyCapTests: XCTestCase {
         XCTAssertFalse(FrequencyCapCache.shared.isCapped(adUnitId: "unit_2", ppid: "user_2", now: nextDay))
     }
 
+    func testALatePriorDayMarkDoesNotWipeCurrentDayEntries() {
+        let nextDay = referenceDate.addingTimeInterval(oneDay)
+        // A request on the new day establishes the current day and caps "current".
+        FrequencyCapCache.shared.markCapped(adUnitId: "current", ppid: "user_1", now: nextDay)
+        // A request that STARTED before midnight finishes now and marks with its prior-day start time;
+        // it must neither rewind the day (wiping "current") nor resurrect the reset prior-day cap.
+        FrequencyCapCache.shared.markCapped(adUnitId: "late", ppid: "user_1", now: referenceDate)
+        XCTAssertTrue(FrequencyCapCache.shared.isCapped(adUnitId: "current", ppid: "user_1", now: nextDay))
+        XCTAssertFalse(FrequencyCapCache.shared.isCapped(adUnitId: "late", ppid: "user_1", now: nextDay))
+    }
+
     func testPipeCharactersInIdsDoNotCollideAcrossPairs() {
         // "foo" + "bar|baz" and "foo|bar" + "baz" must be distinct keys (a naive concatenation with a
         // '|' delimiter would collide them into "foo|bar|baz").
