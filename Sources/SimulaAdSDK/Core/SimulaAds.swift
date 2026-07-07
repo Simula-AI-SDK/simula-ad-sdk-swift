@@ -183,6 +183,37 @@ public enum SimulaAds {
         shared?.updatePrimaryUserID(id)
     }
 
+    /// Checks whether the user has hit their frequency cap for `adUnitId` — a read-only check
+    /// against the backend that records no impression (PRD). Publishers can call this before
+    /// rendering an ad-gated surface to skip it entirely when no ad would serve.
+    ///
+    /// - Parameters:
+    ///   - adUnitId: required.
+    ///   - primaryUserID: optional; falls back to the SDK's current PPID (set at `initialize` or
+    ///     via `updatePrimaryUserID`) when omitted, and ultimately to the backend's IP/device/
+    ///     session signals when neither is available.
+    /// - Returns: `true` if the cap has been reached (skip the surface); `false` if the user is
+    ///   still eligible, before `initialize`, or on any network/server failure (fails open so a
+    ///   transport hiccup can never hide an ad surface that would otherwise have served).
+    ///
+    /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
+    /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
+    public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
+        guard let provider = shared, !adUnitId.isEmpty else { return false }
+        let ppid = (primaryUserID?.isEmpty == false) ? primaryUserID : provider.primaryUserID
+        if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid) { return true }
+
+        let sessionId = await provider.ensureSession()
+        let capped = await SimulaAPI.shared.checkFrequencyCap(
+            apiKey: provider.apiKey,
+            adUnitId: adUnitId,
+            ppid: ppid,
+            sessionId: sessionId
+        )
+        if capped { FrequencyCapCache.shared.markCapped(adUnitId: adUnitId, ppid: ppid) }
+        return capped
+    }
+
     #if os(iOS)
     /// Imperatively preload one native ad before its slot scrolls into view. Fires a single
     /// `POST /load/native` using the current provider context, caches the full response, and returns

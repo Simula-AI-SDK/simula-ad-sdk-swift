@@ -74,6 +74,21 @@ struct CreateSessionResponse: Decodable {
     }
 }
 
+/// Response body for `GET /frequency-cap/status`: `{"capped": true|false}`. Defaults to `false`
+/// (not capped) so a malformed/partial payload never falsely hides an ad surface.
+struct FrequencyCapResponse: Decodable {
+    let capped: Bool
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.capped = (try? c.decode(Bool.self, forKey: .capped)) ?? false
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case capped
+    }
+}
+
 /// Device capability snapshot reported on ad requests (the "capability handshake"). The backend
 /// uses it to withhold variants the OS can't support — e.g. SKOverlay requires iOS 14+,
 /// AdAttributionKit requires iOS 17.4+. Computed once per process (`current`) since it never
@@ -989,6 +1004,55 @@ public final class SimulaAPI: @unchecked Sendable {
             let (_, response) = try await session.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             return (200...299).contains(code)
+        } catch {
+            return false
+        }
+    }
+
+    // MARK: - Frequency Cap
+
+    /// Builds the frequency-cap status request URL. `adUnitId` is required; `ppid` and
+    /// `sessionId` are appended only when non-empty (the backend falls back to IP address,
+    /// device id, and other session signals when omitted). Pure/testable.
+    static func frequencyCapURL(adUnitId: String, ppid: String? = nil, sessionId: String? = nil) -> URL? {
+        guard var components = URLComponents(string: "\(API_BASE_URL)/frequency-cap/status") else {
+            return nil
+        }
+        var items = [URLQueryItem(name: "ad_unit_id", value: adUnitId)]
+        if let ppid, !ppid.isEmpty {
+            items.append(URLQueryItem(name: "ppid", value: ppid))
+        }
+        if let sessionId, !sessionId.isEmpty {
+            items.append(URLQueryItem(name: "session_id", value: sessionId))
+        }
+        components.queryItems = items
+        return components.url
+    }
+
+    /// Checks whether the user has hit their frequency cap for `adUnitId` via
+    /// `GET /frequency-cap/status` — a read-only check that records no impression. Fails open:
+    /// any non-2xx response, undecodable body, or thrown error resolves to `false` so a transport
+    /// hiccup can never hide an ad surface that would otherwise have served.
+    public func checkFrequencyCap(
+        apiKey: String,
+        adUnitId: String,
+        ppid: String? = nil,
+        sessionId: String? = nil
+    ) async -> Bool {
+        guard let url = Self.frequencyCapURL(adUnitId: adUnitId, ppid: ppid, sessionId: sessionId) else {
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return false
+            }
+            return (try? JSONDecoder().decode(FrequencyCapResponse.self, from: data))?.capped ?? false
         } catch {
             return false
         }
