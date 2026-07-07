@@ -449,9 +449,27 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertFalse(SimulaUserAgent.safariUserAgent.contains("Simula-SDK"))
     }
 
+    func testSafariUserAgentComposeForBothDeviceFamilies() {
+        // iPhone keeps the "iPhone; CPU iPhone OS" tokens; iPad uses "iPad; CPU OS" (no "iPhone").
+        XCTAssertEqual(
+            SimulaUserAgent.composeSafariUserAgent(isPad: false, osVersionUnderscore: "17_2"),
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        )
+        XCTAssertEqual(
+            SimulaUserAgent.composeSafariUserAgent(isPad: true, osVersionUnderscore: "17_2"),
+            "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        )
+        // iPad must NOT report as iPhone.
+        XCTAssertFalse(SimulaUserAgent.composeSafariUserAgent(isPad: true, osVersionUnderscore: "17_2").contains("iPhone"))
+    }
+
     func testSafariUserAgentFormat() {
+        // Device-dependent: accept either family's prefix (the running device decides which).
         let ua = SimulaUserAgent.safariUserAgent
-        XCTAssertTrue(ua.hasPrefix("Mozilla/5.0 (iPhone; CPU iPhone OS "))
+        XCTAssertTrue(
+            ua.hasPrefix("Mozilla/5.0 (iPhone; CPU iPhone OS ") || ua.hasPrefix("Mozilla/5.0 (iPad; CPU OS "),
+            "Unexpected Safari UA prefix: \(ua)"
+        )
         XCTAssertTrue(ua.contains("like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"))
     }
 

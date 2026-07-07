@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Builds (once) and caches the custom User-Agent the SDK stamps on every native HTTP request
 /// (User-Agent for Apps SDK PRD). Format is the standard ad-SDK layout:
@@ -47,13 +50,39 @@ enum SimulaUserAgent {
     /// pairs the click's IP + UA against the UA the Adjust SDK reports at install, and a custom
     /// `Simula-SDK/...` UA doesn't resemble the device's standard UA, degrading match confidence.
     ///
-    /// Format: `Mozilla/5.0 (iPhone; CPU iPhone OS {osVersion} like Mac OS X) AppleWebKit/605.1.15
-    /// (KHTML, like Gecko) Mobile/15E148` — the WebKit/Mobile build numbers are fixed shared
-    /// constants (they don't vary meaningfully across the OS versions this SDK targets), so only
-    /// the OS version is live.
-    static let safariUserAgent: String = {
-        "Mozilla/5.0 (iPhone; CPU iPhone OS \(safariOSVersionString()) like Mac OS X) " +
+    /// The device-family token matches the running device so the click UA resembles that device's
+    /// genuine Safari UA:
+    /// - iPhone: `Mozilla/5.0 (iPhone; CPU iPhone OS {osVersion} like Mac OS X) AppleWebKit/605.1.15
+    ///   (KHTML, like Gecko) Mobile/15E148`
+    /// - iPad:   `Mozilla/5.0 (iPad; CPU OS {osVersion} like Mac OS X) AppleWebKit/605.1.15
+    ///   (KHTML, like Gecko) Mobile/15E148`
+    ///
+    /// The WebKit/Mobile build numbers are fixed shared constants (they don't vary meaningfully across
+    /// the OS versions this SDK targets), so only the OS version + device family are live.
+    static let safariUserAgent: String = composeSafariUserAgent(
+        isPad: isPad,
+        osVersionUnderscore: safariOSVersionString()
+    )
+
+    /// Pure assembly of the Safari-style UA, split out so both device families are unit-testable
+    /// without a real device. iPad uses `iPad; CPU OS …` (no `iPhone`); iPhone uses
+    /// `iPhone; CPU iPhone OS …`.
+    static func composeSafariUserAgent(isPad: Bool, osVersionUnderscore: String) -> String {
+        let platform = isPad
+            ? "iPad; CPU OS \(osVersionUnderscore)"
+            : "iPhone; CPU iPhone OS \(osVersionUnderscore)"
+        return "Mozilla/5.0 (\(platform) like Mac OS X) " +
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }
+
+    /// Whether the running device is an iPad, so the Safari UA uses the iPad tokens rather than
+    /// hardcoding iPhone. Resolved once; `false` on non-iOS (test/host) builds.
+    private static let isPad: Bool = {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .pad
+        #else
+        return false
+        #endif
     }()
 
     /// Underscore-separated OS version (`17_2`), matching Safari's UA convention (vs. the
