@@ -253,6 +253,14 @@ public final class SimulaProvider: ObservableObject {
             if let self, let resolved, self.sessionGeneration == generation {
                 self.sessionId = resolved
                 self.sessionUserID = ppidAtCreation
+                // A login/switch that fired WHILE this session was being created couldn't reconcile
+                // (sessionId was still nil when updatePrimaryUserID ran, so reconcileServerPpid
+                // no-oped). Now that the session exists, drive it to the current ppid if it diverged
+                // from the one it was created with — otherwise the server session would stay on the
+                // old ppid until the host happened to call updatePrimaryUserID again.
+                if self.ppidStore.current != ppidAtCreation {
+                    self.reconcileServerPpid()
+                }
             }
             return resolved
         }
