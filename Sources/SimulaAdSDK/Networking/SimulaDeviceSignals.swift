@@ -62,7 +62,7 @@ final class SimulaDeviceSignals: @unchecked Sendable {
         }
         #endif
 
-        queue.async { [weak self] in self?.refresh() }
+        launchRefresh()
     }
 
     /// The current signals as request headers. O(1) read of the cached snapshot; if it is older than
@@ -71,12 +71,22 @@ final class SimulaDeviceSignals: @unchecked Sendable {
     func headers() -> [String: String] {
         lock.lock()
         let current = snapshot
-        let shouldRefresh = started && !refreshing && Date().timeIntervalSince(computedAt) > Self.ttl
-        if shouldRefresh { refreshing = true }
+        let stale = started && Date().timeIntervalSince(computedAt) > Self.ttl
         lock.unlock()
 
-        if shouldRefresh { queue.async { [weak self] in self?.refresh() } }
+        if stale { launchRefresh() }
         return current
+    }
+
+    /// Dispatch a snapshot refresh at most once at a time. The `refreshing` guard is acquired here
+    /// and released only when that same dispatched `refresh()` completes — so a `start()`-time
+    /// refresh and a TTL-driven refresh from `headers()` can never overlap or clear each other's flag.
+    private func launchRefresh() {
+        lock.lock()
+        if refreshing { lock.unlock(); return }
+        refreshing = true
+        lock.unlock()
+        queue.async { [weak self] in self?.refresh() }
     }
 
     /// Recompute the snapshot from live device state. Runs off the main thread (on `queue`).

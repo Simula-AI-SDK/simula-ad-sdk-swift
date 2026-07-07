@@ -68,6 +68,11 @@ public final class SimulaProvider: ObservableObject {
     /// when they diverge. Touched only on the main actor, like `sessionTask`.
     private(set) var sessionUserID: String?
 
+    /// Serializes PPID reconciliation: each `reconcileServerPpid()` chains after this task so PATCHes
+    /// run strictly one at a time (the server applies them in order, and no out-of-order PATCH can
+    /// leave `sessionUserID` disagreeing with the real server identity). Touched only on the main actor.
+    private var ppidSyncTask: Task<Void, Never>?
+
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
     // Host-facing legacy cache API (getCachedAd/cacheAd/…). No internal callers, but a host using it
     // across many distinct slots would grow these without bound — so each is a size-capped store.
@@ -277,15 +282,39 @@ public final class SimulaProvider: ObservableObject {
     public func updatePrimaryUserID(_ id: String?) {
         let normalized = (id?.isEmpty == false) ? id : nil
         ppidStore.set(normalized)
-        // With no session yet, the pending/next createSession carries the new value, so no PATCH is
-        // needed. PATCH a live session to push the new value server-side.
-        guard let normalized, let sid = sessionId, !sid.isEmpty else { return }
-        Task { [weak self, api, apiKey] in
-            // Advance the tracked session identity only once the server confirms the PATCH, so
-            // checkFrequencyCap keeps treating the session as stale until it actually reflects the
-            // new user. This Task inherits the main actor, so the assignment is race-free.
-            let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
-            if ok { self?.sessionUserID = normalized }
+        // Reconcile the live server session toward the new id (serialized + single-flight). No-op
+        // when there's no session yet (the next createSession carries the value) or on logout (which
+        // can't be pushed server-side; the session is then treated as stale).
+        reconcileServerPpid()
+    }
+
+    /// Drive the server session's PPID toward the current `ppidStore` value and, on success, advance
+    /// `sessionUserID` to match — but only while that value is still the desired identity. Each call
+    /// chains after the previous (`ppidSyncTask`), so reconciles run strictly serially: at most one
+    /// PATCH is in flight, the server applies them in order, and a late/out-of-order PATCH can never
+    /// mark an identity the server didn't converge to. Rapid switches collapse (a chained run finds
+    /// the value already synced and no-ops). A logout (nil) or not-yet-created session is a
+    /// deliberate no-op that leaves `sessionUserID` stale, so a frequency-cap check drops the
+    /// now-mismatched session id rather than trusting it.
+    @MainActor
+    private func reconcileServerPpid() {
+        let previous = ppidSyncTask
+        ppidSyncTask = Task { @MainActor [weak self] in
+            _ = await previous?.value
+            guard let self else { return }
+            while true {
+                let target = self.ppidStore.current
+                guard let target, let sid = self.sessionId, !sid.isEmpty else { break }
+                if target == self.sessionUserID { break }
+                let ok = await self.api.updatePpid(apiKey: self.apiKey, sessionId: sid, ppid: target)
+                if !ok { break }
+                // Accept the result only if the target is still current; otherwise loop to sync the
+                // newer value. Serialized, so the PATCH just sent is the latest to reach the server.
+                if target == self.ppidStore.current {
+                    self.sessionUserID = target
+                    break
+                }
+            }
         }
     }
 
