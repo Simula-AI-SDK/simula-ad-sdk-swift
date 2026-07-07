@@ -204,22 +204,51 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func ensureSession() async -> String? {
-        if let sessionId, !sessionId.isEmpty { return sessionId }
-        // Coalesce onto an in-flight creation, then return the PUBLISHED `sessionId` — not the task's
-        // raw value. The awaited task may have been superseded by a resync (its generation guard then
-        // skips publishing), in which case its return value is a stale id while the provider already
-        // points at the newer session (or nil mid-resync). Returning provider state never leaks a
-        // stale id to a coalesced caller.
-        if let sessionTask {
-            _ = await sessionTask.value
+        // Loop so a caller that coalesces onto (or starts) a creation which is then superseded by a
+        // resync retries onto the replacement, instead of returning a premature nil while a session
+        // is still being created.
+        while true {
+            if let sessionId, !sessionId.isEmpty { return sessionId }
+
+            // Await the in-flight creation — an existing one (coalesce) or a fresh one we start.
+            // `awaitedGeneration` is that creation's generation: sessionTask and sessionGeneration are
+            // only ever set together (in startSessionCreation / resyncSession, synchronously), so
+            // reading them here with no intervening await yields a consistent pair.
+            let taskToAwait: Task<String?, Never>
+            let awaitedGeneration: Int
+            if let existing = sessionTask {
+                taskToAwait = existing
+                awaitedGeneration = sessionGeneration
+            } else {
+                let created = startSessionCreation()
+                taskToAwait = created.task
+                awaitedGeneration = created.generation
+            }
+
+            _ = await taskToAwait.value
+
+            // Superseded mid-await (a resync bumped the generation and started a replacement): retry
+            // so we await/observe the replacement rather than this abandoned creation's nil.
+            if sessionGeneration != awaitedGeneration { continue }
+
+            // The creation we awaited is still current and has settled. Clear the handle so a failed
+            // attempt is retried by the NEXT call, and return whatever it published (a genuine nil on
+            // failure is never re-created within this same call).
+            sessionTask = nil
             return sessionId
         }
+    }
 
+    /// Starts a session-creation task (bumps the generation and stores the in-flight handle) and
+    /// returns it with its generation. The task publishes the `(sessionId, sessionUserID)` pair
+    /// itself — guarded by the generation so a creation superseded by a resync can't overwrite the
+    /// current session — so every awaiter observes consistent state the moment it resolves.
+    @MainActor
+    private func startSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
         let snapshot = SimulaPrivacy.shared.currentSnapshot
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
         // session's true identity (used to detect a stale session after a mid-session change).
         let ppidAtCreation = ppidStore.current
-        // Tag this creation; only the still-current generation may publish its result below.
         sessionGeneration &+= 1
         let generation = sessionGeneration
         let task = Task<String?, Never> { @MainActor [weak self, api, apiKey, devMode] in
@@ -244,12 +273,10 @@ public final class SimulaProvider: ObservableObject {
             } catch {
                 Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
             }
-            // Assign the provider state INSIDE the task so every awaiter — the creating caller AND any
-            // coalesced waiters — observes a consistent (sessionId, sessionUserID) pair the moment
-            // `task.value` resolves. Previously only the creator assigned it afterward, so a waiter
-            // could resume first and read both as nil, dropping a session that was created fine.
-            // Guard on the generation: if a resync (or newer creation) superseded this task, its late
-            // completion must NOT overwrite the current session with this stale pair.
+            // Publish INSIDE the task so every awaiter — the creating caller AND any coalesced waiters
+            // — observes a consistent (sessionId, sessionUserID) pair the moment `task.value` resolves.
+            // Guard on the generation: a creation superseded by a resync must NOT overwrite the current
+            // session with its stale pair.
             if let self, let resolved, self.sessionGeneration == generation {
                 self.sessionId = resolved
                 self.sessionUserID = ppidAtCreation
@@ -265,13 +292,7 @@ public final class SimulaProvider: ObservableObject {
             return resolved
         }
         sessionTask = task
-
-        // Await completion (state was assigned inside the task). Clear the in-flight handle only if
-        // this creation is still the current one — a resync may have replaced it with a newer task
-        // whose handle must not be stomped — so a failed attempt can still be retried on the next call.
-        _ = await task.value
-        if sessionGeneration == generation { sessionTask = nil }
-        return sessionId
+        return (task, generation)
     }
 
     /// Invalidates the current session and recreates it so the backend sees the
