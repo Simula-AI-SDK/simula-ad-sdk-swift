@@ -117,6 +117,11 @@ public enum SimulaAds {
         _ = SimulaUserAgent.value
         _ = SimulaDeviceId.value
 
+        // Begin device-signal collection so the `X-*` device headers are populated before the first
+        // request. Idempotent (also started by `SimulaProvider.init` below); starting it here keeps
+        // the first snapshot off the critical path.
+        SimulaDeviceSignals.shared.start()
+
         let provider = SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,

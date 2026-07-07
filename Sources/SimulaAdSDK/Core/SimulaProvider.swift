@@ -119,6 +119,10 @@ public final class SimulaProvider: ObservableObject {
         // telemetry one.
         SimulaConnectionType.shared.start()
 
+        // Start device-signal collection so the `X-*` device headers are populated before the first
+        // request. Idempotent and independent of telemetry, like the connection-type monitor.
+        SimulaDeviceSignals.shared.start()
+
         // Install telemetry before the first request so the /session/create call (and every
         // subsequent SDK request) is captured. First call wins, so a re-created provider
         // doesn't churn it; the facade re-gates PII on the live consent snapshot.

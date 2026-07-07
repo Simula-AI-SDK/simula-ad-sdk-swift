@@ -922,6 +922,11 @@ public final class SimulaAPI: @unchecked Sendable {
         // `postTelemetry`) funnels through; CTA / MMP redirect sessions bypass it entirely (they
         // build their own `URLSessionConfiguration` via `SimulaUserAgent.sessionConfiguration()`).
         headers["X-Connection-Type"] = String(SimulaConnectionType.shared.current)
+        // Device-context signals (timezone, storage, memory, battery, volume) from the cached
+        // snapshot — an O(1) read, no per-request syscalls (see `SimulaDeviceSignals`).
+        for (key, value) in SimulaDeviceSignals.shared.headers() {
+            headers[key] = value
+        }
         return headers
     }
 
