@@ -60,6 +60,14 @@ public final class SimulaProvider: ObservableObject {
     /// Touched only from `@MainActor` methods.
     private var sessionTask: Task<String?, Never>?
 
+    /// The PPID the current *server* session actually represents — set to the value the session was
+    /// created with, and advanced only when a `PATCH …/ppid` succeeds. This can lag `primaryUserID`
+    /// after a mid-session login/logout/switch (the local id updates immediately; the server session
+    /// reconciles asynchronously, and a logout can't be pushed at all). Consumers that must evaluate
+    /// for a specific identity (e.g. the frequency-cap check) compare the two and drop the session id
+    /// when they diverge. Touched only on the main actor, like `sessionTask`.
+    private(set) var sessionUserID: String?
+
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
     // Host-facing legacy cache API (getCachedAd/cacheAd/…). No internal callers, but a host using it
     // across many distinct slots would grow these without bound — so each is a size-capped store.
@@ -189,7 +197,10 @@ public final class SimulaProvider: ObservableObject {
         if let sessionTask { return await sessionTask.value }
 
         let snapshot = SimulaPrivacy.shared.currentSnapshot
-        let task = Task<String?, Never> { [api, apiKey, devMode, ppidStore] in
+        // Capture the ppid this session is created with so `sessionUserID` tracks the server
+        // session's true identity (used to detect a stale session after a mid-session change).
+        let ppidAtCreation = ppidStore.current
+        let task = Task<String?, Never> { [api, apiKey, devMode] in
             // Emit session_created/session_failed once per creation attempt (callers coalesce onto
             // this single task). Best-effort telemetry; never affects session creation.
             let startNanos = DispatchTime.now().uptimeNanoseconds
@@ -198,7 +209,7 @@ public final class SimulaProvider: ObservableObject {
                 let id = try await api.createSession(
                     apiKey: apiKey,
                     devMode: devMode,
-                    primaryUserID: ppidStore.current,
+                    primaryUserID: ppidAtCreation,
                     privacy: snapshot
                 )
                 let resolved = (id?.isEmpty == false) ? id : nil
@@ -220,6 +231,7 @@ public final class SimulaProvider: ObservableObject {
         sessionTask = nil
         if let id, !id.isEmpty {
             sessionId = id
+            sessionUserID = ppidAtCreation
         }
         return sessionId
     }
@@ -268,8 +280,12 @@ public final class SimulaProvider: ObservableObject {
         // With no session yet, the pending/next createSession carries the new value, so no PATCH is
         // needed. PATCH a live session to push the new value server-side.
         guard let normalized, let sid = sessionId, !sid.isEmpty else { return }
-        Task { [api, apiKey] in
-            await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
+        Task { [weak self, api, apiKey] in
+            // Advance the tracked session identity only once the server confirms the PATCH, so
+            // checkFrequencyCap keeps treating the session as stale until it actually reflects the
+            // new user. This Task inherits the main actor, so the assignment is race-free.
+            let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
+            if ok { self?.sessionUserID = normalized }
         }
     }
 

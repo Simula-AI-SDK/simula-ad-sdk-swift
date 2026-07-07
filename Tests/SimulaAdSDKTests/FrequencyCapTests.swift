@@ -27,6 +27,31 @@ final class FrequencyCapTests: XCTestCase {
         XCTAssertFalse(query.contains("session_id"))
     }
 
+    // MARK: - session-consistency gate (stale-session identity fix)
+
+    func testSessionIdSentWhenItMatchesCheckedPpid() {
+        XCTAssertEqual(SimulaAds.consistentSessionId("sess_1", sessionUserID: "user_1", ppid: "user_1"), "sess_1")
+    }
+
+    func testSessionIdDroppedWhenIdentityDiverges() {
+        // Session still represents user_1 but we're checking user_2 (mid-session switch/login).
+        XCTAssertNil(SimulaAds.consistentSessionId("sess_1", sessionUserID: "user_1", ppid: "user_2"))
+    }
+
+    func testSessionIdDroppedAfterLogoutWhenSessionHoldsPriorUser() {
+        // ppid cleared (logout) but the server session can't be cleared, so it still holds user_1.
+        XCTAssertNil(SimulaAds.consistentSessionId("sess_1", sessionUserID: "user_1", ppid: nil))
+    }
+
+    func testAnonymousSessionMatchesAnonymousCheck() {
+        XCTAssertEqual(SimulaAds.consistentSessionId("sess_1", sessionUserID: nil, ppid: nil), "sess_1")
+    }
+
+    func testNoSessionIdYieldsNil() {
+        XCTAssertNil(SimulaAds.consistentSessionId(nil, sessionUserID: nil, ppid: nil))
+        XCTAssertNil(SimulaAds.consistentSessionId(nil, sessionUserID: "user_1", ppid: "user_1"))
+    }
+
     // MARK: - FrequencyCapCache
 
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
