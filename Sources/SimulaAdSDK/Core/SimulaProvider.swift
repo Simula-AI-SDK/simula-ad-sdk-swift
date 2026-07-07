@@ -205,11 +205,12 @@ public final class SimulaProvider: ObservableObject {
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
         // session's true identity (used to detect a stale session after a mid-session change).
         let ppidAtCreation = ppidStore.current
-        let task = Task<String?, Never> { [api, apiKey, devMode] in
+        let task = Task<String?, Never> { @MainActor [weak self, api, apiKey, devMode] in
             // Emit session_created/session_failed once per creation attempt (callers coalesce onto
             // this single task). Best-effort telemetry; never affects session creation.
             let startNanos = DispatchTime.now().uptimeNanoseconds
             func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
+            var resolved: String? = nil
             do {
                 let id = try await api.createSession(
                     apiKey: apiKey,
@@ -217,27 +218,31 @@ public final class SimulaProvider: ObservableObject {
                     primaryUserID: ppidAtCreation,
                     privacy: snapshot
                 )
-                let resolved = (id?.isEmpty == false) ? id : nil
+                resolved = (id?.isEmpty == false) ? id : nil
                 if resolved != nil {
                     Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
                 } else {
                     Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
                 }
-                return resolved
             } catch {
                 Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
-                return nil
             }
+            // Assign the provider state INSIDE the task so every awaiter — the creating caller AND any
+            // coalesced waiters — observes a consistent (sessionId, sessionUserID) pair the moment
+            // `task.value` resolves. Previously only the creator assigned it afterward, so a waiter
+            // could resume first and read both as nil, dropping a session that was created fine.
+            if let self, let resolved {
+                self.sessionId = resolved
+                self.sessionUserID = ppidAtCreation
+            }
+            return resolved
         }
         sessionTask = task
 
-        let id = await task.value
-        // Clear the task so a failed attempt can be retried on the next call.
+        // Await completion (state was assigned inside the task) and clear the in-flight handle so a
+        // failed attempt can be retried on the next call.
+        _ = await task.value
         sessionTask = nil
-        if let id, !id.isEmpty {
-            sessionId = id
-            sessionUserID = ppidAtCreation
-        }
         return sessionId
     }
 
