@@ -205,24 +205,34 @@ public enum SimulaAds {
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
         guard let provider = shared, !adUnitId.isEmpty else { return false }
-        let ppid = (primaryUserID?.isEmpty == false) ? primaryUserID : provider.primaryUserID
+        // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback
+        // tracks the provider's live PPID (resolved below, after the session await).
+        let explicitPPID = (primaryUserID?.isEmpty == false) ? primaryUserID : nil
         // Capture the local day at the START of the check and attribute the result to it. The network
         // round-trip can cross local midnight; stamping the cache with the completion time would file
         // a prior-day capped result under the new day and keep hiding surfaces after the backend's
         // daily reset. The start time is the day the result actually reflects.
         let now = Date()
+
+        // Warm/ensure the session, then read the effective ppid, session id, and session identity
+        // TOGETHER in one synchronous main-actor step (no await between the reads). Resolving the ppid
+        // here rather than at entry is what keeps this call coherent: ensureSession() suspends, and a
+        // mid-call updatePrimaryUserID (which runs on the same main actor) can switch the active user
+        // during that suspension. Reading it afterwards means the cache lookup, the consistentSessionId
+        // identity gate, the network request, and markCapped all use one snapshot of the same user
+        // instead of a value pinned before the switch — this matters for the SDK fallback, where an
+        // omitted primaryUserID would otherwise be checked (and cached) against a now-stale user.
+        // Pairing sessionId with sessionUserID in the same step is likewise required: a coalesced
+        // waiter can observe the id before the creator sets the identity, and a consent-driven resync
+        // can clear the id after ensureSession() returned it. Only attach the id when it represents the
+        // same identity we're checking; otherwise drop it and let the backend fall back to the
+        // ppid + device-id/IP signals.
+        await provider.ensureSession()
+        let ppid = explicitPPID ?? provider.primaryUserID
+        let sessionId = consistentSessionId(provider.sessionId, sessionUserID: provider.sessionUserID, ppid: ppid)
+
         if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid, now: now) { return true }
 
-        // Warm/ensure the session, then read its id and identity TOGETHER in one synchronous
-        // main-actor step (no await between the two reads). Pairing the value returned by
-        // ensureSession() with a separately read sessionUserID could attach a freshly created — or a
-        // resync-invalidated — session to the wrong identity, because a coalesced waiter can observe
-        // the id before the creator sets the identity, and a consent-driven resync can clear the id
-        // after ensureSession() returned it. Reading the live provider state atomically avoids both.
-        // Only attach the id when it represents the same identity we're checking; otherwise drop it
-        // and let the backend fall back to the ppid + device-id/IP signals.
-        await provider.ensureSession()
-        let sessionId = consistentSessionId(provider.sessionId, sessionUserID: provider.sessionUserID, ppid: ppid)
         let capped = await SimulaAPI.shared.checkFrequencyCap(
             apiKey: provider.apiKey,
             adUnitId: adUnitId,
