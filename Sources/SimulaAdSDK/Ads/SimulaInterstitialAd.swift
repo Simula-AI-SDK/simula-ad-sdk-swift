@@ -652,14 +652,22 @@ public final class SimulaInterstitialAd {
         fallbackPrefetch?.cancel()
         prefetchedFallbacks = nil
         guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
-        let api = self.api
-        fallbackPrefetch = Task { [weak self] in
-            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
-            self?.prefetchedFallbacks = ads   // @MainActor self → main-thread write
-            return ads
-        }
+        // Single-call task closure (inherits @MainActor) — see the task-shape note in TelemetryManager.
+        fallbackPrefetch = Task { [weak self] in await self?.runFallbackPrefetch(impressionId: impressionId) ?? [] }
         #endif
     }
+
+    #if os(iOS)
+    /// Task body for the fallback prefetch (named method — see the task-shape note in
+    /// TelemetryManager). @MainActor via the class, so the `prefetchedFallbacks` write
+    /// stays a main-thread write as before.
+    private func runFallbackPrefetch(impressionId: String) async -> [FallbackAd] {
+        let ads: [FallbackAd]
+        do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
+        prefetchedFallbacks = ads
+        return ads
+    }
+    #endif
 
     /// After the creative closes, present the prefetched fallback ad screens full-screen in reveal
     /// order. When the prefetch has landed (the common case) it presents **synchronously**, so the

@@ -615,14 +615,22 @@ public final class SimulaRewardedAd {
         fallbackPrefetch?.cancel()
         prefetchedFallbacks = nil
         guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
-        let api = self.api
-        fallbackPrefetch = Task { [weak self] in
-            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
-            self?.prefetchedFallbacks = ads   // @MainActor self → main-thread write
-            return ads
-        }
+        // Single-call task closure (inherits @MainActor) — see the task-shape note in TelemetryManager.
+        fallbackPrefetch = Task { [weak self] in await self?.runFallbackPrefetch(impressionId: impressionId) ?? [] }
         #endif
     }
+
+    #if os(iOS)
+    /// Task body for the fallback prefetch (named method — see the task-shape note in
+    /// TelemetryManager). @MainActor via the class, so the `prefetchedFallbacks` write
+    /// stays a main-thread write as before.
+    private func runFallbackPrefetch(impressionId: String) async -> [FallbackAd] {
+        let ads: [FallbackAd]
+        do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
+        prefetchedFallbacks = ads
+        return ads
+    }
+    #endif
 
     /// Presents the prefetched fallback ad screens on close. Synchronous when the prefetch has
     /// landed (the common case), so the fallback window is up before the minigame window is torn

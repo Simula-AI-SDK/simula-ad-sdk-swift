@@ -519,7 +519,8 @@ private struct CreativeInterstitialView: View {
             // overflow and trap) — same pattern as the close-delay gate above.
             let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
             if sleepNs.isFinite, sleepNs > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(sleepNs))
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
             }
             if Task.isCancelled { return }
             showStorePrompt()
@@ -574,7 +575,8 @@ private struct CreativeInterstitialView: View {
         skOverlayTask?.cancel()
         skOverlayTask = Task { @MainActor in
             if config.delaySeconds > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000)
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000) } catch { return }
             }
             if Task.isCancelled { return }
             presentSKOverlay(config: config)

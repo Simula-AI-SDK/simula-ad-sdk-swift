@@ -504,18 +504,24 @@ public struct MiniGameMenu: View {
 
         if !adFetched, let serveId = currentServeId {
             adLoading = true
-            Task {
-                let ads = (try? await api.fetchFallbacks(impressionId: serveId)) ?? []
-                await MainActor.run {
-                    adLoading = false
-                    if !ads.isEmpty {
-                        self.fallbackAds = ads
-                        self.fallbackAdIndex = 0
-                        self.adFetched = true
-                        self.showAdOverlay = true
-                    }
-                }
-            }
+            // Single-call task closure — see the task-shape note in TelemetryManager.
+            Task { await loadFallbacksAfterIframeClose(serveId: serveId) }
+        }
+    }
+
+    /// Task body for the post-iframe-close fallback fetch (named method — see the task-shape
+    /// note in TelemetryManager). @MainActor so the @State writes stay on the main thread,
+    /// exactly like the previous `MainActor.run` block.
+    @MainActor
+    private func loadFallbacksAfterIframeClose(serveId: String) async {
+        let ads: [FallbackAd]
+        do { ads = try await api.fetchFallbacks(impressionId: serveId) } catch { ads = [] }
+        adLoading = false
+        if !ads.isEmpty {
+            fallbackAds = ads
+            fallbackAdIndex = 0
+            adFetched = true
+            showAdOverlay = true
         }
     }
 
