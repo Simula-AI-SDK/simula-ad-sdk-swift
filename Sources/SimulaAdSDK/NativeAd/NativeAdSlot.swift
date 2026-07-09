@@ -416,7 +416,10 @@ public struct NativeAdSlot: View {
     @MainActor
     private func watchForMissingHeight() async {
         guard awaitingHeight else { return }
-        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        // Explicit do/catch (not `try?`): the sleep only throws on cancellation (height
+        // arrived / slot left), and `try?`-wrapped awaits in task closures are one of the
+        // shapes miscompiled by Swift 6.1–6.3 (see the task-shape note in TelemetryManager).
+        do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
         guard !Task.isCancelled, awaitingHeight else { return }
         handleLoadFailure()
     }

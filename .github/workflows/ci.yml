@@ -17,6 +17,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Guard against reintroducing the Swift-concurrency shapes that affected
+      # optimizers (Swift 6.1–6.3) miscompile into task-teardown aborts in host
+      # apps ("freed pointer was not the last allocation"). Full rules + history:
+      # .cursor/skills/swift-concurrency-task-shape/SKILL.md
+      - name: Lint concurrency task shapes
+        run: |
+          set -euo pipefail
+          fail=0
+          if grep -rnE 'try\? await' Sources/; then
+            echo '::error::`try? await` is banned in SDK code — use explicit do/catch (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          if grep -rnE 'async let' Sources/; then
+            echo '::error::`async let` is banned in SDK code — use sequential await or a task group (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          exit $fail
+
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:

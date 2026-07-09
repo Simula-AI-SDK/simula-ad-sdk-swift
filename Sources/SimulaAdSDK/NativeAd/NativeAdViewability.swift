@@ -65,18 +65,24 @@ struct NativeAdViewabilityModifier: ViewModifier {
         if fraction >= thresholdFraction {
             // Already counting down? Don't restart — a sustained view must keep its timer running.
             guard dwellTask == nil else { return }
-            dwellTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: UInt64(minVisibleSeconds * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                fired = true
-                dwellTask = nil
-                onImpression(accumulator.finish(now: ProcessInfo.processInfo.systemUptime))
-            }
+            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+            dwellTask = Task { await runDwellTimer() }
         } else {
             // Dropped below threshold before the dwell elapsed → reset the timer (PRD).
             dwellTask?.cancel()
             dwellTask = nil
         }
+    }
+
+    /// Dwell timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runDwellTimer() async {
+        // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+        do { try await Task.sleep(nanoseconds: UInt64(minVisibleSeconds * 1_000_000_000)) } catch { return }
+        guard !Task.isCancelled else { return }
+        fired = true
+        dwellTask = nil
+        onImpression(accumulator.finish(now: ProcessInfo.processInfo.systemUptime))
     }
 
     /// Fraction (0..1) of the slot's area currently within the screen bounds.

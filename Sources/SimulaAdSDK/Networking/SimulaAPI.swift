@@ -1425,7 +1425,8 @@ public final class SimulaAPI: @unchecked Sendable {
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Track Shown
@@ -1442,7 +1443,8 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Track Impression
@@ -1461,7 +1463,8 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Track Click
@@ -1478,7 +1481,8 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Report Ad
@@ -1498,7 +1502,8 @@ public final class SimulaAPI: @unchecked Sendable {
         if let note, !note.isEmpty { body["note"] = note }
         request.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? "{}".data(using: .utf8)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Record Interest
@@ -1517,7 +1522,8 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "PATCH"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
 
-        _ = try? await session.data(for: request)
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
     }
 
     // MARK: - Durable beacon
