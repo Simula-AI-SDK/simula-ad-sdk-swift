@@ -44,28 +44,48 @@ enum CreativeCTARouter {
     ///   `.inlineInstall`) → in-app `SKStoreProductViewController` / `SFSafariViewController`.
     /// - `.external` → leave the app: the App Store app for store links, the default
     ///   browser otherwise (resolving the attribution redirect first for store CTAs).
+    ///
+    /// `storeUrl` is the campaign's raw App Store link (`ios_store_url`). When it carries an app id
+    /// and the destination is `.appstore`, the route is **deterministic**: the store surface opens
+    /// from that id and the MMP tracker (`trackingUrl`) is fired in the background — no dependency
+    /// on the tracker's redirect chain (the same pattern `resolveAppStoreID` uses for SKOverlay).
+    /// `nil`/id-less falls back to redirect-chain resolution.
     static func open(
         trackingUrl: String?,
         destination: AdDestination,
         storeOpen: StoreOpen = .skstoreproduct,
+        storeUrl: String? = nil,
         attribution: AdAttribution? = nil
     ) {
         guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
+            // No tracker on the serve — a raw store link still gives the CTA somewhere to go
+            // (previously a silent no-op). No tracker means no background click to fire.
+            if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
+                if storeOpen == .external, let storeURL = storeUrl.flatMap(URL.init(string:)) {
+                    UIApplication.shared.open(storeURL)
+                } else {
+                    presentStoreProduct(appID: appID, attribution: attribution)
+                }
+            }
             return
         }
 
         if storeOpen == .external {
             // `.external` leaves the app to the App Store / browser, which StoreKit attribution tokens
             // can't ride on — they apply only to the in-app store sheet below.
-            openExternally(initialURL: url, destination: destination)
+            openExternally(initialURL: url, destination: destination, storeUrl: storeUrl)
             return
         }
 
         switch destination {
         case .appstore:
-            // If the tracking URL is already an App Store URL, present the sheet
-            // directly; otherwise resolve the attribution redirect chain first.
+            // If the tracking URL is already an App Store URL, present the sheet directly.
+            // Otherwise prefer the deterministic route (store id from the raw `ios_store_url`,
+            // tracker fired in the background); only without one resolve the redirect chain.
             if let appID = appStoreID(from: url) {
+                presentStoreProduct(appID: appID, attribution: attribution)
+            } else if let appID = appStoreID(fromString: storeUrl) {
+                fireClickTracker(url)
                 presentStoreProduct(appID: appID, attribution: attribution)
             } else {
                 resolveAndRoute(url: url, attribution: attribution)
@@ -78,6 +98,49 @@ enum CreativeCTARouter {
                 UIApplication.shared.open(url)
             }
         }
+    }
+
+    /// Routes a user-activated click-through from inside a creative WebView (the game iframe's
+    /// `window.open(TRACKING_URL)` / cross-domain CTA), given the serve's routing context.
+    ///
+    /// `url` is the URL the creative navigated to — the macro-stamped click tracker baked into the
+    /// creative at render time — and is always the click that's registered with the MMP. When the
+    /// serve supplied a raw `ios_store_url` (`storeUrl`) and the destination is `.appstore`, the
+    /// route is deterministic: fire `url` in the background and present the in-app store sheet from
+    /// the store link's app id. Without that context (older payloads, previews, the declarative
+    /// menu) it falls back to today's redirect-chain resolution, byte-for-byte.
+    static func routeCreativeTap(
+        url: URL,
+        destination: AdDestination,
+        storeUrl: String?,
+        attribution: AdAttribution? = nil
+    ) {
+        // A tap straight onto a store URL needs no tracker fire — it IS the destination.
+        if let appID = appStoreID(from: url) {
+            presentStoreProduct(appID: appID, attribution: attribution)
+            return
+        }
+        if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
+            fireClickTracker(url)
+            presentStoreProduct(appID: appID, attribution: attribution)
+            return
+        }
+        resolveAndRoute(url: url, attribution: attribution)
+    }
+
+    /// Fires the MMP click tracker in the background (fire-and-forget GET), used when the store
+    /// surface is opened deterministically instead of by navigating the tracker's redirect chain.
+    /// Uses the same Safari-style-UA session configuration as `RedirectResolver`, so the click
+    /// fingerprints for probabilistic attribution exactly like a resolved click. Redirects are
+    /// followed by default; a hop into a non-http scheme (`itms-appss://`) just ends the task.
+    nonisolated static func fireClickTracker(_ url: URL) {
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" else { return }
+        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration())
+        let task = session.dataTask(with: URLRequest(url: url)) { _, _, _ in
+            session.finishTasksAndInvalidate()
+        }
+        task.resume()
     }
 
     // MARK: - App Store id extraction
@@ -105,6 +168,13 @@ enum CreativeCTARouter {
         return String(string[idRange])
     }
 
+    /// String-flavored variant of `appStoreID(from:)` for optional raw links (e.g. the serve's
+    /// `ios_store_url`). `nil`/empty/unparseable → nil.
+    nonisolated static func appStoreID(fromString urlString: String?) -> String? {
+        guard let urlString, !urlString.isEmpty, let url = URL(string: urlString) else { return nil }
+        return appStoreID(from: url)
+    }
+
     /// Pure regex extraction — `nonisolated` so the WKWebView navigation-policy
     /// decision (and any non-main context) can call it directly without a
     /// `MainActor.assumeIsolated` trap.
@@ -128,15 +198,28 @@ enum CreativeCTARouter {
     // MARK: - App Store id resolution (for SKOverlay)
 
     /// Resolves the advertised app's numeric App Store id (adamId) for `SKOverlay.AppConfiguration`.
-    /// Tries the tracking URL directly; if it's an http(s) attribution tracker for a store CTA,
-    /// follows the redirect chain (the same `RedirectResolver` the CTA uses) to the final App Store
-    /// URL. Calls back with `nil` when none can be resolved (the overlay then safely no-ops).
-    /// The completion is always delivered on the main thread.
+    /// Prefers the serve's raw store link (`storeUrl` — deterministic, the SKOverlay click still
+    /// fires in the background), then the tracking URL directly; an http(s) attribution tracker for
+    /// a store CTA falls back to following the redirect chain (the same `RedirectResolver` the CTA
+    /// uses) to the final App Store URL. Calls back with `nil` when none can be resolved (the
+    /// overlay then safely no-ops). The completion is always delivered on the main thread.
     static func resolveAppStoreID(
         trackingUrl: String?,
         destination: AdDestination,
+        storeUrl: String? = nil,
         completion: @escaping (String?) -> Void
     ) {
+        // Deterministic path: the raw store link carries the id — no redirect resolution needed.
+        // The MMP click (flagged `is_skoverlay=true`, matching the resolver path below) still fires
+        // so the SKOverlay engagement is registered.
+        if let appID = appStoreID(fromString: storeUrl) {
+            if let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl),
+               appStoreID(from: url) == nil {
+                fireClickTracker(appendingQueryItem(url, name: "is_skoverlay", value: "true"))
+            }
+            completion(appID)
+            return
+        }
         guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
             completion(nil)
             return
@@ -322,15 +405,25 @@ enum CreativeCTARouter {
 
     /// Opens the destination externally (leaving the app) for `store_open == .external`.
     /// Direct App Store / non-http links and web destinations open immediately; an
-    /// http(s) attribution tracker for a store CTA is resolved through its redirect chain
-    /// first so we land on the real App Store page rather than bouncing through the tracker.
-    static func openExternally(initialURL: URL, destination: AdDestination) {
+    /// http(s) attribution tracker for a store CTA is opened deterministically when the serve
+    /// carries a raw store link (`storeUrl` — tracker fired in the background, store opened
+    /// directly), else resolved through its redirect chain so we land on the real App Store
+    /// page rather than bouncing through the tracker.
+    static func openExternally(initialURL: URL, destination: AdDestination, storeUrl: String? = nil) {
         let scheme = initialURL.scheme?.lowercased() ?? ""
         let isHTTP = scheme == "http" || scheme == "https"
 
         // Already a store / custom-scheme link, or a plain web destination — open as-is.
         if appStoreID(from: initialURL) != nil || !isHTTP || destination == .web {
             UIApplication.shared.open(initialURL)
+            return
+        }
+
+        // Deterministic external store open: fire the tracker in the background and jump straight
+        // to the App Store from the raw store link — no redirect-chain dependency.
+        if appStoreID(fromString: storeUrl) != nil, let storeURL = storeUrl.flatMap(URL.init(string:)) {
+            fireClickTracker(initialURL)
+            UIApplication.shared.open(storeURL)
             return
         }
 

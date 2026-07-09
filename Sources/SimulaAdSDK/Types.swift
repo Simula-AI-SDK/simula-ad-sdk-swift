@@ -487,18 +487,20 @@ public enum ClosePosition: Sendable, Equatable {
     }
 }
 
-/// How a CTA tap opens the advertiser's store. Unknown/missing → `.external`. `inline_install`
-/// (Android-only) is accepted and routed to each platform's native store at the router. Legacy
-/// `external_browser`/`sk_store_product`/`sk_overlay` aliased. Retained from v1; the v2 payload
-/// omits `store_open`, so it simply defaults (CTA store path unchanged — SKStoreProductVC stays on).
+/// How a CTA tap opens the advertiser's store. Unknown/missing → `.skstoreproduct` (the in-app
+/// store sheet) — the v2 payload omits `store_open` entirely, and the documented intent is that
+/// the SKStoreProductVC path stays on; leaving the app is opt-in via an explicit `external`
+/// (legacy `external_browser` aliased). `inline_install` (Android-only) is accepted and routed to
+/// each platform's native store at the router. Legacy `sk_store_product`/`sk_overlay` aliased.
 public enum StoreOpen: Sendable, Equatable {
     case external, skstoreproduct, inlineInstall
 
     static func from(_ raw: String?) -> StoreOpen {
         switch normalizeBehaviorToken(raw) {
-        case "skstoreproduct", "sk_store_product", "sk_overlay": return .skstoreproduct
+        case "external", "external_browser": return .external
         case "inline_install": return .inlineInstall
-        default: return .external
+        // skstoreproduct / sk_store_product / sk_overlay, plus missing/unknown → in-app sheet.
+        default: return .skstoreproduct
         }
     }
 }
@@ -870,7 +872,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
 
     public init(
         close: CloseBehavior = CloseBehavior(),
-        storeOpen: StoreOpen = .external,
+        storeOpen: StoreOpen = .skstoreproduct,
         storePrompt: StorePrompt? = nil,
         skoverlay: SKOverlayConfig? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil

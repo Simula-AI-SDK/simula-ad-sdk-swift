@@ -429,12 +429,14 @@ public final class SimulaInterstitialAd {
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
                 // CLOSED fires from onAllClosed — after the LAST fallback screen, not the playable close.
                 self.presentFallbackAds(
+                    response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
                         CreativeCTARouter.open(
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                            storeUrl: response.iosStoreUrl,
                             attribution: response.skanAttribution
                         )
                     },
@@ -667,6 +669,7 @@ public final class SimulaInterstitialAd {
     /// `dismiss`) — no fetch-after-close gap and no handoff flash. If the user closed before the
     /// prefetch finished (rare), it awaits and presents on the next runloop. Empty → nothing shown.
     private func presentFallbackAds(
+        response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -677,12 +680,12 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             Task { [weak self] in
                 let ads = await prefetch.value
                 guard let self else { onAllClosed(); return }
-                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+                self.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
         } else {
             onAllClosed()
@@ -693,8 +696,11 @@ public final class SimulaInterstitialAd {
     }
 
     /// Presents the fallback ad window for `ads` (fires `onAllClosed` immediately if empty). Best-effort.
+    /// `response` threads the serve's CTA routing context (destination / raw store link /
+    /// attribution) into the end-screen WebViews for the deterministic store route.
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
+        response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -704,6 +710,9 @@ public final class SimulaInterstitialAd {
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) }

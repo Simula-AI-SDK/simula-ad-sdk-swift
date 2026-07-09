@@ -30,12 +30,21 @@ final class FallbackAdPresenter {
     private var autoRedirectFired = false
     /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
     private var onAdClick: (() -> Void)?
+    /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
+    /// opens deterministically (in-app store sheet from the raw `ios_store_url` + background tracker
+    /// fire) instead of resolving the tracker's redirect chain. Defaults keep today's behavior.
+    private var ctaDestination: AdDestination = .appstore
+    private var ctaStoreUrl: String?
+    private var attribution: AdAttribution?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onClose` is then never called).
     @discardableResult
     func present(
         ads: [FallbackAd],
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil,
+        attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
@@ -45,6 +54,9 @@ final class FallbackAdPresenter {
         self.ads = ads
         self.index = 0
         self.onClose = onClose
+        self.ctaDestination = ctaDestination
+        self.ctaStoreUrl = ctaStoreUrl
+        self.attribution = attribution
         self.autoStoreRedirect = autoStoreRedirect
         self.onAutoStoreRedirect = onAutoStoreRedirect
         self.onAdClick = onAdClick
@@ -83,7 +95,10 @@ final class FallbackAdPresenter {
             onClose: { [weak self] in self?.advance() },
             adId: ad.adId,
             html: ad.html,
-            onAdClick: { [weak self] in self?.onAdClick?() }
+            onAdClick: { [weak self] in self?.onAdClick?() },
+            ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl,
+            attribution: attribution
         )
         let hosting = UIHostingController(rootView: root)
         hosting.view.backgroundColor = .black

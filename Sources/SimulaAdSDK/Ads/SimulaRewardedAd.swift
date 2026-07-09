@@ -326,6 +326,7 @@ public final class SimulaRewardedAd {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+            storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onClick: { [weak self] in
@@ -359,12 +360,14 @@ public final class SimulaRewardedAd {
                 // user completing the WHOLE ad unit (playable + every fallback screen), not just
                 // closing the playable. With no fallback screens it fires immediately on close.
                 self.presentFallbackAds(
+                    response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
                         CreativeCTARouter.open(
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                            storeUrl: response.iosStoreUrl,
                             attribution: response.skanAttribution
                         )
                     },
@@ -627,8 +630,10 @@ public final class SimulaRewardedAd {
     /// Presents the prefetched fallback ad screens on close. Synchronous when the prefetch has
     /// landed (the common case), so the fallback window is up before the minigame window is torn
     /// down (see the presenter's `dismiss`) — no handoff flash; awaits only if the user closed
-    /// before the prefetch finished. Empty → nothing shown.
+    /// before the prefetch finished. Empty → nothing shown. `response` carries the serve's CTA
+    /// routing context (destination / raw store link / attribution) into the end-screen WebViews.
     private func presentFallbackAds(
+        response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -639,12 +644,12 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             Task { [weak self] in
                 let ads = await prefetch.value
                 guard let self else { onAllClosed(); return }
-                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+                self.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
         } else {
             // No prefetch ran (e.g. empty impression id) — nothing to show, so the ad unit is
@@ -659,6 +664,7 @@ public final class SimulaRewardedAd {
     /// Presents the fallback ad window for `ads` (no-op if empty). Best-effort.
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
+        response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -669,6 +675,9 @@ public final class SimulaRewardedAd {
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) }

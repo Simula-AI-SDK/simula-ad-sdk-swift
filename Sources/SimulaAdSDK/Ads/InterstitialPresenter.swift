@@ -363,6 +363,10 @@ private struct CreativeInterstitialView: View {
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
             attribution: response.skanAttribution,
+            // The serve's routing context: an in-creative CTA opens the store deterministically
+            // (in-app sheet from the raw ios_store_url + background tracker fire) when available.
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
             telemetryAdFormat: "interstitial"
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -536,6 +540,7 @@ private struct CreativeInterstitialView: View {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: storeOpen,
+            storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution
         )
     }
@@ -557,7 +562,8 @@ private struct CreativeInterstitialView: View {
         guard #available(iOS 14.0, *) else { return }
         CreativeCTARouter.resolveAppStoreID(
             trackingUrl: response.trackingUrl,
-            destination: response.destinationKind
+            destination: response.destinationKind,
+            storeUrl: response.iosStoreUrl
         ) { id in
             resolvedAppID = id
             if config.timing == .duringPlay || config.timing == .delayed {

@@ -720,7 +720,8 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(b.close.treatment, .hidden)
         XCTAssertEqual(b.close.position, .topRight)
         XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
-        XCTAssertEqual(b.storeOpen, .external)
+        // Unknown/missing store_open falls back to the in-app store sheet (documented default).
+        XCTAssertEqual(b.storeOpen, .skstoreproduct)
     }
 
     func testAdBehaviorNegativeDelayClampsToZero() throws {
