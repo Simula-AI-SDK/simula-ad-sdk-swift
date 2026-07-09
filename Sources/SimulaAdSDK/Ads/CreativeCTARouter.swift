@@ -211,8 +211,10 @@ enum CreativeCTARouter {
     ) {
         // Deterministic path: the raw store link carries the id — no redirect resolution needed.
         // The MMP click (flagged `is_skoverlay=true`, matching the resolver path below) still fires
-        // so the SKOverlay engagement is registered.
-        if let appID = appStoreID(fromString: storeUrl) {
+        // so the SKOverlay engagement is registered. Gated on an `.appstore` destination — a web
+        // campaign that happens to carry an ios_store_url must not surface SKOverlay (the resolver
+        // fallback below returns nil for `.web`, and this branch must agree).
+        if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
             if let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl),
                appStoreID(from: url) == nil {
                 fireClickTracker(appendingQueryItem(url, name: "is_skoverlay", value: "true"))
