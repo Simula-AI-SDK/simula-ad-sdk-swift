@@ -522,23 +522,35 @@ final class TelemetryManager: @unchecked Sendable {
         return env
     }
 
+    // Task-shape note: every `Task {}` in this SDK keeps its closure body to a single call
+    // into a named method, with no `try?`-wrapped awaits inside the closure — affected Swift
+    // toolchains miscompile richer shapes into task-teardown aborts in host apps. Before
+    // changing any Task closure, read .cursor/skills/swift-concurrency-task-shape/SKILL.md.
+
     private func scheduleTimedFlush() {
         guard claimFlushSchedule() else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: UInt64(self.flushInterval * 1_000_000_000))
-            self.releaseFlushSchedule()
-            await self.flush()
-        }
+        Task { [weak self] in await self?.timedFlush() }
+    }
+
+    /// Timed-flush task body (named method — see the task-shape note above).
+    private func timedFlush() async {
+        // These tasks are never cancelled, so a sleep error is impossible in practice;
+        // swallow-and-continue preserves the prior `try?` semantics without putting a
+        // `try?`-wrapped await inside a Task closure.
+        do { try await Task.sleep(nanoseconds: UInt64(flushInterval * 1_000_000_000)) } catch {}
+        releaseFlushSchedule()
+        await flush()
     }
 
     private func scheduleRetry() {
         let rc = currentRetryCount()
-        Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: UInt64(self.backoff(rc) * 1_000_000_000))
-            await self.flush()
-        }
+        Task { [weak self] in await self?.retryFlush(after: rc) }
+    }
+
+    /// Retry-flush task body (named method — see the task-shape note above).
+    private func retryFlush(after retryCount: Int) async {
+        do { try await Task.sleep(nanoseconds: UInt64(backoff(retryCount) * 1_000_000_000)) } catch {}
+        await flush()
     }
 
     // Synchronous lock-guarded accessors so the schedulers' async closures never touch NSLock.

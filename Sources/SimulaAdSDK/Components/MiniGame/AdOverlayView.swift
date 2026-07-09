@@ -236,7 +236,8 @@ public struct AdOverlayView: View {
         countdownTask = Task { @MainActor in
             var lastTick = ProcessInfo.processInfo.systemUptime
             while accumulatedMs < totalMs {
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
                 if Task.isCancelled { return }
                 let now = ProcessInfo.processInfo.systemUptime
                 accumulatedMs += (now - lastTick) * 1000

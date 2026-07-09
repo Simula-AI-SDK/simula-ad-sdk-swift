@@ -404,7 +404,8 @@ private struct CreativeInterstitialView: View {
             var accruedMs: Double = 0
             var lastTick = ProcessInfo.processInfo.systemUptime
             while accruedMs < fullscreenImpressionDelayMs {
-                try? await Task.sleep(nanoseconds: impressionTickNanos)
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
                 if Task.isCancelled { return }
                 let now = ProcessInfo.processInfo.systemUptime
                 let delta = (now - lastTick) * 1000
@@ -452,7 +453,8 @@ private struct CreativeInterstitialView: View {
                 var left = Int(ceil(remaining))
                 closeRemaining = left
                 while left > 0 {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
                     if Task.isCancelled { return }
                     left -= 1
                     closeRemaining = left
@@ -461,7 +463,8 @@ private struct CreativeInterstitialView: View {
                 // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
                 let sleepNs = remaining * 1_000_000_000
                 if sleepNs.isFinite, sleepNs > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(sleepNs))
+                    // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                    do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
                 }
             }
             if Task.isCancelled { return }

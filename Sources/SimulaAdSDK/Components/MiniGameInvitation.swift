@@ -322,7 +322,8 @@ public struct MiniGameInvitation: View {
     private func setupAutoClose() {
         guard let duration = autoCloseDuration, duration > 0 else { return }
         autoCloseTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000)) // ms to ns
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000)) } catch { return } // ms to ns
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 handleDismiss()

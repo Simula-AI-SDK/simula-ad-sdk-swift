@@ -361,7 +361,8 @@ private struct RewardedGameView: View {
         }
         timerTask = Task { @MainActor in
             while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
                 if Task.isCancelled { return }
                 elapsedPlayTime += 1
                 // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
@@ -386,7 +387,8 @@ private struct RewardedGameView: View {
             var accruedMs: Double = 0
             var lastTick = ProcessInfo.processInfo.systemUptime
             while accruedMs < fullscreenImpressionDelayMs {
-                try? await Task.sleep(nanoseconds: impressionTickNanos)
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
                 if Task.isCancelled { return }
                 let now = ProcessInfo.processInfo.systemUptime
                 let delta = (now - lastTick) * 1000
