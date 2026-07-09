@@ -117,6 +117,11 @@ public enum SimulaAds {
         _ = SimulaUserAgent.value
         _ = SimulaDeviceId.value
 
+        // Begin device-signal collection so the `X-*` device headers are populated before the first
+        // request. Idempotent (also started by `SimulaProvider.init` below); starting it here keeps
+        // the first snapshot off the critical path.
+        SimulaDeviceSignals.shared.start()
+
         let provider = SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,
@@ -181,6 +186,68 @@ public enum SimulaAds {
     /// telemetry reports it, and a live session is PATCHed server-side when consent allows.
     public static func updatePrimaryUserID(_ id: String?) {
         shared?.updatePrimaryUserID(id)
+    }
+
+    /// Checks whether the user has hit their frequency cap for `adUnitId` — a read-only check
+    /// against the backend that records no impression (PRD). Publishers can call this before
+    /// rendering an ad-gated surface to skip it entirely when no ad would serve.
+    ///
+    /// - Parameters:
+    ///   - adUnitId: required.
+    ///   - primaryUserID: optional; falls back to the SDK's current PPID (set at `initialize` or
+    ///     via `updatePrimaryUserID`) when omitted, and ultimately to the backend's IP/device/
+    ///     session signals when neither is available.
+    /// - Returns: `true` if the cap has been reached (skip the surface); `false` if the user is
+    ///   still eligible, before `initialize`, or on any network/server failure (fails open so a
+    ///   transport hiccup can never hide an ad surface that would otherwise have served).
+    ///
+    /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
+    /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
+    public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
+        guard let provider = shared, !adUnitId.isEmpty else { return false }
+        // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback
+        // tracks the provider's live PPID (resolved below, after the session await).
+        let explicitPPID = (primaryUserID?.isEmpty == false) ? primaryUserID : nil
+        // Capture the local day at the START of the check and attribute the result to it. The network
+        // round-trip can cross local midnight; stamping the cache with the completion time would file
+        // a prior-day capped result under the new day and keep hiding surfaces after the backend's
+        // daily reset. The start time is the day the result actually reflects.
+        let now = Date()
+
+        // Warm/ensure the session, then read the effective ppid, session id, and session identity
+        // TOGETHER in one synchronous main-actor step (no await between the reads). Resolving the ppid
+        // here rather than at entry is what keeps this call coherent: ensureSession() suspends, and a
+        // mid-call updatePrimaryUserID (which runs on the same main actor) can switch the active user
+        // during that suspension. Reading it afterwards means the cache lookup, the consistentSessionId
+        // identity gate, the network request, and markCapped all use one snapshot of the same user
+        // instead of a value pinned before the switch — this matters for the SDK fallback, where an
+        // omitted primaryUserID would otherwise be checked (and cached) against a now-stale user.
+        // Pairing sessionId with sessionUserID in the same step is likewise required: a coalesced
+        // waiter can observe the id before the creator sets the identity, and a consent-driven resync
+        // can clear the id after ensureSession() returned it. Only attach the id when it represents the
+        // same identity we're checking; otherwise drop it and let the backend fall back to the
+        // ppid + device-id/IP signals.
+        await provider.ensureSession()
+        let ppid = explicitPPID ?? provider.primaryUserID
+        let sessionId = consistentSessionId(provider.sessionId, sessionUserID: provider.sessionUserID, ppid: ppid)
+
+        if FrequencyCapCache.shared.isCapped(adUnitId: adUnitId, ppid: ppid, now: now) { return true }
+
+        let capped = await SimulaAPI.shared.checkFrequencyCap(
+            apiKey: provider.apiKey,
+            adUnitId: adUnitId,
+            ppid: ppid,
+            sessionId: sessionId
+        )
+        if capped { FrequencyCapCache.shared.markCapped(adUnitId: adUnitId, ppid: ppid, now: now) }
+        return capped
+    }
+
+    /// Returns `sessionId` only when the session's identity (`sessionUserID`) matches the `ppid`
+    /// being checked; otherwise nil (drop the stale session). Pure/testable; `nonisolated` so it can
+    /// be exercised without the main actor. Both-nil (anonymous) counts as a match.
+    nonisolated static func consistentSessionId(_ sessionId: String?, sessionUserID: String?, ppid: String?) -> String? {
+        sessionUserID == ppid ? sessionId : nil
     }
 
     #if os(iOS)

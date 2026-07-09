@@ -661,6 +661,26 @@ final class VisibilityRelay {
         let r = min(1, max(0, ratio))
         if last >= 0, abs(r - last) < 0.01 { return }
         last = r
+        push(r)
+    }
+
+    /// Deterministic foreground wake-up (call on `UIApplication.willEnterForegroundNotification`
+    /// while the slot is mounted). The creative (`character_ad.html`) can freeze mid-video/mid-typing
+    /// when its WKWebView's content process was suspended while backgrounded, and its own
+    /// `visibilitychange`/`pageshow`/`focus` listeners are not guaranteed to fire across that
+    /// suspend. `evaluateJavaScript` reaches the page regardless, so this calls the creative's
+    /// `onAppForeground` self-heal directly, then re-arms the dedupe and re-pushes the last known
+    /// ratio — the on-screen geometry is typically unchanged from before backgrounding, so without
+    /// resetting `last` the creative would never receive another `onVisibility` telling it the app
+    /// (and thus playback) is live again.
+    func resyncOnForeground() {
+        webView?.evaluateJavaScript("window.onAppForeground&&window.onAppForeground()", completionHandler: nil)
+        let previous = last
+        last = -1
+        if previous >= 0 { report(previous) }
+    }
+
+    private func push(_ r: CGFloat) {
         let s = String(format: "%.2f", r)
         webView?.evaluateJavaScript("window.onVisibility&&window.onVisibility(\(s))", completionHandler: nil)
     }
