@@ -190,29 +190,10 @@ public final class SimulaProvider: ObservableObject {
         if let sessionTask { return await sessionTask.value }
 
         let snapshot = SimulaPrivacy.shared.currentSnapshot
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        // `ppidStore.current` is read when the task runs (not at scheduling), matching the prior body.
         let task = Task<String?, Never> { [api, apiKey, devMode, ppidStore] in
-            // Emit session_created/session_failed once per creation attempt (callers coalesce onto
-            // this single task). Best-effort telemetry; never affects session creation.
-            let startNanos = DispatchTime.now().uptimeNanoseconds
-            func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
-            do {
-                let id = try await api.createSession(
-                    apiKey: apiKey,
-                    devMode: devMode,
-                    primaryUserID: ppidStore.current,
-                    privacy: snapshot
-                )
-                let resolved = (id?.isEmpty == false) ? id : nil
-                if resolved != nil {
-                    Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
-                } else {
-                    Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
-                }
-                return resolved
-            } catch {
-                Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
-                return nil
-            }
+            await Self.runSessionCreation(api: api, apiKey: apiKey, devMode: devMode, ppid: ppidStore.current, snapshot: snapshot)
         }
         sessionTask = task
 
@@ -223,6 +204,41 @@ public final class SimulaProvider: ObservableObject {
             sessionId = id
         }
         return sessionId
+    }
+
+    /// Session-creation task body (named method — see the task-shape note in TelemetryManager).
+    /// Emits session_created/session_failed once per creation attempt (callers coalesce onto the
+    /// single task). Best-effort telemetry; never affects session creation. Static so the task
+    /// keeps the prior capture semantics (no strong `self`). `@MainActor` preserves the closure's
+    /// inherited isolation.
+    @MainActor
+    private static func runSessionCreation(
+        api: SimulaAPI,
+        apiKey: String,
+        devMode: Bool,
+        ppid: String?,
+        snapshot: ConsentSnapshot
+    ) async -> String? {
+        let startNanos = DispatchTime.now().uptimeNanoseconds
+        func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
+        do {
+            let id = try await api.createSession(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: ppid,
+                privacy: snapshot
+            )
+            let resolved = (id?.isEmpty == false) ? id : nil
+            if resolved != nil {
+                Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
+            } else {
+                Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
+            }
+            return resolved
+        } catch {
+            Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
+            return nil
+        }
     }
 
     /// Invalidates the current session and recreates it so the backend sees the

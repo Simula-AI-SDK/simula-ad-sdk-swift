@@ -359,19 +359,24 @@ private struct RewardedGameView: View {
         if remaining > 0 {
             withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
         }
-        timerTask = Task { @MainActor in
-            while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                if Task.isCancelled { return }
-                elapsedPlayTime += 1
-                // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-                if elapsedPlayTime >= Double(gateSeconds) / 2 {
-                    withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
-                }
-                if elapsedPlayTime >= Double(gateSeconds) {
-                    rewardEarned = true
-                }
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        timerTask = Task { await runPlayTimer() }
+    }
+
+    /// Play-to-earn timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runPlayTimer() async {
+        while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+            if Task.isCancelled { return }
+            elapsedPlayTime += 1
+            // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
+            if elapsedPlayTime >= Double(gateSeconds) / 2 {
+                withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+            }
+            if elapsedPlayTime >= Double(gateSeconds) {
+                rewardEarned = true
             }
         }
     }
@@ -383,22 +388,27 @@ private struct RewardedGameView: View {
     /// so a backgrounded playable can't accrue the delay. Cancelled in `.onDisappear`.
     private func startImpressionTimer() {
         guard !impressionFired, impressionTask == nil else { return }
-        impressionTask = Task { @MainActor in
-            var accruedMs: Double = 0
-            var lastTick = ProcessInfo.processInfo.systemUptime
-            while accruedMs < fullscreenImpressionDelayMs {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
-                if Task.isCancelled { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                let delta = (now - lastTick) * 1000
-                lastTick = now
-                if appForegrounded && !storeSheetPresented { accruedMs += delta }
-            }
-            if Task.isCancelled || impressionFired { return }
-            impressionFired = true
-            onImpression()
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        impressionTask = Task { await runImpressionTimer() }
+    }
+
+    /// Impression timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runImpressionTimer() async {
+        var accruedMs: Double = 0
+        var lastTick = ProcessInfo.processInfo.systemUptime
+        while accruedMs < fullscreenImpressionDelayMs {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
+            if Task.isCancelled { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let delta = (now - lastTick) * 1000
+            lastTick = now
+            if appForegrounded && !storeSheetPresented { accruedMs += delta }
         }
+        if Task.isCancelled || impressionFired { return }
+        impressionFired = true
+        onImpression()
     }
 
     /// Runs the play-to-earn timer only while foreground-active and no in-app store sheet covers the

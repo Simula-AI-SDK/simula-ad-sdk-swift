@@ -137,15 +137,21 @@ final class CoverImageCache: @unchecked Sendable {
         }
 
         let box = InFlight(waiters: 1)
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         let task = Task<CoverImage, Never> { [weak self] in
-            guard let self else { return .failed }
-            let result = await self.performLoad(url: url)
-            self.clearInFlight(url, ifMatches: box)
-            return result
+            await self?.loadAndClear(url: url, box: box) ?? .failed
         }
         box.task = task
         inFlight[url] = box
         return task
+    }
+
+    /// Shared-download task body (named method — see the task-shape note in TelemetryManager):
+    /// download + decode, then retire the in-flight entry.
+    private func loadAndClear(url: String, box: InFlight) async -> CoverImage {
+        let result = await performLoad(url: url)
+        clearInFlight(url, ifMatches: box)
+        return result
     }
 
     /// Clears the in-flight entry for `url` once its download finishes, but only
