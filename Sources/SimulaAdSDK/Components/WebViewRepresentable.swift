@@ -326,6 +326,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// `.web` opens the link directly — falling back to `fallback` (the URL the creative itself
         /// navigated to) when the serve carried no tracker.
         ///
+        /// The serve's raw store link (`ctaStoreUrl`) makes both branches deterministic, exactly like
+        /// the interstitial/rewarded WebViews: the store surface opens from its app id while the
+        /// tracker fires in the background, instead of depending on the tracker's redirect chain.
+        ///
         /// SKAN parity with interstitial/rewarded: when the serve carries usable `skan_attribution`
         /// tokens AND the CTA is an App Store destination, the click instead routes through the **in-app**
         /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
@@ -335,20 +339,22 @@ struct WebViewRepresentable: UIViewRepresentable {
             let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
             let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
             let destination = ctaDestination
+            let storeUrl = ctaStoreUrl
             let attribution = self.attribution
             Task { @MainActor in
                 if destination == .appstore, attribution?.hasUsableTokens == true {
                     // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
-                    // imperative formats). Prefers the tracker (router resolves it to the store), else
-                    // the in-creative URL.
+                    // imperative formats). Prefers the tracker (router resolves it to the store —
+                    // deterministically via the raw store link when present), else the in-creative URL.
                     CreativeCTARouter.open(
                         trackingUrl: (trackingURL ?? fallback).absoluteString,
                         destination: destination,
                         storeOpen: .skstoreproduct,
+                        storeUrl: storeUrl,
                         attribution: attribution
                     )
                 } else if let trackingURL {
-                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
+                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination, storeUrl: storeUrl)
                 } else {
                     UIApplication.shared.open(fallback)
                 }

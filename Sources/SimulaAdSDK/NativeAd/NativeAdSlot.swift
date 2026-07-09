@@ -158,8 +158,10 @@ public struct NativeAdSlot: View {
                     attribution: response.skanAttribution,
                     externalClickOnly: true,
                     // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).
+                    // The raw store link makes the App Store route deterministic (see `openNativeCTA`).
                     ctaTrackingUrl: response.trackingUrl,
                     ctaDestination: response.destinationKind,
+                    ctaStoreUrl: response.iosStoreUrl,
                     reportsContentHeight: true,
                     telemetryAdFormat: response.adFormat,
                     visibilityRelay: visibilityRelay

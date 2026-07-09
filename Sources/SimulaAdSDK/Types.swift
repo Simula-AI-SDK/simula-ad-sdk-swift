@@ -1137,6 +1137,10 @@ public struct NativeAdResponse: Decodable, Sendable {
     /// MMP click-tracking URL the CTA opens (attribution-preserving); nil when the serve carries no
     /// tracker (the SDK then falls back to the URL the creative itself navigates to).
     public let trackingUrl: String?
+    /// Raw, unwrapped App Store link (`ios_store_url`) — parity with the interstitial/rewarded
+    /// responses. Drives the deterministic CTA route for the native card (see `openNativeCTA`);
+    /// nil when the campaign has no raw store link.
+    public let iosStoreUrl: String?
     /// Raw mountable-creative fields; use ``iframeURL`` / ``renderedHTML`` for the trimmed accessors.
     public let iframeUrl: String?
     public let renderedHtml: String?
@@ -1161,6 +1165,7 @@ public struct NativeAdResponse: Decodable, Sendable {
         case bidAmt = "bid_amt"
         case destination
         case trackingUrl = "tracking_url"
+        case iosStoreUrl = "ios_store_url"
         case iframeUrl = "iframe_url"
         case renderedHtml = "rendered_html"
         case skanAttribution = "skan_attribution"
@@ -1174,6 +1179,7 @@ public struct NativeAdResponse: Decodable, Sendable {
         bidAmt = (try c.decodeIfPresent(Double.self, forKey: .bidAmt)) ?? 0
         destination = (try c.decodeIfPresent(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         trackingUrl = try c.decodeIfPresent(String.self, forKey: .trackingUrl)
+        iosStoreUrl = try c.decodeIfPresent(String.self, forKey: .iosStoreUrl)
         iframeUrl = try c.decodeIfPresent(String.self, forKey: .iframeUrl)
         renderedHtml = try c.decodeIfPresent(String.self, forKey: .renderedHtml)
         skanAttribution = try c.decodeIfPresent(AdAttribution.self, forKey: .skanAttribution)
@@ -1188,6 +1194,7 @@ public struct NativeAdResponse: Decodable, Sendable {
         renderedHtml: String? = nil,
         destination: String = "appstore",
         trackingUrl: String? = nil,
+        iosStoreUrl: String? = nil,
         bidAmt: Double = 0,
         skanAttribution: AdAttribution? = nil
     ) {
@@ -1197,6 +1204,7 @@ public struct NativeAdResponse: Decodable, Sendable {
         self.bidAmt = bidAmt
         self.destination = destination
         self.trackingUrl = trackingUrl
+        self.iosStoreUrl = iosStoreUrl
         self.iframeUrl = iframeUrl
         self.renderedHtml = renderedHtml
         self.skanAttribution = skanAttribution
