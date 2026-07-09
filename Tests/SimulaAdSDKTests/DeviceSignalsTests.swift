@@ -45,26 +45,26 @@ final class DeviceSignalsTests: XCTestCase {
     func testBuildHeadersEmitsEveryAvailableSignal() {
         let headers = SimulaDeviceSignals.buildHeaders(
             timezone: "America/Sao_Paulo",
-            storageFreeBytes: 123_456,
             memoryFreeBytes: 654_321,
             batteryLevel: 0.87,
             batteryStateRaw: 2,
             outputVolume: 0.5
         )
         XCTAssertEqual(headers["X-Timezone"], "America/Sao_Paulo")
-        XCTAssertEqual(headers["X-Storage-Free"], "123456")
         XCTAssertEqual(headers["X-Memory-Free"], "654321")
         XCTAssertEqual(headers["X-Battery-Level"], "87")
         XCTAssertEqual(headers["X-Battery-State"], "charging")
         XCTAssertEqual(headers["X-Volume"], "50")
         // iOS has no public silent-switch API, so no ringer-mode header is emitted.
         XCTAssertNil(headers["X-Ringer-Mode"])
+        // Free-disk-space is a required-reason API with no off-device-sending reason, so iOS never
+        // emits X-Storage-Free (Android only).
+        XCTAssertNil(headers["X-Storage-Free"])
     }
 
     func testBuildHeadersOmitsUnavailableSignals() {
         let headers = SimulaDeviceSignals.buildHeaders(
             timezone: "",
-            storageFreeBytes: -1,
             memoryFreeBytes: nil,
             batteryLevel: -1,
             batteryStateRaw: nil,

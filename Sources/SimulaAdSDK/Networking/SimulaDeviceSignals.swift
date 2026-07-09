@@ -9,8 +9,6 @@ import os
 /// telemetry request (merged in at `SimulaAPI.makeHeaders`):
 ///
 /// - `X-Timezone` — IANA time-zone id.
-/// - `X-Storage-Free` — available bytes on the app's data volume (helpful to know if the user could
-///   even install a promoted app).
 /// - `X-Memory-Free` — memory available to the process (`os_proc_available_memory`).
 /// - `X-Battery-Level` — 0–100 (omitted when unknown).
 /// - `X-Battery-State` — `charging` | `full` | `unplugged` | `unknown`.
@@ -18,6 +16,10 @@ import os
 ///
 /// iOS exposes no public silent-switch API, so there is no `X-Ringer-Mode` header here (Android
 /// only); output volume is still sent.
+///
+/// There is deliberately no `X-Storage-Free` header on iOS (Android only): every free-disk-space API
+/// (`volumeAvailableCapacity*`, `statfs`, …) is on Apple's Disk Space required-reason list, and none
+/// of the approved reasons permit sending the value off-device, so it cannot be collected here.
 ///
 /// Performance: the request path only ever reads a pre-built cached dictionary (`headers()`) — no
 /// syscalls, never blocks. The snapshot is computed off the main thread at `start()` and refreshed
@@ -93,7 +95,6 @@ final class SimulaDeviceSignals: @unchecked Sendable {
     private func refresh() {
         let built = Self.buildHeaders(
             timezone: TimeZone.current.identifier,
-            storageFreeBytes: Self.availableStorageBytes(),
             memoryFreeBytes: Self.availableMemoryBytes(),
             batteryLevel: Self.currentBatteryLevel(),
             batteryStateRaw: Self.currentBatteryStateRaw(),
@@ -107,12 +108,6 @@ final class SimulaDeviceSignals: @unchecked Sendable {
     }
 
     // MARK: - Device reads (guarded, platform-specific)
-
-    private static func availableStorageBytes() -> Int64? {
-        let url = URL(fileURLWithPath: NSHomeDirectory())
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
-    }
 
     private static func availableMemoryBytes() -> Int64? {
         #if os(iOS)
@@ -175,7 +170,6 @@ final class SimulaDeviceSignals: @unchecked Sendable {
     /// Assembles the header map from raw signal values, omitting any that are unavailable. Pure.
     static func buildHeaders(
         timezone: String?,
-        storageFreeBytes: Int64?,
         memoryFreeBytes: Int64?,
         batteryLevel: Float?,
         batteryStateRaw: Int?,
@@ -183,7 +177,6 @@ final class SimulaDeviceSignals: @unchecked Sendable {
     ) -> [String: String] {
         var headers: [String: String] = [:]
         if let timezone, !timezone.isEmpty { headers["X-Timezone"] = timezone }
-        if let storageFreeBytes, storageFreeBytes >= 0 { headers["X-Storage-Free"] = String(storageFreeBytes) }
         if let memoryFreeBytes, memoryFreeBytes >= 0 { headers["X-Memory-Free"] = String(memoryFreeBytes) }
         if let level = batteryPercent(batteryLevel) { headers["X-Battery-Level"] = String(level) }
         if let state = batteryStateLabel(batteryStateRaw) { headers["X-Battery-State"] = state }

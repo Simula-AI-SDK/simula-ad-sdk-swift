@@ -449,18 +449,28 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertFalse(SimulaUserAgent.safariUserAgent.contains("Simula-SDK"))
     }
 
-    func testSafariUserAgentComposeForBothDeviceFamilies() {
+    func testSafariUserAgentComposeForEveryDeviceFamily() {
         // iPhone keeps the "iPhone; CPU iPhone OS" tokens; iPad uses "iPad; CPU OS" (no "iPhone").
         XCTAssertEqual(
-            SimulaUserAgent.composeSafariUserAgent(isPad: false, osVersionUnderscore: "17_2"),
+            SimulaUserAgent.composeSafariUserAgent(family: .phone, osVersionUnderscore: "17_2"),
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
         )
         XCTAssertEqual(
-            SimulaUserAgent.composeSafariUserAgent(isPad: true, osVersionUnderscore: "17_2"),
+            SimulaUserAgent.composeSafariUserAgent(family: .pad, osVersionUnderscore: "17_2"),
             "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
         )
+        // Mac (Catalyst / Designed-for-iPad on Apple Silicon) uses the desktop Macintosh token.
+        XCTAssertEqual(
+            SimulaUserAgent.composeSafariUserAgent(family: .mac, osVersionUnderscore: "17_2"),
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 17_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        )
         // iPad must NOT report as iPhone.
-        XCTAssertFalse(SimulaUserAgent.composeSafariUserAgent(isPad: true, osVersionUnderscore: "17_2").contains("iPhone"))
+        XCTAssertFalse(SimulaUserAgent.composeSafariUserAgent(family: .pad, osVersionUnderscore: "17_2").contains("iPhone"))
+        // Unknown / tv / carPlay fall back to the plausible mobile Safari (iPhone) token.
+        XCTAssertEqual(
+            SimulaUserAgent.composeSafariUserAgent(family: .unknown, osVersionUnderscore: "17_2"),
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        )
     }
 
     func testSafariUserAgentFormat() {

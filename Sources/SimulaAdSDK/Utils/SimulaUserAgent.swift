@@ -45,6 +45,19 @@ enum SimulaUserAgent {
         return config
     }
 
+    /// The interface-idiom families the Safari-UA composer distinguishes. Kept as an explicit enum
+    /// (rather than a binary iPad/iPhone flag) so a `switch` covers every idiom UIKit can report —
+    /// iPhone, iPad, Mac (Catalyst / Designed-for-iPad on Apple Silicon), and the rest — and any
+    /// future idiom lands on `.unknown` instead of silently masquerading as an iPhone.
+    enum DeviceFamily {
+        case phone
+        case pad
+        case mac
+        case tv
+        case carPlay
+        case unknown
+    }
+
     /// A WebKit/Safari-style mobile User-Agent, built once and cached. Used only for the CTA /
     /// redirect-resolver click (Adjust User-Agent for Apps PRD): Adjust's probabilistic matching
     /// pairs the click's IP + UA against the UA the Adjust SDK reports at install, and a custom
@@ -56,32 +69,52 @@ enum SimulaUserAgent {
     ///   (KHTML, like Gecko) Mobile/15E148`
     /// - iPad:   `Mozilla/5.0 (iPad; CPU OS {osVersion} like Mac OS X) AppleWebKit/605.1.15
     ///   (KHTML, like Gecko) Mobile/15E148`
+    /// - Mac:    `Mozilla/5.0 (Macintosh; Intel Mac OS X {osVersion} …)` (Mac Catalyst /
+    ///   Designed-for-iPad on Apple Silicon).
     ///
     /// The WebKit/Mobile build numbers are fixed shared constants (they don't vary meaningfully across
     /// the OS versions this SDK targets), so only the OS version + device family are live.
     static let safariUserAgent: String = composeSafariUserAgent(
-        isPad: isPad,
+        family: deviceFamily,
         osVersionUnderscore: safariOSVersionString()
     )
 
-    /// Pure assembly of the Safari-style UA, split out so both device families are unit-testable
-    /// without a real device. iPad uses `iPad; CPU OS …` (no `iPhone`); iPhone uses
-    /// `iPhone; CPU iPhone OS …`.
-    static func composeSafariUserAgent(isPad: Bool, osVersionUnderscore: String) -> String {
-        let platform = isPad
-            ? "iPad; CPU OS \(osVersionUnderscore)"
-            : "iPhone; CPU iPhone OS \(osVersionUnderscore)"
-        return "Mozilla/5.0 (\(platform) like Mac OS X) " +
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    /// Pure assembly of the Safari-style UA, split out so every device family is unit-testable
+    /// without a real device. iPad uses `iPad; CPU OS …` (no `iPhone`); Mac uses the desktop
+    /// `Macintosh; Intel Mac OS X …` token; everything else falls back to the iPhone token so the
+    /// attribution UA stays a plausible mobile Safari string.
+    static func composeSafariUserAgent(family: DeviceFamily, osVersionUnderscore: String) -> String {
+        switch family {
+        case .pad:
+            let platform = "iPad; CPU OS \(osVersionUnderscore)"
+            return "Mozilla/5.0 (\(platform) like Mac OS X) " +
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        case .mac:
+            let platform = "Macintosh; Intel Mac OS X \(osVersionUnderscore)"
+            return "Mozilla/5.0 (\(platform)) " +
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        case .phone, .tv, .carPlay, .unknown:
+            let platform = "iPhone; CPU iPhone OS \(osVersionUnderscore)"
+            return "Mozilla/5.0 (\(platform) like Mac OS X) " +
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        }
     }
 
-    /// Whether the running device is an iPad, so the Safari UA uses the iPad tokens rather than
-    /// hardcoding iPhone. Resolved once; `false` on non-iOS (test/host) builds.
-    private static let isPad: Bool = {
+    /// The running device's interface idiom, resolved once via a `switch` so every case UIKit can
+    /// report is handled explicitly. `.phone` on non-iOS (test/host) builds.
+    private static let deviceFamily: DeviceFamily = {
         #if os(iOS)
-        return UIDevice.current.userInterfaceIdiom == .pad
+        switch UIDevice.current.userInterfaceIdiom {
+        case .phone: return .phone
+        case .pad: return .pad
+        case .mac: return .mac
+        case .tv: return .tv
+        case .carPlay: return .carPlay
+        // `.unspecified`, `.vision`, and any idiom added in a future SDK land here.
+        @unknown default: return .unknown
+        }
         #else
-        return false
+        return .phone
         #endif
     }()
 
