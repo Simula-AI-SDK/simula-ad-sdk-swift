@@ -321,22 +321,35 @@ struct WebViewRepresentable: UIViewRepresentable {
             let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
             let destination = ctaDestination
             let attribution = self.attribution
+            // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { @MainActor in
-                if destination == .appstore, attribution?.hasUsableTokens == true {
-                    // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
-                    // imperative formats). Prefers the tracker (router resolves it to the store), else
-                    // the in-creative URL.
-                    CreativeCTARouter.open(
-                        trackingUrl: (trackingURL ?? fallback).absoluteString,
-                        destination: destination,
-                        storeOpen: .skstoreproduct,
-                        attribution: attribution
-                    )
-                } else if let trackingURL {
-                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
-                } else {
-                    UIApplication.shared.open(fallback)
-                }
+                Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, attribution: attribution, fallback: fallback)
+            }
+        }
+
+        /// Task body for the native-CTA routing (named method — see the task-shape note in
+        /// TelemetryManager).
+        @MainActor
+        private static func routeNativeCTA(
+            trackingURL: URL?,
+            destination: AdDestination,
+            attribution: AdAttribution?,
+            fallback: URL
+        ) {
+            if destination == .appstore, attribution?.hasUsableTokens == true {
+                // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
+                // imperative formats). Prefers the tracker (router resolves it to the store), else
+                // the in-creative URL.
+                CreativeCTARouter.open(
+                    trackingUrl: (trackingURL ?? fallback).absoluteString,
+                    destination: destination,
+                    storeOpen: .skstoreproduct,
+                    attribution: attribution
+                )
+            } else if let trackingURL {
+                CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
+            } else {
+                UIApplication.shared.open(fallback)
             }
         }
 

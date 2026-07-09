@@ -146,18 +146,23 @@ public final class SimulaProvider: ObservableObject {
             // state triggers exactly one /session/create instead of a race.
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
-                Task { @MainActor in
-                    #if os(iOS)
-                    // The storage policy may have flipped (TCF Purpose 1 / GDPR);
-                    // drop prewarmed web views so the next game/ad is built with a
-                    // data store matching the new consent. (`acquire` also guards
-                    // this lazily; this just frees stale views proactively.)
-                    WebViewPool.shared.clear()
-                    #endif
-                    await self?.resyncSession()
-                }
+                // Single-call task closure — see the task-shape note in TelemetryManager.
+                Task { @MainActor in await self?.handleConsentChange() }
             }
             .store(in: &cancellables)
+    }
+
+    /// Task body for the consent-change reaction (named method — see the task-shape note in
+    /// TelemetryManager): drop consent-scoped web views, then re-sync the session.
+    @MainActor
+    private func handleConsentChange() async {
+        #if os(iOS)
+        // The storage policy may have flipped (TCF Purpose 1 / GDPR); drop prewarmed web
+        // views so the next game/ad is built with a data store matching the new consent.
+        // (`acquire` also guards this lazily; this just frees stale views proactively.)
+        WebViewPool.shared.clear()
+        #endif
+        await resyncSession()
     }
 
     // MARK: - Session Management
