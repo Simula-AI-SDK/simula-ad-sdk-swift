@@ -630,18 +630,23 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
         // Single-call task closure (inherits @MainActor) — see the task-shape note in TelemetryManager.
-        fallbackPrefetch = Task { [weak self] in await self?.runFallbackPrefetch(impressionId: impressionId) ?? [] }
+        // `api` is captured strongly so the fetch still runs — and any awaiter still receives real
+        // screens — even if this ad object is released before the task starts (parity with the
+        // pre-refactor closure); `self` stays weak and only gates the state write.
+        fallbackPrefetch = Task { [weak self, api] in await Self.runFallbackPrefetch(api: api, impressionId: impressionId, ad: self) }
         #endif
     }
 
     #if os(iOS)
     /// Task body for the fallback prefetch (named method — see the task-shape note in
-    /// TelemetryManager). @MainActor via the class, so the `prefetchedFallbacks` write
-    /// stays a main-thread write as before.
-    private func runFallbackPrefetch(impressionId: String) async -> [FallbackAd] {
+    /// TelemetryManager). Static with a strongly captured `api` + optional `ad`, so the fetch never
+    /// depends on the ad object's liveness; the `prefetchedFallbacks` write stays a main-actor
+    /// write (and simply no-ops when the ad was released).
+    @MainActor
+    private static func runFallbackPrefetch(api: SimulaAPI, impressionId: String, ad: SimulaRewardedAd?) async -> [FallbackAd] {
         let ads: [FallbackAd]
         do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
-        prefetchedFallbacks = ads
+        ad?.prefetchedFallbacks = ads
         return ads
     }
     #endif
