@@ -342,9 +342,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
             // Single-call task closure — see the task-shape note in TelemetryManager.
-            Task { @MainActor in
-                Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback)
-            }
+            Task { @MainActor in Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback) }
         }
 
         /// Task body for the native-CTA routing (named method — see the task-shape note in
@@ -568,11 +566,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                     let attribution = self.attribution
                     let destination = ctaDestination
                     let storeUrl = ctaStoreUrl
-                    Task { @MainActor in
-                        CreativeCTARouter.routeCreativeTap(
-                            url: url, destination: destination, storeUrl: storeUrl, attribution: attribution
-                        )
-                    }
+                    // Single-call task closure — see the task-shape note in TelemetryManager.
+                    Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
                     decisionHandler(.cancel)
                     return
                 }
@@ -616,11 +611,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                         let attribution = self.attribution
                         let destination = ctaDestination
                         let storeUrl = ctaStoreUrl
-                        Task { @MainActor in
-                            CreativeCTARouter.routeCreativeTap(
-                                url: url, destination: destination, storeUrl: storeUrl, attribution: attribution
-                            )
-                        }
+                        // Single-call task closure — see the task-shape note in TelemetryManager.
+                        Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))

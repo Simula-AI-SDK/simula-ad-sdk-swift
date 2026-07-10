@@ -288,11 +288,14 @@ public struct MiniGameMenu: View {
         .animation(.easeInOut(duration: 0.2), value: isOpen)
         .animation(.easeInOut(duration: 0.2), value: showGameIframe)
         .animation(.easeInOut(duration: 0.2), value: showAdOverlay)
-        .task(id: isOpen) {
-            if isOpen {
-                await loadCatalog()
-            }
-        }
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        .task(id: isOpen) { await loadCatalogIfOpen() }
+    }
+
+    /// Task body for the menu-open catalog load (named method — see the task-shape note in
+    /// TelemetryManager).
+    private func loadCatalogIfOpen() async {
+        if isOpen { await loadCatalog() }
     }
 
     // MARK: - Header (matching Kotlin's Row layout exactly)
@@ -477,13 +480,8 @@ public struct MiniGameMenu: View {
 
     private func handleGameSelect(gameId: String, gameName: String) {
         if let menuId = menuId {
-            Task {
-                await api.trackMenuGameClick(
-                    menuId: menuId,
-                    gameName: gameName,
-                    apiKey: provider.apiKey
-                )
-            }
+            // Single-call task closure — see the task-shape note in TelemetryManager.
+            Task { await api.trackMenuGameClick(menuId: menuId, gameName: gameName, apiKey: provider.apiKey) }
         }
 
         selectedGameId = gameId

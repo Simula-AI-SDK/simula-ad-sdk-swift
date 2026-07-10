@@ -259,9 +259,7 @@ public final class SimulaProvider: ObservableObject {
         sessionGeneration &+= 1
         let generation = sessionGeneration
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        let task = Task<String?, Never> { @MainActor [weak self] in
-            await self?.createAndPublishSession(generation: generation, ppidAtCreation: ppidAtCreation, snapshot: snapshot) ?? nil
-        }
+        let task = Task<String?, Never> { @MainActor [weak self] in await self?.createAndPublishSession(generation: generation, ppidAtCreation: ppidAtCreation, snapshot: snapshot) ?? nil }
         sessionTask = task
         return (task, generation)
     }
@@ -400,9 +398,7 @@ public final class SimulaProvider: ObservableObject {
     private func reconcileServerPpid() {
         let previous = ppidSyncTask
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        ppidSyncTask = Task { @MainActor [weak self] in
-            await self?.runPpidReconcile(after: previous)
-        }
+        ppidSyncTask = Task { @MainActor [weak self] in await self?.runPpidReconcile(after: previous) }
     }
 
     /// PPID-reconcile task body (named method — see the task-shape note in TelemetryManager):
@@ -659,20 +655,22 @@ public struct SimulaProviderView<Content: View>: View {
             // Also expose it non-observingly so NativeAdSlot can read it without re-rendering on
             // every @Published change (see EnvironmentValues.simulaProvider).
             .environment(\.simulaProvider, provider)
-            .task {
-                await provider.createSession()
-            }
+            // Single-call task closures into named methods — see the task-shape note in
+            // TelemetryManager.
+            .task { await provider.createSession() }
             // Push privacy-prop changes into the store. SwiftUI does not re-init
             // the @StateObject when the `privacy`/`hasPrivacyConsent` props change,
             // so without this a host updating them at render time would be ignored.
-            .task(id: resolvedConfig) {
-                provider.updateConsent(resolvedConfig)
-            }
+            .task(id: resolvedConfig) { provider.updateConsent(resolvedConfig) }
             // Push native-ad context prop changes onto the (possibly reused) provider. Only when a
             // value is supplied, so a host setting context imperatively via SimulaAds.updateContext
             // isn't clobbered by a nil prop.
-            .task(id: adContext) {
-                if let adContext { provider.updateContext(adContext) }
-            }
+            .task(id: adContext) { pushAdContext() }
+    }
+
+    /// Task body for the ad-context prop push (named method — see the task-shape note in
+    /// TelemetryManager).
+    private func pushAdContext() {
+        if let adContext { provider.updateContext(adContext) }
     }
 }

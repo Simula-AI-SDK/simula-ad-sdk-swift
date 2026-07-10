@@ -30,9 +30,8 @@ final class NativeAdPreloadCache {
         }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)
         let id = UUID().uuidString
-        tasks[id] = Task { @MainActor in
-            try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position, theme: resolvedTheme)
-        }
+        // Single-call task closure — see the task-shape note in TelemetryManager.
+        tasks[id] = Task { @MainActor in try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position, theme: resolvedTheme) }
         return id
     }
 
