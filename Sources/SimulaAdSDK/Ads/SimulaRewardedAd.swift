@@ -633,13 +633,17 @@ public final class SimulaRewardedAd {
                 Telemetry.shared.recordLifecycle(stage: "reward_verification_failed", adFormat: SimulaRewardedAd.adFormat, adUnitId: adUnitId, adId: adId, serveId: serveId, durationMs: verifyMs, errorCode: "verify_failed")
                 Telemetry.shared.recordError(signature: "rewarded:verify", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "RewardVerificationManager.queueVerification")
             }
-            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { @MainActor in ad?.dispatchVerificationResult(result) }
+            // GCD main-queue hop, not `Task { @MainActor }` — the verification callback lands
+            // off-main and only needs to deliver a delegate call on main (see the concurrency
+            // note in TelemetryManager). The dispatch guarantees main before the isolation cast.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { ad?.dispatchVerificationResult(result) }
+            }
         }
     }
 
-    /// Reward-verification delegate dispatch (named method — see the task-shape note in
-    /// TelemetryManager). `@MainActor` via the class, matching the prior explicit hop.
+    /// Reward-verification delegate dispatch (named method, invoked via the guaranteed-main
+    /// GCD hop above). `@MainActor` via the class, matching the prior explicit hop.
     private func dispatchVerificationResult(_ result: Result<String?, Error>) {
         switch result {
         case .success(let token):

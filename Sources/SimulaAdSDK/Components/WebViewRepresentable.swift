@@ -341,12 +341,15 @@ struct WebViewRepresentable: UIViewRepresentable {
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
-            // Single-call task closure — see the task-shape note in TelemetryManager.
-            Task { @MainActor in Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback) }
+            // GCD main-queue hop, not `Task { @MainActor }` — ad-interaction paths must not
+            // create Swift Concurrency tasks (see the concurrency note in TelemetryManager).
+            // The dispatch guarantees main before the isolation cast, so it can never trap.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback) }
+            }
         }
 
-        /// Task body for the native-CTA routing (named method — see the task-shape note in
-        /// TelemetryManager).
+        /// Native-CTA routing body (named method, invoked via the guaranteed-main GCD hop above).
         @MainActor
         private static func routeNativeCTA(
             trackingURL: URL?,
@@ -523,10 +526,11 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // Intercept App Store URLs → show in-app store sheet. The router's
-            // presentation entry points are `@MainActor`; WebKit delivers this
-            // delegate callback on the main thread, so hop there explicitly (no
-            // `assumeIsolated`, which would trap if ever called off-main).
+            // Intercept App Store URLs → show in-app store sheet. The router's presentation
+            // entry points are `@MainActor`; hop via `DispatchQueue.main.async` + isolation
+            // cast — the dispatch guarantees main first, so the cast can never trap even if
+            // this delegate were ever delivered off-main. GCD, not `Task { @MainActor }`
+            // (see the concurrency note in TelemetryManager).
             if let appID = appStoreID(from: url) {
                 // Fire CLICKED only for a user-activated link — consistent with the
                 // cross-domain branch below and Android's `hasGesture()` guard — so a
@@ -534,7 +538,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // unconditional (the game iframe's post-game auto-redirect still opens).
                 if navigationAction.navigationType == .linkActivated { onAdClick?() }
                 let attribution = self.attribution
-                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                }
                 decisionHandler(.cancel)
                 return
             }
@@ -544,10 +550,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if navigationAction.navigationType == .linkActivated { onAdClick?() } // CLICKED, user-activated only
                 if let appID = appStoreID(from: url) {
                     let attribution = self.attribution
-                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                    }
                 } else {
                     // Couldn't extract app ID — let the system handle it
-                    Task { @MainActor in UIApplication.shared.open(url) }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { UIApplication.shared.open(url) }
+                    }
                 }
                 decisionHandler(.cancel)
                 return
@@ -566,8 +576,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                     let attribution = self.attribution
                     let destination = ctaDestination
                     let storeUrl = ctaStoreUrl
-                    // Single-call task closure — see the task-shape note in TelemetryManager.
-                    Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                    // GCD hop + guaranteed-main isolation cast — see the concurrency note in TelemetryManager.
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                    }
                     decisionHandler(.cancel)
                     return
                 }
@@ -603,16 +615,18 @@ struct WebViewRepresentable: UIViewRepresentable {
                     if !targetHost.isEmpty && currentHost != targetHost {
                         // Cross-domain → deterministic store route when the serve supplied its raw
                         // store link, else resolve redirects then route. Router entry point is
-                        // `@MainActor`; this delegate runs on main, so hop explicitly rather than
-                        // asserting isolation. `createWebViewWith` is only invoked for
+                        // `@MainActor`; the GCD dispatch guarantees main before the isolation
+                        // cast, so it can never trap. `createWebViewWith` is only invoked for
                         // user-initiated new-window requests (target="_blank" / window.open), so
                         // this is a real click.
                         fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                         let attribution = self.attribution
                         let destination = ctaDestination
                         let storeUrl = ctaStoreUrl
-                        // Single-call task closure — see the task-shape note in TelemetryManager.
-                        Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                        // GCD hop, not `Task { @MainActor }` — see the concurrency note in TelemetryManager.
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated { CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                        }
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))

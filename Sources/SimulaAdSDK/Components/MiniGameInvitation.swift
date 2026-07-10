@@ -77,7 +77,8 @@ public struct MiniGameInvitation: View {
     @State private var imageError = false
     @State private var isClosing = false
     @State private var shouldRender = false
-    @State private var autoCloseTask: Task<Void, Never>?
+    /// Auto-close timer (GCD-backed — see `MainQueueTimer`; ad-path timing never uses `Task.sleep`).
+    @State private var autoCloseTimer = MainQueueTimer()
 
     // MARK: - Constants
 
@@ -146,7 +147,7 @@ public struct MiniGameInvitation: View {
                 setupAutoClose()
             }
             .onDisappear {
-                autoCloseTask?.cancel()
+                autoCloseTimer.cancel()
             }
         }
 
@@ -282,7 +283,7 @@ public struct MiniGameInvitation: View {
                 shouldRender = true
             }
         } else {
-            autoCloseTask?.cancel()
+            autoCloseTimer.cancel()
             withAnimation(.easeOut(duration: animationDuration)) {
                 shouldRender = false
             }
@@ -291,7 +292,7 @@ public struct MiniGameInvitation: View {
     }
 
     private func handleCtaClick() {
-        autoCloseTask?.cancel()
+        autoCloseTimer.cancel()
         onClose?()
         onClick()
         if resolvedAnimation == .none {
@@ -306,7 +307,7 @@ public struct MiniGameInvitation: View {
     }
 
     private func handleDismiss() {
-        autoCloseTask?.cancel()
+        autoCloseTimer.cancel()
         onClose?()
         if resolvedAnimation == .none {
             withAnimation { shouldRender = false }
@@ -321,17 +322,8 @@ public struct MiniGameInvitation: View {
 
     private func setupAutoClose() {
         guard let duration = autoCloseDuration, duration > 0 else { return }
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        autoCloseTask = Task { await runAutoClose(duration: duration) }
-    }
-
-    /// Auto-close task body (named method — see the task-shape note in TelemetryManager).
-    /// `@MainActor` so `handleDismiss()` stays a main-thread call (was `MainActor.run`).
-    @MainActor
-    private func runAutoClose(duration: TimeInterval) async {
-        // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-        do { try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000)) } catch { return } // ms to ns
-        guard !Task.isCancelled else { return }
-        handleDismiss()
+        // GCD one-shot on the main actor (duration is in MILLISECONDS) — see `MainQueueTimer` /
+        // the concurrency note in TelemetryManager. A cancelled timer never delivers.
+        autoCloseTimer.schedule(after: duration / 1000) { handleDismiss() }
     }
 }

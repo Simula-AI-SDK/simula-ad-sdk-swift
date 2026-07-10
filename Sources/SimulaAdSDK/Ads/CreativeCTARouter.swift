@@ -501,7 +501,11 @@ private final class StoreProductDelegate: NSObject, SKStoreProductViewController
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
         viewController.dismiss(animated: true)
         let onFinish = self.onFinish
-        Task { @MainActor in onFinish() }
+        // Main-queue hop via GCD, not `Task { @MainActor }`: this fires around ad interactions,
+        // and affected host toolchains miscompile optimized task teardown (see the concurrency
+        // note in TelemetryManager). The dispatch guarantees main before the isolation cast, so
+        // `assumeIsolated` can never trap even if StoreKit ever called this off-main.
+        DispatchQueue.main.async { MainActor.assumeIsolated { onFinish() } }
     }
 }
 
@@ -519,7 +523,8 @@ private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate {
 
     func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
         let onFinish = self.onFinish
-        Task { @MainActor in onFinish() }
+        // GCD main-queue hop + isolation cast — same rationale as `StoreProductDelegate` above.
+        DispatchQueue.main.async { MainActor.assumeIsolated { onFinish() } }
     }
 }
 

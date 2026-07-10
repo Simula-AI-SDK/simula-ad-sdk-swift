@@ -76,7 +76,11 @@ final class WebViewPool {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.clear() }
+            // Delivered on the main queue (`queue: .main` above), so the isolation cast is
+            // always valid — and running `clear()` immediately (not on a deferred task) frees
+            // the warm buffer while the memory-pressure notification is still being handled.
+            // GCD/no-Task on purpose — see the concurrency note in TelemetryManager.
+            MainActor.assumeIsolated { self?.clear() }
         }
     }
 
@@ -196,8 +200,9 @@ final class WebViewPool {
         active[ObjectIdentifier(pooled.webView)] = pooled
 
         // Refill on the next runloop turn so this acquire returns immediately and
-        // the following one (e.g. the post-game ad) is also warm.
-        Task { @MainActor [weak self] in self?.prewarm() }
+        // the following one (e.g. the post-game ad) is also warm. GCD hop, not
+        // `Task { @MainActor }` — see the concurrency note in TelemetryManager.
+        DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.prewarm() } }
 
         // Warm (pool hit) vs cold (had to create) — surfaces prewarm effectiveness + cold cost.
         Telemetry.shared.recordOperation(

@@ -29,8 +29,33 @@ jobs:
             echo '::error::`try? await` is banned in SDK code — use explicit do/catch (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
             fail=1
           fi
+          if grep -rnE 'try! await' Sources/; then
+            echo '::error::`try! await` is banned in SDK code — use explicit do/catch (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
           if grep -rnE 'async let' Sources/; then
             echo '::error::`async let` is banned in SDK code — use sequential await or a task group (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          # @_alwaysEmitIntoClient generic sleeps mint per-module copies that same-name
+          # coalescing can poison in multi-SDK hosts (swiftlang/swift#86204); only the
+          # dylib entry point Task.sleep(nanoseconds:) is allowed.
+          if grep -rnE 'Task\.sleep\((for|until):' Sources/; then
+            echo '::error::`Task.sleep(for:/until:)` is banned in SDK code — use Task.sleep(nanoseconds:) or MainQueueTimer (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          if grep -rnE 'with(Checked|Unsafe)(Throwing)?Continuation' Sources/; then
+            echo '::error::continuations are banned in SDK code — use one-shot-guarded callback registries (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          # The telemetry flush engine and Ipv4Beacon must stay on GCD (launch path —
+          # see SKILL.md rule 1): no Swift Concurrency task creation in those files.
+          if grep -nE 'Task( |\.detached)?\{|Task\.detached' \
+              Sources/SimulaAdSDK/Telemetry/TelemetryManager.swift \
+              Sources/SimulaAdSDK/Telemetry/TelemetrySender.swift \
+              Sources/SimulaAdSDK/Networking/Ipv4Beacon.swift \
+            | grep -vE '^\S+:[0-9]+: *//'; then
+            echo '::error::the launch path (telemetry flush engine, Ipv4Beacon) must not create Swift Concurrency tasks — GCD only (see .cursor/skills/swift-concurrency-task-shape/SKILL.md rule 1)'
             fail=1
           fi
           exit $fail
@@ -62,3 +87,44 @@ jobs:
             -scheme SimulaAdSDK \
             -configuration Release \
             -destination 'generic/platform=iOS Simulator'
+
+  release-canary:
+    # Release-mode (-O) crash canary with a multi-module "zoo" link — catches the
+    # toolchain-level task-teardown abort class ("freed pointer was not the last
+    # allocation") that no source grep can see: optimizer dealloc reordering and
+    # divergent @_alwaysEmitIntoClient copies both need -O + multiple Swift modules
+    # in one binary to fire. See .cursor/skills/swift-concurrency-task-shape/SKILL.md.
+    name: Release concurrency canary (module zoo)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # -enable-testing keeps @testable imports compiling at -O.
+      - name: Canary at -O (macOS host)
+        run: swift test -c release -Xswiftc -enable-testing --filter ReleaseConcurrencyCanaryTests
+
+      - name: Canary at -O (iOS Simulator)
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -r '[.devices[][] | select(.name|test("iPhone"))][0].udid')
+          echo "Using simulator $UDID"
+          xcodebuild test \
+            -scheme SimulaAdSDK \
+            -configuration Release \
+            -destination "id=$UDID" \
+            -only-testing:SimulaAdSDKTests/ReleaseConcurrencyCanaryTests \
+            ENABLE_TESTABILITY=YES
+
+      # Informational: enumerate what the linker folded in a Release link. If a future
+      # toolchain's fold goes wrong, this log names the folded async thunks first.
+      - name: Report linker deduplication (informational)
+        continue-on-error: true
+        run: |
+          swift build -c release -Xlinker -verbose_deduplicate 2>&1 \
+            | grep -iE 'dedup|folded' | head -80 || true

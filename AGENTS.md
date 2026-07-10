@@ -81,13 +81,21 @@ Lock-guarded snapshot (cross-thread mutable state — `@unchecked Sendable` + `N
 
 ```swift
 lock.lock(); let snapshot = state; lock.unlock()
-await sender.send(snapshot)          // never await while holding the lock
+sender.send(snapshot) { ack in … }   // never block or await while holding the lock
 ```
 
-Main-actor hop for imperative API from background code:
+Main-actor hop from background/nonisolated code (GCD, never `Task { @MainActor }` /
+`MainActor.run` — see `.cursor/skills/swift-concurrency-task-shape/SKILL.md` rule 1):
 
 ```swift
-await MainActor.run { SimulaAds.initialize(apiKey: key) }
+DispatchQueue.main.async { MainActor.assumeIsolated { SimulaAds.initialize(apiKey: key) } }
+```
+
+Sleep-then-act / tick timers (GCD-backed, generation-cancelled — never `Task.sleep`):
+
+```swift
+@State private var dwellTimer = MainQueueTimer()
+dwellTimer.schedule(after: seconds) { fire() }   // .onDisappear { dwellTimer.cancel() }
 ```
 
 ## Non-negotiable behaviors

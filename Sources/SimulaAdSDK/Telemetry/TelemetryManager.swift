@@ -73,6 +73,16 @@ final class TelemetryManager: @unchecked Sendable {
     // paths persist via `persistSync` (must complete before returning).
     private let persistQueue = DispatchQueue(label: "ad.simula.telemetry.persist", qos: .utility)
 
+    // Serial queue that runs the whole flush engine (recover, flush attempts, timed/backoff
+    // wake-ups, send completions). Deliberately GCD, not Swift Concurrency: these are the
+    // launch-time work items that died in host apps when affected Swift toolchains miscompiled
+    // task teardown ("freed pointer was not the last allocation" in swift_task_dealloc /
+    // completeTaskWithClosure) — see .cursor/skills/swift-concurrency-task-shape/SKILL.md.
+    // A dispatch work item has no task allocator, so the entire crash class is unreachable.
+    // MUST stay distinct from `persistQueue`: completeFlush → persistSync dispatches SYNC onto
+    // persistQueue, which would deadlock if the flush engine itself ran there.
+    private let flushQueue = DispatchQueue(label: "ad.simula.telemetry.flush", qos: .utility)
+
     private let lock = NSLock()
     private var buffer: [TelemetryEvent] = []
     private var errorAgg: [String: TelemetryEvent] = [:]
@@ -136,14 +146,15 @@ final class TelemetryManager: @unchecked Sendable {
         self.perfSampledIn = enabled && random() < sampleRate
     }
 
-    /// Recover any buffer left by a prior process, then attempt a flush.
+    /// Recover any buffer left by a prior process, then attempt a flush. Runs on `flushQueue`
+    /// so the UserDefaults read + JSON decode stays off the caller's thread (init runs on main).
     func start() {
-        Task { [weak self] in await self?.recoverAndFlush() }
+        flushQueue.async { [weak self] in self?.recoverAndFlush() }
     }
 
-    private func recoverAndFlush() async {
+    private func recoverAndFlush() {
         recover()
-        await flush()
+        flush()
     }
 
     /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6).
@@ -290,7 +301,7 @@ final class TelemetryManager: @unchecked Sendable {
         // JSON encode + UserDefaults write.
         persistAsync(snapshot)
         if let logEvent { debugLog?(formatForLog(logEvent)) }
-        Task { [weak self] in await self?.flush() } // eager — an error may precede a crash/kill
+        requestFlush() // eager — an error may precede a crash/kill
     }
 
     /// Persist + attempt a flush now (e.g. app background).
@@ -299,7 +310,7 @@ final class TelemetryManager: @unchecked Sendable {
         emitFunnelSummary()
         emitDiagnostics()
         persistNow()
-        Task { [weak self] in await self?.flush() }
+        requestFlush()
     }
 
     /// Emit one `funnel_summary` operation per active format (cumulative since the last emit), then
@@ -390,7 +401,7 @@ final class TelemetryManager: @unchecked Sendable {
         let shouldFlush = buffer.count >= flushThreshold
         lock.unlock()
         debugLog?(formatForLog(event))
-        if shouldFlush { Task { [weak self] in await self?.flush() } } else { scheduleTimedFlush() }
+        if shouldFlush { requestFlush() } else { scheduleTimedFlush() }
     }
 
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
@@ -407,13 +418,35 @@ final class TelemetryManager: @unchecked Sendable {
         persistQueue.sync { [store] in store.save(events) }
     }
 
-    /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
-    /// reconcile (sync, under lock). All `NSLock` use stays in the synchronous helpers.
-    private func flush() async {
+    /// Hop onto the flush engine's serial queue and attempt a flush. The record entry points
+    /// call this (never `flush()` directly) so the encode + send setup stays off their thread —
+    /// `recordError` often runs on the main thread during ad-failure callbacks.
+    private func requestFlush() {
+        flushQueue.async { [weak self] in self?.flush() }
+    }
+
+    /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async network,
+    /// off lock), reconcile in the completion (back on `flushQueue`). All `NSLock` use stays
+    /// in the synchronous helpers. Single-flight is enforced by `isFlushing` in `beginFlush`,
+    /// so a redundant `requestFlush` while a send is in flight is a cheap no-op.
+    private func flush() {
         guard let batch = beginFlush() else { return }
-        let ack: TelemetryAck = batch.body.isEmpty ? .retry : await sender.send(batch.body)
+        if batch.body.isEmpty { // encode failed with events pending — transient, back off and retry
+            finishFlush(ack: .retry, batch: batch)
+            return
+        }
+        let queue = flushQueue
+        sender.send(batch.body) { [weak self] ack in
+            queue.async { self?.finishFlush(ack: ack, batch: batch) }
+        }
+    }
+
+    /// Reconcile the send outcome, then either back off (transient failure) or re-drain
+    /// leftovers that arrived mid-send. The re-drain re-dispatches (iterative, not recursive)
+    /// so one long error storm can't grow the stack or starve the queue.
+    private func finishFlush(ack: TelemetryAck, batch: FlushBatch) {
         let outcome = completeFlush(ack: ack, batch: batch)
-        if outcome.needRetry { scheduleRetry() } else if outcome.reFlush { await flush() }
+        if outcome.needRetry { scheduleRetry() } else if outcome.reFlush { requestFlush() }
     }
 
     private struct FlushBatch {
@@ -522,35 +555,32 @@ final class TelemetryManager: @unchecked Sendable {
         return env
     }
 
-    // Task-shape note: every `Task {}` in this SDK keeps its closure body to a single call
-    // into a named method, with no `try?`-wrapped awaits inside the closure — affected Swift
-    // toolchains miscompile richer shapes into task-teardown aborts in host apps. Before
-    // changing any Task closure, read .cursor/skills/swift-concurrency-task-shape/SKILL.md.
+    // Concurrency note: this engine runs entirely on GCD (serial `flushQueue` + `asyncAfter`
+    // wake-ups), NOT Swift Concurrency. Its work items fire on every launch, and affected Swift
+    // toolchains (6.1–6.3, Xcode 16.3+) miscompile optimized async code into task-teardown
+    // aborts in host apps ("freed pointer was not the last allocation" in swift_task_dealloc).
+    // Do not reintroduce `Task {}` / `Task.sleep` here — a dispatch work item has no task
+    // allocator, so the crash class is structurally unreachable. Details + upstream refs:
+    // .cursor/skills/swift-concurrency-task-shape/SKILL.md.
 
     private func scheduleTimedFlush() {
         guard claimFlushSchedule() else { return }
-        Task { [weak self] in await self?.timedFlush() }
+        flushQueue.asyncAfter(deadline: .now() + flushInterval) { [weak self] in
+            self?.timedFlushFire()
+        }
     }
 
-    /// Timed-flush task body (named method — see the task-shape note above).
-    private func timedFlush() async {
-        // These tasks are never cancelled, so a sleep error is impossible in practice;
-        // swallow-and-continue preserves the prior `try?` semantics without putting a
-        // `try?`-wrapped await inside a Task closure.
-        do { try await Task.sleep(nanoseconds: UInt64(flushInterval * 1_000_000_000)) } catch {}
+    /// Timed-flush wake-up body (named method — keeps the scheduled closure to a single call).
+    private func timedFlushFire() {
         releaseFlushSchedule()
-        await flush()
+        flush()
     }
 
     private func scheduleRetry() {
         let rc = currentRetryCount()
-        Task { [weak self] in await self?.retryFlush(after: rc) }
-    }
-
-    /// Retry-flush task body (named method — see the task-shape note above).
-    private func retryFlush(after retryCount: Int) async {
-        do { try await Task.sleep(nanoseconds: UInt64(backoff(retryCount) * 1_000_000_000)) } catch {}
-        await flush()
+        flushQueue.asyncAfter(deadline: .now() + backoff(rc)) { [weak self] in
+            self?.flush()
+        }
     }
 
     // Synchronous lock-guarded accessors so the schedulers' async closures never touch NSLock.
