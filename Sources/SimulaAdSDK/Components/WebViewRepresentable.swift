@@ -368,10 +368,12 @@ struct WebViewRepresentable: UIViewRepresentable {
                     storeUrl: storeUrl,
                     attribution: attribution
                 )
-            } else if let trackingURL {
-                CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination, storeUrl: storeUrl)
             } else {
-                UIApplication.shared.open(fallback)
+                // With no tracker, the in-creative URL (`fallback` — typically the macro-stamped
+                // click tracker baked into the creative) takes its place, so an aligned payload
+                // still gets the deterministic store open + background click. The router opens
+                // store links / non-http schemes / `.web` destinations as-is (previous behavior).
+                CreativeCTARouter.openExternally(initialURL: trackingURL ?? fallback, destination: destination, storeUrl: storeUrl)
             }
         }
 

@@ -41,7 +41,11 @@ final class TelemetryManagerTests: XCTestCase {
             lock.unlock()
             if shouldGate {
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    lock.lock(); gateCont = cont; lock.unlock()
+                    // Re-check under the lock: if release() ran between the gated read above and
+                    // here, parking now would leak the continuation and deadlock the flush.
+                    lock.lock()
+                    if gated { gateCont = cont; lock.unlock() }
+                    else { lock.unlock(); cont.resume() }
                 }
             }
             lock.lock()
@@ -141,7 +145,15 @@ final class TelemetryManagerTests: XCTestCase {
         // Give the eager flushes time to enqueue + park on the gate.
         try? await Task.sleep(nanoseconds: 50_000_000)
         sender.release()
-        await waitUntil { store.load().isEmpty }
+        // Wait on the observable OUTCOME (all 3 occurrences delivered + buffer reconciled empty).
+        // "store empty" alone is satisfied by the initial state: the persist/flush pipeline is
+        // async, so on a slow CI simulator the assertions could run before anything was sent.
+        await waitUntil {
+            let delivered = self.allEvents(sender.batches)
+                .filter { $0.type == TelemetryType.error }
+                .reduce(0) { $0 + ($1.count ?? 0) }
+            return delivered == 3 && store.load().isEmpty
+        }
 
         let errors = allEvents(sender.batches).filter { $0.type == TelemetryType.error }
         XCTAssertTrue(errors.allSatisfy { $0.name == "api:decode" }, "only one distinct error signature")
