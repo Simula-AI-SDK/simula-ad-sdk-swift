@@ -100,9 +100,8 @@ final class CoverImageCache: @unchecked Sendable {
         await withTaskGroup(of: Void.self) { group in
             for url in urls {
                 guard cache.object(forKey: url as NSString) == nil else { continue }
-                group.addTask { [weak self] in
-                    _ = await self?.load(url: url)
-                }
+                // Single-call task closure — see the task-shape note in TelemetryManager.
+                group.addTask { [weak self] in _ = await self?.load(url: url) }
             }
         }
     }
@@ -138,9 +137,7 @@ final class CoverImageCache: @unchecked Sendable {
 
         let box = InFlight(waiters: 1)
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        let task = Task<CoverImage, Never> { [weak self] in
-            await self?.loadAndClear(url: url, box: box) ?? .failed
-        }
+        let task = Task<CoverImage, Never> { [weak self] in await self?.loadAndClear(url: url, box: box) ?? .failed }
         box.task = task
         inFlight[url] = box
         return task

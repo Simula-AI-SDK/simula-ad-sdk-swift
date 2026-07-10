@@ -135,9 +135,8 @@ public enum SimulaAds {
 
         // Warm the session so the first `load()` doesn't pay session creation.
         // Inherits the main actor from the enclosing `@MainActor` context.
-        Task {
-            await provider.createSession()
-        }
+        // Single-call task closure — see the task-shape note in TelemetryManager.
+        Task { await provider.createSession() }
 
         // Independently of session warm-up (each queued verification carries its own
         // session), recover any reward verifications a prior launch left pending (e.g. a

@@ -294,9 +294,7 @@ public final class SimulaInterstitialAd {
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        loadTask = Task { [weak self] in
-            await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc)
-        }
+        loadTask = Task { [weak self] in await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc) }
     }
 
     /// Load task body (named method — see the task-shape note in TelemetryManager).
@@ -706,9 +704,7 @@ public final class SimulaInterstitialAd {
             presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
             // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { [weak self] in
-                await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
-            }
+            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed) }
         } else {
             onAllClosed()
         }
