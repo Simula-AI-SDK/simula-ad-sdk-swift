@@ -7,10 +7,11 @@
 # whose target is the prebuilt XCFramework. SPM consumers pin tags/versions, so they
 # resolve the binary; the repo itself always builds from source.
 #
-# Called by .github/workflows/release.yml on the release commit, right before tagging:
+# MANUAL release step (the workflow only builds + uploads the artifact — see
+# .github/workflows/release.yml). After the workflow produced the draft release:
 #   scripts/make-release-manifest.sh <version> <checksum>
-# where <checksum> is the output of `swift package compute-checksum` on the zip that
-# will be attached to the GitHub Release for <version>.
+# then commit, tag <version>, push the tag, and publish the draft against it.
+# <checksum> is `swift package compute-checksum` of the zip (printed in the draft notes).
 
 set -euo pipefail
 

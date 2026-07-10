@@ -1,18 +1,19 @@
 name: Release (binary XCFramework)
 
-# Builds, validates, and publishes the binary SimulaAdSDK.xcframework release:
+# Builds the binary SimulaAdSDK.xcframework with the PINNED toolchain and attaches it to a
+# DRAFT GitHub Release. Nothing else — no tagging, no pod push. Publishing is manual:
 #
-#   1. Validates the toolchain: full test suite in Debug AND Release (-O) — the
-#      task-teardown miscompile class only manifests optimized — plus the iOS-simulator run.
-#   2. Builds the XCFramework (scripts/build-xcframework.sh) with the PINNED Xcode below.
-#   3. Smoke-builds a binary consumer against the artifact (Examples/BinarySmoke).
-#   4. Commits the binary consumer manifest (scripts/make-release-manifest.sh) and the tag —
-#      `main` keeps the source manifest; only tags carry the binaryTarget.
-#   5. Creates the GitHub Release with the zip attached, then pushes the podspec to trunk.
+#   1. Run scripts/make-release-manifest.sh <version> <checksum> (checksum is in the draft
+#      release notes), commit, tag <version>, push the tag.
+#   2. Publish the draft release against that tag.
+#   3. pod trunk push SimulaAdSDK.podspec (the :http source resolves to the published asset).
+#   4. Smoke-test the demo app.
+#
+# Test gates (Debug + Release/-O incl. TaskChurnStressTests + iOS Simulator) run in CI on
+# every PR/push (.github/workflows/ci.yml) — release from a green main.
 #
 # WHY BINARY: affected host Xcodes (Swift 6.1–6.3 optimizers) miscompile Swift Concurrency
-# shapes in source SDKs into task-teardown aborts inside host apps. A prebuilt, module-stable
-# framework means host toolchains never compile SDK implementation code.
+# shapes in source SDKs into task-teardown aborts inside host apps.
 # History: .cursor/skills/swift-concurrency-task-shape/SKILL.md
 
 on:
@@ -33,21 +34,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build-and-upload:
     runs-on: macos-15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Select pinned Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: ${{ env.XCODE_VERSION }}
 
-      - name: Verify version sync (input == podspec == SIMULA_SDK_VERSION)
+      # Artifact-labeling guard: the binary embeds SIMULA_SDK_VERSION (telemetry), so a
+      # mismatched input would ship a mislabeled framework.
+      - name: Verify version sync
         run: |
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
@@ -55,65 +56,23 @@ jobs:
             || { echo "::error::podspec s.version != $V"; exit 1; }
           grep -q "let SIMULA_SDK_VERSION = \"$V\"" Sources/SimulaAdSDK/Telemetry/Telemetry.swift \
             || { echo "::error::SIMULA_SDK_VERSION != $V"; exit 1; }
-          if git rev-parse "$V" >/dev/null 2>&1; then
-            echo "::error::tag $V already exists"; exit 1
-          fi
-
-      - name: Validate toolchain — tests (Debug)
-        run: swift test
-
-      - name: Validate toolchain — tests optimized (Release, incl. task-churn stress)
-        run: swift test -c release -Xswiftc -enable-testing
-
-      - name: Validate toolchain — tests on iOS Simulator
-        run: |
-          set -euo pipefail
-          UDID=$(xcrun simctl list devices available --json \
-            | jq -r '[.devices[][] | select(.name|test("iPhone"))][0].udid')
-          xcodebuild test -scheme SimulaAdSDK -destination "id=$UDID"
 
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
 
-      - name: Smoke-build a binary consumer against the artifact
-        working-directory: Examples/BinarySmoke
-        run: |
-          xcodebuild build \
-            -scheme BinarySmoke \
-            -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Commit binary manifest, tag, push
-        run: |
-          set -euo pipefail
-          V="${{ github.event.inputs.version }}"
-          CHECKSUM=$(cat build/SimulaAdSDK.xcframework.zip.checksum)
-          ./scripts/make-release-manifest.sh "$V" "$CHECKSUM"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "release/$V"
-          git add Package.swift
-          git commit -m "Release $V: binary consumer manifest (checksum $CHECKSUM)"
-          git tag "$V"
-          git push origin "$V"
-
-      - name: Create GitHub Release + upload artifact
+      - name: Create draft release with artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
+          CHECKSUM=$(cat build/SimulaAdSDK.xcframework.zip.checksum)
           gh release create "$V" \
+            --draft \
             --title "$V" \
-            --notes "Binary XCFramework release. SPM: pin version $V (binaryTarget). CocoaPods: SimulaAdSDK $V (vendored XCFramework). Built with Xcode ${{ env.XCODE_VERSION }}; dSYMs embedded in the xcframework." \
-            "build/SimulaAdSDK.xcframework.zip"
+            --notes "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} (dSYMs embedded).
 
-      # pod spec lint downloads the :http zip from the release created above, so this must
-      # run last. Requires the COCOAPODS_TRUNK_TOKEN secret (pod trunk register).
-      - name: Publish podspec to CocoaPods trunk
-        env:
-          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
-        run: |
-          set -euo pipefail
-          pod spec lint SimulaAdSDK.podspec --allow-warnings
-          pod trunk push SimulaAdSDK.podspec --allow-warnings
+SPM checksum: \`$CHECKSUM\`
+
+Before publishing: run \`scripts/make-release-manifest.sh $V $CHECKSUM\`, commit, tag \`$V\`, push the tag, then publish this draft and push the podspec to trunk." \
+            "build/SimulaAdSDK.xcframework.zip"
