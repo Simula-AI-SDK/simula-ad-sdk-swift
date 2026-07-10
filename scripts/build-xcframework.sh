@@ -67,6 +67,11 @@ archive_slice() {
   # when the bundle is missing — embedding it here is a hard correctness requirement.
   ditto "$products/$BUNDLE_NAME" "$fw/$BUNDLE_NAME"
 
+  # Privacy manifest ALSO at the framework root (next to Info.plist): App Store Connect
+  # scans framework bundle roots for third-party SDK manifests. The copy inside the
+  # resource bundle stays for Bundle.module consumers; this one is for Apple's scanner.
+  cp "$fw/$BUNDLE_NAME/PrivacyInfo.xcprivacy" "$fw/PrivacyInfo.xcprivacy"
+
   # --- Assertions: fail the release rather than ship a broken artifact ---
   ls "$fw/Modules/$SCHEME.swiftmodule/"*.swiftinterface >/dev/null \
     || { echo "ERROR: no .swiftinterface in $slice slice (library evolution not applied)"; exit 1; }
@@ -81,6 +86,8 @@ archive_slice() {
     [[ -f "$fw/$BUNDLE_NAME/$resource" ]] \
       || { echo "ERROR: $resource missing from resource bundle in $slice slice"; exit 1; }
   done
+  [[ -f "$fw/PrivacyInfo.xcprivacy" ]] \
+    || { echo "ERROR: PrivacyInfo.xcprivacy missing from framework root in $slice slice"; exit 1; }
 }
 
 archive_slice "generic/platform=iOS"           "ios"           "Release-iphoneos"

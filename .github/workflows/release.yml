@@ -59,6 +59,13 @@ jobs:
           grep -q "let SIMULA_SDK_VERSION = \"$V\"" Sources/SimulaAdSDK/Telemetry/Telemetry.swift \
             || { echo "::error::SIMULA_SDK_VERSION != $V"; exit 1; }
 
+      # The one test gate that cannot live in CI: CI validates latest-stable, but the binary
+      # bakes in THIS pinned toolchain's codegen. Run the optimized suite (including
+      # TaskChurnStressTests, which exists to catch -O task-teardown miscompiles) on the
+      # exact compiler that produces the shipped artifact.
+      - name: Validate pinned toolchain (optimized test suite)
+        run: swift test -c release -Xswiftc -enable-testing
+
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
 
@@ -69,12 +76,24 @@ jobs:
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
           CHECKSUM=$(cat build/SimulaAdSDK.xcframework.zip.checksum)
+          # NOTE: a DRAFT release does not create the git tag. But if this draft is
+          # published while tag $V does not exist yet, GitHub creates the tag at this
+          # workflow's (source-manifest) commit and SPM consumers silently build from
+          # source — hence the warning below. Push the binary-manifest tag FIRST.
+          {
+            printf '%s\n' "**Do NOT publish this draft until tag \`$V\` exists.** Publishing without the tag makes GitHub create \`$V\` on a source-manifest commit, and SPM consumers would silently build from source instead of this binary."
+            printf '%s\n' ""
+            printf '%s\n' "Publish sequence:"
+            printf '%s\n' "1. \`scripts/make-release-manifest.sh $V $CHECKSUM\`"
+            printf '%s\n' "2. Commit, tag \`$V\`, push the tag"
+            printf '%s\n' "3. Publish this draft (it will attach to the pushed tag)"
+            printf '%s\n' "4. \`pod trunk push SimulaAdSDK.podspec\`"
+            printf '%s\n' "5. Validate on the demo app"
+            printf '%s\n' ""
+            printf '%s\n' "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} (dSYMs embedded). SPM checksum: \`$CHECKSUM\`"
+          } > release-notes.md
           gh release create "$V" \
             --draft \
             --title "$V" \
-            --notes "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} (dSYMs embedded).
-
-SPM checksum: \`$CHECKSUM\`
-
-Before publishing: run \`scripts/make-release-manifest.sh $V $CHECKSUM\`, commit, tag \`$V\`, push the tag, then publish this draft and push the podspec to trunk." \
+            --notes-file release-notes.md \
             "build/SimulaAdSDK.xcframework.zip"

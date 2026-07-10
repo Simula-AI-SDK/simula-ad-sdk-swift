@@ -95,7 +95,7 @@ final class TaskChurnStressTests: XCTestCase {
             advertisingIdProvider: { nil },
             enabled: true,
             sampleRate: 1.0,
-            now: { Date().timeIntervalSince1970 },
+            now: { Date().timeIntervalSince1970 * 1000 }, // epoch ms — the manager's clock contract
             random: { 0.0 },
             backoff: { _ in 0 },
             debugLog: nil,
