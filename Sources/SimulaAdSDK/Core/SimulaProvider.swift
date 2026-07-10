@@ -60,6 +60,25 @@ public final class SimulaProvider: ObservableObject {
     /// Touched only from `@MainActor` methods.
     private var sessionTask: Task<String?, Never>?
 
+    /// Monotonic tag bumped on every session creation. A creation task captures its generation and
+    /// only publishes its (sessionId, sessionUserID) pair if that generation is still current — so a
+    /// creation abandoned by `resyncSession` (consent change) can't clobber the newer session when it
+    /// finishes late with a now-stale privacy snapshot / ppid. Touched only on the main actor.
+    private var sessionGeneration = 0
+
+    /// The PPID the current *server* session actually represents — set to the value the session was
+    /// created with, and advanced only when a `PATCH …/ppid` succeeds. This can lag `primaryUserID`
+    /// after a mid-session login/logout/switch (the local id updates immediately; the server session
+    /// reconciles asynchronously, and a logout can't be pushed at all). Consumers that must evaluate
+    /// for a specific identity (e.g. the frequency-cap check) compare the two and drop the session id
+    /// when they diverge. Touched only on the main actor, like `sessionTask`.
+    private(set) var sessionUserID: String?
+
+    /// Serializes PPID reconciliation: each `reconcileServerPpid()` chains after this task so PATCHes
+    /// run strictly one at a time (the server applies them in order, and no out-of-order PATCH can
+    /// leave `sessionUserID` disagreeing with the real server identity). Touched only on the main actor.
+    private var ppidSyncTask: Task<Void, Never>?
+
     // MARK: - Ad Caching Infrastructure (matching Flutter/React SDK)
     // Host-facing legacy cache API (getCachedAd/cacheAd/…). No internal callers, but a host using it
     // across many distinct slots would grow these without bound — so each is a size-capped store.
@@ -119,6 +138,10 @@ public final class SimulaProvider: ObservableObject {
         // telemetry one.
         SimulaConnectionType.shared.start()
 
+        // Start device-signal collection so the `X-*` device headers are populated before the first
+        // request. Idempotent and independent of telemetry, like the connection-type monitor.
+        SimulaDeviceSignals.shared.start()
+
         // Install telemetry before the first request so the /session/create call (and every
         // subsequent SDK request) is captured. First call wins, so a re-created provider
         // doesn't churn it; the facade re-gates PII on the live consent snapshot.
@@ -146,18 +169,23 @@ public final class SimulaProvider: ObservableObject {
             // state triggers exactly one /session/create instead of a race.
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
-                Task { @MainActor in
-                    #if os(iOS)
-                    // The storage policy may have flipped (TCF Purpose 1 / GDPR);
-                    // drop prewarmed web views so the next game/ad is built with a
-                    // data store matching the new consent. (`acquire` also guards
-                    // this lazily; this just frees stale views proactively.)
-                    WebViewPool.shared.clear()
-                    #endif
-                    await self?.resyncSession()
-                }
+                // Single-call task closure — see the task-shape note in TelemetryManager.
+                Task { @MainActor in await self?.handleConsentChange() }
             }
             .store(in: &cancellables)
+    }
+
+    /// Task body for the consent-change reaction (named method — see the task-shape note in
+    /// TelemetryManager): drop consent-scoped web views, then re-sync the session.
+    @MainActor
+    private func handleConsentChange() async {
+        #if os(iOS)
+        // The storage policy may have flipped (TCF Purpose 1 / GDPR); drop prewarmed web
+        // views so the next game/ad is built with a data store matching the new consent.
+        // (`acquire` also guards this lazily; this just frees stale views proactively.)
+        WebViewPool.shared.clear()
+        #endif
+        await resyncSession()
     }
 
     // MARK: - Session Management
@@ -181,43 +209,126 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func ensureSession() async -> String? {
-        if let sessionId, !sessionId.isEmpty { return sessionId }
-        if let sessionTask { return await sessionTask.value }
+        // Loop so a caller that coalesces onto (or starts) a creation which is then superseded by a
+        // resync retries onto the replacement, instead of returning a premature nil while a session
+        // is still being created.
+        while true {
+            if let sessionId, !sessionId.isEmpty { return sessionId }
 
-        let snapshot = SimulaPrivacy.shared.currentSnapshot
-        let task = Task<String?, Never> { [api, apiKey, devMode, ppidStore] in
-            // Emit session_created/session_failed once per creation attempt (callers coalesce onto
-            // this single task). Best-effort telemetry; never affects session creation.
-            let startNanos = DispatchTime.now().uptimeNanoseconds
-            func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
-            do {
-                let id = try await api.createSession(
-                    apiKey: apiKey,
-                    devMode: devMode,
-                    primaryUserID: ppidStore.current,
-                    privacy: snapshot
-                )
-                let resolved = (id?.isEmpty == false) ? id : nil
-                if resolved != nil {
-                    Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
-                } else {
-                    Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
-                }
-                return resolved
-            } catch {
-                Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
-                return nil
+            // Await the in-flight creation — an existing one (coalesce) or a fresh one we start.
+            // `awaitedGeneration` is that creation's generation: sessionTask and sessionGeneration are
+            // only ever set together (in startSessionCreation / resyncSession, synchronously), so
+            // reading them here with no intervening await yields a consistent pair.
+            let taskToAwait: Task<String?, Never>
+            let awaitedGeneration: Int
+            if let existing = sessionTask {
+                taskToAwait = existing
+                awaitedGeneration = sessionGeneration
+            } else {
+                let created = startSessionCreation()
+                taskToAwait = created.task
+                awaitedGeneration = created.generation
             }
+
+            _ = await taskToAwait.value
+
+            // Superseded mid-await (a resync bumped the generation and started a replacement): retry
+            // so we await/observe the replacement rather than this abandoned creation's nil.
+            if sessionGeneration != awaitedGeneration { continue }
+
+            // The creation we awaited is still current and has settled. Clear the handle so a failed
+            // attempt is retried by the NEXT call, and return whatever it published (a genuine nil on
+            // failure is never re-created within this same call).
+            sessionTask = nil
+            return sessionId
+        }
+    }
+
+    /// Starts a session-creation task (bumps the generation and stores the in-flight handle) and
+    /// returns it with its generation. The task publishes the `(sessionId, sessionUserID)` pair
+    /// itself — guarded by the generation so a creation superseded by a resync can't overwrite the
+    /// current session — so every awaiter observes consistent state the moment it resolves.
+    @MainActor
+    private func startSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
+        let snapshot = SimulaPrivacy.shared.currentSnapshot
+        // Capture the ppid this session is created with so `sessionUserID` tracks the server
+        // session's true identity (used to detect a stale session after a mid-session change).
+        // Deliberately read at scheduling (not when the task runs): the created session represents
+        // THIS identity, and `createAndPublishSession` reconciles any change that lands mid-flight.
+        let ppidAtCreation = ppidStore.current
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        let task = Task<String?, Never> { @MainActor [weak self] in
+            await self?.createAndPublishSession(generation: generation, ppidAtCreation: ppidAtCreation, snapshot: snapshot) ?? nil
         }
         sessionTask = task
+        return (task, generation)
+    }
 
-        let id = await task.value
-        // Clear the task so a failed attempt can be retried on the next call.
-        sessionTask = nil
-        if let id, !id.isEmpty {
-            sessionId = id
+    /// Session-creation task body (named method — see the task-shape note in TelemetryManager):
+    /// runs the network call + telemetry (`runSessionCreation`), then publishes the
+    /// (sessionId, sessionUserID) pair INSIDE the task — so every awaiter, the creating caller AND
+    /// any coalesced waiters, observes a consistent pair the moment `task.value` resolves. Guarded
+    /// on the generation: a creation superseded by a resync must NOT overwrite the current session
+    /// with its stale pair.
+    @MainActor
+    private func createAndPublishSession(
+        generation: Int,
+        ppidAtCreation: String?,
+        snapshot: ConsentSnapshot
+    ) async -> String? {
+        let resolved = await Self.runSessionCreation(
+            api: api, apiKey: apiKey, devMode: devMode, ppid: ppidAtCreation, snapshot: snapshot
+        )
+        if let resolved, sessionGeneration == generation {
+            sessionId = resolved
+            sessionUserID = ppidAtCreation
+            // A login/switch that fired WHILE this session was being created couldn't reconcile
+            // (sessionId was still nil when updatePrimaryUserID ran, so reconcileServerPpid
+            // no-oped). Now that the session exists, drive it to the current ppid if it diverged
+            // from the one it was created with — otherwise the server session would stay on the
+            // old ppid until the host happened to call updatePrimaryUserID again.
+            if ppidStore.current != ppidAtCreation {
+                reconcileServerPpid()
+            }
         }
-        return sessionId
+        return resolved
+    }
+
+    /// Session-creation task body (named method — see the task-shape note in TelemetryManager).
+    /// Emits session_created/session_failed once per creation attempt (callers coalesce onto the
+    /// single task). Best-effort telemetry; never affects session creation. Static so the task
+    /// keeps the prior capture semantics (no strong `self`). `@MainActor` preserves the closure's
+    /// inherited isolation.
+    @MainActor
+    private static func runSessionCreation(
+        api: SimulaAPI,
+        apiKey: String,
+        devMode: Bool,
+        ppid: String?,
+        snapshot: ConsentSnapshot
+    ) async -> String? {
+        let startNanos = DispatchTime.now().uptimeNanoseconds
+        func durationMs() -> Int { Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000) }
+        do {
+            let id = try await api.createSession(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: ppid,
+                privacy: snapshot
+            )
+            let resolved = (id?.isEmpty == false) ? id : nil
+            if resolved != nil {
+                Telemetry.shared.recordOperation(name: "session_created", durationMs: durationMs(), success: true)
+            } else {
+                Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
+            }
+            return resolved
+        } catch {
+            Telemetry.shared.recordOperation(name: "session_failed", durationMs: durationMs(), success: false, failureClass: "no_session")
+            return nil
+        }
     }
 
     /// Invalidates the current session and recreates it so the backend sees the
@@ -225,6 +336,16 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     private func resyncSession() async {
         sessionId = nil
+        // Clear the tracked identity together with the id it belonged to, so a frequency-cap check
+        // during the resync window never pairs the (now-invalidated) old id with a stale identity —
+        // the recreated session sets both again atomically.
+        sessionUserID = nil
+        // Invalidate any in-flight creation UP FRONT (bump before cancel): a task already past its
+        // network call would otherwise still satisfy its generation guard and publish a session built
+        // from the now-stale consent snapshot. Bumping first guarantees that guard fails. Cancelling
+        // additionally aborts the wasted request; `ensureSession` below starts a fresh creation.
+        sessionGeneration &+= 1
+        sessionTask?.cancel()
         sessionTask = nil
         await ensureSession()
     }
@@ -261,11 +382,47 @@ public final class SimulaProvider: ObservableObject {
     public func updatePrimaryUserID(_ id: String?) {
         let normalized = (id?.isEmpty == false) ? id : nil
         ppidStore.set(normalized)
-        // With no session yet, the pending/next createSession carries the new value, so no PATCH is
-        // needed. PATCH a live session to push the new value server-side.
-        guard let normalized, let sid = sessionId, !sid.isEmpty else { return }
-        Task { [api, apiKey] in
-            await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: normalized)
+        // Reconcile the live server session toward the new id (serialized + single-flight). No-op
+        // when there's no session yet (the next createSession carries the value) or on logout (which
+        // can't be pushed server-side; the session is then treated as stale).
+        reconcileServerPpid()
+    }
+
+    /// Drive the server session's PPID toward the current `ppidStore` value and, on success, advance
+    /// `sessionUserID` to match — but only while that value is still the desired identity. Each call
+    /// chains after the previous (`ppidSyncTask`), so reconciles run strictly serially: at most one
+    /// PATCH is in flight, the server applies them in order, and a late/out-of-order PATCH can never
+    /// mark an identity the server didn't converge to. Rapid switches collapse (a chained run finds
+    /// the value already synced and no-ops). A logout (nil) or not-yet-created session is a
+    /// deliberate no-op that leaves `sessionUserID` stale, so a frequency-cap check drops the
+    /// now-mismatched session id rather than trusting it.
+    @MainActor
+    private func reconcileServerPpid() {
+        let previous = ppidSyncTask
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        ppidSyncTask = Task { @MainActor [weak self] in
+            await self?.runPpidReconcile(after: previous)
+        }
+    }
+
+    /// PPID-reconcile task body (named method — see the task-shape note in TelemetryManager):
+    /// waits for the previous reconcile (strict serialization), then drives the server session's
+    /// PPID toward the current `ppidStore` value.
+    @MainActor
+    private func runPpidReconcile(after previous: Task<Void, Never>?) async {
+        _ = await previous?.value
+        while true {
+            let target = ppidStore.current
+            guard let target, let sid = sessionId, !sid.isEmpty else { break }
+            if target == sessionUserID { break }
+            let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: target)
+            if !ok { break }
+            // The PATCH just moved the server session to `target` (reconciles are serialized, so
+            // no other PATCH interleaves). Record that truth UNCONDITIONALLY — even if the desired
+            // identity has already moved on — so sessionUserID always reflects the server's real
+            // state and can never falsely match a newer ppid. Then loop; the top-of-loop check
+            // exits once the server has converged to the latest.
+            sessionUserID = target
         }
     }
 

@@ -41,7 +41,8 @@ final class NativeAdPreloadCache {
     /// request, surfacing no error (PRD).
     func consume(_ id: String) async -> NativeAdResponse? {
         guard let task = tasks.removeValue(forKey: id) else { return nil }
-        return try? await task.value
+        // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
+        do { return try await task.value } catch { return nil }
     }
 
     /// Release a preloaded ad that was never consumed, cancelling its request if still in flight.

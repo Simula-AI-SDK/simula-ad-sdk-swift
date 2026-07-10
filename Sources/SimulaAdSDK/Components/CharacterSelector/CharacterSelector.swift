@@ -285,18 +285,23 @@ public struct CharacterSelector: View {
         entries = host + CharacterSelector.loadingEntries(fill) // back to the loading state
         guard fill > 0 else { return }
         // Backfill the gap from /character-selector (needs the publisher apiKey + a
-        // session). Resolve the loading state either way: real results when we got any,
-        // else the default characters. `@MainActor` so the `entries` write lands on the
-        // main thread after the off-main fetch.
-        Task { @MainActor in
-            let sessionId = await provider.ensureSession()
-            var fetched: [CharacterSelectorEntry] = []
-            if let sessionId, !sessionId.isEmpty {
-                fetched = await api.fetchCharacters(apiKey: provider.apiKey, sessionId: sessionId, fill: fill)
-                    .map { CharacterSelectorEntry(data: $0) }
-            }
-            entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterSelector.fallbackEntries)
+        // session). Single-call task closure — see the task-shape note in TelemetryManager.
+        Task { await backfillRoster(host: host, fill: fill) }
+    }
+
+    /// Task body for the roster backfill (named method — see the task-shape note in
+    /// TelemetryManager). Resolves the loading state either way: real results when we got
+    /// any, else the default characters. `@MainActor` so the `entries` write lands on the
+    /// main thread after the off-main fetch.
+    @MainActor
+    private func backfillRoster(host: [CharacterSelectorEntry], fill: Int) async {
+        let sessionId = await provider.ensureSession()
+        var fetched: [CharacterSelectorEntry] = []
+        if let sessionId, !sessionId.isEmpty {
+            fetched = await api.fetchCharacters(apiKey: provider.apiKey, sessionId: sessionId, fill: fill)
+                .map { CharacterSelectorEntry(data: $0) }
         }
+        entries = mergeRoster(host: host, fetched: fetched, fallback: CharacterSelector.fallbackEntries)
     }
 
     private func launch() {

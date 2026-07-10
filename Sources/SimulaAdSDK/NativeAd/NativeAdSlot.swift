@@ -126,6 +126,14 @@ public struct NativeAdSlot: View {
             .task(id: taskKey) { await load() }
             // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
             .task(id: awaitingHeight) { await watchForMissingHeight() }
+            // The creative can freeze mid-video/mid-typing across a background/foreground cycle (its
+            // WKWebView's content process suspends, and in-page visibilitychange/pageshow/focus
+            // listeners aren't guaranteed to fire on the way back). Deterministically wake it via the
+            // relay's onAppForeground bridge on every foreground return while a creative is mounted.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                guard case .filled = phase else { return }
+                visibilityRelay.resyncOnForeground()
+            }
     }
 
     /// The ad content for the current phase, before any width sizing.
@@ -410,7 +418,10 @@ public struct NativeAdSlot: View {
     @MainActor
     private func watchForMissingHeight() async {
         guard awaitingHeight else { return }
-        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        // Explicit do/catch (not `try?`): the sleep only throws on cancellation (height
+        // arrived / slot left), and `try?`-wrapped awaits in task closures are one of the
+        // shapes miscompiled by Swift 6.1–6.3 (see the task-shape note in TelemetryManager).
+        do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
         guard !Task.isCancelled, awaitingHeight else { return }
         handleLoadFailure()
     }

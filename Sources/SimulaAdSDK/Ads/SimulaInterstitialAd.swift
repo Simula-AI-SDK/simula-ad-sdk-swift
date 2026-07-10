@@ -293,66 +293,76 @@ public final class SimulaInterstitialAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         loadTask = Task { [weak self] in
-            guard let self else { return }
+            await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc)
+        }
+    }
 
-            let sessionId = await provider.ensureSession()
+    /// Load task body (named method — see the task-shape note in TelemetryManager).
+    private func runLoad(
+        provider: SimulaProvider,
+        charId: String?,
+        charName: String?,
+        charImage: String?,
+        charDesc: String?
+    ) async {
+        let sessionId = await provider.ensureSession()
+        if Task.isCancelled { return }
+        guard let sessionId, !sessionId.isEmpty else {
+            failLoad(.noSession)
+            return
+        }
+        // The real session id is now known. Refresh the dedup key — the
+        // synchronous gate at load() time may have keyed on an empty session
+        // during cold-start warm-up — so a subsequent same-key load() still
+        // deduplicates. `currentKeyAt` intentionally stays at the original load time.
+        currentKey = Self.dedupKey(adUnitId: adUnitId, charId: charId, charName: charName, sessionId: sessionId)
+
+        do {
+            let response = try await api.loadAd(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc,
+                // AdContext (contextual targeting) now rides on the full-screen request too, read
+                // from the same provider-level store the native surface uses.
+                context: provider.adContext
+            )
             if Task.isCancelled { return }
-            guard let sessionId, !sessionId.isEmpty else {
-                self.failLoad(.noSession)
+            // Fillable only when the payload carries a non-blank `rendered_html`
+            // creative (whitespace-only HTML trims to nil → no-fill).
+            guard response.adInserted, response.htmlCreative != nil else {
+                failLoad(.noFill)
                 return
             }
-            // The real session id is now known. Refresh the dedup key — the
-            // synchronous gate at load() time may have keyed on an empty session
-            // during cold-start warm-up — so a subsequent same-key load() still
-            // deduplicates. `currentKeyAt` intentionally stays at the original load time.
-            self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
-
-            do {
-                let response = try await self.api.loadAd(
-                    adUnitId: self.adUnitId,
-                    sessionId: sessionId,
-                    charId: charId,
-                    charName: charName,
-                    charImage: charImage,
-                    charDesc: charDesc,
-                    // AdContext (contextual targeting) now rides on the full-screen request too, read
-                    // from the same provider-level store the native surface uses.
-                    context: provider.adContext
-                )
-                if Task.isCancelled { return }
-                // Fillable only when the payload carries a non-blank `rendered_html`
-                // creative (whitespace-only HTML trims to nil → no-fill).
-                guard response.adInserted, response.htmlCreative != nil else {
-                    self.failLoad(.noFill)
-                    return
-                }
-                #if os(iOS)
-                // Warm a WKWebView so the first spin-up is off the present() critical path.
-                WebViewPool.shared.prewarm()
-                #endif
-                Telemetry.shared.setExperiment(experimentId: response.experiment?.experimentId, variantId: response.experiment?.variantId)
-                Telemetry.shared.recordLifecycle(
-                    stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
-                )
-                self.state = .ready(response, loadedAt: Date())
-                self.delegate?.interstitialDidLoad(self)
-            } catch let apiError as SimulaAPIError {
-                // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
-                // lifecycle event comes from failLoad()).
-                Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
-                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
-                // own case rather than burying it in the generic .network bucket.
-                if case .adUnitNotFound = apiError {
-                    self.failLoad(.adUnitNotFound)
-                } else {
-                    self.failLoad(.network(apiError))
-                }
-            } catch {
-                Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
-                self.failLoad(.network(.invalidResponse))
+            #if os(iOS)
+            // Warm a WKWebView so the first spin-up is off the present() critical path.
+            WebViewPool.shared.prewarm()
+            #endif
+            Telemetry.shared.setExperiment(experimentId: response.experiment?.experimentId, variantId: response.experiment?.variantId)
+            Telemetry.shared.recordLifecycle(
+                stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
+                adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
+            )
+            state = .ready(response, loadedAt: Date())
+            delegate?.interstitialDidLoad(self)
+        } catch let apiError as SimulaAPIError {
+            // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
+            // lifecycle event comes from failLoad()).
+            Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
+            // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+            // own case rather than burying it in the generic .network bucket.
+            if case .adUnitNotFound = apiError {
+                failLoad(.adUnitNotFound)
+            } else {
+                failLoad(.network(apiError))
             }
+        } catch {
+            Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
+            failLoad(.network(.invalidResponse))
         }
     }
 
@@ -654,14 +664,27 @@ public final class SimulaInterstitialAd {
         fallbackPrefetch?.cancel()
         prefetchedFallbacks = nil
         guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
-        let api = self.api
-        fallbackPrefetch = Task { [weak self] in
-            let ads = (try? await api.fetchFallbacks(impressionId: impressionId)) ?? []
-            self?.prefetchedFallbacks = ads   // @MainActor self → main-thread write
-            return ads
-        }
+        // Single-call task closure (inherits @MainActor) — see the task-shape note in TelemetryManager.
+        // `api` is captured strongly so the fetch still runs — and any awaiter still receives real
+        // screens — even if this ad object is released before the task starts (parity with the
+        // pre-refactor closure); `self` stays weak and only gates the state write.
+        fallbackPrefetch = Task { [weak self, api] in await Self.runFallbackPrefetch(api: api, impressionId: impressionId, ad: self) }
         #endif
     }
+
+    #if os(iOS)
+    /// Task body for the fallback prefetch (named method — see the task-shape note in
+    /// TelemetryManager). Static with a strongly captured `api` + optional `ad`, so the fetch never
+    /// depends on the ad object's liveness; the `prefetchedFallbacks` write stays a main-actor
+    /// write (and simply no-ops when the ad was released).
+    @MainActor
+    private static func runFallbackPrefetch(api: SimulaAPI, impressionId: String, ad: SimulaInterstitialAd?) async -> [FallbackAd] {
+        let ads: [FallbackAd]
+        do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
+        ad?.prefetchedFallbacks = ads
+        return ads
+    }
+    #endif
 
     /// After the creative closes, present the prefetched fallback ad screens full-screen in reveal
     /// order. When the prefetch has landed (the common case) it presents **synchronously**, so the
@@ -682,10 +705,9 @@ public final class SimulaInterstitialAd {
         if let ready {
             presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
+            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
             Task { [weak self] in
-                let ads = await prefetch.value
-                guard let self else { onAllClosed(); return }
-                self.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+                await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
         } else {
             onAllClosed()
@@ -694,6 +716,25 @@ public final class SimulaInterstitialAd {
         onAllClosed()
         #endif
     }
+
+    #if os(iOS)
+    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager):
+    /// wait for the in-flight prefetch, then present. Static with an optional `ad` so a released
+    /// ad object still completes the close flow via `onAllClosed`, as before.
+    @MainActor
+    private static func awaitPrefetchAndPresent(
+        ad: SimulaInterstitialAd?,
+        prefetch: Task<[FallbackAd], Never>,
+        response: AdLoadResponse,
+        autoStoreRedirect: AutoStoreRedirect?,
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
+    ) async {
+        let ads = await prefetch.value
+        guard let ad else { onAllClosed(); return }
+        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+    }
+    #endif
 
     /// Presents the fallback ad window for `ads` (fires `onAllClosed` immediately if empty). Best-effort.
     /// `response` threads the serve's CTA routing context (destination / raw store link /

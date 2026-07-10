@@ -241,23 +241,29 @@ public struct AdOverlayView: View {
         // Accrue only foreground time: a 50ms ticker driven by the monotonic clock, re-anchored each
         // (re)start so a backgrounded / store-sheet gap is never counted. The ring is snapped per tick
         // so it freezes on pause and resumes from where it left off. Cancelled on background / dismiss.
-        countdownTask = Task { @MainActor in
-            var lastTick = ProcessInfo.processInfo.systemUptime
-            while accumulatedMs < totalMs {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-                if Task.isCancelled { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                accumulatedMs += (now - lastTick) * 1000
-                lastTick = now
-                let progress = accumulatedMs / totalMs
-                ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
-                // Int(nonFinite) traps; clamp before converting.
-                let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
-                adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
-            }
-            adCountdown = 0
-            ringProgress = 1
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        countdownTask = Task { await runCountdown(totalMs: totalMs) }
+    }
+
+    /// Countdown ticker task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runCountdown(totalMs: Double) async {
+        var lastTick = ProcessInfo.processInfo.systemUptime
+        while accumulatedMs < totalMs {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+            if Task.isCancelled { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            accumulatedMs += (now - lastTick) * 1000
+            lastTick = now
+            let progress = accumulatedMs / totalMs
+            ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
+            // Int(nonFinite) traps; clamp before converting.
+            let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
+            adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
         }
+        adCountdown = 0
+        ringProgress = 1
     }
 }
 

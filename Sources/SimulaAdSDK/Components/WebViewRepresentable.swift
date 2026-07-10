@@ -341,23 +341,37 @@ struct WebViewRepresentable: UIViewRepresentable {
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
+            // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { @MainActor in
-                if destination == .appstore, attribution?.hasUsableTokens == true {
-                    // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
-                    // imperative formats). Prefers the tracker (router resolves it to the store —
-                    // deterministically via the raw store link when present), else the in-creative URL.
-                    CreativeCTARouter.open(
-                        trackingUrl: (trackingURL ?? fallback).absoluteString,
-                        destination: destination,
-                        storeOpen: .skstoreproduct,
-                        storeUrl: storeUrl,
-                        attribution: attribution
-                    )
-                } else if let trackingURL {
-                    CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination, storeUrl: storeUrl)
-                } else {
-                    UIApplication.shared.open(fallback)
-                }
+                Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback)
+            }
+        }
+
+        /// Task body for the native-CTA routing (named method — see the task-shape note in
+        /// TelemetryManager).
+        @MainActor
+        private static func routeNativeCTA(
+            trackingURL: URL?,
+            destination: AdDestination,
+            storeUrl: String?,
+            attribution: AdAttribution?,
+            fallback: URL
+        ) {
+            if destination == .appstore, attribution?.hasUsableTokens == true {
+                // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
+                // imperative formats). Prefers the tracker (router resolves it to the store —
+                // deterministically via the raw store link when present), else the in-creative URL.
+                CreativeCTARouter.open(
+                    trackingUrl: (trackingURL ?? fallback).absoluteString,
+                    destination: destination,
+                    storeOpen: .skstoreproduct,
+                    storeUrl: storeUrl,
+                    attribution: attribution
+                )
+            } else if let trackingURL {
+                CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination, storeUrl: storeUrl)
+            } else {
+                UIApplication.shared.open(fallback)
             }
         }
 
@@ -697,6 +711,26 @@ final class VisibilityRelay {
         let r = min(1, max(0, ratio))
         if last >= 0, abs(r - last) < 0.01 { return }
         last = r
+        push(r)
+    }
+
+    /// Deterministic foreground wake-up (call on `UIApplication.willEnterForegroundNotification`
+    /// while the slot is mounted). The creative (`character_ad.html`) can freeze mid-video/mid-typing
+    /// when its WKWebView's content process was suspended while backgrounded, and its own
+    /// `visibilitychange`/`pageshow`/`focus` listeners are not guaranteed to fire across that
+    /// suspend. `evaluateJavaScript` reaches the page regardless, so this calls the creative's
+    /// `onAppForeground` self-heal directly, then re-arms the dedupe and re-pushes the last known
+    /// ratio — the on-screen geometry is typically unchanged from before backgrounding, so without
+    /// resetting `last` the creative would never receive another `onVisibility` telling it the app
+    /// (and thus playback) is live again.
+    func resyncOnForeground() {
+        webView?.evaluateJavaScript("window.onAppForeground&&window.onAppForeground()", completionHandler: nil)
+        let previous = last
+        last = -1
+        if previous >= 0 { report(previous) }
+    }
+
+    private func push(_ r: CGFloat) {
         let s = String(format: "%.2f", r)
         webView?.evaluateJavaScript("window.onVisibility&&window.onVisibility(\(s))", completionHandler: nil)
     }
@@ -716,8 +750,11 @@ struct WebViewRepresentable: NSViewRepresentable {
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
     /// Accepted for signature parity with the iOS variant (the imperative HTML
-    /// creative is iOS-only, so this is unused on macOS).
+    /// creative is iOS-only, so these are unused on macOS).
     var onAdClick: (() -> Void)?
+    var attribution: AdAttribution?
+    var ctaDestination: AdDestination
+    var ctaStoreUrl: String?
 
     init(
         url: URL? = nil,
@@ -726,7 +763,10 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        attribution: AdAttribution? = nil,
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -735,6 +775,9 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.attribution = attribution
+        self.ctaDestination = ctaDestination
+        self.ctaStoreUrl = ctaStoreUrl
     }
 
     func makeNSView(context: Context) -> WKWebView {
