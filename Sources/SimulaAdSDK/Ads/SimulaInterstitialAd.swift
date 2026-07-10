@@ -448,14 +448,24 @@ public final class SimulaInterstitialAd {
                             attribution: response.skanAttribution
                         )
                     },
-                    onAllClosed: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClose(self) }
-                )
-                // Preload the next ad after close, reusing the last character context.
-                self.load(
-                    charId: self.lastCharId,
-                    charName: self.lastCharName,
-                    charImage: self.lastCharImage,
-                    charDesc: self.lastCharDesc
+                    onAllClosed: { [weak self] in
+                        guard let self else { return }
+                        self.delegate?.interstitialDidClose(self)
+                        // Auto-preload the next ad only now that the WHOLE unit is closed (Android
+                        // parity). Preloading at creative close made the next LOADED land BEFORE
+                        // CLOSED whenever fallback screens were up — inverting the publisher-visible
+                        // event order and stranding a ready ad behind any "loaded" mirror the host
+                        // keeps (e.g. the React Native hook). Skipped when the host already started
+                        // its own load during the fallback phase.
+                        if case .idle = self.state {
+                            self.load(
+                                charId: self.lastCharId,
+                                charName: self.lastCharName,
+                                charImage: self.lastCharImage,
+                                charDesc: self.lastCharDesc
+                            )
+                        }
+                    }
                 )
             }
         )

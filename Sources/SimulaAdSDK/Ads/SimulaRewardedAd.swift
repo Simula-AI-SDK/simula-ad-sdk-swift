@@ -324,6 +324,11 @@ public final class SimulaRewardedAd {
 
         let presenter = RewardedPresenter()
         showStartNanos = DispatchTime.now().uptimeNanoseconds
+        // Captured by value for the teardown salvage: the presenters self-retain while on
+        // screen, so the close flow below can run after the host destroyed this ad object —
+        // with `self == nil` — and must still be able to enqueue an earned reward.
+        let salvageSessionId = sessionId
+        let salvageAdUnitId = adUnitId
         let didPresent = presenter.present(
             impressionId: response.impressionId,
             apiKey: provider.apiKey,
@@ -356,7 +361,20 @@ public final class SimulaRewardedAd {
                 AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "seen", adFormat: Self.adFormat, adUnitId: self.adUnitId)
             },
             onClose: { [weak self] earned, elapsedPlayTime in
-                guard let self else { return }
+                guard let self else {
+                    // The host destroyed this ad object while the playable was up (the presenter
+                    // self-retains, so the unit stayed on screen). Delegates and fallback screens
+                    // die with the object, but an earned reward must not — enqueue the durable,
+                    // idempotent verification directly (parity with Android's teardown salvage).
+                    SimulaRewardedAd.salvageReward(
+                        earned: earned,
+                        impressionId: response.impressionId,
+                        sessionId: salvageSessionId,
+                        elapsedPlayTime: elapsedPlayTime,
+                        adUnitId: salvageAdUnitId
+                    )
+                    return
+                }
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
@@ -380,19 +398,37 @@ public final class SimulaRewardedAd {
                         )
                     },
                     onAllClosed: { [weak self] in
-                        guard let self else { return }
+                        guard let self else {
+                            // The host destroyed this ad object during the fallback screens (they
+                            // self-retain and stay up): still salvage the earned reward.
+                            SimulaRewardedAd.salvageReward(
+                                earned: earned,
+                                impressionId: response.impressionId,
+                                sessionId: salvageSessionId,
+                                elapsedPlayTime: elapsedPlayTime,
+                                adUnitId: salvageAdUnitId
+                            )
+                            return
+                        }
                         // CLOSE fires after the LAST fallback screen (not the playable close), then
                         // reward earn/verification (handleClose) — preserving the close → complete order.
                         self.delegate?.rewardedDidClose(self)
                         self.handleClose(response: response, earned: earned, elapsedPlayTime: elapsedPlayTime)
+                        // Auto-preload the next ad only now that the WHOLE unit is closed (Android
+                        // parity). Preloading at playable close made the next LOADED land BEFORE
+                        // CLOSED whenever fallback screens were up — inverting the publisher-visible
+                        // event order and stranding a ready ad behind any "loaded" mirror the host
+                        // keeps (e.g. the React Native hook). Skipped when the host already started
+                        // its own load during the fallback phase.
+                        if case .idle = self.state {
+                            self.load(
+                                charId: self.lastCharId,
+                                charName: self.lastCharName,
+                                charImage: self.lastCharImage,
+                                charDesc: self.lastCharDesc
+                            )
+                        }
                     }
-                )
-                // Preload the next ad after close, reusing the last character context.
-                self.load(
-                    charId: self.lastCharId,
-                    charName: self.lastCharName,
-                    charImage: self.lastCharImage,
-                    charDesc: self.lastCharDesc
                 )
             }
         )
@@ -531,21 +567,62 @@ public final class SimulaRewardedAd {
         Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.impressionId, serveId: nil)
         delegate?.rewardedDidEarnReward(self)
 
+        Self.enqueueVerification(
+            impressionId: response.impressionId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            ad: self
+        )
+    }
+
+    /// Teardown salvage (parity with Android's `reward_salvaged_on_teardown`): the ad object
+    /// was destroyed while its unit was still on screen, so the normal completion path
+    /// (`handleClose`) can never run. The earned reward must not be lost with it — enqueue the
+    /// durable, idempotent verification directly so the server-side SSV postback still fires;
+    /// only the delegate callbacks die with the object.
+    private static func salvageReward(
+        earned: Bool,
+        impressionId: String,
+        sessionId: String?,
+        elapsedPlayTime: Double,
+        adUnitId: String
+    ) {
+        guard earned, let sessionId, !sessionId.isEmpty, !impressionId.isEmpty else { return }
+        Telemetry.shared.recordLifecycle(stage: "reward_salvaged_on_teardown", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId, serveId: nil)
+        enqueueVerification(
+            impressionId: impressionId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            ad: nil
+        )
+    }
+
+    /// Enqueues the durable server verification for an earned play and records its telemetry.
+    /// Static and value-typed so the teardown salvage can reuse it after the ad object is gone
+    /// (`ad == nil` → the SSV postback still fires; only the delegate dispatch is skipped).
+    private static func enqueueVerification(
+        impressionId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String,
+        ad: SimulaRewardedAd?
+    ) {
         // Captured as values so the verification callback (off-main, possibly after retries)
-        // records telemetry without touching `self`. End-to-end latency includes queue backoff.
+        // records telemetry without touching the ad. End-to-end latency includes queue backoff.
         // The consolidated `impressionId` is the single id; the verify wire body still names it
         // `serve_id`, but telemetry carries it in `adId` (serve id is gone) for cross-format parity.
-        let adUnitId = self.adUnitId
-        let adId = response.impressionId
+        let adId = impressionId
         let serveId: String? = nil
         let verifyStartNanos = DispatchTime.now().uptimeNanoseconds
 
         RewardVerificationManager.shared.queueVerification(
-            serveId: response.impressionId,
+            serveId: impressionId,
             sessionId: sessionId,
             elapsedPlayTime: elapsedPlayTime,
             adUnitId: adUnitId
-        ) { [weak self] result in
+        ) { [weak ad] result in
             let verifyMs = Int((DispatchTime.now().uptimeNanoseconds &- verifyStartNanos) / 1_000_000)
             switch result {
             case .success:
@@ -557,7 +634,7 @@ public final class SimulaRewardedAd {
                 Telemetry.shared.recordError(signature: "rewarded:verify", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "RewardVerificationManager.queueVerification")
             }
             // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { @MainActor in self?.dispatchVerificationResult(result) }
+            Task { @MainActor in ad?.dispatchVerificationResult(result) }
         }
     }
 
