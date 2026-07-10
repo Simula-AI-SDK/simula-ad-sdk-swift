@@ -293,6 +293,15 @@ public final class SimulaProvider: ObservableObject {
                 reconcileServerPpid()
             }
         }
+        if sessionGeneration == generation {
+            // IPv4 capture for this session (fire-and-forget, deduped per identity). Fired even
+            // when creation failed (sid omitted) so the backend can still key on ppid/did —
+            // parity with the RN-layer beacon this replaces. Skipped for a creation superseded
+            // by a resync: the replacement creation fires for its own (current) session id.
+            Ipv4Beacon.shared.fire(
+                apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
+            )
+        }
         return resolved
     }
 
@@ -386,6 +395,16 @@ public final class SimulaProvider: ObservableObject {
         // when there's no session yet (the next createSession carries the value) or on logout (which
         // can't be pushed server-side; the session is then treated as stale).
         reconcileServerPpid()
+        // IPv4 capture: a login/switch re-captures against the new identity (with the current
+        // session id when one exists); a logout resets the dedup memory so a later re-login —
+        // even with the same ppid — runs a fresh capture. Fire-and-forget, never throws.
+        if let normalized {
+            Ipv4Beacon.shared.fire(
+                apiKey: apiKey, sessionId: sessionId, ppid: normalized, reason: Ipv4Beacon.reasonPpidUpdate
+            )
+        } else {
+            Ipv4Beacon.shared.onLogout()
+        }
     }
 
     /// Drive the server session's PPID toward the current `ppidStore` value and, on success, advance
