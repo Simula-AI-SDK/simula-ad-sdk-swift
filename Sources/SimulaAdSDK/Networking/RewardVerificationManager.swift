@@ -64,6 +64,10 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private let verifier: RewardVerifying
     private let defaults: UserDefaults
     private let now: @Sendable () -> TimeInterval
+    /// Suspends for the retry-wake delay. Production uses `Task.sleep`; tests inject a
+    /// controllable sleeper so the wake can be released after advancing the fake clock —
+    /// without waiting on wall-clock backoff (5s → 60s).
+    private let sleep: @Sendable (TimeInterval) async -> Void
     private let lock = NSLock()
     private var isProcessing = false
 
@@ -83,18 +87,26 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.verifier = SimulaAPI()
         self.defaults = .standard
         self.now = { Date().timeIntervalSince1970 }
+        self.sleep = { delay in
+            do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
+        }
     }
 
-    /// Test seam: inject a fake verifier, an isolated `UserDefaults`, and a controllable
-    /// clock so the draining logic can be exercised deterministically.
+    /// Test seam: inject a fake verifier, an isolated `UserDefaults`, a controllable
+    /// clock, and (optionally) a controllable sleeper so the draining + retry-wake logic
+    /// can be exercised deterministically — no network, no wall-clock timing.
     init(
         verifier: RewardVerifying,
         defaults: UserDefaults,
-        now: @escaping @Sendable () -> TimeInterval
+        now: @escaping @Sendable () -> TimeInterval,
+        sleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) {
         self.verifier = verifier
         self.defaults = defaults
         self.now = now
+        self.sleep = sleep ?? { delay in
+            do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
+        }
     }
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
@@ -238,8 +250,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
     /// Retry-wake task body (named method — see the task-shape note in TelemetryManager).
     private func runRetryWake(delay: TimeInterval) async {
-        // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-        do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
+        await sleep(delay)
+        guard !Task.isCancelled else { return }
         triggerProcessQueue()
     }
 
