@@ -8,8 +8,13 @@ let package = Package(
         .macOS(.v12)
     ],
     products: [
+        // Dynamic so `xcodebuild archive` emits a real SimulaAdSDK.framework — the input for the
+        // binary XCFramework release artifact (scripts/build-xcframework.sh). Also gives dynamic
+        // linkage for source consumers, which keeps MetricKit crash attribution working (the
+        // SimulaAdSDK binary name appears in call-stack trees — see SimulaCrashGuard).
         .library(
             name: "SimulaAdSDK",
+            type: .dynamic,
             targets: ["SimulaAdSDK"]
         ),
     ],

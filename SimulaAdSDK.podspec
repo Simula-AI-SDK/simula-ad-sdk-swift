@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "SimulaAdSDK"
-  s.version          = "1.1.3"
+  s.version          = "1.1.4"
   s.summary          = "Interactive, AI-native ad experiences for modern apps"
 
   s.description      = <<-DESC
@@ -13,22 +13,19 @@ Pod::Spec.new do |s|
   s.license          = { :type => "MIT", :file => "LICENSE" }
   s.author           = { "Simula AI" => "admin@simula.ad" }
 
+  # Binary distribution (1.1.4+): a prebuilt, module-stable XCFramework. Host Xcodes never
+  # compile SDK source — the mitigation for the Swift 6.1–6.3 optimizer task-teardown
+  # miscompilation that aborted host apps (see the repo's swift-concurrency-task-shape skill).
+  # The artifact is built + validated by .github/workflows/release.yml; resources (including
+  # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
   s.source           = {
-    :git => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift.git",
-    :tag => s.version.to_s
+    :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
   }
 
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
 
-  s.source_files     = "Sources/SimulaAdSDK/**/*.swift"
-
-  s.resource_bundles = {
-    "SimulaAdSDK" => [
-      "Sources/SimulaAdSDK/Resources/*.png",
-      "Sources/SimulaAdSDK/Resources/PrivacyInfo.xcprivacy"
-    ]
-  }
+  s.vendored_frameworks = "SimulaAdSDK.xcframework"
 
   s.frameworks       = [
     "StoreKit",

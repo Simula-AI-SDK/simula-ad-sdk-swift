@@ -106,10 +106,20 @@ await MainActor.run { SimulaAds.initialize(apiKey: key) }
 
 Tests in `Tests/SimulaAdSDKTests/`, XCTest with `@testable import`. Tier 0: pure functions (parsing, classify, backoff). Tier 1: engines with `FakeStore`/`FakeSender` and isolated `UserDefaults(suiteName: UUID)`. Inject `now`, `random`, `backoff` for determinism. No real network.
 
-## Version sync (both, always together)
+## Distribution (binary XCFramework since 1.1.4)
+
+Consumers get a **prebuilt XCFramework** — host Xcodes never compile SDK source (the mitigation for the Swift 6.1–6.3 optimizer task-teardown miscompile; see `.cursor/skills/swift-concurrency-task-shape/SKILL.md`). Consequences for code changes:
+
+- `main` keeps the source manifest; each release **tag** carries a generated binary manifest (`scripts/make-release-manifest.sh`). Never hand-edit a tag's `Package.swift`.
+- Releases go through `.github/workflows/release.yml` only: pinned Xcode, full Debug + Release (`-O`) test suites (including `TaskChurnStressTests`), `scripts/build-xcframework.sh`, a binary-consumer smoke build (`Examples/BinarySmoke`), then tag + GitHub Release + `pod trunk push`.
+- The public API must stay **library-evolution clean** (`BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — CI checks this). No `@inlinable`/`@_alwaysEmitIntoClient` on public API: inlined bodies would be compiled by host toolchains, re-opening the miscompile.
+- Resources (including `PrivacyInfo.xcprivacy`) ship inside the framework's `SimulaAdSDK_SimulaAdSDK.bundle`; the build script hard-fails if they're missing.
+
+## Version sync (all, always together)
 
 1. `Sources/SimulaAdSDK/Telemetry/Telemetry.swift` — `SIMULA_SDK_VERSION`
-2. `SimulaAdSDK.podspec` — `s.version` (and the SPM release tag)
+2. `SimulaAdSDK.podspec` — `s.version`
+3. The release tag (created by the release workflow, which also writes the binary `Package.swift` url/checksum for that tag)
 
 ## Definition of done — mandatory gate
 
@@ -120,4 +130,4 @@ swift build
 swift test
 ```
 
-CI (`.github/workflows/ci.yml`) additionally runs the test suite on an iOS Simulator, which exercises `#if os(iOS)` code — keep platform guards correct or CI fails even when `swift test` passes locally. If you changed public API or behavior, check whether the same change is needed in `../simula-ad-sdk-kotlin` and say so in your summary.
+CI (`.github/workflows/ci.yml`) additionally runs the test suite on an iOS Simulator (exercises `#if os(iOS)` code), the suite again under `-c release` (optimized — the only lane that can catch the task-teardown miscompile class), and a `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` build (binary-artifact readiness) — keep platform guards and the public interface clean or CI fails even when `swift test` passes locally. If you changed public API or behavior, check whether the same change is needed in `../simula-ad-sdk-kotlin` and say so in your summary.

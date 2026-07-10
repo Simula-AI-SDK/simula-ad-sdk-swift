@@ -55,6 +55,12 @@ jobs:
             -scheme SimulaAdSDK \
             -destination "id=$UDID"
 
+      # Optimized-build lane: the Swift 6.1–6.3 task-teardown miscompile only manifests in
+      # optimizer builds, which debug `swift test` can never catch. Runs the whole suite —
+      # including TaskChurnStressTests — under -O (a regression aborts the test process).
+      - name: Run tests optimized (release configuration)
+        run: swift test -c release -Xswiftc -enable-testing
+
       - name: Build artifact (release + iOS)
         run: |
           swift build -c release
@@ -62,3 +68,14 @@ jobs:
             -scheme SimulaAdSDK \
             -configuration Release \
             -destination 'generic/platform=iOS Simulator'
+
+      # The binary release artifact requires a module-stable interface. Fail PRs that break
+      # library evolution here rather than at release time (scripts/build-xcframework.sh).
+      - name: Check library evolution (binary distribution readiness)
+        run: |
+          xcodebuild build \
+            -scheme SimulaAdSDK \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+            CODE_SIGNING_ALLOWED=NO
