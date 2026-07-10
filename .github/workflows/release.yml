@@ -9,8 +9,8 @@ name: Release (binary XCFramework)
 #   3. pod trunk push SimulaAdSDK.podspec (the :http source resolves to the published asset).
 #   4. Smoke-test the demo app.
 #
-# Test gates (Debug + Release/-O incl. TaskChurnStressTests + iOS Simulator) run in CI on
-# every PR/push (.github/workflows/ci.yml) — release from a green main.
+# Test gates (Debug + Release/-O + iOS Simulator) run in CI on every PR/push
+# (.github/workflows/ci.yml) — release from a green main.
 #
 # WHY BINARY: affected host Xcodes (Swift 6.1–6.3 optimizers) miscompile Swift Concurrency
 # shapes in source SDKs into task-teardown aborts inside host apps.
@@ -24,9 +24,9 @@ on:
         required: true
 
 env:
-  # PINNED, VALIDATED builder toolchain. Bump only after the Release-lane suite (incl.
-  # TaskChurnStressTests) passes on the new version. Do NOT use latest-stable here: the
-  # binary bakes in this toolchain's codegen, so it must be a deliberate choice.
+  # PINNED, VALIDATED builder toolchain. Bump only after the Release-lane (-O) suite
+  # passes on the new version. Do NOT use latest-stable here: the binary bakes in this
+  # toolchain's codegen, so it must be a deliberate choice.
   XCODE_VERSION: "26.4.1"
 
 concurrency:
@@ -60,9 +60,8 @@ jobs:
             || { echo "::error::SIMULA_SDK_VERSION != $V"; exit 1; }
 
       # The one test gate that cannot live in CI: CI validates latest-stable, but the binary
-      # bakes in THIS pinned toolchain's codegen. Run the optimized suite (including
-      # TaskChurnStressTests, which exists to catch -O task-teardown miscompiles) on the
-      # exact compiler that produces the shipped artifact.
+      # bakes in THIS pinned toolchain's codegen. Run the optimized (-O) suite on the exact
+      # compiler that produces the shipped artifact to catch task-teardown miscompiles.
       - name: Validate pinned toolchain (optimized test suite)
         run: swift test -c release -Xswiftc -enable-testing
 

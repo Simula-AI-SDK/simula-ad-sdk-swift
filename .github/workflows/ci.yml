@@ -56,8 +56,8 @@ jobs:
             -destination "id=$UDID"
 
       # Optimized-build lane: the Swift 6.1–6.3 task-teardown miscompile only manifests in
-      # optimizer builds, which debug `swift test` can never catch. Runs the whole suite —
-      # including TaskChurnStressTests — under -O (a regression aborts the test process).
+      # optimizer builds, which debug `swift test` can never catch. Runs the whole suite
+      # under -O (a regression aborts the test process).
       - name: Run tests optimized (release configuration)
         run: swift test -c release -Xswiftc -enable-testing
 
