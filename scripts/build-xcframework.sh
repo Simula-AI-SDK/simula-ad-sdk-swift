@@ -70,10 +70,17 @@ archive_slice() {
   # --- Assertions: fail the release rather than ship a broken artifact ---
   ls "$fw/Modules/$SCHEME.swiftmodule/"*.swiftinterface >/dev/null \
     || { echo "ERROR: no .swiftinterface in $slice slice (library evolution not applied)"; exit 1; }
-  [[ -f "$fw/$BUNDLE_NAME/PrivacyInfo.xcprivacy" ]] \
-    || { echo "ERROR: PrivacyInfo.xcprivacy missing from resource bundle in $slice slice"; exit 1; }
-  [[ -f "$fw/$BUNDLE_NAME/game_icon.png" ]] \
-    || { echo "ERROR: bundled images missing from resource bundle in $slice slice"; exit 1; }
+  # Every resource declared in Package.swift: the generated Bundle.module accessor
+  # fatalErrors on a missing bundle, and UI code loads each of these at runtime.
+  local resource
+  for resource in \
+    PrivacyInfo.xcprivacy \
+    game_icon.png \
+    games_unavailable.png \
+    minigame_interstitial_background.png; do
+    [[ -f "$fw/$BUNDLE_NAME/$resource" ]] \
+      || { echo "ERROR: $resource missing from resource bundle in $slice slice"; exit 1; }
+  done
 }
 
 archive_slice "generic/platform=iOS"           "ios"           "Release-iphoneos"

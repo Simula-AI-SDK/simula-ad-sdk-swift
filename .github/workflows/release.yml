@@ -35,7 +35,9 @@ concurrency:
 
 jobs:
   build-and-upload:
-    runs-on: macos-15
+    # macOS 26 runner required: Xcode 26.4.x does not install on macOS 15 (Sequoia) images.
+    # Keep this in lockstep with XCODE_VERSION above when either changes.
+    runs-on: macos-26
     permissions:
       contents: write
     steps:

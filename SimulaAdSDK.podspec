@@ -10,7 +10,9 @@ Pod::Spec.new do |s|
   DESC
 
   s.homepage         = "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift"
-  s.license          = { :type => "MIT", :file => "LICENSE" }
+  # :text (not :file): the :http source zip contains only the XCFramework (SPM binaryTarget
+  # requires the artifact at the zip root), so there is no LICENSE file for lint to find.
+  s.license          = { :type => "MIT", :text => "MIT License — Copyright (c) 2026 Simula AI SDK. See https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/blob/main/LICENSE" }
   s.author           = { "Simula AI" => "admin@simula.ad" }
 
   # Binary distribution (1.1.4+): a prebuilt, module-stable XCFramework. Host Xcodes never
