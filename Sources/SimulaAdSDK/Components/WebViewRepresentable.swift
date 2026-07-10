@@ -408,6 +408,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             if reportsContentHeight {
                 webView.evaluateJavaScript(Coordinator.heightReportingScript, completionHandler: nil)
             }
+            // Replay the current visibility ratio now that window.onVisibility exists — pushes
+            // issued while the page was loading were dropped by the guard but still advanced the
+            // relay's dedup baseline, leaving an off-screen creative deaf to the bridge (its
+            // no-bridge fallback then animates before the slot scrolls into view).
+            visibilityRelay?.flush()
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -699,21 +704,36 @@ struct WebViewRepresentable: UIViewRepresentable {
 /// All access is on the main thread (the SwiftUI viewability callbacks + representable lifecycle).
 final class VisibilityRelay {
     private weak var webView: WKWebView?
-    private var last: CGFloat = -1
+    /// Last ratio actually pushed over the JS bridge (dedup baseline). -1 = nothing pushed yet.
+    private var lastSent: CGFloat = -1
+    /// Latest ratio the viewability modifier reported, whether or not the push reached the page.
+    /// -1 = no geometry sample yet.
+    private var latest: CGFloat = -1
 
     /// Point the relay at the live `WKWebView` (or `nil` to detach on teardown).
     func bind(_ webView: WKWebView?) {
         self.webView = webView
-        last = -1
+        lastSent = -1
     }
 
     /// Forward a 0..1 ratio to the creative, de-duped against the last forwarded value (~1%
     /// granularity). Guarded so it's a no-op until `window.onVisibility` is defined.
     func report(_ ratio: CGFloat) {
         let r = min(1, max(0, ratio))
-        if last >= 0, abs(r - last) < 0.01 { return }
-        last = r
+        latest = r
+        if lastSent >= 0, abs(r - lastSent) < 0.01 { return }
         push(r)
+    }
+
+    /// Re-deliver the latest ratio unconditionally, bypassing the dedup. Called when the creative
+    /// finishes loading: any `report` issued while the page was still loading was silently dropped
+    /// by the `window.onVisibility&&…` guard (the function didn't exist yet) but still advanced the
+    /// dedup baseline, so without this replay a creative that mounts off-screen never hears a
+    /// ratio at all — and its no-bridge fallback animates the card before it scrolls into view.
+    /// With no geometry sample yet, sends 0 ("bridge is live, not visible") so the creative arms
+    /// its visibility gating instead of the fallback timer; the first real sample follows.
+    func flush() {
+        push(max(latest, 0))
     }
 
     /// Deterministic foreground wake-up (call on `UIApplication.willEnterForegroundNotification`
@@ -721,18 +741,19 @@ final class VisibilityRelay {
     /// when its WKWebView's content process was suspended while backgrounded, and its own
     /// `visibilitychange`/`pageshow`/`focus` listeners are not guaranteed to fire across that
     /// suspend. `evaluateJavaScript` reaches the page regardless, so this calls the creative's
-    /// `onAppForeground` self-heal directly, then re-arms the dedupe and re-pushes the last known
+    /// `onAppForeground` self-heal directly, then re-arms the dedupe and re-pushes the latest known
     /// ratio — the on-screen geometry is typically unchanged from before backgrounding, so without
-    /// resetting `last` the creative would never receive another `onVisibility` telling it the app
-    /// (and thus playback) is live again.
+    /// resetting `lastSent` the creative would never receive another `onVisibility` telling it the
+    /// app (and thus playback) is live again.
     func resyncOnForeground() {
         webView?.evaluateJavaScript("window.onAppForeground&&window.onAppForeground()", completionHandler: nil)
-        let previous = last
-        last = -1
+        let previous = latest
+        lastSent = -1
         if previous >= 0 { report(previous) }
     }
 
     private func push(_ r: CGFloat) {
+        lastSent = r
         let s = String(format: "%.2f", r)
         webView?.evaluateJavaScript("window.onVisibility&&window.onVisibility(\(s))", completionHandler: nil)
     }
