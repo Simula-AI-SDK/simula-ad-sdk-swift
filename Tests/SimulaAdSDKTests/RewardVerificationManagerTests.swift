@@ -193,6 +193,74 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertTrue(persistedQueue().isEmpty)
     }
 
+    /// The retry-wake path: a 5xx bail must schedule a drain that re-fires on its own after
+    /// backoff — without a new enqueue or app relaunch. Controllable sleep + clock so this
+    /// doesn't wait on wall-clock 5s.
+    func testRetryWakeReDrainsAfterBackoffWithoutNewEnqueue() async {
+        let verifier = FakeVerifier()
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
+        let clock = TestClock(0)
+        let sleeper = ControllableSleep()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            defaults: defaults,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        let failExp = expectation(description: "first attempt fails")
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
+            if case .failure = result { failExp.fulfill() }
+        }
+        await fulfillment(of: [failExp], timeout: 2)
+        XCTAssertEqual(verifier.callCount("A"), 1)
+
+        let requested = await sleeper.waitForSleepRequest()
+        XCTAssertEqual(requested, 5, accuracy: 0.01, "backoff(1) = 5s must drive the wake delay")
+
+        // Become eligible, then release the wake — no re-enqueue / trigger from the test.
+        verifier.clearError(for: "A")
+        verifier.setToken("tokA", for: "A")
+        clock.time = 5
+        sleeper.release()
+
+        try? await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        XCTAssertEqual(verifier.callCount("A"), 2, "wake must re-drain once the backoff elapses")
+        XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
+    }
+
+    /// A wake that finds nothing eligible (frozen clock) must terminate — not reschedule
+    /// itself forever against a backend that just failed.
+    func testRetryWakeDoesNotRescheduleWhenStillBackedOff() async {
+        let verifier = FakeVerifier()
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
+        let clock = TestClock(0)
+        let sleeper = ControllableSleep()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            defaults: defaults,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        let failExp = expectation(description: "first attempt fails")
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
+            if case .failure = result { failExp.fulfill() }
+        }
+        await fulfillment(of: [failExp], timeout: 2)
+        _ = await sleeper.waitForSleepRequest()
+
+        // Release the wake without advancing the clock → task still ineligible.
+        sleeper.release()
+        try? await waitUntil(timeout: 2) { !sleeper.isSleeping }
+        // Settle so a wrongly chained wake would have parked on sleep again.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(verifier.callCount("A"), 1)
+        XCTAssertEqual(persistedQueue().count, 1)
+        XCTAssertEqual(sleeper.count, 1, "ineligible wake must not chain another sleep")
+    }
+
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
     // applicable here, as Swift completion closures are non-throwing by type.
 
@@ -217,6 +285,69 @@ private final class TestClock: @unchecked Sendable {
     var time: TimeInterval {
         get { lock.lock(); defer { lock.unlock() }; return t }
         set { lock.lock(); t = newValue; lock.unlock() }
+    }
+}
+
+/// Parks the retry-wake until the test advances the fake clock and calls [release].
+private final class ControllableSleep: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingDelay: TimeInterval?
+    private var delayWaiter: CheckedContinuation<TimeInterval, Never>?
+    private var releaseCont: CheckedContinuation<Void, Never>?
+    private var _count = 0
+    private var sleeping = false
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _count
+    }
+
+    var isSleeping: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sleeping
+    }
+
+    func sleep(_ delay: TimeInterval) async {
+        lock.lock()
+        _count += 1
+        sleeping = true
+        pendingDelay = delay
+        let waiter = delayWaiter
+        delayWaiter = nil
+        lock.unlock()
+        waiter?.resume(returning: delay)
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            releaseCont = cont
+            lock.unlock()
+        }
+
+        lock.lock()
+        sleeping = false
+        pendingDelay = nil
+        lock.unlock()
+    }
+
+    func waitForSleepRequest() async -> TimeInterval {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if let delay = pendingDelay {
+                lock.unlock()
+                cont.resume(returning: delay)
+                return
+            }
+            delayWaiter = cont
+            lock.unlock()
+        }
+    }
+
+    func release() {
+        lock.lock()
+        let cont = releaseCont
+        releaseCont = nil
+        lock.unlock()
+        cont?.resume()
     }
 }
 
