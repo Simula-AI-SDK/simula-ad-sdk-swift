@@ -293,11 +293,17 @@ public final class SimulaProvider: ObservableObject {
                 reconcileServerPpid()
             }
         }
-        if sessionGeneration == generation {
+        if sessionGeneration == generation, ppidStore.current == ppidAtCreation {
             // IPv4 capture for this session (fire-and-forget, deduped per identity). Fired even
             // when creation failed (sid omitted) so the backend can still key on ppid/did —
-            // parity with the RN-layer beacon this replaces. Skipped for a creation superseded
-            // by a resync: the replacement creation fires for its own (current) session id.
+            // parity with the RN-layer beacon this replaces. Skipped when superseded:
+            //   • by a resync (generation moved on) — the replacement creation fires for its
+            //     own (current) session id;
+            //   • by a mid-creation login/switch/logout (ppidStore.current diverged from
+            //     ppidAtCreation) — beaconing the stale ppid would misattribute the capture;
+            //     a login/switch is instead captured by the reconcile convergence beacon once
+            //     the server session actually represents the new user, and a logout must not
+            //     re-enter the dedup memory it just reset.
             Ipv4Beacon.shared.fire(
                 apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
             )
@@ -395,14 +401,13 @@ public final class SimulaProvider: ObservableObject {
         // when there's no session yet (the next createSession carries the value) or on logout (which
         // can't be pushed server-side; the session is then treated as stale).
         reconcileServerPpid()
-        // IPv4 capture: a login/switch re-captures against the new identity (with the current
-        // session id when one exists); a logout resets the dedup memory so a later re-login —
-        // even with the same ppid — runs a fresh capture. Fire-and-forget, never throws.
-        if let normalized {
-            Ipv4Beacon.shared.fire(
-                apiKey: apiKey, sessionId: sessionId, ppid: normalized, reason: Ipv4Beacon.reasonPpidUpdate
-            )
-        } else {
+        // IPv4 capture on a login/switch fires from INSIDE the reconcile loop, once the server
+        // session has converged to the new ppid — so the sid it carries (the backend keys the
+        // capture by sid first) genuinely represents the new user, never the previous one the
+        // session still holds pre-PATCH (the same stale-identity gate consistentSessionId
+        // applies for the frequency-cap check). A login with no session yet is covered by the
+        // session-creation init beacon. Only the logout dedup reset lives here.
+        if normalized == nil {
             Ipv4Beacon.shared.onLogout()
         }
     }
@@ -433,14 +438,31 @@ public final class SimulaProvider: ObservableObject {
         while true {
             let target = ppidStore.current
             guard let target, let sid = sessionId, !sid.isEmpty else { break }
-            if target == sessionUserID { break }
+            if target == sessionUserID {
+                // Converged: the server session now genuinely represents `target`. Fire the
+                // IPv4 capture HERE — not from updatePrimaryUserID — so the sid it carries
+                // (the backend keys the capture by sid first) no longer represents the
+                // PREVIOUS user (pre-PATCH it still does; the same stale-identity concern
+                // consistentSessionId guards for the frequency-cap check). `target` is the
+                // live ppid: it was read this iteration with no suspension since, and this
+                // whole method is main-actor-isolated, so a logout can't interleave between
+                // the read and this fire. Deduped per (apiKey, sid, ppid) inside the beacon,
+                // so the steady-state reconcile is free; a post-logout re-login with the same
+                // ppid lands here without needing a PATCH and re-captures because the logout
+                // cleared the dedup memory.
+                Ipv4Beacon.shared.fire(
+                    apiKey: apiKey, sessionId: sid, ppid: target, reason: Ipv4Beacon.reasonPpidUpdate
+                )
+                break
+            }
             let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: target)
             if !ok { break }
             // The PATCH just moved the server session to `target` (reconciles are serialized, so
             // no other PATCH interleaves). Record that truth UNCONDITIONALLY — even if the desired
             // identity has already moved on — so sessionUserID always reflects the server's real
             // state and can never falsely match a newer ppid. Then loop; the top-of-loop check
-            // exits once the server has converged to the latest.
+            // exits once the server has converged to the latest (and fires the IPv4 capture for
+            // the identity it converged to).
             sessionUserID = target
         }
     }
