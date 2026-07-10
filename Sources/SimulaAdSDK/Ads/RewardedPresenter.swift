@@ -19,6 +19,13 @@ final class RewardedPresenter {
     /// The host's key window, captured before we take key. Restored on dismiss so the
     /// host regains touch/keyboard focus (a new key window doesn't auto-revert).
     private weak var originalKeyWindow: UIWindow?
+    /// Deliberate self-retention while the window is on screen. The presentation must survive
+    /// its owning ad object: a host can release the ad mid-unit (e.g. React Native's
+    /// `destroy()` on unmount, or an error handler recreating the instance), and since UIKit
+    /// does not retain windows, dropping the last reference to this presenter would deallocate
+    /// the window and rip the ad off screen. Set on a successful `present`, released in
+    /// `dismiss` (the only teardown path — close remains user-driven).
+    private var retainedWhilePresenting: RewardedPresenter?
 
     /// Presents the playable minigame iframe. `onClose` fires once the window has been
     /// torn down, carrying `(rewardEarned, elapsedPlayTime)`.
@@ -89,6 +96,7 @@ final class RewardedPresenter {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        retainedWhilePresenting = self
         // Give the bridge the orientation host + window now that they exist.
         bridge.orientationHost = hosting
         bridge.window = window
@@ -112,6 +120,9 @@ final class RewardedPresenter {
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
+        // Release the presentation-scoped self-retention. The caller's reference keeps `self`
+        // alive through this method even when this was the last strong reference.
+        retainedWhilePresenting = nil
         callback?(earned, elapsedPlayTime)
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).

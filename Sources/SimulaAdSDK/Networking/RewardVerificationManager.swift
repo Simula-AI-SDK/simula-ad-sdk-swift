@@ -67,6 +67,12 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private let lock = NSLock()
     private var isProcessing = false
 
+    /// A scheduled wake-up for the earliest backed-off task after a retryable failure (e.g. a
+    /// server 5xx). Without it the backoff computed eligibility but nothing ever re-triggered
+    /// the drain — a failed verify sat in the queue until the NEXT earned reward or app
+    /// relaunch, so REWARD_VERIFIED could stall for a whole session. Guarded by `lock`.
+    private var retryTask: Task<Void, Never>?
+
     /// Per-`serveId` result callbacks, so a verification's outcome reaches the caller
     /// that enqueued it — not whoever happens to be draining the queue. One-shot:
     /// removed the first time the task is attempted, so it can't be misrouted to
@@ -195,12 +201,46 @@ public final class RewardVerificationManager: @unchecked Sendable {
         lock.lock()
         isProcessing = false
         var reDrain = false
+        var retryDelay: TimeInterval?
+        let nowTs = now()
         if reDrainIfEligible {
-            let nowTs = now()
             reDrain = loadQueue().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
+        } else {
+            // Bailed on a retryable failure: schedule a wake at the earliest remaining backoff so
+            // the retry actually happens in-session, instead of waiting for the next enqueue or
+            // launch. Scheduled ONLY from the bail path (not from every pass with pending tasks),
+            // so a wake that finds nothing eligible — e.g. under a frozen test clock — terminates
+            // instead of rescheduling itself forever.
+            let queue = loadQueue()
+            if !queue.isEmpty {
+                let soonest = queue
+                    .map { rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp) }
+                    .min() ?? 0
+                // ≥1s floor: never hot-loop against a backend that just failed.
+                retryDelay = max(soonest, 1)
+            }
         }
         lock.unlock()
         if reDrain { triggerProcessQueue() }
+        if let retryDelay { scheduleRetry(after: retryDelay) }
+    }
+
+    /// Schedules (replacing any prior schedule) a queue drain after `delay`. A single pending
+    /// wake is enough: every bail recomputes the earliest eligibility across the WHOLE queue,
+    /// and a completed wake either drains or chains the next bail's schedule.
+    private func scheduleRetry(after delay: TimeInterval) {
+        lock.lock()
+        retryTask?.cancel()
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        retryTask = Task { await self.runRetryWake(delay: delay) }
+        lock.unlock()
+    }
+
+    /// Retry-wake task body (named method — see the task-shape note in TelemetryManager).
+    private func runRetryWake(delay: TimeInterval) async {
+        // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+        do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
+        triggerProcessQueue()
     }
 
     // MARK: - Queue state (lock-guarded)

@@ -22,6 +22,14 @@ final class FallbackAdPresenter {
     /// The host's key window, captured before we take key. Restored on dismiss so the host
     /// regains touch/keyboard focus.
     private weak var originalKeyWindow: UIWindow?
+    /// Deliberate self-retention while the window is on screen. The end screens must survive
+    /// their owning ad object: a host can release the ad mid-unit (e.g. React Native's
+    /// `destroy()` on unmount, or an error handler reacting to the auto-preload's LOAD_FAILED —
+    /// which lands exactly while an end screen is up), and since UIKit does not retain windows,
+    /// dropping the last reference to this presenter would deallocate the window and skip the
+    /// remaining screens (and, on the rewarded flow, the close/verification that follows them).
+    /// Set on a successful `present`, released in `dismiss` (the only teardown path).
+    private var retainedWhilePresenting: FallbackAdPresenter?
 
     /// auto_store_redirect END_SCREEN_N: the primary ad's config + a closure that opens its store,
     /// fired once when the fallback screen whose index matches the trigger is presented.
@@ -71,6 +79,7 @@ final class FallbackAdPresenter {
         window.rootViewController = hostingController(for: firstAd)
         window.makeKeyAndVisible()
         self.window = window
+        retainedWhilePresenting = self
         // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
         // where `.hideStatusBar` in the end-screen view is a no-op. No-op in native hosts.
         SimulaAppStatusBar.hide()
@@ -118,13 +127,20 @@ final class FallbackAdPresenter {
 
     /// Tears down the presentation window and fires the close callback once.
     private func dismiss() {
-        window?.isHidden = true
-        window?.rootViewController = nil
+        // Capture locals and clear `self`'s references before invoking the callback: releasing
+        // the self-retention below may leave the callback's owner as the last reference to this
+        // presenter, so `self` can be deallocated by the time the callback returns. The caller's
+        // reference keeps `self` alive through this method itself.
+        let win = window
+        let hostKeyWindow = originalKeyWindow
         window = nil
-        originalKeyWindow?.makeKey()
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
+        retainedWhilePresenting = nil
+        win?.isHidden = true
+        win?.rootViewController = nil
+        hostKeyWindow?.makeKey()
         callback?()
         // Balanced with the present-time hide(); ref count keeps the bar hidden if the close
         // callback opens another presenter, restoring the host only when the last one ends.
