@@ -363,6 +363,10 @@ private struct CreativeInterstitialView: View {
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
             attribution: response.skanAttribution,
+            // The serve's routing context: an in-creative CTA opens the store deterministically
+            // (in-app sheet from the raw ios_store_url + background tracker fire) when available.
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
             telemetryAdFormat: "interstitial"
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -400,23 +404,28 @@ private struct CreativeInterstitialView: View {
     /// accrue the delay. Cancelled in `.onDisappear`.
     private func startImpressionTimer() {
         guard !impressionFired, impressionTask == nil else { return }
-        impressionTask = Task { @MainActor in
-            var accruedMs: Double = 0
-            var lastTick = ProcessInfo.processInfo.systemUptime
-            while accruedMs < fullscreenImpressionDelayMs {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
-                if Task.isCancelled { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                let delta = (now - lastTick) * 1000
-                lastTick = now
-                // Count only foreground, on-ad time (parity with the close gate's `reconcileGate`).
-                if appForegrounded && !storeSheetPresented { accruedMs += delta }
-            }
-            if Task.isCancelled || impressionFired { return }
-            impressionFired = true
-            onImpression()
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        impressionTask = Task { await runImpressionTimer() }
+    }
+
+    /// Impression timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runImpressionTimer() async {
+        var accruedMs: Double = 0
+        var lastTick = ProcessInfo.processInfo.systemUptime
+        while accruedMs < fullscreenImpressionDelayMs {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
+            if Task.isCancelled { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let delta = (now - lastTick) * 1000
+            lastTick = now
+            // Count only foreground, on-ad time (parity with the close gate's `reconcileGate`).
+            if appForegrounded && !storeSheetPresented { accruedMs += delta }
         }
+        if Task.isCancelled || impressionFired { return }
+        impressionFired = true
+        onImpression()
     }
 
     /// Close-delay gate. The interstitial gates its close button on the server-driven
@@ -448,28 +457,33 @@ private struct CreativeInterstitialView: View {
 
         // Cancellable gate: a fire-and-forget asyncAfter would still fire after dismiss and mutate
         // dead @State. The Task is cancelled in `.onDisappear`.
-        gateTask = Task { @MainActor in
-            if treatment == .rewardOrCloseLabel {
-                var left = Int(ceil(remaining))
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        gateTask = Task { await runGate(treatment: treatment, remaining: remaining) }
+    }
+
+    /// Close-gate task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runGate(treatment: CloseTreatment, remaining: TimeInterval) async {
+        if treatment == .rewardOrCloseLabel {
+            var left = Int(ceil(remaining))
+            closeRemaining = left
+            while left > 0 {
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                if Task.isCancelled { return }
+                left -= 1
                 closeRemaining = left
-                while left > 0 {
-                    // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                    if Task.isCancelled { return }
-                    left -= 1
-                    closeRemaining = left
-                }
-            } else {
-                // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
-                let sleepNs = remaining * 1_000_000_000
-                if sleepNs.isFinite, sleepNs > 0 {
-                    // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                    do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
-                }
             }
-            if Task.isCancelled { return }
-            withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
+        } else {
+            // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
+            let sleepNs = remaining * 1_000_000_000
+            if sleepNs.isFinite, sleepNs > 0 {
+                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+                do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
+            }
         }
+        if Task.isCancelled { return }
+        withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
     }
 
     /// Pauses the close-delay countdown when the app leaves the foreground: stops accruing dwell and
@@ -514,17 +528,22 @@ private struct CreativeInterstitialView: View {
         let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
         guard closeDelay > 0 else { return }
         storePromptScheduled = true
-        storePromptTask = Task { @MainActor in
-            // Guard the Double→UInt64 conversion (an extreme server `closeDelay` would otherwise
-            // overflow and trap) — same pattern as the close-delay gate above.
-            let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
-            if sleepNs.isFinite, sleepNs > 0 {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
-            }
-            if Task.isCancelled { return }
-            showStorePrompt()
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        storePromptTask = Task { await runStorePromptTrigger(closeDelay: closeDelay) }
+    }
+
+    /// Store-prompt trigger task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runStorePromptTrigger(closeDelay: Int) async {
+        // Guard the Double→UInt64 conversion (an extreme server `closeDelay` would otherwise
+        // overflow and trap) — same pattern as the close-delay gate above.
+        let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
+        if sleepNs.isFinite, sleepNs > 0 {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
         }
+        if Task.isCancelled { return }
+        showStorePrompt()
     }
 
     /// Reveals the store prompt. Idempotent — driven by the `closeTime / 2` timer.
@@ -540,6 +559,7 @@ private struct CreativeInterstitialView: View {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: storeOpen,
+            storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution
         )
     }
@@ -561,7 +581,8 @@ private struct CreativeInterstitialView: View {
         guard #available(iOS 14.0, *) else { return }
         CreativeCTARouter.resolveAppStoreID(
             trackingUrl: response.trackingUrl,
-            destination: response.destinationKind
+            destination: response.destinationKind,
+            storeUrl: response.iosStoreUrl
         ) { id in
             resolvedAppID = id
             if config.timing == .duringPlay || config.timing == .delayed {
@@ -573,14 +594,19 @@ private struct CreativeInterstitialView: View {
     private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
         guard !skOverlayPresented, resolvedAppID != nil else { return }
         skOverlayTask?.cancel()
-        skOverlayTask = Task { @MainActor in
-            if config.delaySeconds > 0 {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000) } catch { return }
-            }
-            if Task.isCancelled { return }
-            presentSKOverlay(config: config)
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        skOverlayTask = Task { await runSKOverlayPresent(config: config) }
+    }
+
+    /// SKOverlay-present task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runSKOverlayPresent(config: SKOverlayConfig) async {
+        if config.delaySeconds > 0 {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000) } catch { return }
         }
+        if Task.isCancelled { return }
+        presentSKOverlay(config: config)
     }
 
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store

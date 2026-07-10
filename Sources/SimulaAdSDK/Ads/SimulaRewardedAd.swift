@@ -215,64 +215,74 @@ public final class SimulaRewardedAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         loadTask = Task { [weak self] in
-            guard let self else { return }
+            await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc)
+        }
+    }
 
-            let sessionId = await provider.ensureSession()
+    /// Load task body (named method — see the task-shape note in TelemetryManager).
+    private func runLoad(
+        provider: SimulaProvider,
+        charId: String?,
+        charName: String?,
+        charImage: String?,
+        charDesc: String?
+    ) async {
+        let sessionId = await provider.ensureSession()
+        if Task.isCancelled { return }
+        guard let sessionId, !sessionId.isEmpty else {
+            failLoad(.noSession)
+            return
+        }
+        self.sessionId = sessionId
+        // The real session id is now known. Refresh the dedup key — the
+        // synchronous gate at load() time may have keyed on an empty session
+        // during cold-start warm-up — so a subsequent same-key load() still
+        // deduplicates. `currentKeyAt` intentionally stays at the original load time.
+        currentKey = Self.dedupKey(adUnitId: adUnitId, charId: charId, charName: charName, sessionId: sessionId)
+
+        do {
+            let response = try await api.loadRewarded(
+                adUnitId: adUnitId,
+                sessionId: sessionId,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc,
+                // AdContext (contextual targeting) now rides on the rewarded request too, read from
+                // the same provider-level store the native surface uses.
+                context: provider.adContext
+            )
             if Task.isCancelled { return }
-            guard let sessionId, !sessionId.isEmpty else {
-                self.failLoad(.noSession)
+            // A rewarded ad with no iframe to render is a no-fill.
+            guard !response.iframeUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                failLoad(.noFill)
                 return
             }
-            self.sessionId = sessionId
-            // The real session id is now known. Refresh the dedup key — the
-            // synchronous gate at load() time may have keyed on an empty session
-            // during cold-start warm-up — so a subsequent same-key load() still
-            // deduplicates. `currentKeyAt` intentionally stays at the original load time.
-            self.currentKey = Self.dedupKey(adUnitId: self.adUnitId, charId: charId, charName: charName, sessionId: sessionId)
-
-            do {
-                let response = try await self.api.loadRewarded(
-                    adUnitId: self.adUnitId,
-                    sessionId: sessionId,
-                    charId: charId,
-                    charName: charName,
-                    charImage: charImage,
-                    charDesc: charDesc,
-                    // AdContext (contextual targeting) now rides on the rewarded request too, read from
-                    // the same provider-level store the native surface uses.
-                    context: provider.adContext
-                )
-                if Task.isCancelled { return }
-                // A rewarded ad with no iframe to render is a no-fill.
-                guard !response.iframeUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    self.failLoad(.noFill)
-                    return
-                }
-                #if os(iOS)
-                // Warm a web view so `show()` doesn't pay WebView cold-start on the
-                // critical path.
-                WebViewPool.shared.prewarm()
-                #endif
-                Telemetry.shared.recordLifecycle(
-                    stage: "load_success", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.impressionId, serveId: nil, durationMs: self.msSince(self.loadStartNanos), errorCode: nil
-                )
-                self.state = .ready(response, loadedAt: Date())
-                self.delegate?.rewardedDidLoad(self)
-            } catch let apiError as SimulaAPIError {
-                Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
-                // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
-                // own case rather than burying it in the generic .network bucket.
-                if case .adUnitNotFound = apiError {
-                    self.failLoad(.adUnitNotFound)
-                } else {
-                    self.failLoad(.network(apiError))
-                }
-            } catch {
-                Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
-                self.failLoad(.network(.invalidResponse))
+            #if os(iOS)
+            // Warm a web view so `show()` doesn't pay WebView cold-start on the
+            // critical path.
+            WebViewPool.shared.prewarm()
+            #endif
+            Telemetry.shared.recordLifecycle(
+                stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
+                adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
+            )
+            state = .ready(response, loadedAt: Date())
+            delegate?.rewardedDidLoad(self)
+        } catch let apiError as SimulaAPIError {
+            Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
+            // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its
+            // own case rather than burying it in the generic .network bucket.
+            if case .adUnitNotFound = apiError {
+                failLoad(.adUnitNotFound)
+            } else {
+                failLoad(.network(apiError))
             }
+        } catch {
+            Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
+            failLoad(.network(.invalidResponse))
         }
     }
 
@@ -326,6 +336,7 @@ public final class SimulaRewardedAd {
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+            storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onClick: { [weak self] in
@@ -359,12 +370,14 @@ public final class SimulaRewardedAd {
                 // user completing the WHOLE ad unit (playable + every fallback screen), not just
                 // closing the playable. With no fallback screens it fires immediately on close.
                 self.presentFallbackAds(
+                    response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     onAutoStoreRedirect: {
                         CreativeCTARouter.open(
                             trackingUrl: response.trackingUrl,
                             destination: response.destinationKind,
                             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                            storeUrl: response.iosStoreUrl,
                             attribution: response.skanAttribution
                         )
                     },
@@ -545,15 +558,19 @@ public final class SimulaRewardedAd {
                 Telemetry.shared.recordLifecycle(stage: "reward_verification_failed", adFormat: SimulaRewardedAd.adFormat, adUnitId: adUnitId, adId: adId, serveId: serveId, durationMs: verifyMs, errorCode: "verify_failed")
                 Telemetry.shared.recordError(signature: "rewarded:verify", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "RewardVerificationManager.queueVerification")
             }
-            Task { @MainActor in
-                guard let self else { return }
-                switch result {
-                case .success(let token):
-                    self.delegate?.rewardedDidVerifyReward(self, token: token)
-                case .failure(let error):
-                    self.delegate?.rewardedRewardVerificationDidFail(self, error: error)
-                }
-            }
+            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+            Task { @MainActor in self?.dispatchVerificationResult(result) }
+        }
+    }
+
+    /// Reward-verification delegate dispatch (named method — see the task-shape note in
+    /// TelemetryManager). `@MainActor` via the class, matching the prior explicit hop.
+    private func dispatchVerificationResult(_ result: Result<String?, Error>) {
+        switch result {
+        case .success(let token):
+            delegate?.rewardedDidVerifyReward(self, token: token)
+        case .failure(let error):
+            delegate?.rewardedRewardVerificationDidFail(self, error: error)
         }
     }
 
@@ -616,18 +633,23 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
         // Single-call task closure (inherits @MainActor) — see the task-shape note in TelemetryManager.
-        fallbackPrefetch = Task { [weak self] in await self?.runFallbackPrefetch(impressionId: impressionId) ?? [] }
+        // `api` is captured strongly so the fetch still runs — and any awaiter still receives real
+        // screens — even if this ad object is released before the task starts (parity with the
+        // pre-refactor closure); `self` stays weak and only gates the state write.
+        fallbackPrefetch = Task { [weak self, api] in await Self.runFallbackPrefetch(api: api, impressionId: impressionId, ad: self) }
         #endif
     }
 
     #if os(iOS)
     /// Task body for the fallback prefetch (named method — see the task-shape note in
-    /// TelemetryManager). @MainActor via the class, so the `prefetchedFallbacks` write
-    /// stays a main-thread write as before.
-    private func runFallbackPrefetch(impressionId: String) async -> [FallbackAd] {
+    /// TelemetryManager). Static with a strongly captured `api` + optional `ad`, so the fetch never
+    /// depends on the ad object's liveness; the `prefetchedFallbacks` write stays a main-actor
+    /// write (and simply no-ops when the ad was released).
+    @MainActor
+    private static func runFallbackPrefetch(api: SimulaAPI, impressionId: String, ad: SimulaRewardedAd?) async -> [FallbackAd] {
         let ads: [FallbackAd]
         do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
-        prefetchedFallbacks = ads
+        ad?.prefetchedFallbacks = ads
         return ads
     }
     #endif
@@ -635,8 +657,10 @@ public final class SimulaRewardedAd {
     /// Presents the prefetched fallback ad screens on close. Synchronous when the prefetch has
     /// landed (the common case), so the fallback window is up before the minigame window is torn
     /// down (see the presenter's `dismiss`) — no handoff flash; awaits only if the user closed
-    /// before the prefetch finished. Empty → nothing shown.
+    /// before the prefetch finished. Empty → nothing shown. `response` carries the serve's CTA
+    /// routing context (destination / raw store link / attribution) into the end-screen WebViews.
     private func presentFallbackAds(
+        response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -647,12 +671,11 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
         } else if let prefetch {
+            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
             Task { [weak self] in
-                let ads = await prefetch.value
-                guard let self else { onAllClosed(); return }
-                self.presentFallbackWindow(ads, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+                await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
             }
         } else {
             // No prefetch ran (e.g. empty impression id) — nothing to show, so the ad unit is
@@ -664,9 +687,29 @@ public final class SimulaRewardedAd {
         #endif
     }
 
+    #if os(iOS)
+    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager):
+    /// wait for the in-flight prefetch, then present. Static with an optional `ad` so a released
+    /// ad object still completes the close flow via `onAllClosed`, as before.
+    @MainActor
+    private static func awaitPrefetchAndPresent(
+        ad: SimulaRewardedAd?,
+        prefetch: Task<[FallbackAd], Never>,
+        response: RewardedInitResponse,
+        autoStoreRedirect: AutoStoreRedirect?,
+        onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        onAllClosed: @escaping @MainActor () -> Void
+    ) async {
+        let ads = await prefetch.value
+        guard let ad else { onAllClosed(); return }
+        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+    }
+    #endif
+
     /// Presents the fallback ad window for `ads` (no-op if empty). Best-effort.
     private func presentFallbackWindow(
         _ ads: [FallbackAd],
+        response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         onAllClosed: @escaping @MainActor () -> Void
@@ -677,6 +720,9 @@ public final class SimulaRewardedAd {
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) }

@@ -126,6 +126,14 @@ public struct NativeAdSlot: View {
             .task(id: taskKey) { await load() }
             // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
             .task(id: awaitingHeight) { await watchForMissingHeight() }
+            // The creative can freeze mid-video/mid-typing across a background/foreground cycle (its
+            // WKWebView's content process suspends, and in-page visibilitychange/pageshow/focus
+            // listeners aren't guaranteed to fire on the way back). Deterministically wake it via the
+            // relay's onAppForeground bridge on every foreground return while a creative is mounted.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                guard case .filled = phase else { return }
+                visibilityRelay.resyncOnForeground()
+            }
     }
 
     /// The ad content for the current phase, before any width sizing.
@@ -158,8 +166,10 @@ public struct NativeAdSlot: View {
                     attribution: response.skanAttribution,
                     externalClickOnly: true,
                     // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).
+                    // The raw store link makes the App Store route deterministic (see `openNativeCTA`).
                     ctaTrackingUrl: response.trackingUrl,
                     ctaDestination: response.destinationKind,
+                    ctaStoreUrl: response.iosStoreUrl,
                     reportsContentHeight: true,
                     telemetryAdFormat: response.adFormat,
                     visibilityRelay: visibilityRelay

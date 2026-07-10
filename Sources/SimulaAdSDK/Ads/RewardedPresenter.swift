@@ -36,6 +36,7 @@ final class RewardedPresenter {
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
         storeOpen: StoreOpen = .skstoreproduct,
+        storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
@@ -63,6 +64,7 @@ final class RewardedPresenter {
             trackingUrl: trackingUrl,
             destination: destination,
             storeOpen: storeOpen,
+            storeUrl: storeUrl,
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
@@ -155,6 +157,10 @@ private struct RewardedGameView: View {
     let trackingUrl: String?
     let destination: AdDestination
     let storeOpen: StoreOpen
+    /// The serve's raw App Store link (`ios_store_url`) — drives the deterministic CTA / store-prompt
+    /// route (in-app sheet from its app id, tracker fired in the background). `nil` → redirect-chain
+    /// resolution as before.
+    let storeUrl: String?
     /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
     let attribution: AdAttribution?
     /// auto_store_redirect config — fires the store open once at the configured creative moment.
@@ -218,15 +224,18 @@ private struct RewardedGameView: View {
             Color.black.ignoresSafeArea()
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
+            // ctaDestination/ctaStoreUrl thread the serve's routing context into the coordinator so
+            // an in-playable CTA opens the store deterministically (in-app sheet + background
+            // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -359,19 +368,24 @@ private struct RewardedGameView: View {
         if remaining > 0 {
             withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
         }
-        timerTask = Task { @MainActor in
-            while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                if Task.isCancelled { return }
-                elapsedPlayTime += 1
-                // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-                if elapsedPlayTime >= Double(gateSeconds) / 2 {
-                    withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
-                }
-                if elapsedPlayTime >= Double(gateSeconds) {
-                    rewardEarned = true
-                }
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        timerTask = Task { await runPlayTimer() }
+    }
+
+    /// Play-to-earn timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runPlayTimer() async {
+        while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+            if Task.isCancelled { return }
+            elapsedPlayTime += 1
+            // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
+            if elapsedPlayTime >= Double(gateSeconds) / 2 {
+                withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+            }
+            if elapsedPlayTime >= Double(gateSeconds) {
+                rewardEarned = true
             }
         }
     }
@@ -383,22 +397,27 @@ private struct RewardedGameView: View {
     /// so a backgrounded playable can't accrue the delay. Cancelled in `.onDisappear`.
     private func startImpressionTimer() {
         guard !impressionFired, impressionTask == nil else { return }
-        impressionTask = Task { @MainActor in
-            var accruedMs: Double = 0
-            var lastTick = ProcessInfo.processInfo.systemUptime
-            while accruedMs < fullscreenImpressionDelayMs {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
-                if Task.isCancelled { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                let delta = (now - lastTick) * 1000
-                lastTick = now
-                if appForegrounded && !storeSheetPresented { accruedMs += delta }
-            }
-            if Task.isCancelled || impressionFired { return }
-            impressionFired = true
-            onImpression()
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        impressionTask = Task { await runImpressionTimer() }
+    }
+
+    /// Impression timer task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runImpressionTimer() async {
+        var accruedMs: Double = 0
+        var lastTick = ProcessInfo.processInfo.systemUptime
+        while accruedMs < fullscreenImpressionDelayMs {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
+            if Task.isCancelled { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let delta = (now - lastTick) * 1000
+            lastTick = now
+            if appForegrounded && !storeSheetPresented { accruedMs += delta }
         }
+        if Task.isCancelled || impressionFired { return }
+        impressionFired = true
+        onImpression()
     }
 
     /// Runs the play-to-earn timer only while foreground-active and no in-app store sheet covers the
@@ -427,7 +446,7 @@ private struct RewardedGameView: View {
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     private func handleStorePromptTap() {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, attribution: attribution)
+        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
     }
 
     /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is

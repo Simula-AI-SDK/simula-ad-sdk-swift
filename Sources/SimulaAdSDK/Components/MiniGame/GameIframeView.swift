@@ -219,11 +219,17 @@ public struct GameIframeView: View {
             WebViewPool.shared.prewarm()
             #endif
         }
-        .task {
-            currentHeight = calculateInitialHeight()
-            appeared = true
-            await loadMinigame()
-        }
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        .task { await appear() }
+    }
+
+    /// `.task` body (named method — see the task-shape note in TelemetryManager): size the sheet,
+    /// fade in, then fetch the minigame.
+    @MainActor
+    private func appear() async {
+        currentHeight = calculateInitialHeight()
+        appeared = true
+        await loadMinigame()
     }
 
     // MARK: - Close Handler

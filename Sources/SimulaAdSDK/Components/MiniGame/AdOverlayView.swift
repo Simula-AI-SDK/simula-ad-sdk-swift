@@ -30,6 +30,13 @@ public struct AdOverlayView: View {
     var html: String? = nil
     /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
     var onAdClick: (() -> Void)? = nil
+    /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
+    /// the in-app store sheet deterministically (tracker fired in the background) instead of
+    /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
+    var ctaDestination: AdDestination = .appstore
+    var ctaStoreUrl: String? = nil
+    /// Attribution tokens carried into the store sheet the end-screen CTA opens.
+    var attribution: AdAttribution? = nil
 
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
@@ -104,10 +111,11 @@ public struct AdOverlayView: View {
                     ZStack {
                         // Ad creative: prefer the inline html (rendered with the iframe origin as base
                         // so the end screen's own click beacon stays same-origin), else load the url.
+                        // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
                         if let html, !html.isEmpty {
-                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick)
+                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick, attribution: attribution, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
                         } else if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url, onAdClick: onAdClick)
+                            WebViewRepresentable(url: url, onAdClick: onAdClick, attribution: attribution, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
                         }
 
                         // Close button / countdown ring — top right
@@ -233,24 +241,29 @@ public struct AdOverlayView: View {
         // Accrue only foreground time: a 50ms ticker driven by the monotonic clock, re-anchored each
         // (re)start so a backgrounded / store-sheet gap is never counted. The ring is snapped per tick
         // so it freezes on pause and resumes from where it left off. Cancelled on background / dismiss.
-        countdownTask = Task { @MainActor in
-            var lastTick = ProcessInfo.processInfo.systemUptime
-            while accumulatedMs < totalMs {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
-                if Task.isCancelled { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                accumulatedMs += (now - lastTick) * 1000
-                lastTick = now
-                let progress = accumulatedMs / totalMs
-                ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
-                // Int(nonFinite) traps; clamp before converting.
-                let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
-                adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
-            }
-            adCountdown = 0
-            ringProgress = 1
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        countdownTask = Task { await runCountdown(totalMs: totalMs) }
+    }
+
+    /// Countdown ticker task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runCountdown(totalMs: Double) async {
+        var lastTick = ProcessInfo.processInfo.systemUptime
+        while accumulatedMs < totalMs {
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+            if Task.isCancelled { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            accumulatedMs += (now - lastTick) * 1000
+            lastTick = now
+            let progress = accumulatedMs / totalMs
+            ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
+            // Int(nonFinite) traps; clamp before converting.
+            let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
+            adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
         }
+        adCountdown = 0
+        ringProgress = 1
     }
 }
 
