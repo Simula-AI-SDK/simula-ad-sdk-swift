@@ -30,6 +30,13 @@ public struct AdOverlayView: View {
     var html: String? = nil
     /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
     var onAdClick: (() -> Void)? = nil
+    /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
+    /// the in-app store sheet deterministically (tracker fired in the background) instead of
+    /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
+    var ctaDestination: AdDestination = .appstore
+    var ctaStoreUrl: String? = nil
+    /// Attribution tokens carried into the store sheet the end-screen CTA opens.
+    var attribution: AdAttribution? = nil
 
     @State private var appeared = false
     /// Countdown seconds remaining (starts at 5)
@@ -104,10 +111,11 @@ public struct AdOverlayView: View {
                     ZStack {
                         // Ad creative: prefer the inline html (rendered with the iframe origin as base
                         // so the end screen's own click beacon stays same-origin), else load the url.
+                        // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
                         if let html, !html.isEmpty {
-                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick)
+                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick, attribution: attribution, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
                         } else if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url, onAdClick: onAdClick)
+                            WebViewRepresentable(url: url, onAdClick: onAdClick, attribution: attribution, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
                         }
 
                         // Close button / countdown ring — top right

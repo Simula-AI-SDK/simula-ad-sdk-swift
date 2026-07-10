@@ -36,6 +36,7 @@ final class RewardedPresenter {
         trackingUrl: String? = nil,
         destination: AdDestination = .appstore,
         storeOpen: StoreOpen = .skstoreproduct,
+        storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
@@ -63,6 +64,7 @@ final class RewardedPresenter {
             trackingUrl: trackingUrl,
             destination: destination,
             storeOpen: storeOpen,
+            storeUrl: storeUrl,
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
@@ -155,6 +157,10 @@ private struct RewardedGameView: View {
     let trackingUrl: String?
     let destination: AdDestination
     let storeOpen: StoreOpen
+    /// The serve's raw App Store link (`ios_store_url`) — drives the deterministic CTA / store-prompt
+    /// route (in-app sheet from its app id, tracker fired in the background). `nil` → redirect-chain
+    /// resolution as before.
+    let storeUrl: String?
     /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
     let attribution: AdAttribution?
     /// auto_store_redirect config — fires the store open once at the configured creative moment.
@@ -218,15 +224,18 @@ private struct RewardedGameView: View {
             Color.black.ignoresSafeArea()
 
             // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
+            // ctaDestination/ctaStoreUrl thread the serve's routing context into the coordinator so
+            // an in-playable CTA opens the store deterministically (in-app sheet + background
+            // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -437,7 +446,7 @@ private struct RewardedGameView: View {
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     private func handleStorePromptTap() {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, attribution: attribution)
+        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
     }
 
     /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is

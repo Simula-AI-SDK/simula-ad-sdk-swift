@@ -63,6 +63,13 @@ struct WebViewRepresentable: UIViewRepresentable {
     var ctaTrackingUrl: String?
     var ctaDestination: AdDestination
 
+    /// The serve's raw App Store link (`ios_store_url`), when known. Drives the deterministic CTA
+    /// route for in-creative click-throughs: the in-app store sheet opens from this link's app id
+    /// while the tapped tracker URL fires in the background (`CreativeCTARouter.routeCreativeTap`).
+    /// `nil` (older payloads / previews / the declarative menu) keeps today's redirect-chain
+    /// resolution unchanged.
+    var ctaStoreUrl: String?
+
     /// Native-ad mode: after load, inject a script that reports the creative's content height over
     /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
     var reportsContentHeight: Bool
@@ -89,6 +96,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         externalClickOnly: Bool = false,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil,
         reportsContentHeight: Bool = false,
         telemetryAdFormat: String? = nil,
         visibilityRelay: VisibilityRelay? = nil
@@ -105,6 +113,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.externalClickOnly = externalClickOnly
         self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
+        self.ctaStoreUrl = ctaStoreUrl
         self.reportsContentHeight = reportsContentHeight
         self.telemetryAdFormat = telemetryAdFormat
         self.visibilityRelay = visibilityRelay
@@ -177,6 +186,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             externalClickOnly: externalClickOnly,
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl,
             reportsContentHeight: reportsContentHeight,
             telemetryAdFormat: telemetryAdFormat
         )
@@ -202,6 +212,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// in-creative URL) and where it routes. See `WebViewRepresentable.ctaTrackingUrl`.
         var ctaTrackingUrl: String?
         var ctaDestination: AdDestination
+        /// The serve's raw App Store link — drives the deterministic in-creative CTA route.
+        /// See `WebViewRepresentable.ctaStoreUrl`.
+        var ctaStoreUrl: String?
         var reportsContentHeight: Bool
         /// Ad-format tag for WebView telemetry; nil → untagged.
         var telemetryAdFormat: String?
@@ -263,6 +276,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             externalClickOnly: Bool = false,
             ctaTrackingUrl: String? = nil,
             ctaDestination: AdDestination = .appstore,
+            ctaStoreUrl: String? = nil,
             reportsContentHeight: Bool = false,
             telemetryAdFormat: String? = nil
         ) {
@@ -275,6 +289,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.externalClickOnly = externalClickOnly
             self.ctaTrackingUrl = ctaTrackingUrl
             self.ctaDestination = ctaDestination
+            self.ctaStoreUrl = ctaStoreUrl
             self.reportsContentHeight = reportsContentHeight
             self.telemetryAdFormat = telemetryAdFormat
         }
@@ -311,6 +326,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// `.web` opens the link directly — falling back to `fallback` (the URL the creative itself
         /// navigated to) when the serve carried no tracker.
         ///
+        /// The serve's raw store link (`ctaStoreUrl`) makes both branches deterministic, exactly like
+        /// the interstitial/rewarded WebViews: the store surface opens from its app id while the
+        /// tracker fires in the background, instead of depending on the tracker's redirect chain.
+        ///
         /// SKAN parity with interstitial/rewarded: when the serve carries usable `skan_attribution`
         /// tokens AND the CTA is an App Store destination, the click instead routes through the **in-app**
         /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
@@ -320,10 +339,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
             let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
             let destination = ctaDestination
+            let storeUrl = ctaStoreUrl
             let attribution = self.attribution
             // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { @MainActor in
-                Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, attribution: attribution, fallback: fallback)
+                Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback)
             }
         }
 
@@ -333,23 +353,27 @@ struct WebViewRepresentable: UIViewRepresentable {
         private static func routeNativeCTA(
             trackingURL: URL?,
             destination: AdDestination,
+            storeUrl: String?,
             attribution: AdAttribution?,
             fallback: URL
         ) {
             if destination == .appstore, attribution?.hasUsableTokens == true {
                 // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
-                // imperative formats). Prefers the tracker (router resolves it to the store), else
-                // the in-creative URL.
+                // imperative formats). Prefers the tracker (router resolves it to the store —
+                // deterministically via the raw store link when present), else the in-creative URL.
                 CreativeCTARouter.open(
                     trackingUrl: (trackingURL ?? fallback).absoluteString,
                     destination: destination,
                     storeOpen: .skstoreproduct,
+                    storeUrl: storeUrl,
                     attribution: attribution
                 )
-            } else if let trackingURL {
-                CreativeCTARouter.openExternally(initialURL: trackingURL, destination: destination)
             } else {
-                UIApplication.shared.open(fallback)
+                // With no tracker, the in-creative URL (`fallback` — typically the macro-stamped
+                // click tracker baked into the creative) takes its place, so an aligned payload
+                // still gets the deterministic store open + background click. The router opens
+                // store links / non-http schemes / `.web` destinations as-is (previous behavior).
+                CreativeCTARouter.openExternally(initialURL: trackingURL ?? fallback, destination: destination, storeUrl: storeUrl)
             }
         }
 
@@ -526,8 +550,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // User-initiated cross-domain clicks → resolve redirect chain first,
-            // then open SKStoreProductViewController (App Store) or SFSafariViewController (other)
+            // User-initiated cross-domain clicks → deterministic store route when the serve
+            // supplied its raw store link (in-app sheet + background tracker fire), else resolve
+            // the redirect chain, then SKStoreProductViewController (App Store) or
+            // SFSafariViewController (other).
             if navigationAction.navigationType == .linkActivated,
                scheme == "http" || scheme == "https" {
                 let currentHost = currentURL?.host?.lowercased() ?? ""
@@ -535,7 +561,13 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if !targetHost.isEmpty && currentHost != targetHost {
                     fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                     let attribution = self.attribution
-                    Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
+                    let destination = ctaDestination
+                    let storeUrl = ctaStoreUrl
+                    Task { @MainActor in
+                        CreativeCTARouter.routeCreativeTap(
+                            url: url, destination: destination, storeUrl: storeUrl, attribution: attribution
+                        )
+                    }
                     decisionHandler(.cancel)
                     return
                 }
@@ -569,14 +601,21 @@ struct WebViewRepresentable: UIViewRepresentable {
                     let currentHost = currentURL?.host?.lowercased() ?? ""
                     let targetHost = url.host?.lowercased() ?? ""
                     if !targetHost.isEmpty && currentHost != targetHost {
-                        // Cross-domain → resolve redirects then route. Router entry
-                        // point is `@MainActor`; this delegate runs on main, so hop
-                        // explicitly rather than asserting isolation. `createWebViewWith`
-                        // is only invoked for user-initiated new-window requests
-                        // (target="_blank" / window.open), so this is a real click.
+                        // Cross-domain → deterministic store route when the serve supplied its raw
+                        // store link, else resolve redirects then route. Router entry point is
+                        // `@MainActor`; this delegate runs on main, so hop explicitly rather than
+                        // asserting isolation. `createWebViewWith` is only invoked for
+                        // user-initiated new-window requests (target="_blank" / window.open), so
+                        // this is a real click.
                         fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
                         let attribution = self.attribution
-                        Task { @MainActor in CreativeCTARouter.resolveAndRoute(url: url, attribution: attribution) }
+                        let destination = ctaDestination
+                        let storeUrl = ctaStoreUrl
+                        Task { @MainActor in
+                            CreativeCTARouter.routeCreativeTap(
+                                url: url, destination: destination, storeUrl: storeUrl, attribution: attribution
+                            )
+                        }
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))
@@ -713,8 +752,11 @@ struct WebViewRepresentable: NSViewRepresentable {
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
     /// Accepted for signature parity with the iOS variant (the imperative HTML
-    /// creative is iOS-only, so this is unused on macOS).
+    /// creative is iOS-only, so these are unused on macOS).
     var onAdClick: (() -> Void)?
+    var attribution: AdAttribution?
+    var ctaDestination: AdDestination
+    var ctaStoreUrl: String?
 
     init(
         url: URL? = nil,
@@ -723,7 +765,10 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil
+        onAdClick: (() -> Void)? = nil,
+        attribution: AdAttribution? = nil,
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil
     ) {
         self.url = url
         self.htmlString = htmlString
@@ -732,6 +777,9 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.attribution = attribution
+        self.ctaDestination = ctaDestination
+        self.ctaStoreUrl = ctaStoreUrl
     }
 
     func makeNSView(context: Context) -> WKWebView {

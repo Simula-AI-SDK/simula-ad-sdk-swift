@@ -545,6 +545,12 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let destination: String
     public let renderedFormat: String?
     public let trackingUrl: String?
+    /// Raw, unwrapped App Store link for the advertised app (`ios_store_url`) — distinct from the
+    /// attribution-wrapped `trackingUrl`. Drives the deterministic CTA route: the in-app
+    /// `SKStoreProductViewController` is opened from this link's app id while `trackingUrl` is fired
+    /// in the background, removing the dependency on the MMP tracker's redirect chain. `nil` when
+    /// the campaign has no raw store link — the CTA then falls back to redirect-chain resolution.
+    public let iosStoreUrl: String?
     /// Server-rendered HTML creative. When present (non-blank) it is rendered
     /// full-screen in a web view — the imperative interstitial's sole creative.
     public let renderedHtml: String?
@@ -593,6 +599,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case destination
         case renderedFormat = "rendered_format"
         case trackingUrl = "tracking_url"
+        case iosStoreUrl = "ios_store_url"
         case renderedHtml = "rendered_html"
         case adBehavior = "ad_behavior"
         case skanAttribution = "skan_attribution"
@@ -609,6 +616,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
         self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
         // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
         // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
@@ -627,6 +635,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         destination: String = "appstore",
         renderedFormat: String? = nil,
         trackingUrl: String? = nil,
+        iosStoreUrl: String? = nil,
         renderedHtml: String? = nil,
         adBehavior: AdBehavior? = nil,
         skanAttribution: AdAttribution? = nil,
@@ -640,6 +649,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.destination = destination
         self.renderedFormat = renderedFormat
         self.trackingUrl = trackingUrl
+        self.iosStoreUrl = iosStoreUrl
         self.renderedHtml = renderedHtml
         self.adBehavior = adBehavior
         self.skanAttribution = skanAttribution
@@ -713,6 +723,10 @@ public struct RewardedInitResponse: Decodable, Sendable {
     // `ad_behavior` → no gate (instantly earned) and no store prompt.
     public let destination: String
     public let trackingUrl: String?
+    /// Raw, unwrapped App Store link (`ios_store_url`) — see ``AdLoadResponse/iosStoreUrl``. Drives
+    /// the deterministic CTA route (in-app store sheet from this link's app id, tracker fired in the
+    /// background); `nil` falls back to redirect-chain resolution.
+    public let iosStoreUrl: String?
     public let adBehavior: AdBehavior?
     /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
     /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
@@ -735,6 +749,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case renderedHtml = "rendered_html"
         case destination
         case trackingUrl = "tracking_url"
+        case iosStoreUrl = "ios_store_url"
         case adBehavior = "ad_behavior"
         case skanAttribution = "skan_attribution"
         case bidAmt = "bid_amt"
@@ -747,6 +762,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.renderedHtml = (try? c.decode(String.self, forKey: .renderedHtml)) ?? ""
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
         self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
@@ -759,6 +775,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         renderedHtml: String = "",
         destination: String = AdDestination.appstore.rawValue,
         trackingUrl: String? = nil,
+        iosStoreUrl: String? = nil,
         adBehavior: AdBehavior? = nil,
         skanAttribution: AdAttribution? = nil,
         bidAmt: Double = 0
@@ -768,6 +785,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.renderedHtml = renderedHtml
         self.destination = destination
         self.trackingUrl = trackingUrl
+        self.iosStoreUrl = iosStoreUrl
         self.adBehavior = adBehavior
         self.skanAttribution = skanAttribution
         self.bidAmt = bidAmt
