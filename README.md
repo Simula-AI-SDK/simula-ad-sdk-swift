@@ -18,28 +18,6 @@ Simula delivers ads that feel native to AI chat and character-driven application
 - Swift 5.9+
 - Xcode 15+
 
-## Installation
-
-From 1.1.4 the SDK ships as a **prebuilt, module-stable XCFramework** (dSYMs embedded). Your
-Xcode links it but never compiles SDK source — this insulates host apps from Swift-toolchain
-optimizer bugs and keeps build times down.
-
-**Swift Package Manager** — pin a version; release tags resolve to the binary artifact:
-
-```swift
-.package(url: "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift.git", from: "1.1.4")
-```
-
-**CocoaPods:**
-
-```ruby
-pod 'SimulaAdSDK', '~> 1.1.4'
-```
-
-Building from source remains possible (depend on the `main` branch, which keeps the source
-manifest), but is not recommended for production: source builds re-expose your app to the
-Swift 6.1–6.3 optimizer task-teardown bug the binary distribution exists to avoid.
-
 ## Getting Started
 
 Full integration guides, API references, and examples are available at:
