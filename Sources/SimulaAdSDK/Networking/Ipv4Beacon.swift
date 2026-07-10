@@ -64,7 +64,7 @@ final class Ipv4Beacon: @unchecked Sendable {
         urlString: String = Ipv4Beacon.defaultURLString,
         send: @escaping @Sendable (URL) async -> Bool = Ipv4Beacon.defaultSend,
         deviceId: @escaping @Sendable () -> String? = { SimulaDeviceId.value },
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.urlString = urlString
         self.send = send
@@ -118,6 +118,12 @@ final class Ipv4Beacon: @unchecked Sendable {
     /// Fire task body (named method — see the task-shape note in TelemetryManager).
     private func runFire(key: String, generation gen: Int, url: URL) async {
         let ok = await send(url)
+        complete(key: key, generation: gen, ok: ok)
+    }
+
+    /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6) — same
+    /// pattern as TelemetryManager.recover().
+    private func complete(key: String, generation gen: Int, ok: Bool) {
         lock.lock()
         defer { lock.unlock() }
         // A logout while in flight already cleared this key; bail instead of resurrecting a
@@ -163,6 +169,16 @@ final class Ipv4Beacon: @unchecked Sendable {
         return components.url
     }
 
+    /// Dedicated session for the beacon (never `URLSession.shared` — SDK hard rule). Ephemeral:
+    /// a pixel needs no cookie/cache/credential storage. Timeouts bounded like the CTA / redirect
+    /// sessions, so a stalled connection can't hold resources for the 7-day system default.
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 10
+        return URLSession(configuration: config)
+    }()
+
     /// Production sender: a short-timeout GET whose response body is ignored. Returns whether
     /// the beacon landed (2xx). Explicit do/catch (never `try?` around an `await` — see the
     /// task-shape note in TelemetryManager); any transport failure is a plain `false` so the
@@ -172,7 +188,7 @@ final class Ipv4Beacon: @unchecked Sendable {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return false }
             return (200..<300).contains(http.statusCode)
         } catch {

@@ -457,13 +457,20 @@ public final class SimulaProvider: ObservableObject {
             }
             let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: target)
             if !ok { break }
-            // The PATCH just moved the server session to `target` (reconciles are serialized, so
-            // no other PATCH interleaves). Record that truth UNCONDITIONALLY — even if the desired
-            // identity has already moved on — so sessionUserID always reflects the server's real
-            // state and can never falsely match a newer ppid. Then loop; the top-of-loop check
-            // exits once the server has converged to the latest (and fires the IPv4 capture for
-            // the identity it converged to).
-            sessionUserID = target
+            // The PATCH just moved server session `sid` to `target` (reconciles are serialized, so
+            // no other PATCH interleaves). Record that truth even if the desired identity has
+            // already moved on — so sessionUserID always reflects the server's real state and can
+            // never falsely match a newer ppid — but ONLY while `sid` is still the current session.
+            // A consent resync that replaced the session mid-PATCH makes this result stale: it
+            // describes the OLD session, and writing it would pair the NEW sessionId with an
+            // identity its server session never held — falsely satisfying the convergence check
+            // above (misattributing the IPv4 capture and skipping the PATCH the new session still
+            // needs) and poisoning the consistentSessionId frequency-cap gate. Discarding it is
+            // safe: the next iteration re-reads the live sessionId/sessionUserID pair and
+            // re-PATCHes the replacement session if it hasn't converged.
+            if sessionId == sid {
+                sessionUserID = target
+            }
         }
     }
 
