@@ -29,8 +29,33 @@ jobs:
             echo '::error::`try? await` is banned in SDK code — use explicit do/catch (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
             fail=1
           fi
+          if grep -rnE 'try! await' Sources/; then
+            echo '::error::`try! await` is banned in SDK code — use explicit do/catch (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
           if grep -rnE 'async let' Sources/; then
             echo '::error::`async let` is banned in SDK code — use sequential await or a task group (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          # @_alwaysEmitIntoClient generic sleeps mint per-module copies that same-name
+          # coalescing can poison in multi-SDK hosts (swiftlang/swift#86204); only the
+          # dylib entry point Task.sleep(nanoseconds:) is allowed.
+          if grep -rnE 'Task\.sleep\((for|until):' Sources/; then
+            echo '::error::`Task.sleep(for:/until:)` is banned in SDK code — use Task.sleep(nanoseconds:) (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          if grep -rnE 'with(Checked|Unsafe)(Throwing)?Continuation' Sources/; then
+            echo '::error::continuations are banned in SDK code — use one-shot-guarded callback registries (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
+            fail=1
+          fi
+          # The telemetry flush engine and Ipv4Beacon must stay on GCD (launch path — they run
+          # on every host launch): no Swift Concurrency task creation in those files.
+          if grep -nE 'Task(<[^>]*>)?\s*\{|Task\.detached|Task\.sleep' \
+              Sources/SimulaAdSDK/Telemetry/TelemetryManager.swift \
+              Sources/SimulaAdSDK/Telemetry/TelemetrySender.swift \
+              Sources/SimulaAdSDK/Networking/Ipv4Beacon.swift \
+            | grep -vE '^[^:]+:[0-9]+:\s*//'; then
+            echo '::error::the launch path (telemetry flush engine, Ipv4Beacon) must not create Swift Concurrency tasks — GCD only (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
             fail=1
           fi
           exit $fail

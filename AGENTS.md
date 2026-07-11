@@ -81,13 +81,23 @@ Lock-guarded snapshot (cross-thread mutable state — `@unchecked Sendable` + `N
 
 ```swift
 lock.lock(); let snapshot = state; lock.unlock()
-await sender.send(snapshot)          // never await while holding the lock
+sender.send(snapshot) { ack in … }   // never block or await while holding the lock
 ```
 
-Main-actor hop for imperative API from background code:
+Main-actor hop from background/nonisolated SDK code (GCD, not `Task { @MainActor }` — the
+dispatch guarantees main before the cast, so it can never trap; see the concurrency note in
+`TelemetryManager` and the swift-concurrency-task-shape skill):
 
 ```swift
-await MainActor.run { SimulaAds.initialize(apiKey: key) }
+DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.prewarm() } }
+```
+
+Sleep-then-act / tick timers on ad surfaces (GCD-backed, generation-cancelled — never
+`Task.sleep` loops):
+
+```swift
+@State private var dwellTimer = MainQueueTimer()
+dwellTimer.schedule(after: seconds) { fire() }   // .onDisappear { dwellTimer.cancel() }
 ```
 
 ## Non-negotiable behaviors
@@ -110,16 +120,18 @@ Tests in `Tests/SimulaAdSDKTests/`, XCTest with `@testable import`. Tier 0: pure
 
 Consumers get a **prebuilt XCFramework** — host Xcodes never compile SDK source (the mitigation for the Swift 6.1–6.3 optimizer task-teardown miscompile; see `.cursor/skills/swift-concurrency-task-shape/SKILL.md`). Consequences for code changes:
 
-- `main` keeps the source manifest; each release **tag** carries a generated binary manifest (`scripts/make-release-manifest.sh`). Never hand-edit a tag's `Package.swift`.
-- The release workflow (`.github/workflows/release.yml`) is artifact-only: pinned Xcode, `scripts/build-xcframework.sh`, then a **draft** GitHub Release with the zip + checksum. Publishing is manual: run `make-release-manifest.sh`, commit + tag, publish the draft against the tag, `pod trunk push`, then validate on the demo app (the release gate for the artifact). Release only from a green `main` (CI runs the Debug, Release/`-O`, and simulator test lanes).
+- `main` keeps the source manifest; each release **tag** carries a generated binary manifest (`scripts/make-release-manifest.sh`, which also stamps `:sha256` into the podspec). Never hand-edit a tag's `Package.swift`.
+- The release workflow (`.github/workflows/release.yml`) is artifact-only: pinned Xcode, optimized test lanes on that exact toolchain, `scripts/build-xcframework.sh`, then a **draft** GitHub Release with the zip + dSYMs + checksum. Publishing is manual, and validation comes BEFORE the irreversible steps (a pushed pod is immutable): (1) validate the draft's zip on the demo app, (2) `make-release-manifest.sh`, (3) commit + tag + push the tag, (4) publish the draft against the tag, (5) `pod trunk push`. Release only from a green `main`.
+- The builder toolchain is pinned to **Xcode 16.2 (Swift 6.0.3)** — older than the Swift 6.1–6.3 miscompile window, and `.swiftinterface` compatibility is forward-only, so every host on Xcode ≥ 16.2 can import the artifact by construction. Bumping the pin requires revisiting both properties and the host floor in README.
+- **Support matrix of binary releases: iOS (device + simulator) only.** No macOS or native Mac Catalyst slices — macOS in the source manifest exists for tests. `SimulaAds.simulateCrash` is `#if DEBUG` and therefore absent from release-built binaries; QA docs must not reference it for binary consumers.
 - The public API must stay **library-evolution clean** (`BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — CI checks this). No `@inlinable`/`@_alwaysEmitIntoClient` on public API: inlined bodies would be compiled by host toolchains, re-opening the miscompile.
-- Resources (including `PrivacyInfo.xcprivacy`) ship inside the framework's `SimulaAdSDK_SimulaAdSDK.bundle`; the build script hard-fails if they're missing.
+- Resources (including `PrivacyInfo.xcprivacy`) ship inside the framework's `SimulaAdSDK_SimulaAdSDK.bundle` (plus the privacy manifest at the framework root); the build script hard-fails if any are missing.
 
 ## Version sync (all, always together)
 
 1. `Sources/SimulaAdSDK/Telemetry/Telemetry.swift` — `SIMULA_SDK_VERSION`
 2. `SimulaAdSDK.podspec` — `s.version`
-3. The release tag (created by the release workflow, which also writes the binary `Package.swift` url/checksum for that tag)
+3. The release tag — created **manually** during publishing, on the commit produced by `scripts/make-release-manifest.sh` (binary `Package.swift` url/checksum + podspec `:sha256`). The workflow does not tag.
 
 ## Definition of done — mandatory gate
 

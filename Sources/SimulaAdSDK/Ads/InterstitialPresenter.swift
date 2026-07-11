@@ -10,7 +10,9 @@ import Combine
 let fullscreenImpressionDelayMs: Double = 2_000
 /// Poll cadence for the foreground impression timer — fine enough to land the 2s mark within ~1 frame,
 /// coarse enough to stay negligible. Shared by the interstitial and rewarded presenters.
-let impressionTickNanos: UInt64 = 200_000_000
+/// (`MainQueueTimer` cadence — the presenters' timers run on GCD, never `Task.sleep`; see the
+/// concurrency note in TelemetryManager.)
+let impressionTickSeconds: TimeInterval = 0.2
 
 // MARK: - InterstitialPresenter
 
@@ -168,9 +170,9 @@ private struct CreativeInterstitialView: View {
     /// Whether the close button may be shown/tapped. Starts `false` when a close delay
     /// (`close.delay_seconds`) applies and unlocks once it elapses.
     @State private var closeEnabled: Bool
-    /// Cancellable close-delay gate timer. Cancelled in `.onDisappear` so it can't fire
-    /// after the surface is gone.
-    @State private var gateTask: Task<Void, Never>?
+    /// Cancellable close-delay gate timer (GCD-backed — see `MainQueueTimer`). Cancelled in
+    /// `.onDisappear` so it can't fire after the surface is gone.
+    @State private var gateTimer = MainQueueTimer()
     /// Remaining whole seconds for the close-delay countdown (drives the `reward_or_close_label` copy).
     @State private var closeRemaining: Int
     /// 0→1 fill for the close-delay countdown (`countdown_circle` ring / `progress_bar`).
@@ -188,12 +190,12 @@ private struct CreativeInterstitialView: View {
     // real close button appears.
     @State private var storePromptVisible = false
     @State private var storePromptScheduled = false
-    @State private var storePromptTask: Task<Void, Never>?
+    @State private var storePromptTimer = MainQueueTimer()
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
     @State private var skOverlayPresented = false
-    @State private var skOverlayTask: Task<Void, Never>?
+    @State private var skOverlayTimer = MainQueueTimer()
 
     // auto_store_redirect — fires the store open once, the first time the creative reports the
     // configured moment.
@@ -202,7 +204,12 @@ private struct CreativeInterstitialView: View {
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
     @State private var impressionFired = false
-    @State private var impressionTask: Task<Void, Never>?
+    @State private var impressionTimer = MainQueueTimer()
+    /// Foreground on-ad milliseconds accrued so far; reset each time the timer (re)starts, matching
+    /// the fresh locals of the old task loop.
+    @State private var impressionAccruedMs: Double = 0
+    /// `systemUptime` at the previous tick — the accrual delta baseline.
+    @State private var impressionLastTick: TimeInterval = 0
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -295,14 +302,10 @@ private struct CreativeInterstitialView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
-            gateTask?.cancel()
-            gateTask = nil
-            impressionTask?.cancel()
-            impressionTask = nil
-            storePromptTask?.cancel()
-            storePromptTask = nil
-            skOverlayTask?.cancel()
-            skOverlayTask = nil
+            gateTimer.cancel()
+            impressionTimer.cancel()
+            storePromptTimer.cancel()
+            skOverlayTimer.cancel()
             // Tear the install banner down with the ad so it doesn't leak into the host app.
             if skOverlayPresented, #available(iOS 14.0, *) {
                 SKOverlayPresenter.dismiss()
@@ -335,8 +338,7 @@ private struct CreativeInterstitialView: View {
         // immediately, cancelling the close-delay gate.
         .onReceive(bridge.$earlyComplete) { earlyComplete in
             guard earlyComplete, !closeEnabled else { return }
-            gateTask?.cancel()
-            gateTask = nil
+            gateTimer.cancel()
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears.
@@ -414,27 +416,25 @@ private struct CreativeInterstitialView: View {
     /// sheet covers the ad — the same gating the close countdown uses — so a backgrounded ad can't
     /// accrue the delay. Cancelled in `.onDisappear`.
     private func startImpressionTimer() {
-        guard !impressionFired, impressionTask == nil else { return }
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        impressionTask = Task { await runImpressionTimer() }
+        guard !impressionFired, !impressionTimer.isArmed else { return }
+        // Fresh accrual per (re)start, matching the old task loop's locals.
+        impressionAccruedMs = 0
+        impressionLastTick = ProcessInfo.processInfo.systemUptime
+        // GCD tick, not `Task.sleep` — see `MainQueueTimer` / the concurrency note in TelemetryManager.
+        impressionTimer.tick(every: impressionTickSeconds) { impressionTick() }
     }
 
-    /// Impression timer task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runImpressionTimer() async {
-        var accruedMs: Double = 0
-        var lastTick = ProcessInfo.processInfo.systemUptime
-        while accruedMs < fullscreenImpressionDelayMs {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
-            if Task.isCancelled { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            let delta = (now - lastTick) * 1000
-            lastTick = now
-            // Count only foreground, on-ad time (parity with the close gate's `reconcileGate`).
-            if appForegrounded && !storeSheetPresented { accruedMs += delta }
-        }
-        if Task.isCancelled || impressionFired { return }
+    /// Impression timer tick body (named method, delivered by `MainQueueTimer` on the main actor;
+    /// cancellation drops pending ticks, replacing the old `Task.isCancelled` checks).
+    private func impressionTick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let delta = (now - impressionLastTick) * 1000
+        impressionLastTick = now
+        // Count only foreground, on-ad time (parity with the close gate's `reconcileGate`).
+        if appForegrounded && !storeSheetPresented { impressionAccruedMs += delta }
+        guard impressionAccruedMs >= fullscreenImpressionDelayMs else { return }
+        impressionTimer.cancel()
+        guard !impressionFired else { return }
         impressionFired = true
         onImpression()
     }
@@ -444,8 +444,8 @@ private struct CreativeInterstitialView: View {
     /// `progress_bar` fill `closeProgress`, `reward_or_close_label` ticks `closeRemaining`,
     /// `hidden` shows nothing until it unlocks.
     private func startGate() {
-        // Don't double-start: a running gate is paused via `pauseGate()` (which nils `gateTask`).
-        guard gateTask == nil else { return }
+        // Don't double-start: a running gate is paused via `pauseGate()` (which cancels `gateTimer`).
+        guard !gateTimer.isArmed else { return }
         guard let close = response.adBehavior?.close else { return }
         let treatment = close.treatment
         let total = TimeInterval(close.delaySeconds)
@@ -466,34 +466,29 @@ private struct CreativeInterstitialView: View {
             withAnimation(.linear(duration: remaining)) { closeProgress = 1 }
         }
 
-        // Cancellable gate: a fire-and-forget asyncAfter would still fire after dismiss and mutate
-        // dead @State. The Task is cancelled in `.onDisappear`.
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        gateTask = Task { await runGate(treatment: treatment, remaining: remaining) }
+        // Cancellable gate (a fire-and-forget asyncAfter would still fire after dismiss and mutate
+        // dead @State — `MainQueueTimer` drops cancelled fires): cancelled in `.onDisappear`.
+        // GCD, not `Task { Task.sleep }` — see the concurrency note in TelemetryManager.
+        if treatment == .rewardOrCloseLabel {
+            closeRemaining = Int(ceil(remaining))
+            gateTimer.tick(every: 1) { gateCountdownTick() }
+        } else {
+            guard remaining.isFinite else { return } // paranoia parity with the old UInt64 guard
+            gateTimer.schedule(after: remaining) { unlockClose() }
+        }
     }
 
-    /// Close-gate task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runGate(treatment: CloseTreatment, remaining: TimeInterval) async {
-        if treatment == .rewardOrCloseLabel {
-            var left = Int(ceil(remaining))
-            closeRemaining = left
-            while left > 0 {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                if Task.isCancelled { return }
-                left -= 1
-                closeRemaining = left
-            }
-        } else {
-            // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
-            let sleepNs = remaining * 1_000_000_000
-            if sleepNs.isFinite, sleepNs > 0 {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
-            }
-        }
-        if Task.isCancelled { return }
+    /// Per-second countdown body for the `reward_or_close_label` treatment (named method,
+    /// delivered by `MainQueueTimer`; cancellation drops pending ticks).
+    private func gateCountdownTick() {
+        closeRemaining -= 1
+        guard closeRemaining <= 0 else { return }
+        gateTimer.cancel()
+        unlockClose()
+    }
+
+    /// Unlocks the close affordance (shared by the gate timers and `AD_EARLY_COMPLETE`).
+    private func unlockClose() {
         withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
     }
 
@@ -501,8 +496,7 @@ private struct CreativeInterstitialView: View {
     /// freezes the in-flight ring/bar fill so it can't elapse while backgrounded.
     private func pauseGate() {
         guard let close = response.adBehavior?.close, close.delaySeconds > 0, !closeEnabled else { return }
-        gateTask?.cancel()
-        gateTask = nil
+        gateTimer.cancel()
         if gatePausedAt == nil { gatePausedAt = ProcessInfo.processInfo.systemUptime }
         if close.treatment == .countdownCircle || close.treatment == .progressBar {
             let total = TimeInterval(close.delaySeconds)
@@ -539,22 +533,10 @@ private struct CreativeInterstitialView: View {
         let closeDelay = response.adBehavior?.close.delaySeconds ?? 0
         guard closeDelay > 0 else { return }
         storePromptScheduled = true
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        storePromptTask = Task { await runStorePromptTrigger(closeDelay: closeDelay) }
-    }
-
-    /// Store-prompt trigger task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runStorePromptTrigger(closeDelay: Int) async {
-        // Guard the Double→UInt64 conversion (an extreme server `closeDelay` would otherwise
-        // overflow and trap) — same pattern as the close-delay gate above.
-        let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
-        if sleepNs.isFinite, sleepNs > 0 {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
-        }
-        if Task.isCancelled { return }
-        showStorePrompt()
+        // GCD one-shot at the halfway point — see `MainQueueTimer` / the concurrency note in
+        // TelemetryManager. (`TimeInterval` math can't overflow like the old Double→UInt64
+        // nanosecond conversion could; `schedule` clamps non-positive delays.)
+        storePromptTimer.schedule(after: Double(closeDelay) / 2) { showStorePrompt() }
     }
 
     /// Reveals the store prompt. Idempotent — driven by the `closeTime / 2` timer.
@@ -604,20 +586,9 @@ private struct CreativeInterstitialView: View {
 
     private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
         guard !skOverlayPresented, resolvedAppID != nil else { return }
-        skOverlayTask?.cancel()
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        skOverlayTask = Task { await runSKOverlayPresent(config: config) }
-    }
-
-    /// SKOverlay-present task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runSKOverlayPresent(config: SKOverlayConfig) async {
-        if config.delaySeconds > 0 {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000) } catch { return }
-        }
-        if Task.isCancelled { return }
-        presentSKOverlay(config: config)
+        // GCD one-shot; re-arming implicitly invalidates any pending fire — see `MainQueueTimer` /
+        // the concurrency note in TelemetryManager.
+        skOverlayTimer.schedule(after: TimeInterval(config.delaySeconds)) { presentSKOverlay(config: config) }
     }
 
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store

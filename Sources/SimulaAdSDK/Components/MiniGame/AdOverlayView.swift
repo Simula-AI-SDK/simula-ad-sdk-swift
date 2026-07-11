@@ -46,7 +46,10 @@ public struct AdOverlayView: View {
     @State private var ringProgress: CGFloat = 0.0
     /// The running countdown ticker. Held so it starts once and is cancelled on disappear, so it
     /// can't outlive the overlay (or be double-started by a re-`onAppear`).
-    @State private var countdownTask: Task<Void, Never>?
+    /// Countdown ticker (GCD-backed — see `MainQueueTimer`; ad-path timing never uses `Task.sleep`).
+    @State private var countdownTimer = MainQueueTimer()
+    /// `systemUptime` at the previous tick — the accrual delta baseline, re-anchored per (re)start.
+    @State private var countdownLastTick: TimeInterval = 0
     /// Foreground time accrued toward the 5s gate, in ms. The countdown advances only while running,
     /// and resumes from this on return so backgrounded / store-sheet time is never counted.
     @State private var accumulatedMs: Double = 0
@@ -204,8 +207,7 @@ public struct AdOverlayView: View {
             startCountdown()
         }
         .onDisappear {
-            countdownTask?.cancel()
-            countdownTask = nil
+            countdownTimer.cancel()
         }
         // Pause the countdown while the app is backgrounded OR an in-app store/Safari sheet covers the
         // ad; resume only when both clear, so it can't elapse off-screen. (iOS-only; no-op elsewhere.)
@@ -224,14 +226,13 @@ public struct AdOverlayView: View {
         if appForegrounded && !storeSheetPresented {
             startCountdown()
         } else {
-            countdownTask?.cancel()
-            countdownTask = nil
+            countdownTimer.cancel()
         }
     }
 
     private func startCountdown() {
         // Start exactly once; a re-`onAppear`, resume, or a SwiftUI double-fire must not restart it.
-        guard countdownTask == nil else { return }
+        guard !countdownTimer.isArmed else { return }
         let totalMs: Double = 5_000
         guard accumulatedMs < totalMs else {
             adCountdown = 0
@@ -241,27 +242,24 @@ public struct AdOverlayView: View {
         // Accrue only foreground time: a 50ms ticker driven by the monotonic clock, re-anchored each
         // (re)start so a backgrounded / store-sheet gap is never counted. The ring is snapped per tick
         // so it freezes on pause and resumes from where it left off. Cancelled on background / dismiss.
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        countdownTask = Task { await runCountdown(totalMs: totalMs) }
+        // GCD tick, not `Task.sleep` — see `MainQueueTimer` / the concurrency note in TelemetryManager.
+        countdownLastTick = ProcessInfo.processInfo.systemUptime
+        countdownTimer.tick(every: 0.05) { countdownTick(totalMs: totalMs) }
     }
 
-    /// Countdown ticker task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runCountdown(totalMs: Double) async {
-        var lastTick = ProcessInfo.processInfo.systemUptime
-        while accumulatedMs < totalMs {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
-            if Task.isCancelled { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            accumulatedMs += (now - lastTick) * 1000
-            lastTick = now
-            let progress = accumulatedMs / totalMs
-            ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
-            // Int(nonFinite) traps; clamp before converting.
-            let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
-            adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
-        }
+    /// Countdown tick body (named method, delivered by `MainQueueTimer` on the main actor;
+    /// pause/dismiss cancel the timer, which drops any pending tick).
+    private func countdownTick(totalMs: Double) {
+        let now = ProcessInfo.processInfo.systemUptime
+        accumulatedMs += (now - countdownLastTick) * 1000
+        countdownLastTick = now
+        let progress = accumulatedMs / totalMs
+        ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
+        // Int(nonFinite) traps; clamp before converting.
+        let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
+        adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
+        guard accumulatedMs >= totalMs else { return }
+        countdownTimer.cancel()
         adCountdown = 0
         ringProgress = 1
     }

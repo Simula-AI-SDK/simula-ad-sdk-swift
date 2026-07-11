@@ -16,11 +16,14 @@
 #
 # Env:
 #   CODESIGN_IDENTITY  optional "Apple Distribution: ..." identity to sign the xcframework.
+#   SIMULA_VERSION     version stamped into the framework Info.plist (MARKETING_VERSION).
+#                      Defaults to the podspec's s.version.
 #
 # Outputs (under build/):
 #   SimulaAdSDK.xcframework
 #   SimulaAdSDK.xcframework.zip
-#   SimulaAdSDK.xcframework.zip.checksum   (SPM binaryTarget checksum)
+#   SimulaAdSDK.xcframework.zip.checksum   (SPM binaryTarget checksum == zip SHA-256)
+#   SimulaAdSDK.dSYMs.zip                  (standalone copy for backend symbolication)
 
 set -euo pipefail
 
@@ -29,6 +32,12 @@ cd "$(dirname "$0")/.."
 SCHEME="SimulaAdSDK"
 BUILD_DIR="$PWD/build"
 BUNDLE_NAME="SimulaAdSDK_SimulaAdSDK.bundle"
+
+# Version stamp for the framework Info.plist — otherwise App Store Connect SDK reporting
+# and dSYM bookkeeping see a default (1.0) version.
+VERSION="${SIMULA_VERSION:-$(sed -nE 's/^ *s\.version *= *"([^"]+)".*/\1/p' SimulaAdSDK.podspec)}"
+[[ -n "$VERSION" ]] || { echo "ERROR: could not resolve version (set SIMULA_VERSION or fix the podspec)"; exit 1; }
+echo "==> Building $SCHEME $VERSION"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -52,6 +61,8 @@ archive_slice() {
     BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
     SKIP_INSTALL=NO \
     CODE_SIGNING_ALLOWED=NO \
+    MARKETING_VERSION="$VERSION" \
+    CURRENT_PROJECT_VERSION="$VERSION" \
     | tail -2
 
   local fw="$archive/Products/usr/local/lib/$SCHEME.framework"
@@ -113,6 +124,15 @@ ditto -c -k --keepParent "$BUILD_DIR/$SCHEME.xcframework" "$BUILD_DIR/$SCHEME.xc
 swift package compute-checksum "$BUILD_DIR/$SCHEME.xcframework.zip" \
   > "$BUILD_DIR/$SCHEME.xcframework.zip.checksum"
 
+# Standalone dSYM zip: the crash guard's MetricKit path relies on server-side dSYM
+# symbolication, so the backend needs the dSYMs without unpacking the whole xcframework.
+DSYM_STAGE="$BUILD_DIR/dSYMs-$VERSION"
+mkdir -p "$DSYM_STAGE/ios" "$DSYM_STAGE/ios-simulator"
+ditto "$BUILD_DIR/ios.xcarchive/dSYMs/$SCHEME.framework.dSYM" "$DSYM_STAGE/ios/$SCHEME.framework.dSYM"
+ditto "$BUILD_DIR/ios-simulator.xcarchive/dSYMs/$SCHEME.framework.dSYM" "$DSYM_STAGE/ios-simulator/$SCHEME.framework.dSYM"
+ditto -c -k --keepParent "$DSYM_STAGE" "$BUILD_DIR/$SCHEME.dSYMs.zip"
+
 echo "==> Done"
 echo "    artifact: build/$SCHEME.xcframework.zip"
+echo "    dSYMs:    build/$SCHEME.dSYMs.zip"
 echo "    checksum: $(cat "$BUILD_DIR/$SCHEME.xcframework.zip.checksum")"

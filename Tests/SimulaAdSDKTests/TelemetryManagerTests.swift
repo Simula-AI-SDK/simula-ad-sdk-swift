@@ -19,40 +19,44 @@ final class TelemetryManagerTests: XCTestCase {
 
     /// Records decoded batches; replays queued acks then falls back to `defaultAck`. Optional
     /// one-shot gate so a test can hold the first send in flight while it enqueues more work.
+    /// Completion-based, mirroring the production `TelemetrySending` (the manager's flush engine
+    /// is GCD, not Swift Concurrency — see the concurrency note in `TelemetryManager`).
     private final class FakeSender: TelemetrySending, @unchecked Sendable {
         private let lock = NSLock()
         private var _batches: [TelemetryEnvelope] = []
         private var acks: [TelemetryAck] = []
         var defaultAck: TelemetryAck = .accepted
-        private var gateCont: CheckedContinuation<Void, Never>?
+        /// The parked delivery of a gated send; `release()` fires it.
+        private var gatedDelivery: (@Sendable () -> Void)?
         private var gated = false
 
         var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
         func enqueueAcks(_ a: [TelemetryAck]) { lock.lock(); acks = a; lock.unlock() }
         func gateFirst() { lock.lock(); gated = true; lock.unlock() }
         func release() {
-            lock.lock(); let c = gateCont; gateCont = nil; gated = false; lock.unlock()
-            c?.resume()
+            lock.lock(); let deliver = gatedDelivery; gatedDelivery = nil; gated = false; lock.unlock()
+            deliver?()
         }
 
-        func send(_ body: Data) async -> TelemetryAck {
-            lock.lock()
-            let shouldGate = gated
-            lock.unlock()
-            if shouldGate {
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    // Re-check under the lock: if release() ran between the gated read above and
-                    // here, parking now would leak the continuation and deadlock the flush.
-                    lock.lock()
-                    if gated { gateCont = cont; lock.unlock() }
-                    else { lock.unlock(); cont.resume() }
-                }
+        func send(_ body: Data, completion: @escaping @Sendable (TelemetryAck) -> Void) {
+            let deliver: @Sendable () -> Void = { [self] in
+                lock.lock()
+                if let env = try? JSONDecoder().decode(TelemetryEnvelope.self, from: body) { _batches.append(env) }
+                let ack = acks.isEmpty ? defaultAck : acks.removeFirst()
+                lock.unlock()
+                completion(ack)
             }
+            // Park-or-deliver decided under ONE lock acquisition, so a concurrent `release()`
+            // can never slip between the check and the park (the race the old continuation
+            // gate had to re-check for).
             lock.lock()
-            if let env = try? JSONDecoder().decode(TelemetryEnvelope.self, from: body) { _batches.append(env) }
-            let ack = acks.isEmpty ? defaultAck : acks.removeFirst()
+            if gated {
+                gatedDelivery = deliver
+                lock.unlock()
+                return
+            }
             lock.unlock()
-            return ack
+            deliver()
         }
     }
 
@@ -277,8 +281,8 @@ final class TelemetryManagerTests: XCTestCase {
 
     func testPiiIncludedWhenProvidedAndOmittedWhenNot() async {
         let withPii = FakeSender()
-        // Retain the manager: its eager-flush Task captures `self` weakly (in production the
-        // manager is retained by Telemetry.shared), so a temporary would be freed before flush.
+        // Retain the manager: its eager-flush work item captures `self` weakly (in production
+        // the manager is retained by Telemetry.shared), so a temporary would be freed before flush.
         let mgrWith = build(store: FakeStore(), sender: withPii, ppid: "user-1", gaid: "gaid-1")
         mgrWith.recordError(signature: "e", errorCode: "c", message: "m")
         await waitUntil { !withPii.batches.isEmpty }

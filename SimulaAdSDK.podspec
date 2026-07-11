@@ -20,9 +20,9 @@ Pod::Spec.new do |s|
   # miscompilation that aborted host apps (see the repo's swift-concurrency-task-shape skill).
   # The artifact is built + validated by .github/workflows/release.yml; resources (including
   # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
-  s.source           = {
-    :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
-  }
+  # Single line on purpose: scripts/make-release-manifest.sh stamps `:sha256 => "…"` into it
+  # at release time so CocoaPods verifies the download like SPM verifies its checksum.
+  s.source           = { :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip" }
 
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"

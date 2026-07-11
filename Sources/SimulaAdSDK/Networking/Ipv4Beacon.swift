@@ -45,7 +45,12 @@ final class Ipv4Beacon: @unchecked Sendable {
     static let reasonPpidUpdate = "ppid_update"
 
     private let urlString: String
-    private let send: @Sendable (URL) async -> Bool
+    /// Completion-based (not `async`) on purpose: the beacon fires on the LAUNCH path, and the
+    /// launch path must never create Swift Concurrency tasks — affected host toolchains
+    /// miscompile optimized task teardown into aborts ("freed pointer was not the last
+    /// allocation"). See the concurrency note in `TelemetryManager` and
+    /// .cursor/skills/swift-concurrency-task-shape/SKILL.md.
+    private let send: @Sendable (URL, @escaping @Sendable (Bool) -> Void) -> Void
     private let deviceId: @Sendable () -> String?
     private let now: @Sendable () -> Date
 
@@ -62,7 +67,7 @@ final class Ipv4Beacon: @unchecked Sendable {
     /// Collaborators are injectable so tests run with fakes — no network, no wall clock.
     init(
         urlString: String = Ipv4Beacon.defaultURLString,
-        send: @escaping @Sendable (URL) async -> Bool = Ipv4Beacon.defaultSend,
+        send: @escaping @Sendable (URL, @escaping @Sendable (Bool) -> Void) -> Void = Ipv4Beacon.defaultSend,
         deviceId: @escaping @Sendable () -> String? = { SimulaDeviceId.value },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -100,8 +105,9 @@ final class Ipv4Beacon: @unchecked Sendable {
         let gen = generation
         lock.unlock()
 
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        Task { [weak self] in await self?.runFire(key: key, generation: gen, url: url) }
+        // No Swift Concurrency on the launch path (see the `send` property note): the sender is
+        // completion-based, and the completion lands in the synchronous `complete(…)` below.
+        send(url) { [weak self] ok in self?.complete(key: key, generation: gen, ok: ok) }
     }
 
     /// Logout ends the capture session: clear the dedup bookkeeping (and invalidate anything
@@ -115,14 +121,8 @@ final class Ipv4Beacon: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Fire task body (named method — see the task-shape note in TelemetryManager).
-    private func runFire(key: String, generation gen: Int, url: URL) async {
-        let ok = await send(url)
-        complete(key: key, generation: gen, ok: ok)
-    }
-
-    /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6) — same
-    /// pattern as TelemetryManager.recover().
+    /// Reconciles a completed send. Synchronous and lock-guarded; runs on whatever queue the
+    /// sender's completion fires on (URLSession delegate queue in production).
     private func complete(key: String, generation gen: Int, ok: Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -179,20 +179,20 @@ final class Ipv4Beacon: @unchecked Sendable {
         return URLSession(configuration: config)
     }()
 
-    /// Production sender: a short-timeout GET whose response body is ignored. Returns whether
-    /// the beacon landed (2xx). Explicit do/catch (never `try?` around an `await` — see the
-    /// task-shape note in TelemetryManager); any transport failure is a plain `false` so the
-    /// identity stays retryable.
+    /// Production sender: a short-timeout GET whose response body is ignored. Calls the
+    /// completion with whether the beacon landed (2xx); any transport failure is a plain
+    /// `false` so the identity stays retryable. Completion-based dataTask (no Swift
+    /// Concurrency — see the `send` property note).
     @Sendable
-    static func defaultSend(_ url: URL) async -> Bool {
+    static func defaultSend(_ url: URL, completion: @escaping @Sendable (Bool) -> Void) {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
-        do {
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            return (200..<300).contains(http.statusCode)
-        } catch {
-            return false
-        }
+        session.dataTask(with: request) { _, response, error in
+            guard error == nil, let http = response as? HTTPURLResponse else {
+                completion(false)
+                return
+            }
+            completion((200..<300).contains(http.statusCode))
+        }.resume()
     }
 }
