@@ -30,7 +30,9 @@ struct NativeAdViewabilityModifier: ViewModifier {
     let onImpression: (ViewabilityStats) -> Void
 
     @State private var fired = false
-    @State private var dwellTask: Task<Void, Never>?
+    // GCD dwell timer, not a `Task` handle — ad-path timing must not touch the Swift
+    // Concurrency task allocator (see `MainQueueTimer` / the note in TelemetryManager).
+    @State private var dwellTimer = MainQueueTimer()
     // Time-integrated exposure for the once-per-impression `viewability` telemetry. A reference type in
     // @State so it persists across re-renders and mutates in place; accessed only on the main actor.
     @State private var accumulator = ViewabilityAccumulator()
@@ -45,8 +47,7 @@ struct NativeAdViewabilityModifier: ViewModifier {
                 }
             )
             .onDisappear {
-                dwellTask?.cancel()
-                dwellTask = nil
+                dwellTimer.cancel()
                 // Slot left the screen → tell the creative it's no longer visible (pause video, etc.).
                 onVisibilityRatio?(0)
             }
@@ -64,24 +65,19 @@ struct NativeAdViewabilityModifier: ViewModifier {
     private func evaluate(_ fraction: CGFloat) {
         if fraction >= thresholdFraction {
             // Already counting down? Don't restart — a sustained view must keep its timer running.
-            guard dwellTask == nil else { return }
-            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            dwellTask = Task { await runDwellTimer() }
+            guard !dwellTimer.isArmed else { return }
+            dwellTimer.schedule(after: minVisibleSeconds) { fireDwell() }
         } else {
             // Dropped below threshold before the dwell elapsed → reset the timer (PRD).
-            dwellTask?.cancel()
-            dwellTask = nil
+            dwellTimer.cancel()
         }
     }
 
-    /// Dwell timer task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runDwellTimer() async {
-        // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-        do { try await Task.sleep(nanoseconds: UInt64(minVisibleSeconds * 1_000_000_000)) } catch { return }
-        guard !Task.isCancelled else { return }
+    /// Dwell fire body (named method, delivered by `MainQueueTimer` on the main actor; a
+    /// cancelled/re-armed timer never delivers, replacing the old `Task.isCancelled` check).
+    private func fireDwell() {
+        guard !fired else { return }
         fired = true
-        dwellTask = nil
         onImpression(accumulator.finish(now: ProcessInfo.processInfo.systemUptime))
     }
 

@@ -1565,22 +1565,29 @@ public final class SimulaAPI: @unchecked Sendable {
     // MARK: - Telemetry
 
     /// Delivers a telemetry batch (`POST /telemetry/events`), reusing the auth + consent
-    /// headers so it inherits the same privacy posture as tracking. Returns the HTTP status
-    /// (or -1 on a connectivity failure) for the caller to map to accept/drop/retry. The
+    /// headers so it inherits the same privacy posture as tracking. Calls `completion` with the
+    /// HTTP status (or -1 on a connectivity failure) for the caller to map to accept/drop/retry;
+    /// the completion fires on URLSession's delegate queue. Completion-based (not `async`) so
+    /// the telemetry flush engine never touches the Swift Concurrency task allocator on the
+    /// launch path — see the concurrency note in `TelemetryManager`. The
     /// `TelemetryURLSessionDelegate` skips this path, so the request is never self-recorded.
-    public func postTelemetry(apiKey: String, body: Data) async -> Int {
-        guard let url = URL(string: "\(API_BASE_URL)/telemetry/events") else { return -1 }
+    public func postTelemetry(apiKey: String, body: Data, completion: @escaping @Sendable (Int) -> Void) {
+        guard let url = URL(string: "\(API_BASE_URL)/telemetry/events") else {
+            completion(-1)
+            return
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
         request.httpBody = body
 
-        do {
-            let (_, response) = try await session.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode ?? -1
-        } catch {
-            return -1
-        }
+        session.dataTask(with: request) { _, response, error in
+            if error != nil {
+                completion(-1)
+                return
+            }
+            completion((response as? HTTPURLResponse)?.statusCode ?? -1)
+        }.resume()
     }
 }

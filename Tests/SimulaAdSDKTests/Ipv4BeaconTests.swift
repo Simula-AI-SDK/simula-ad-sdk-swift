@@ -23,7 +23,7 @@ final class Ipv4BeaconTests: XCTestCase {
     ) -> Ipv4Beacon {
         Ipv4Beacon(
             urlString: urlString,
-            send: { url in await recorder.record(url) },
+            send: { url, completion in recorder.record(url, completion: completion) },
             deviceId: { deviceId },
             now: { [date = referenceDate] in date }
         )
@@ -210,12 +210,15 @@ final class Ipv4BeaconTests: XCTestCase {
 // MARK: - Test double
 
 /// Records every sent URL, returns a programmable result, and can gate a send in flight so a
-/// test can observe/act while the beacon is mid-request.
+/// test can observe/act while the beacon is mid-request. Completion-based, mirroring the
+/// production sender seam (the beacon's launch path uses no Swift Concurrency — see the
+/// `send` property note in `Ipv4Beacon`).
 private final class SendRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [URL] = []
-    private var gateStream: AsyncStream<Void>?
-    private var gateContinuation: AsyncStream<Void>.Continuation?
+    private var gated = false
+    /// Deliveries parked while gated; `open()` fires them all.
+    private var parked: [@Sendable () -> Void] = []
 
     var result = true
 
@@ -223,32 +226,29 @@ private final class SendRecorder: @unchecked Sendable {
     var urls: [URL] { lock.lock(); defer { lock.unlock() }; return recorded }
 
     /// Hold subsequent sends open until `open()` is called.
-    func gate() {
-        lock.lock()
-        defer { lock.unlock() }
-        var continuation: AsyncStream<Void>.Continuation?
-        gateStream = AsyncStream<Void> { continuation = $0 }
-        gateContinuation = continuation
-    }
+    func gate() { lock.lock(); gated = true; lock.unlock() }
 
     func open() {
         lock.lock()
-        let continuation = gateContinuation
-        gateStream = nil
-        gateContinuation = nil
+        let deliveries = parked
+        parked = []
+        gated = false
         lock.unlock()
-        continuation?.finish()
+        for deliver in deliveries { deliver() }
     }
 
-    func record(_ url: URL) async -> Bool {
+    func record(_ url: URL, completion: @escaping @Sendable (Bool) -> Void) {
         lock.lock()
         recorded.append(url)
-        let stream = gateStream
         let outcome = result
-        lock.unlock()
-        if let stream {
-            for await _ in stream {}
+        // Park-or-deliver decided under one lock acquisition so a concurrent `open()` can
+        // never slip between the check and the park.
+        if gated {
+            parked.append { completion(outcome) }
+            lock.unlock()
+            return
         }
-        return outcome
+        lock.unlock()
+        completion(outcome)
     }
 }

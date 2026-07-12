@@ -15,8 +15,7 @@ Simula delivers ads that feel native to AI chat and character-driven application
 ## Requirements
 
 - iOS 15.0+
-- Swift 5.9+
-- Xcode 15+
+- Xcode 16.2+ (SDK releases from 1.1.4 ship as a prebuilt XCFramework)
 
 ## Getting Started
 

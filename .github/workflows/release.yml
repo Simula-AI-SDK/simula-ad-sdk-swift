@@ -1,13 +1,16 @@
 name: Release (binary XCFramework)
 
 # Builds the binary SimulaAdSDK.xcframework with the PINNED toolchain and attaches it to a
-# DRAFT GitHub Release. Nothing else — no tagging, no pod push. Publishing is manual:
+# DRAFT GitHub Release. Nothing else — no tagging, no pod push. Publishing is manual and
+# validation comes BEFORE the irreversible steps (a pushed pod version is immutable):
 #
-#   1. Run scripts/make-release-manifest.sh <version> <checksum> (checksum is in the draft
-#      release notes), commit, tag <version>, push the tag.
-#   2. Publish the draft release against that tag.
-#   3. pod trunk push SimulaAdSDK.podspec (the :http source resolves to the published asset).
-#   4. Smoke-test the demo app.
+#   1. Download the zip from the draft and validate it on the demo app (local binary
+#      manifest / podspec pointed at the file).
+#   2. Run scripts/make-release-manifest.sh <version> <checksum> (checksum is in the draft
+#      release notes) — writes the binary Package.swift AND stamps :sha256 into the podspec.
+#   3. Commit, tag <version>, push the tag.
+#   4. Publish the draft release against that tag.
+#   5. pod trunk push SimulaAdSDK.podspec (the :http source resolves to the published asset).
 #
 # Test gates (Debug + Release/-O + iOS Simulator) run in CI on every PR/push
 # (.github/workflows/ci.yml) — release from a green main.
@@ -24,10 +27,14 @@ on:
         required: true
 
 env:
-  # PINNED, VALIDATED builder toolchain. Bump only after the Release-lane (-O) suite
-  # passes on the new version. Do NOT use latest-stable here: the binary bakes in this
-  # toolchain's codegen, so it must be a deliberate choice.
-  XCODE_VERSION: "26.4.1"
+  # PINNED builder toolchain: Xcode 16.2 (Swift 6.0.3) — deliberately OLDER than the
+  # miscompile window (Swift 6.1–6.3 / Xcode 16.3+), so the binary's codegen comes from a
+  # compiler outside the implicated range. Equally important: .swiftinterface compatibility
+  # is forward-only (newer compilers read older interfaces, not the reverse), so building
+  # with the oldest clean toolchain makes the artifact importable by every host on
+  # Xcode >= 16.2 by construction. Do NOT bump toward newer Xcodes without revisiting both
+  # properties and the host-support floor documented in README/AGENTS.
+  XCODE_VERSION: "16.2"
 
 concurrency:
   group: release
@@ -35,9 +42,9 @@ concurrency:
 
 jobs:
   build-and-upload:
-    # macOS 26 runner required: Xcode 26.4.x does not install on macOS 15 (Sequoia) images.
-    # Keep this in lockstep with XCODE_VERSION above when either changes.
-    runs-on: macos-26
+    # Keep the image in lockstep with XCODE_VERSION: macos-15 ships the Xcode 16.x line.
+    # If the image drops 16.2, setup-xcode fails loudly — fall back to macos-14.
+    runs-on: macos-15
     permissions:
       contents: write
     steps:
@@ -48,33 +55,53 @@ jobs:
         with:
           xcode-version: ${{ env.XCODE_VERSION }}
 
+      # Hard assertion, not just a pin: the artifact's safety rests on the builder compiler
+      # being OLDER than the Swift 6.1–6.3 miscompile window. Fails the release if version
+      # selection ever resolves to a different toolchain (fuzzy match, image changes, or a
+      # future "bump the Xcode" edit that skipped the safety analysis in the env comment).
+      - name: Assert pre-regression Swift toolchain (6.0.x)
+        run: |
+          set -euo pipefail
+          swift --version
+          swift --version 2>&1 | grep -q 'Swift version 6\.0\.' \
+            || { echo "::error::builder toolchain is not Swift 6.0.x — refusing to build a release artifact with a compiler inside/after the 6.1–6.3 miscompile window"; exit 1; }
+
       # Artifact-labeling guard: the binary embeds SIMULA_SDK_VERSION (telemetry), so a
       # mismatched input would ship a mislabeled framework.
       - name: Verify version sync
         run: |
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
-          grep -q "s.version          = \"$V\"" SimulaAdSDK.podspec \
+          grep -Eq "s\.version\s*=\s*\"$V\"" SimulaAdSDK.podspec \
             || { echo "::error::podspec s.version != $V"; exit 1; }
-          grep -q "let SIMULA_SDK_VERSION = \"$V\"" Sources/SimulaAdSDK/Telemetry/Telemetry.swift \
+          grep -Eq "let SIMULA_SDK_VERSION = \"$V\"" Sources/SimulaAdSDK/Telemetry/Telemetry.swift \
             || { echo "::error::SIMULA_SDK_VERSION != $V"; exit 1; }
 
       # The one test gate that cannot live in CI: CI validates latest-stable, but the binary
       # bakes in THIS pinned toolchain's codegen. Run the optimized (-O) suite on the exact
       # compiler that produces the shipped artifact to catch task-teardown miscompiles.
+      # Accepted residual risks: tests build with -enable-testing (codegen close to, but not
+      # bit-identical with, the shipped one), and this macOS run compiles out `#if os(iOS)`
+      # code — the iOS slices are exercised by CI's simulator lane and the demo-app
+      # validation step before publishing.
       - name: Validate pinned toolchain (optimized test suite)
         run: swift test -c release -Xswiftc -enable-testing
 
       - name: Build XCFramework
-        run: ./scripts/build-xcframework.sh
+        run: SIMULA_VERSION="${{ github.event.inputs.version }}" ./scripts/build-xcframework.sh
 
-      - name: Create draft release with artifact
+      - name: Create draft release with artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
           CHECKSUM=$(cat build/SimulaAdSDK.xcframework.zip.checksum)
+          # Retry-friendly: replace an existing DRAFT for this version; never touch a
+          # published release (the create below fails loudly in that case).
+          if gh release view "$V" --json isDraft --jq .isDraft 2>/dev/null | grep -q true; then
+            gh release delete "$V" --yes
+          fi
           # NOTE: a DRAFT release does not create the git tag. But if this draft is
           # published while tag $V does not exist yet, GitHub creates the tag at this
           # workflow's (source-manifest) commit and SPM consumers silently build from
@@ -82,17 +109,18 @@ jobs:
           {
             printf '%s\n' "**Do NOT publish this draft until tag \`$V\` exists.** Publishing without the tag makes GitHub create \`$V\` on a source-manifest commit, and SPM consumers would silently build from source instead of this binary."
             printf '%s\n' ""
-            printf '%s\n' "Publish sequence:"
-            printf '%s\n' "1. \`scripts/make-release-manifest.sh $V $CHECKSUM\`"
-            printf '%s\n' "2. Commit, tag \`$V\`, push the tag"
-            printf '%s\n' "3. Publish this draft (it will attach to the pushed tag)"
-            printf '%s\n' "4. \`pod trunk push SimulaAdSDK.podspec\`"
-            printf '%s\n' "5. Validate on the demo app"
+            printf '%s\n' "Publish sequence (validate BEFORE the irreversible steps — a pushed pod is immutable):"
+            printf '%s\n' "1. Download \`SimulaAdSDK.xcframework.zip\` from this draft and validate it on the demo app (point a local binary manifest / podspec at the file)"
+            printf '%s\n' "2. \`scripts/make-release-manifest.sh $V $CHECKSUM\` (writes Package.swift + podspec :sha256)"
+            printf '%s\n' "3. Commit, tag \`$V\`, push the tag"
+            printf '%s\n' "4. Publish this draft (it will attach to the pushed tag)"
+            printf '%s\n' "5. \`pod trunk push SimulaAdSDK.podspec\`"
             printf '%s\n' ""
-            printf '%s\n' "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} (dSYMs embedded). SPM checksum: \`$CHECKSUM\`"
+            printf '%s\n' "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} from commit \`${{ github.sha }}\` (dSYMs embedded; standalone dSYM zip attached for backend symbolication). Host support floor: Xcode 16.2+. SPM checksum / zip SHA-256: \`$CHECKSUM\`"
           } > release-notes.md
           gh release create "$V" \
             --draft \
             --title "$V" \
             --notes-file release-notes.md \
-            "build/SimulaAdSDK.xcframework.zip"
+            "build/SimulaAdSDK.xcframework.zip" \
+            "build/SimulaAdSDK.dSYMs.zip"

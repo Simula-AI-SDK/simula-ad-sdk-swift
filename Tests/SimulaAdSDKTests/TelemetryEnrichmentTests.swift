@@ -17,11 +17,13 @@ final class TelemetryEnrichmentTests: XCTestCase {
         private let lock = NSLock()
         private var _batches: [TelemetryEnvelope] = []
         var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
-        func send(_ body: Data) async -> TelemetryAck {
+        // Completion-based, mirroring the production protocol (the flush engine is GCD —
+        // see the concurrency note in `TelemetryManager`).
+        func send(_ body: Data, completion: @escaping @Sendable (TelemetryAck) -> Void) {
             lock.lock()
             if let env = try? JSONDecoder().decode(TelemetryEnvelope.self, from: body) { _batches.append(env) }
             lock.unlock()
-            return .accepted
+            completion(.accepted)
         }
     }
 

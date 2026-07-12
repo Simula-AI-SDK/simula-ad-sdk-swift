@@ -8,10 +8,12 @@
 # resolve the binary; the repo itself always builds from source.
 #
 # MANUAL release step (the workflow only builds + uploads the artifact — see
-# .github/workflows/release.yml). After the workflow produced the draft release:
+# .github/workflows/release.yml). After the workflow produced the draft release AND the
+# artifact was validated on the demo app:
 #   scripts/make-release-manifest.sh <version> <checksum>
-# then commit, tag <version>, push the tag, and publish the draft against it.
-# <checksum> is `swift package compute-checksum` of the zip (printed in the draft notes).
+# then commit, tag <version>, push the tag, publish the draft against it, pod trunk push.
+# <checksum> is `swift package compute-checksum` of the zip (printed in the draft notes);
+# it equals the zip's SHA-256, so the same value is stamped into the podspec's :sha256.
 
 set -euo pipefail
 
@@ -19,6 +21,15 @@ cd "$(dirname "$0")/.."
 
 VERSION="${1:?usage: make-release-manifest.sh <version> <checksum>}"
 CHECKSUM="${2:?usage: make-release-manifest.sh <version> <checksum>}"
+
+# Integrity check for CocoaPods: SPM verifies its checksum, but an :http pod source verifies
+# nothing unless :sha256 is present. The SPM checksum IS the zip's SHA-256, so stamp the same
+# value. (Idempotent: strips any :sha256 already present before adding the fresh one.)
+sed -i '' -E \
+  's|(s\.source *= *\{ *:http => "[^"]+")(, *:sha256 => "[0-9a-f]+")? *\}|\1, :sha256 => "'"$CHECKSUM"'" }|' \
+  SimulaAdSDK.podspec
+grep -q ":sha256 => \"$CHECKSUM\"" SimulaAdSDK.podspec \
+  || { echo "ERROR: failed to stamp :sha256 into SimulaAdSDK.podspec"; exit 1; }
 
 cat > Package.swift <<EOF
 // swift-tools-version: 5.9
@@ -50,4 +61,4 @@ let package = Package(
 )
 EOF
 
-echo "Wrote binary Package.swift for ${VERSION} (checksum ${CHECKSUM})"
+echo "Wrote binary Package.swift and stamped podspec :sha256 for ${VERSION} (checksum ${CHECKSUM})"

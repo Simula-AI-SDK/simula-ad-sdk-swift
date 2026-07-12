@@ -203,14 +203,20 @@ private struct RewardedGameView: View {
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
     @State private var visible = true
-    @State private var timerTask: Task<Void, Never>?
+    /// Play-to-earn accrual timer (GCD-backed — see `MainQueueTimer`).
+    @State private var playTimer = MainQueueTimer()
     /// auto_store_redirect one-shot guard.
     @State private var autoRedirectFired = false
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
     @State private var impressionFired = false
-    @State private var impressionTask: Task<Void, Never>?
+    @State private var impressionTimer = MainQueueTimer()
+    /// Foreground on-ad milliseconds accrued so far; reset each time the timer (re)starts, matching
+    /// the fresh locals of the old task loop.
+    @State private var impressionAccruedMs: Double = 0
+    /// `systemUptime` at the previous tick — the accrual delta baseline.
+    @State private var impressionLastTick: TimeInterval = 0
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -296,10 +302,8 @@ private struct RewardedGameView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
-            timerTask?.cancel()
-            timerTask = nil
-            impressionTask?.cancel()
-            impressionTask = nil
+            playTimer.cancel()
+            impressionTimer.cancel()
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
@@ -331,8 +335,7 @@ private struct RewardedGameView: View {
         // reward and reveal the close button immediately, bypassing the play timer.
         .onReceive(bridge.$earlyComplete) { earlyComplete in
             guard earlyComplete, !rewardEarned else { return }
-            timerTask?.cancel()
-            timerTask = nil
+            playTimer.cancel()
             rewardEarned = true
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
@@ -365,39 +368,37 @@ private struct RewardedGameView: View {
     // MARK: Timer
 
     private func startTimer() {
-        guard timerTask == nil else { return }
+        // `!rewardEarned` also blocks a re-`onAppear` after a fully-played-out gate from
+        // re-arming the tick (the old completed task handle blocked that implicitly).
+        guard !playTimer.isArmed, !rewardEarned else { return }
         // A zero/negative gate is earned immediately (no gate).
         guard gateSeconds > 0 else {
             rewardEarned = true
             return
         }
         // Glide the bar/ring fill linearly to full over the remaining gate (resuming from the
-        // fraction already elapsed). The 1 s accrual loop below only drives gate / store-prompt /
+        // fraction already elapsed). The 1 s accrual tick below only drives gate / store-prompt /
         // reward logic — the indicator is animated, not stepped, so it no longer looks laggy.
         let remaining = Double(gateSeconds) - elapsedPlayTime
         closeProgressAnim = closeProgress
         if remaining > 0 {
             withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
         }
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        timerTask = Task { await runPlayTimer() }
+        // GCD tick, not `Task.sleep` — see `MainQueueTimer` / the concurrency note in TelemetryManager.
+        playTimer.tick(every: 1) { playTimerTick() }
     }
 
-    /// Play-to-earn timer task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runPlayTimer() async {
-        while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-            if Task.isCancelled { return }
-            elapsedPlayTime += 1
-            // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-            if elapsedPlayTime >= Double(gateSeconds) / 2 {
-                withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
-            }
-            if elapsedPlayTime >= Double(gateSeconds) {
-                rewardEarned = true
-            }
+    /// Play-to-earn accrual tick (named method, delivered by `MainQueueTimer` on the main actor;
+    /// pause/dismiss cancel the timer, which drops any pending tick).
+    private func playTimerTick() {
+        elapsedPlayTime += 1
+        // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
+        if elapsedPlayTime >= Double(gateSeconds) / 2 {
+            withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+        }
+        if elapsedPlayTime >= Double(gateSeconds) {
+            playTimer.cancel()
+            rewardEarned = true
         }
     }
 
@@ -407,26 +408,24 @@ private struct RewardedGameView: View {
     /// foreground-active and no store/Safari sheet covers the playable (same gating as the play timer),
     /// so a backgrounded playable can't accrue the delay. Cancelled in `.onDisappear`.
     private func startImpressionTimer() {
-        guard !impressionFired, impressionTask == nil else { return }
-        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        impressionTask = Task { await runImpressionTimer() }
+        guard !impressionFired, !impressionTimer.isArmed else { return }
+        // Fresh accrual per (re)start, matching the old task loop's locals.
+        impressionAccruedMs = 0
+        impressionLastTick = ProcessInfo.processInfo.systemUptime
+        // GCD tick, not `Task.sleep` — see `MainQueueTimer` / the concurrency note in TelemetryManager.
+        impressionTimer.tick(every: impressionTickSeconds) { impressionTick() }
     }
 
-    /// Impression timer task body (named method — see the task-shape note in TelemetryManager).
-    @MainActor
-    private func runImpressionTimer() async {
-        var accruedMs: Double = 0
-        var lastTick = ProcessInfo.processInfo.systemUptime
-        while accruedMs < fullscreenImpressionDelayMs {
-            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: impressionTickNanos) } catch { return }
-            if Task.isCancelled { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            let delta = (now - lastTick) * 1000
-            lastTick = now
-            if appForegrounded && !storeSheetPresented { accruedMs += delta }
-        }
-        if Task.isCancelled || impressionFired { return }
+    /// Impression timer tick body (named method, delivered by `MainQueueTimer` on the main actor;
+    /// cancellation drops pending ticks, replacing the old `Task.isCancelled` checks).
+    private func impressionTick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let delta = (now - impressionLastTick) * 1000
+        impressionLastTick = now
+        if appForegrounded && !storeSheetPresented { impressionAccruedMs += delta }
+        guard impressionAccruedMs >= fullscreenImpressionDelayMs else { return }
+        impressionTimer.cancel()
+        guard !impressionFired else { return }
         impressionFired = true
         onImpression()
     }
@@ -437,8 +436,7 @@ private struct RewardedGameView: View {
         if appForegrounded && !storeSheetPresented {
             if !rewardEarned { startTimer() }
         } else {
-            timerTask?.cancel()
-            timerTask = nil
+            playTimer.cancel()
             // Freeze the animated fill at the true elapsed fraction so it stops gliding while paused
             // (disable the implicit animation so it doesn't tween toward the frozen value).
             var tx = Transaction(); tx.disablesAnimations = true

@@ -40,6 +40,9 @@ public struct NativeAdSlot: View {
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
+    /// Missing-height watchdog (GCD-backed — see `MainQueueTimer`; runs at render time, so it
+    /// must not be a Swift Concurrency task — see the concurrency note in TelemetryManager).
+    @State private var missingHeightTimer = MainQueueTimer()
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
     /// Forwards the slot's live visible fraction into the creative (`window.onVisibility`); bound to
@@ -124,8 +127,29 @@ public struct NativeAdSlot: View {
     public var body: some View {
         sizedSlot
             .task(id: taskKey) { await load() }
-            // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
-            .task(id: awaitingHeight) { await watchForMissingHeight() }
+            // Collapse a creative that loaded but never reported a height. GCD watchdog, not a
+            // SwiftUI `.task` — this fires at render time on every search-surface mount, so it
+            // must stay off the Swift Concurrency task allocator (see `MainQueueTimer`). The
+            // arm/cancel edges reproduce `.task(id: awaitingHeight)`'s cancel-on-flip semantics.
+            .onChange(of: awaitingHeight) { nowAwaiting in
+                if nowAwaiting {
+                    missingHeightTimer.schedule(after: 4) { fireMissingHeightWatchdog() }
+                } else {
+                    missingHeightTimer.cancel()
+                }
+            }
+            .onAppear {
+                // A slot can (re)appear already awaiting (e.g. recycled row seeded `.filled` with
+                // no height): `.task(id:)` used to restart its window on appear — mirror that.
+                if awaitingHeight {
+                    missingHeightTimer.schedule(after: 4) { fireMissingHeightWatchdog() }
+                }
+            }
+            .onDisappear {
+                // `awaitingHeight` doesn't flip on disappear (it's computed from phase/height),
+                // so cancel explicitly — `.task` used to get this for free from SwiftUI.
+                missingHeightTimer.cancel()
+            }
             // The creative can freeze mid-video/mid-typing across a background/foreground cycle (its
             // WKWebView's content process suspends, and in-page visibilitychange/pageshow/focus
             // listeners aren't guaranteed to fire on the way back). Deterministically wake it via the
@@ -412,17 +436,12 @@ public struct NativeAdSlot: View {
     /// A creative can finish loading (no navigation failure, no HTTP error) yet never post a usable
     /// `SIMULA_AD_HEIGHT` — a broken/empty creative. Without this it would hold the 160 pt provisional
     /// block forever (reserved empty space — the "bump"). Give a genuine load a generous window to
-    /// paint; if it still hasn't, collapse the slot to zero height. SwiftUI cancels this automatically
-    /// when `awaitingHeight` flips false (height arrived, or the slot left the screen), so it only ever
-    /// fires for a creative that truly never measured.
-    @MainActor
-    private func watchForMissingHeight() async {
+    /// paint; if it still hasn't, collapse the slot to zero height. The `onChange(of: awaitingHeight)`
+    /// / `onDisappear` edges cancel the timer the moment a height arrives or the slot leaves the
+    /// screen, so this only ever fires for a creative that truly never measured (a cancelled
+    /// `MainQueueTimer` never delivers — the old `.task` cancellation, without the task).
+    private func fireMissingHeightWatchdog() {
         guard awaitingHeight else { return }
-        // Explicit do/catch (not `try?`): the sleep only throws on cancellation (height
-        // arrived / slot left), and `try?`-wrapped awaits in task closures are one of the
-        // shapes miscompiled by Swift 6.1–6.3 (see the task-shape note in TelemetryManager).
-        do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
-        guard !Task.isCancelled, awaitingHeight else { return }
         handleLoadFailure()
     }
 
