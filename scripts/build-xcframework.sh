@@ -37,7 +37,11 @@ BUNDLE_NAME="SimulaAdSDK_SimulaAdSDK.bundle"
 # and dSYM bookkeeping see a default (1.0) version.
 VERSION="${SIMULA_VERSION:-$(sed -nE 's/^ *s\.version *= *"([^"]+)".*/\1/p' SimulaAdSDK.podspec)}"
 [[ -n "$VERSION" ]] || { echo "ERROR: could not resolve version (set SIMULA_VERSION or fix the podspec)"; exit 1; }
-echo "==> Building $SCHEME $VERSION"
+# Info.plist version keys must be period-separated integers (App Store validation rejects
+# prerelease suffixes in embedded frameworks) — strip any "-beta.N" for the plist stamp only.
+# Telemetry's SIMULA_SDK_VERSION keeps the full prerelease string.
+PLIST_VERSION="${VERSION%%-*}"
+echo "==> Building $SCHEME $VERSION (Info.plist version $PLIST_VERSION)"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -61,8 +65,8 @@ archive_slice() {
     BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
     SKIP_INSTALL=NO \
     CODE_SIGNING_ALLOWED=NO \
-    MARKETING_VERSION="$VERSION" \
-    CURRENT_PROJECT_VERSION="$VERSION" \
+    MARKETING_VERSION="$PLIST_VERSION" \
+    CURRENT_PROJECT_VERSION="$PLIST_VERSION" \
     | tail -2
 
   local fw="$archive/Products/usr/local/lib/$SCHEME.framework"
