@@ -22,7 +22,7 @@ Pod::Spec.new do |s|
   # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
   # Single line on purpose: scripts/make-release-manifest.sh stamps `:sha256 => "…"` into it
   # at release time so CocoaPods verifies the download like SPM verifies its checksum.
-  s.source           = { :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip" }
+  s.source           = { :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip", :sha256 => "ded7e94301d891a087957e002ff040bb42cc0ff63984bc6afdad6c473c1d3e07" }
 
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
