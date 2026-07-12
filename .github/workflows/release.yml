@@ -55,6 +55,17 @@ jobs:
         with:
           xcode-version: ${{ env.XCODE_VERSION }}
 
+      # Hard assertion, not just a pin: the artifact's safety rests on the builder compiler
+      # being OLDER than the Swift 6.1–6.3 miscompile window. Fails the release if version
+      # selection ever resolves to a different toolchain (fuzzy match, image changes, or a
+      # future "bump the Xcode" edit that skipped the safety analysis in the env comment).
+      - name: Assert pre-regression Swift toolchain (6.0.x)
+        run: |
+          set -euo pipefail
+          swift --version
+          swift --version 2>&1 | grep -q 'Swift version 6\.0\.' \
+            || { echo "::error::builder toolchain is not Swift 6.0.x — refusing to build a release artifact with a compiler inside/after the 6.1–6.3 miscompile window"; exit 1; }
+
       # Artifact-labeling guard: the binary embeds SIMULA_SDK_VERSION (telemetry), so a
       # mismatched input would ship a mislabeled framework.
       - name: Verify version sync

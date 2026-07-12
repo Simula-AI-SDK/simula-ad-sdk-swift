@@ -191,6 +191,23 @@ public final class SimulaPrivacy: ObservableObject {
         return status
     }
 
+    /// Completion-based variant of `requestTrackingAuthorization` for callers that must not
+    /// create Swift Concurrency tasks themselves — e.g. the React Native bridge, whose source
+    /// is compiled by host toolchains affected by the task-teardown miscompile (see the
+    /// swift-concurrency-task-shape skill). The task lives INSIDE the SDK binary. `completion`
+    /// fires on the main actor with the resolved status.
+    @MainActor
+    public func requestTrackingAuthorization(completion: @escaping @MainActor (ATTrackingManager.AuthorizationStatus) -> Void) {
+        // Single-call task closure into a named method — see the swift-concurrency-task-shape skill.
+        Task { await self.runRequestTrackingAuthorization(completion: completion) }
+    }
+
+    /// Task body for the completion-based `requestTrackingAuthorization` (named method — see the skill).
+    @MainActor
+    private func runRequestTrackingAuthorization(completion: @escaping @MainActor (ATTrackingManager.AuthorizationStatus) -> Void) async {
+        completion(await requestTrackingAuthorization())
+    }
+
     private func applyTrackingStatus(_ status: ATTrackingManager.AuthorizationStatus) {
         lock.lock()
         attStatusRaw = Int(status.rawValue)
