@@ -74,6 +74,12 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// the JS bridge (`{type:"SIMULA_AD_HEIGHT", height}`) so the slot can size its container.
     var reportsContentHeight: Bool
 
+    /// Native-ad mode: the serve's impression id, keying this creative's rendered `WKWebView` in
+    /// `NativeAdWebViewStore` so a recycled feed row reattaches the same, already-rendered view
+    /// (no reload — no blank-then-pop flash). `nil` (previews / non-native surfaces) keeps the
+    /// ephemeral `WebViewPool` path.
+    var retainedImpressionId: String?
+
     /// Optional ad-format tag for WebView telemetry (page-load timing, render crash, JS errors).
     /// `nil` → untagged.
     var telemetryAdFormat: String?
@@ -98,6 +104,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         ctaDestination: AdDestination = .appstore,
         ctaStoreUrl: String? = nil,
         reportsContentHeight: Bool = false,
+        retainedImpressionId: String? = nil,
         telemetryAdFormat: String? = nil,
         visibilityRelay: VisibilityRelay? = nil
     ) {
@@ -115,6 +122,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.ctaDestination = ctaDestination
         self.ctaStoreUrl = ctaStoreUrl
         self.reportsContentHeight = reportsContentHeight
+        self.retainedImpressionId = retainedImpressionId
         self.telemetryAdFormat = telemetryAdFormat
         self.visibilityRelay = visibilityRelay
     }
@@ -130,10 +138,32 @@ struct WebViewRepresentable: UIViewRepresentable {
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
         let coordinator = context.coordinator
-        let webView = WebViewPool.shared.acquire(
-            delegate: coordinator,
-            onMessage: { [weak coordinator] body in coordinator?.handleMessage(body) }
-        )
+        let onMessage: (String) -> Void = { [weak coordinator] body in coordinator?.handleMessage(body) }
+        let webView: WKWebView
+        if let impressionId = retainedImpressionId, !impressionId.isEmpty {
+            // Native-ad retained path: reattach this serve's already-rendered view when the store
+            // has one (no reload — eliminates the blank-then-pop flash on a recycled feed row), or
+            // adopt a fresh pool view into the store so the NEXT remount reattaches it.
+            let attach = NativeAdWebViewStore.shared.attach(
+                impressionId: impressionId,
+                creativeKey: storeCreativeKey,
+                delegate: coordinator,
+                onMessage: onMessage
+            )
+            webView = attach.webView
+            if attach.alreadyLoaded {
+                // Pre-mark the coordinator with the current content so `updateUIView` sees no
+                // change and does NOT reload the creative into the retained view. The injected
+                // height script keeps running in-page; the slot's height was restored from
+                // NativeAdCache, so no re-report is needed either.
+                coordinator.currentHTML = htmlString
+                coordinator.currentURL = url
+                coordinator.currentBaseURL = baseURL
+                coordinator.realLoadStarted = true
+            }
+        } else {
+            webView = WebViewPool.shared.acquire(delegate: coordinator, onMessage: onMessage)
+        }
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView
         // Point the visibility relay at this acquired view so scroll-driven `window.onVisibility`
@@ -168,11 +198,25 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     /// Return the web view to the pool when SwiftUI tears this representable down,
     /// so the (expensive) WKWebView + its Web Content process is recycled for the
-    /// next acquire instead of being deallocated.
+    /// next acquire instead of being deallocated. A retained native-ad view is
+    /// instead kept — rendered DOM intact — by `NativeAdWebViewStore` for the next
+    /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
-        // Stop forwarding visibility into a view that's about to be recycled by the pool.
+        // Stop forwarding visibility into a view that's about to be recycled/retained.
         coordinator.visibilityRelay?.bind(nil)
+        if let impressionId = coordinator.retainedImpressionId,
+           NativeAdWebViewStore.shared.detach(uiView, impressionId: impressionId) {
+            return // retained (or destroyed if render-dead) — never pool-released
+        }
         WebViewPool.shared.release(uiView)
+    }
+
+    /// The creative-identity key for `NativeAdWebViewStore`: the iframe URL when loading by URL,
+    /// else the HTML content hash (stable within a process — the cached response is reused across
+    /// remounts, so the same serve always produces the same key).
+    private var storeCreativeKey: String {
+        if let url { return url.absoluteString }
+        return "html:\(htmlString?.hashValue ?? 0)"
     }
 
     func makeCoordinator() -> Coordinator {
@@ -188,6 +232,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
             reportsContentHeight: reportsContentHeight,
+            retainedImpressionId: retainedImpressionId,
             telemetryAdFormat: telemetryAdFormat
         )
     }
@@ -216,6 +261,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// See `WebViewRepresentable.ctaStoreUrl`.
         var ctaStoreUrl: String?
         var reportsContentHeight: Bool
+        /// Native-ad retained-store key; drives the dismantle retain-vs-pool-release decision and
+        /// the render-death bookkeeping. See `WebViewRepresentable.retainedImpressionId`.
+        var retainedImpressionId: String?
         /// Ad-format tag for WebView telemetry; nil → untagged.
         var telemetryAdFormat: String?
         /// Native-ad visibility relay (set on acquire); used to unbind on dismantle. See `VisibilityRelay`.
@@ -255,6 +303,18 @@ struct WebViewRepresentable: UIViewRepresentable {
             onAdClick?()
         }
 
+        /// Retained native-ad path: the view no longer shows a valid creative (render process died,
+        /// or the main-frame load failed — e.g. offline when the row scrolled in). Flag the store
+        /// session so the next attach rebuilds the creative instead of reattaching a blank view —
+        /// which would also suppress the retry a remount of the still-cached fill is expected to do.
+        /// No-op for ephemeral (non-retained) views.
+        private func noteRetainedUnusable(_ webView: WKWebView?) {
+            guard retainedImpressionId != nil, let webView else { return }
+            let viewID = ObjectIdentifier(webView)
+            // Single-call task closure — see the task-shape note in TelemetryManager.
+            Task { @MainActor in NativeAdWebViewStore.shared.noteUnusable(viewID: viewID) }
+        }
+
         /// Schemes that should be handled within the webview
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
@@ -278,6 +338,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             ctaDestination: AdDestination = .appstore,
             ctaStoreUrl: String? = nil,
             reportsContentHeight: Bool = false,
+            retainedImpressionId: String? = nil,
             telemetryAdFormat: String? = nil
         ) {
             self.onNavigationFinished = onNavigationFinished
@@ -291,6 +352,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.ctaDestination = ctaDestination
             self.ctaStoreUrl = ctaStoreUrl
             self.reportsContentHeight = reportsContentHeight
+            self.retainedImpressionId = retainedImpressionId
             self.telemetryAdFormat = telemetryAdFormat
         }
 
@@ -393,6 +455,13 @@ struct WebViewRepresentable: UIViewRepresentable {
             // A clean load means the (possibly just-reloaded) creative is healthy — restore the
             // one-shot render-recovery budget for any future web-content-process termination.
             renderRecoveryAttempted = false
+            // Retained native-ad view: clear the store's render-dead flag too, so a recovered view
+            // is retained (not destroyed) on the next detach.
+            if retainedImpressionId != nil {
+                let viewID = ObjectIdentifier(webView)
+                // Single-call task closure — see the task-shape note in TelemetryManager.
+                Task { @MainActor in NativeAdWebViewStore.shared.noteLoadSucceeded(viewID: viewID) }
+            }
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
             if let start = pageStartUptime {
                 pageStartUptime = nil
@@ -422,6 +491,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
+            // Retained native-ad view: flag the store session so a dead view is never reattached.
+            // The in-place recovery below may still succeed — didFinish clears the flag then.
+            noteRetainedUnusable(webView)
             // Recover in place: a WKWebView is reusable after a termination, so re-issue the SAME
             // creative so the slot comes back instead of collapsing. reload() can't restore a
             // loadHTMLString load (its URL is the baseURL, not the content), so re-load the stored
@@ -463,11 +535,13 @@ struct WebViewRepresentable: UIViewRepresentable {
                   let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
                 return
             }
+            noteRetainedUnusable(webView)
             onNavigationFailed?(NSError(domain: "SimulaWebView", code: http.statusCode))
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             if isCancelled(error) { return }
+            noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
 
@@ -475,6 +549,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // A cancelled provisional load happens when the real URL supersedes
             // the prewarm's about:blank load; it isn't a genuine failure.
             if isCancelled(error) { return }
+            noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
 
@@ -645,19 +720,22 @@ struct WebViewRepresentable: UIViewRepresentable {
         (function () {
           var lastH = 0, timer = null;
           function measure() {
-            var de = document.documentElement, b = document.body;
-            if (!b) return de ? de.scrollHeight : 0;
-            // Measure the creative's NATURAL content height, independent of the height the SDK gave the
-            // WebView. A full-height creative (html,body{height:100%}) otherwise reports back the size we
-            // set, which feeds back and grows the slot on every resize. Forcing height:auto for the
-            // measurement (restored synchronously, before any paint) reads the true content height.
-            var prevDe = de.style.height, prevB = b.style.height;
-            de.style.height = 'auto';
-            b.style.height = 'auto';
-            var h = Math.max(de.scrollHeight, b.scrollHeight);
-            de.style.height = prevDe;
-            b.style.height = prevB;
-            return h;
+            var b = document.body;
+            if (!b) { var de = document.documentElement; return de ? de.scrollHeight : 0; }
+            // The bottom of the lowest in-flow child = the creative's content height, independent of
+            // the height the SDK gave the WebView. A full-height creative (html,body{height:100%} or
+            // an inner 100%/100vh element) otherwise reports back the size we set, which feeds back
+            // and grows the slot on every resize — the height:auto trick only neutralized html/body,
+            // so inner full-height elements still looped. The card's content is top-packed in a flex
+            // column, so the lowest child's bottom is the true height and never tracks our resize.
+            // Mirrors the Android SDK's BRIDGE_SCRIPT measurement (cross-platform height parity).
+            var max = 0, kids = b.children;
+            for (var i = 0; i < kids.length; i++) {
+              var bottom = kids[i].getBoundingClientRect().bottom;
+              if (bottom > max) max = bottom;
+            }
+            max += (window.scrollY || window.pageYOffset || 0);
+            return Math.ceil(max) || b.scrollHeight;
           }
           function send() {
             try {

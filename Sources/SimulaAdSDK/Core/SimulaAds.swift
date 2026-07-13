@@ -276,12 +276,17 @@ public enum SimulaAds {
     /// reuses the same serve (no duplicate request or impression); call this to force a refresh for
     /// that slot. Use `invalidateNativeAds()` to clear them all.
     public static func invalidateNativeAd(adUnitId: String? = nil, position: Int = 0) {
-        NativeAdCache.shared.invalidate(adUnitId, position)
+        // Drop the retained rendered web view for the invalidated serve too, so the refreshed slot
+        // can't reattach the stale creative.
+        if let impressionId = NativeAdCache.shared.invalidate(adUnitId, position) {
+            NativeAdWebViewStore.shared.evict(impressionId: impressionId)
+        }
     }
 
     /// Clear every cached native ad (all slots).
     public static func invalidateNativeAds() {
         NativeAdCache.shared.invalidateAll()
+        NativeAdWebViewStore.shared.evictAllIdle()
     }
     #endif
 }

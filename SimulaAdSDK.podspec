@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "SimulaAdSDK"
-  s.version          = "1.1.4"
+  s.version          = "1.1.4-beta.2"
   s.summary          = "Interactive, AI-native ad experiences for modern apps"
 
   s.description      = <<-DESC
@@ -20,6 +20,9 @@ Pod::Spec.new do |s|
   # miscompilation that aborted host apps (see the repo's swift-concurrency-task-shape skill).
   # The artifact is built + validated by .github/workflows/release.yml; resources (including
   # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
+  #
+  # Local `:path` installs (no XCFramework present) fall back to compiling Sources/ so
+  # unreleased changes can be tested from sibling demo apps without a binary build.
   s.source           = {
     :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
   }
@@ -27,7 +30,21 @@ Pod::Spec.new do |s|
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
 
-  s.vendored_frameworks = "SimulaAdSDK.xcframework"
+  xcframework_at_root = File.join(__dir__, "SimulaAdSDK.xcframework")
+  xcframework_in_build = File.join(__dir__, "build", "SimulaAdSDK.xcframework")
+  if File.directory?(xcframework_at_root)
+    s.vendored_frameworks = "SimulaAdSDK.xcframework"
+  elsif File.directory?(xcframework_in_build)
+    s.vendored_frameworks = "build/SimulaAdSDK.xcframework"
+  else
+    s.source_files = "Sources/SimulaAdSDK/**/*.swift"
+    s.resource_bundles = {
+      "SimulaAdSDK" => [
+        "Sources/SimulaAdSDK/Resources/*.png",
+        "Sources/SimulaAdSDK/Resources/PrivacyInfo.xcprivacy"
+      ]
+    }
+  end
 
   s.frameworks       = [
     "StoreKit",

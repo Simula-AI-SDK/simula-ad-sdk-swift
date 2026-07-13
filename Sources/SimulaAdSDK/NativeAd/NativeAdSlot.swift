@@ -171,6 +171,10 @@ public struct NativeAdSlot: View {
                     ctaDestination: response.destinationKind,
                     ctaStoreUrl: response.iosStoreUrl,
                     reportsContentHeight: true,
+                    // Key this serve's rendered WKWebView in NativeAdWebViewStore so a recycled row
+                    // reattaches the same, already-rendered view (no reload, no flash). Previews
+                    // (empty id) stay on the ephemeral pool path.
+                    retainedImpressionId: impressionId.isEmpty ? nil : impressionId,
                     telemetryAdFormat: response.adFormat,
                     visibilityRelay: visibilityRelay
                 )

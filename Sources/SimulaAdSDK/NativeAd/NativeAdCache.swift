@@ -113,15 +113,21 @@ final class NativeAdCache: @unchecked Sendable {
         lock.unlock()
     }
 
-    func invalidate(_ adUnitId: String?, _ position: Int) {
+    /// Returns the invalidated fill's impression id (nil for a no-fill / unknown slot) so the caller
+    /// can evict the matching retained web view from `NativeAdWebViewStore` too.
+    @discardableResult
+    func invalidate(_ adUnitId: String?, _ position: Int) -> String? {
         lock.lock(); defer { lock.unlock() }
         let k = key(adUnitId, position)
+        var invalidatedId: String?
         // Drop the impression-id mark too so a deliberately-refreshed slot can fire again.
         if let removed = entries.removeValue(forKey: k),
            let id = removed.response?.impressionId, !id.isEmpty {
             firedImpressions.remove(id)
+            invalidatedId = id
         }
         if let idx = accessOrder.firstIndex(of: k) { accessOrder.remove(at: idx) }
+        return invalidatedId
     }
 
     func invalidateAll() {
