@@ -1,0 +1,222 @@
+#if os(iOS)
+import XCTest
+import WebKit
+@testable import SimulaAdSDK
+
+/// State-machine tests for `NativeAdWebViewStore` (PR #44 review fixes). iOS-only: the store and
+/// `WKWebView` are `#if os(iOS)`; CI's simulator lane runs these. Each test uses fresh UUID
+/// impression ids and evicts what it created, so the shared store never leaks state across tests.
+@MainActor
+final class NativeAdWebViewStoreTests: XCTestCase {
+    private final class StubDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {}
+
+    private let delegate = StubDelegate()
+
+    private func attach(_ id: String, key: String = "creative") -> (webView: WKWebView, alreadyLoaded: Bool) {
+        NativeAdWebViewStore.shared.attach(
+            impressionId: id,
+            creativeKey: key,
+            delegate: delegate,
+            onMessage: { _ in }
+        )
+    }
+
+    private func cleanup(_ webView: WKWebView, id: String) {
+        _ = NativeAdWebViewStore.shared.detach(webView, impressionId: id)
+        NativeAdWebViewStore.shared.evict(impressionId: id)
+    }
+
+    /// A session detached before its creative load finished is destroyed at detach (not retained):
+    /// its didFinish while detached would go unobserved, so it could never become reattachable.
+    /// The remount must rebuild fresh so it issues the load itself.
+    func testDetachDestroysNeverLoadedSessionAndRemountRebuilds() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        XCTAssertFalse(first.alreadyLoaded)
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                      "store owned the view — handled by destroying it")
+
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded, "never-finished session must be rebuilt, not reattached")
+        XCTAssertFalse(second.webView === first.webView, "the mid-load view was destroyed, not retained")
+        cleanup(second.webView, id: id)
+    }
+
+    /// In-place slot recycling (updateUIView with a new serve): rebind re-keys the session so the
+    /// new serve keeps retention and the old serve can never reattach the wrong DOM.
+    func testRebindReKeysSessionToNewServe() {
+        let oldId = UUID().uuidString
+        let newId = UUID().uuidString
+        let first = attach(oldId, key: "creative-a")
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: oldId, to: newId, creativeKey: "creative-b")
+        // The new creative finishes loading in the same view.
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        // The old key no longer owns the view...
+        XCTAssertFalse(NativeAdWebViewStore.shared.detach(first.webView, impressionId: oldId))
+        // ...the new key does, and retains it on detach.
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: newId))
+
+        let reattached = attach(newId, key: "creative-b")
+        XCTAssertTrue(reattached.alreadyLoaded)
+        XCTAssertTrue(reattached.webView === first.webView)
+
+        // A revisit of the old serve rebuilds fresh — never the rebound DOM.
+        let oldAgain = attach(oldId, key: "creative-a")
+        XCTAssertFalse(oldAgain.alreadyLoaded)
+        XCTAssertFalse(oldAgain.webView === first.webView)
+
+        cleanup(reattached.webView, id: newId)
+        cleanup(oldAgain.webView, id: oldId)
+    }
+
+    /// A rebound session starts un-loaded: rebind resets `loadCompleted`, so until the NEW serve's
+    /// navigation finishes, scroll-out destroys the session (never retains the old serve's DOM under
+    /// the new id). `updateUIView` guarantees that navigation by clearing its load-tracking state on
+    /// an id change, even for byte-identical markup.
+    func testReboundSessionRequiresFreshLoadForRetention() {
+        let oldId = UUID().uuidString
+        let newId = UUID().uuidString
+        let first = attach(oldId, key: "creative-a")
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: oldId, to: newId, creativeKey: "creative-a")
+
+        // New serve's load never finished — detach destroys instead of retaining the stale DOM.
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: newId))
+        let again = attach(newId, key: "creative-a")
+        XCTAssertFalse(again.alreadyLoaded, "old serve's DOM must never be retained under the new id")
+        cleanup(again.webView, id: newId)
+    }
+
+    /// Rebinding to a blank id (serve → preview) orphans the view: the store forgets it entirely.
+    func testRebindToBlankIdOrphansView() {
+        let id = UUID().uuidString
+        let first = attach(id)
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: id, to: nil, creativeKey: "any")
+
+        XCTAssertFalse(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                       "orphaned view is no longer store-owned")
+        let again = attach(id)
+        XCTAssertFalse(again.alreadyLoaded)
+        cleanup(again.webView, id: id)
+    }
+
+    /// The healthy path: load finished, detached, reattached — same view, no reload.
+    func testReattachAfterSuccessfulLoadReturnsSameViewWithoutReload() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+
+        let second = attach(id)
+        XCTAssertTrue(second.alreadyLoaded)
+        XCTAssertTrue(second.webView === first.webView, "reattach must hand back the retained view")
+        cleanup(second.webView, id: id)
+    }
+
+    /// `markUnusable` from the main thread must land synchronously: a detach in the same runloop
+    /// turn destroys the session instead of retaining the dead view.
+    func testMarkUnusableIsSynchronousOnMainThread() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+        NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(first.webView))
+        // No runloop spin between mark and detach — this is exactly the race being guarded.
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded, "unusable session must be destroyed, not reattached")
+        cleanup(second.webView, id: id)
+    }
+
+    /// A changed creative under the same impression id rebuilds fresh (stale-creative guard).
+    func testReattachWithDifferentCreativeKeyRebuildsFresh() {
+        let id = UUID().uuidString
+        let first = attach(id, key: "creative-a")
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+        _ = NativeAdWebViewStore.shared.detach(first.webView, impressionId: id)
+
+        let second = attach(id, key: "creative-b")
+        XCTAssertFalse(second.alreadyLoaded)
+        XCTAssertFalse(second.webView === first.webView)
+        cleanup(second.webView, id: id)
+    }
+
+    /// Consent change: idle sessions are destroyed immediately; attached (on-screen) ones are
+    /// flagged so scroll-out destroys them — neither may serve under the stale data store.
+    func testConsentChangeEvictsIdleAndFlagsAttached() {
+        let idleId = UUID().uuidString
+        let attachedId = UUID().uuidString
+
+        let idle = attach(idleId)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(idle.webView))
+        _ = NativeAdWebViewStore.shared.detach(idle.webView, impressionId: idleId)
+
+        let attached = attach(attachedId)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(attached.webView))
+
+        NativeAdWebViewStore.shared.invalidateAllSessions()
+
+        // Idle session was destroyed — next attach rebuilds fresh.
+        let idleAgain = attach(idleId)
+        XCTAssertFalse(idleAgain.alreadyLoaded)
+
+        // Attached session was flagged — destroyed on detach, never reattached.
+        _ = NativeAdWebViewStore.shared.detach(attached.webView, impressionId: attachedId)
+        let attachedAgain = attach(attachedId)
+        XCTAssertFalse(attachedAgain.alreadyLoaded)
+
+        cleanup(idleAgain.webView, id: idleId)
+        cleanup(attachedAgain.webView, id: attachedId)
+    }
+
+    /// Watchdog path: a slot collapse flags the session by impression id — even though the load
+    /// completed cleanly — so the remount rebuilds and reloads instead of reattaching silently.
+    func testNoteUnusableByImpressionIdBlocksReattach() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.noteUnusable(impressionId: id) // slot collapsed (e.g. no height)
+
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                      "flagged session is destroyed on detach")
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded)
+        XCTAssertFalse(second.webView === first.webView)
+        cleanup(second.webView, id: id)
+    }
+
+    /// Invalidation while the ad is on screen: the view is never yanked, but the session is flagged
+    /// so scroll-out destroys it — a remount can't reattach the invalidated creative.
+    func testEvictWhileAttachedFlagsSessionForDestructionOnDetach() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.evict(impressionId: id) // invalidateNativeAd while on screen
+
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded, "invalidated creative must not be reattached")
+        cleanup(second.webView, id: id)
+    }
+
+    /// Batch eviction (cache-eviction path) drops idle retained sessions for the given ids.
+    func testEvictAllImpressionIdsDropsIdleSessions() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+        _ = NativeAdWebViewStore.shared.detach(first.webView, impressionId: id)
+
+        NativeAdWebViewStore.shared.evictAll(impressionIds: [id, "unknown-id"])
+
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded, "evicted session must not be reattached")
+        cleanup(second.webView, id: id)
+    }
+}
+#endif
