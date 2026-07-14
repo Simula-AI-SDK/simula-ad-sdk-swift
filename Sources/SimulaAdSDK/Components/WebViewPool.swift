@@ -208,6 +208,15 @@ final class WebViewPool {
         return pooled.webView
     }
 
+    /// Transfers ownership of an active (handed-out) web view to the caller — the native-ad
+    /// retained store — so a later `release` no-ops instead of resetting it to `about:blank`.
+    /// Returns the stable message forwarder wired at creation (the new owner re-points its
+    /// `onMessage` on each reattach); `nil` when the view isn't pool-active (already released
+    /// or adopted), in which case ownership does not transfer.
+    func adopt(_ webView: WKWebView) -> WebViewMessageForwarder? {
+        active.removeValue(forKey: ObjectIdentifier(webView))?.forwarder
+    }
+
     /// Reset a finished web view and return it to the pool (or discard if full /
     /// privacy mismatch). Idempotent: a second call for the same view no-ops
     /// because `active` no longer holds it.

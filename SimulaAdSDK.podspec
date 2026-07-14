@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "SimulaAdSDK"
-  s.version          = "1.1.4"
+  s.version          = "1.1.5-dev.1"
   s.summary          = "Interactive, AI-native ad experiences for modern apps"
 
   s.description      = <<-DESC
@@ -20,6 +20,12 @@ Pod::Spec.new do |s|
   # miscompilation that aborted host apps (see the repo's swift-concurrency-task-shape skill).
   # The artifact is built + validated by .github/workflows/release.yml; resources (including
   # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
+  #
+  # IMPORTANT: `pod trunk push` resolves this spec to static JSON on the publishing machine.
+  # The layout gate below therefore RAISES when the XCFramework isn't beside the podspec and
+  # SIMULA_LOCAL_DEV isn't set — a push from a bare checkout fails loudly instead of silently
+  # publishing a SOURCE pod (which would re-expose the miscompile to hosts). Push from the
+  # release staging layout (podspec + extracted SimulaAdSDK.xcframework side by side).
   s.source           = {
     :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
   }
@@ -27,7 +33,30 @@ Pod::Spec.new do |s|
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
 
-  s.vendored_frameworks = "SimulaAdSDK.xcframework"
+  # Layout gate (fail-loud). Consumers must always get the prebuilt binary; compiling Sources/
+  # with a host toolchain re-exposes the miscompile. So:
+  #   - Release staging layout (XCFramework beside the podspec — the release zip): binary.
+  #   - Local source development (:path install for unreleased testing): must OPT IN explicitly
+  #     with SIMULA_LOCAL_DEV=1. Never publish from this mode.
+  #   - Anything else (e.g. a trunk/spec push from a bare checkout): raise, so a release-time
+  #     misconfiguration fails loudly instead of silently shipping a SOURCE pod.
+  if File.directory?(File.join(__dir__, "SimulaAdSDK.xcframework"))
+    s.vendored_frameworks = "SimulaAdSDK.xcframework"
+  elsif ENV["SIMULA_LOCAL_DEV"] == "1"
+    s.source_files = "Sources/SimulaAdSDK/**/*.swift"
+    s.resource_bundles = {
+      "SimulaAdSDK" => ["Sources/SimulaAdSDK/Resources/*"]
+    }
+  else
+    raise <<-MSG
+[SimulaAdSDK] SimulaAdSDK.xcframework not found next to the podspec.
+Consumers must receive the prebuilt binary (mitigation for the Swift 6.1-6.3
+host-toolchain task-teardown miscompile). To fix:
+  - Releasing: push from the staging layout — podspec + extracted
+    SimulaAdSDK.xcframework side by side (see .github/workflows/release.yml).
+  - Local source development: set SIMULA_LOCAL_DEV=1 for a :path install of Sources/.
+    MSG
+  end
 
   s.frameworks       = [
     "StoreKit",

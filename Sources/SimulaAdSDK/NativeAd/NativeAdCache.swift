@@ -64,15 +64,29 @@ final class NativeAdCache: @unchecked Sendable {
     }
 
     /// Evicts least-recently-used entries until within `maxEntries`, dropping each evicted fill's
-    /// impression mark. Caller must hold `lock`.
-    private func evictIfNeeded() {
+    /// impression mark. Returns the evicted fills' impression ids so the caller can (off-lock)
+    /// evict their retained web views too — the fill is gone, so a retained view for it could
+    /// never be legitimately reattached. Caller must hold `lock`.
+    private func evictIfNeeded() -> [String] {
+        var evictedIds: [String] = []
         while entries.count > maxEntries, !accessOrder.isEmpty {
             let oldest = accessOrder.removeFirst()
             if let removed = entries.removeValue(forKey: oldest),
                let id = removed.response?.impressionId, !id.isEmpty {
                 firedImpressions.remove(id)
+                evictedIds.append(id)
             }
         }
+        return evictedIds
+    }
+
+    /// Drops the retained rendered web views for fills this cache just evicted, keeping the two
+    /// LRUs from disagreeing about which serves are alive. Called OFF-lock (the store is
+    /// `@MainActor`; hopping while holding `lock` is forbidden). Single-call task closure — see
+    /// the task-shape note in TelemetryManager.
+    private func evictRetainedWebViews(_ impressionIds: [String]) {
+        guard !impressionIds.isEmpty else { return }
+        Task { @MainActor in NativeAdWebViewStore.shared.evictAll(impressionIds: impressionIds) }
     }
 
     /// Atomically marks `impressionId` as having fired. Returns `true` only the first time, so callers
@@ -99,8 +113,9 @@ final class NativeAdCache: @unchecked Sendable {
         let k = key(adUnitId, position)
         entries[k] = entry
         touch(k)
-        evictIfNeeded()
+        let evicted = evictIfNeeded()
         lock.unlock()
+        evictRetainedWebViews(evicted)
         return entry
     }
 
@@ -109,19 +124,26 @@ final class NativeAdCache: @unchecked Sendable {
         let k = key(adUnitId, position)
         entries[k] = Entry(response: nil)
         touch(k)
-        evictIfNeeded()
+        let evicted = evictIfNeeded()
         lock.unlock()
+        evictRetainedWebViews(evicted)
     }
 
-    func invalidate(_ adUnitId: String?, _ position: Int) {
+    /// Returns the invalidated fill's impression id (nil for a no-fill / unknown slot) so the caller
+    /// can evict the matching retained web view from `NativeAdWebViewStore` too.
+    @discardableResult
+    func invalidate(_ adUnitId: String?, _ position: Int) -> String? {
         lock.lock(); defer { lock.unlock() }
         let k = key(adUnitId, position)
+        var invalidatedId: String?
         // Drop the impression-id mark too so a deliberately-refreshed slot can fire again.
         if let removed = entries.removeValue(forKey: k),
            let id = removed.response?.impressionId, !id.isEmpty {
             firedImpressions.remove(id)
+            invalidatedId = id
         }
         if let idx = accessOrder.firstIndex(of: k) { accessOrder.remove(at: idx) }
+        return invalidatedId
     }
 
     func invalidateAll() {
