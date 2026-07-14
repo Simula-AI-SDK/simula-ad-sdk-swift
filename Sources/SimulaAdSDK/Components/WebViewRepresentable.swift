@@ -160,6 +160,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                 coordinator.currentURL = url
                 coordinator.currentBaseURL = baseURL
                 coordinator.realLoadStarted = true
+                // Re-assert overflow:hidden on reattach — the full height script is not re-run
+                // on this path, and older retained sessions may predate the lock CSS.
+                webView.evaluateJavaScript(Coordinator.overflowLockScript, completionHandler: nil)
             }
         } else {
             webView = WebViewPool.shared.acquire(delegate: coordinator, onMessage: onMessage)
@@ -170,13 +173,15 @@ struct WebViewRepresentable: UIViewRepresentable {
         // pushes reach it; held on the coordinator so dismantle can unbind. No-op when unset.
         coordinator.visibilityRelay = visibilityRelay
         visibilityRelay?.bind(webView)
-        // A native ad sizes to content and is not scrollable (PRD); disabling the inner scroll keeps
-        // it from intercepting the host feed's scroll. Set per-acquire since the pool reuses views.
-        webView.scrollView.isScrollEnabled = !reportsContentHeight
+        configureScrollBehavior(webView, coordinator: coordinator)
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
+        // Re-apply every update: pool reuse + content-size churn can re-enable bounce even when
+        // `isScrollEnabled` stays false (visible as a tiny rubber-band while the feed scrolls).
+        configureScrollBehavior(webView, coordinator: context.coordinator)
+
         // Only load if URL/HTML changed
         let currentURL = context.coordinator.currentURL
         let currentHTML = context.coordinator.currentHTML
@@ -196,12 +201,42 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
     }
 
+    /// Native ads size to content and must never scroll (PRD) — even a 1pt rubber-band steals the
+    /// host feed's gesture. Games keep the default scrollable WKWebView.
+    private func configureScrollBehavior(_ webView: WKWebView, coordinator: Coordinator) {
+        let scrollable = !reportsContentHeight
+        let scrollView = webView.scrollView
+        scrollView.isScrollEnabled = scrollable
+        scrollView.bounces = scrollable
+        scrollView.alwaysBounceVertical = false
+        scrollView.alwaysBounceHorizontal = false
+        scrollView.contentInsetAdjustmentBehavior = .never
+        if !scrollable {
+            scrollView.showsVerticalScrollIndicator = false
+            scrollView.showsHorizontalScrollIndicator = false
+            scrollView.contentInset = .zero
+            scrollView.scrollIndicatorInsets = .zero
+            scrollView.panGestureRecognizer.isEnabled = false
+            // WebKit still nudges contentOffset when contentSize is a hair taller than bounds
+            // (looks like a tiny scroll at the bottom of the card). Pin it continuously via KVO —
+            // do not assign scrollView.delegate (WKWebView owns that).
+            coordinator.lockContentOffset(scrollView)
+            if scrollView.contentOffset != .zero {
+                scrollView.setContentOffset(.zero, animated: false)
+            }
+        } else {
+            scrollView.panGestureRecognizer.isEnabled = true
+            coordinator.unlockContentOffset()
+        }
+    }
+
     /// Return the web view to the pool when SwiftUI tears this representable down,
     /// so the (expensive) WKWebView + its Web Content process is recycled for the
     /// next acquire instead of being deallocated. A retained native-ad view is
     /// instead kept — rendered DOM intact — by `NativeAdWebViewStore` for the next
     /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        coordinator.unlockContentOffset()
         // Stop forwarding visibility into a view that's about to be recycled/retained.
         coordinator.visibilityRelay?.bind(nil)
         if let impressionId = coordinator.retainedImpressionId,
@@ -295,12 +330,36 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// at most once per ~0.5s window (de-dupes the delegate double-call). See `fireAdClickOnce`.
         private var lastAdClickUptime: TimeInterval = -1
 
+        /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
+        /// use KVO instead of becoming the scroll delegate.
+        private var contentOffsetObservation: NSKeyValueObservation?
+
         /// Fire the publisher CLICKED callback at most once per CTA tap.
         private func fireAdClickOnce() {
             let now = ProcessInfo.processInfo.systemUptime
             guard now - lastAdClickUptime >= 0.5 else { return }
             lastAdClickUptime = now
             onAdClick?()
+        }
+
+        /// Continuously cancel any WebKit-driven offset nudge (sub-pt content overflow).
+        func lockContentOffset(_ scrollView: UIScrollView) {
+            guard reportsContentHeight else {
+                unlockContentOffset()
+                return
+            }
+            if contentOffsetObservation == nil {
+                contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) { scrollView, _ in
+                    if scrollView.contentOffset != .zero {
+                        scrollView.setContentOffset(.zero, animated: false)
+                    }
+                }
+            }
+        }
+
+        func unlockContentOffset() {
+            contentOffsetObservation?.invalidate()
+            contentOffsetObservation = nil
         }
 
         /// Retained native-ad path: the view no longer shows a valid creative (render process died,
@@ -716,7 +775,53 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// height to native (over the pool's `simulaSDK` channel) on load + whenever it changes, so
         /// the slot resizes to fit. A `<meta viewport width=device-width,initial-scale=1>` creative
         /// maps 1 CSS px → 1 point, so the reported value is used directly as the SwiftUI height.
+        /// Injected on native-ad load (and on retained-view reattach) so nothing in the creative can
+        /// scroll. `scrollView.isScrollEnabled = false` only disables the WebView's MAIN scrolling
+        /// node — WebKit gives inner scrollable regions (the `<iframe srcdoc>` the creative renders
+        /// in, overflow divs) their own composited scrolling nodes that keep handling touches. The
+        /// visible symptom: the card content nudges a few px at the start of a feed scroll. Styling
+        /// the iframe *element* is not enough; the lock must land on `html,body` INSIDE each iframe
+        /// document (same-origin — srcdoc inherits the parent origin — so `contentDocument` works).
+        /// Re-applied on iframe `load` (a reload wipes injected styles) and via a MutationObserver
+        /// for iframes attached after this script runs. Idempotent per document.
+        static let overflowLockScript = """
+        (function () {
+          function lockDoc(doc) {
+            try {
+              if (!doc || doc.__simulaNoScroll) return;
+              doc.__simulaNoScroll = true;
+              var s = doc.createElement('style');
+              s.textContent = 'html,body{overflow:hidden!important;overscroll-behavior:none!important;}';
+              (doc.head || doc.documentElement).appendChild(s);
+            } catch (e) {}
+          }
+          function lockFrame(frame) {
+            try {
+              frame.setAttribute('scrolling', 'no');
+              frame.style.overflow = 'hidden';
+            } catch (e) {}
+            lockDoc(frame.contentDocument);
+            if (!frame.__simulaNoScrollHook) {
+              frame.__simulaNoScrollHook = true;
+              try { frame.addEventListener('load', function () { lockDoc(frame.contentDocument); }); } catch (e) {}
+            }
+          }
+          function lockAll() {
+            try { document.querySelectorAll('iframe').forEach(lockFrame); } catch (e) {}
+          }
+          lockDoc(document);
+          lockAll();
+          try {
+            if (window.MutationObserver && document.body && !document.body.__simulaNoScrollMO) {
+              document.body.__simulaNoScrollMO = true;
+              new MutationObserver(lockAll).observe(document.body, { childList: true, subtree: true });
+            }
+          } catch (e) {}
+        })();
+        """
+
         static let heightReportingScript = """
+        \(overflowLockScript)
         (function () {
           var lastH = 0, timer = null;
           function measure() {
@@ -735,7 +840,8 @@ struct WebViewRepresentable: UIViewRepresentable {
               if (bottom > max) max = bottom;
             }
             max += (window.scrollY || window.pageYOffset || 0);
-            return Math.ceil(max) || b.scrollHeight;
+            // +1pt cushion so sub-pixel layout can't leave contentSize > bounds (tiny bottom scroll).
+            return (Math.ceil(max) || b.scrollHeight) + 1;
           }
           function send() {
             try {

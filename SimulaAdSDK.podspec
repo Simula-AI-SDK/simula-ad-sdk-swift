@@ -31,11 +31,11 @@ Pod::Spec.new do |s|
   s.swift_version    = "5.9"
 
   xcframework_at_root = File.join(__dir__, "SimulaAdSDK.xcframework")
-  xcframework_in_build = File.join(__dir__, "build", "SimulaAdSDK.xcframework")
+  # Only the release-zip layout (XCFramework at the podspec root) uses the binary.
+  # Do NOT auto-pick build/SimulaAdSDK.xcframework — a stale local archive would
+  # silently shadow Sources/ during :path installs used for unreleased testing.
   if File.directory?(xcframework_at_root)
     s.vendored_frameworks = "SimulaAdSDK.xcframework"
-  elsif File.directory?(xcframework_in_build)
-    s.vendored_frameworks = "build/SimulaAdSDK.xcframework"
   else
     s.source_files = "Sources/SimulaAdSDK/**/*.swift"
     s.resource_bundles = {

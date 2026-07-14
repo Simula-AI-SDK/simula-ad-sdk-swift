@@ -249,6 +249,30 @@ public enum SimulaAds {
         sessionUserID == ppid ? sessionId : nil
     }
 
+    /// Completion-based variant of `checkFrequencyCap` for callers that must not create Swift
+    /// Concurrency tasks themselves — e.g. the React Native bridge, whose source is compiled by
+    /// host toolchains affected by the task-teardown miscompile (see the
+    /// swift-concurrency-task-shape skill). The task lives INSIDE the SDK binary, which release
+    /// builds compile with the pinned pre-regression toolchain. `completion` fires on the main
+    /// actor with the same fail-open semantics as the async variant.
+    public static func checkFrequencyCap(
+        adUnitId: String,
+        primaryUserID: String? = nil,
+        completion: @escaping @MainActor (Bool) -> Void
+    ) {
+        // Single-call task closure into a named method — see the swift-concurrency-task-shape skill.
+        Task { await runCheckFrequencyCap(adUnitId: adUnitId, primaryUserID: primaryUserID, completion: completion) }
+    }
+
+    /// Task body for the completion-based `checkFrequencyCap` (named method — see the skill).
+    private static func runCheckFrequencyCap(
+        adUnitId: String,
+        primaryUserID: String?,
+        completion: @escaping @MainActor (Bool) -> Void
+    ) async {
+        completion(await checkFrequencyCap(adUnitId: adUnitId, primaryUserID: primaryUserID))
+    }
+
     #if os(iOS)
     /// Imperatively preload one native ad before its slot scrolls into view. Fires a single
     /// `POST /load/native` using the current provider context, caches the full response, and returns
@@ -264,6 +288,24 @@ public enum SimulaAds {
     public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0, theme: String? = nil) async -> String? {
         guard let provider = shared else { return nil }
         return NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position, theme: theme)
+    }
+
+    /// Completion-based variant of `preloadNativeAd` for callers that must not create Swift
+    /// Concurrency tasks themselves (e.g. the React Native bridge — see the
+    /// swift-concurrency-task-shape skill). The preload registration is synchronous under the
+    /// hood, so this creates no task at all; `completion` fires inline on the main actor with
+    /// the `preloadedAdId` (nil before `initialize`).
+    public static func preloadNativeAd(
+        adUnitId: String? = nil,
+        position: Int = 0,
+        theme: String? = nil,
+        completion: @escaping @MainActor (String?) -> Void
+    ) {
+        guard let provider = shared else {
+            completion(nil)
+            return
+        }
+        completion(NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position, theme: theme))
     }
 
     /// Release a preloaded native ad that was never consumed, cancelling its request if in flight.

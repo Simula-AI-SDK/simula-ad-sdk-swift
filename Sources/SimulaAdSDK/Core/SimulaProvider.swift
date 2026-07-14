@@ -190,6 +190,25 @@ public final class SimulaProvider: ObservableObject {
 
     // MARK: - Session Management
 
+    /// Completion-based variant of `createSession` for callers that must not create Swift
+    /// Concurrency tasks themselves — e.g. the React Native bridge, whose source is compiled by
+    /// host toolchains affected by the task-teardown miscompile (see the
+    /// swift-concurrency-task-shape skill). The task lives INSIDE the SDK binary. `completion`
+    /// fires on the main actor once the session is ready (or failed — same semantics as awaiting
+    /// `createSession()`).
+    @MainActor
+    public func createSession(completion: @escaping @MainActor () -> Void) {
+        // Single-call task closure into a named method — see the swift-concurrency-task-shape skill.
+        Task { await self.runCreateSession(completion: completion) }
+    }
+
+    /// Task body for the completion-based `createSession` (named method — see the skill).
+    @MainActor
+    private func runCreateSession(completion: @escaping @MainActor () -> Void) async {
+        await ensureSession()
+        completion()
+    }
+
     /// Creates a session with the server. Called automatically by `SimulaProviderView`.
     /// Translates the `useEffect(() => { ensureSession() }, [...])` from SimulaProvider.tsx.
     @MainActor
