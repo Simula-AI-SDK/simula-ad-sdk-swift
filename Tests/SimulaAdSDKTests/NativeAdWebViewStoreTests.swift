@@ -154,6 +154,38 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         cleanup(attachedAgain.webView, id: attachedId)
     }
 
+    /// Watchdog path: a slot collapse flags the session by impression id — even though the load
+    /// completed cleanly — so the remount rebuilds and reloads instead of reattaching silently.
+    func testNoteUnusableByImpressionIdBlocksReattach() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.noteUnusable(impressionId: id) // slot collapsed (e.g. no height)
+
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                      "flagged session is destroyed on detach")
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded)
+        XCTAssertFalse(second.webView === first.webView)
+        cleanup(second.webView, id: id)
+    }
+
+    /// Invalidation while the ad is on screen: the view is never yanked, but the session is flagged
+    /// so scroll-out destroys it — a remount can't reattach the invalidated creative.
+    func testEvictWhileAttachedFlagsSessionForDestructionOnDetach() {
+        let id = UUID().uuidString
+        let first = attach(id)
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.evict(impressionId: id) // invalidateNativeAd while on screen
+
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+        let second = attach(id)
+        XCTAssertFalse(second.alreadyLoaded, "invalidated creative must not be reattached")
+        cleanup(second.webView, id: id)
+    }
+
     /// Batch eviction (cache-eviction path) drops idle retained sessions for the given ids.
     func testEvictAllImpressionIdsDropsIdleSessions() {
         let id = UUID().uuidString

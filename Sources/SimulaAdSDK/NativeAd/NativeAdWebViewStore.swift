@@ -188,6 +188,17 @@ final class NativeAdWebViewStore {
         if !session.attached { remove(key) }
     }
 
+    /// Same as `noteUnusable(viewID:)`, keyed by impression id. Used by `NativeAdSlot` when it
+    /// collapses a slot the store can't see failing itself — e.g. the missing-height watchdog: the
+    /// creative loaded cleanly (`loadCompleted` is set) but never reported a height, so without
+    /// this flag a remount would reattach it `alreadyLoaded`, skip the reload, and show the same
+    /// blank creative while the still-cached fill expects a retry.
+    func noteUnusable(impressionId: String) {
+        guard let session = sessions[impressionId] else { return }
+        session.unusable = true
+        if !session.attached { remove(impressionId) }
+    }
+
     /// A (possibly recovery) load completed cleanly on `viewID` — the view is healthy again.
     func noteLoadSucceeded(viewID: ObjectIdentifier) {
         guard let session = sessionByView(viewID)?.session else { return }
@@ -218,10 +229,16 @@ final class NativeAdWebViewStore {
     }
 
     /// Drop the retained view for `impressionId` (the slot was invalidated for a fresh ad). An
-    /// attached view is skipped — its representable still owns it; it simply won't be retained with
-    /// a matching creative once the refreshed slot remounts, and ages out of the LRU.
+    /// attached view is never yanked off screen — its representable still owns it — but it IS
+    /// flagged `unusable`: the fill is gone from the cache, so retaining its DOM on scroll-out
+    /// would let a later remount of the same serve reattach the stale creative with no reload.
+    /// The flag makes `detach` destroy it instead.
     func evict(impressionId: String) {
-        guard let session = sessions[impressionId], !session.attached else { return }
+        guard let session = sessions[impressionId] else { return }
+        if session.attached {
+            session.unusable = true
+            return
+        }
         remove(impressionId)
     }
 

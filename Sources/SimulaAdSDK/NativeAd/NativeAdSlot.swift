@@ -399,7 +399,14 @@ public struct NativeAdSlot: View {
     /// connectivity returns.
     @MainActor
     private func handleLoadFailure() {
-        guard case .filled = phase else { return }
+        guard case .filled(let response) = phase else { return }
+        // The store may still hold this serve's rendered view as healthy — the missing-height
+        // watchdog collapses on a CLEAN load that never measured, which the store can't observe.
+        // Flag it so the remount (the fill stays cached and is expected to retry) rebuilds and
+        // reloads instead of reattaching the same silent creative `alreadyLoaded`.
+        if let impressionId = response.impressionId, !impressionId.isEmpty {
+            NativeAdWebViewStore.shared.noteUnusable(impressionId: impressionId)
+        }
         heightPt = 0
         phase = .empty
         reportError(.network)

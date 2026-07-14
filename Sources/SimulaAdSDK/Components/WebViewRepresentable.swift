@@ -866,8 +866,16 @@ struct WebViewRepresentable: UIViewRepresentable {
               if (bottom > max) max = bottom;
             }
             max += (window.scrollY || window.pageYOffset || 0);
+            var raw = Math.ceil(max) || b.scrollHeight;
+            // Viewport-echo guard: a 100%/100vh child (or a child-less full-height body, where the
+            // scrollHeight fallback kicks in) doesn't measure content — it reflects whatever height
+            // the SDK just gave the WebView. Adding the +1 cushion to that echo would ratchet the
+            // slot +1pt per resize forever (measure -> +1 -> resize -> measure...). Report the echo
+            // verbatim instead: identical to lastH, so the loop terminates.
+            var vh = window.innerHeight || 0;
+            if (vh > 0 && Math.abs(raw - vh) <= 2) return vh;
             // +1pt cushion so sub-pixel layout can't leave contentSize > bounds (tiny bottom scroll).
-            return (Math.ceil(max) || b.scrollHeight) + 1;
+            return raw + 1;
           }
           function send() {
             try {
