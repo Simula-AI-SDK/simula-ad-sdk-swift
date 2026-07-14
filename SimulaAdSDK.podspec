@@ -21,8 +21,11 @@ Pod::Spec.new do |s|
   # The artifact is built + validated by .github/workflows/release.yml; resources (including
   # PrivacyInfo.xcprivacy) ship inside the framework's SimulaAdSDK_SimulaAdSDK.bundle.
   #
-  # Local `:path` installs (no XCFramework present) fall back to compiling Sources/ so
-  # unreleased changes can be tested from sibling demo apps without a binary build.
+  # IMPORTANT: `pod trunk push` resolves this spec to static JSON on the publishing machine,
+  # so the binary declaration must be unconditional — a source-fallback branch here would
+  # silently publish a SOURCE pod when pushed from a checkout without the XCFramework,
+  # re-exposing the miscompile to hosts. Push from the release staging layout (podspec +
+  # extracted SimulaAdSDK.xcframework side by side), never from the bare repo.
   s.source           = {
     :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
   }
@@ -30,21 +33,7 @@ Pod::Spec.new do |s|
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
 
-  xcframework_at_root = File.join(__dir__, "SimulaAdSDK.xcframework")
-  # Only the release-zip layout (XCFramework at the podspec root) uses the binary.
-  # Do NOT auto-pick build/SimulaAdSDK.xcframework — a stale local archive would
-  # silently shadow Sources/ during :path installs used for unreleased testing.
-  if File.directory?(xcframework_at_root)
-    s.vendored_frameworks = "SimulaAdSDK.xcframework"
-  else
-    s.source_files = "Sources/SimulaAdSDK/**/*.swift"
-    s.resource_bundles = {
-      "SimulaAdSDK" => [
-        "Sources/SimulaAdSDK/Resources/*.png",
-        "Sources/SimulaAdSDK/Resources/PrivacyInfo.xcprivacy"
-      ]
-    }
-  end
+  s.vendored_frameworks = "SimulaAdSDK.xcframework"
 
   s.frameworks       = [
     "StoreKit",
