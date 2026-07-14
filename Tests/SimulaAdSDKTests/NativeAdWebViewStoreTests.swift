@@ -71,6 +71,25 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         cleanup(oldAgain.webView, id: oldId)
     }
 
+    /// A rebound session starts un-loaded: rebind resets `loadCompleted`, so until the NEW serve's
+    /// navigation finishes, scroll-out destroys the session (never retains the old serve's DOM under
+    /// the new id). `updateUIView` guarantees that navigation by clearing its load-tracking state on
+    /// an id change, even for byte-identical markup.
+    func testReboundSessionRequiresFreshLoadForRetention() {
+        let oldId = UUID().uuidString
+        let newId = UUID().uuidString
+        let first = attach(oldId, key: "creative-a")
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: oldId, to: newId, creativeKey: "creative-a")
+
+        // New serve's load never finished — detach destroys instead of retaining the stale DOM.
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: newId))
+        let again = attach(newId, key: "creative-a")
+        XCTAssertFalse(again.alreadyLoaded, "old serve's DOM must never be retained under the new id")
+        cleanup(again.webView, id: newId)
+    }
+
     /// Rebinding to a blank id (serve → preview) orphans the view: the store forgets it entirely.
     func testRebindToBlankIdOrphansView() {
         let id = UUID().uuidString
@@ -139,7 +158,7 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         let attached = attach(attachedId)
         NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(attached.webView))
 
-        NativeAdWebViewStore.shared.evictAllForConsentChange()
+        NativeAdWebViewStore.shared.invalidateAllSessions()
 
         // Idle session was destroyed — next attach rebuilds fresh.
         let idleAgain = attach(idleId)

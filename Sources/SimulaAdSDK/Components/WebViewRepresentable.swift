@@ -197,6 +197,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                 )
             }
             context.coordinator.retainedImpressionId = retainedImpressionId
+            // A DIFFERENT serve must always issue a fresh navigation, even when its markup is
+            // byte-identical to the previous serve's (templated creatives): the old page is live
+            // DOM with the old serve's state (timers, macros, viewed animations) while clicks and
+            // beacons already carry the new id. Clearing the load-tracking state makes the block
+            // below re-issue the load; its didFinish then marks the rebound store session
+            // loadCompleted, so the new serve is retained (not destroyed) on scroll-out.
+            context.coordinator.currentHTML = nil
+            context.coordinator.currentURL = nil
         }
 
         // Only load if URL/HTML changed
@@ -535,15 +543,23 @@ struct WebViewRepresentable: UIViewRepresentable {
             // gating on the URL would also drop the native (nil-baseURL → about:blank) creative's load
             // and never inject the height-reporting script, collapsing the slot.
             guard realLoadStarted else { return }
+            // Main-frame 4xx/5xx: this didFinish is WebKit rendering the ERROR page, not the
+            // creative — the slot already collapsed via onNavigationFailed (decidePolicyFor). Run
+            // NONE of the success path: don't mark the store session healthy (it was just flagged
+            // unusable), don't fire onNavigationFinished, and don't inject the height script — the
+            // error page would post SIMULA_AD_HEIGHT, resizing the collapsed slot and poisoning the
+            // cached height the retry restores. (Only the native path can set this flag.)
+            if mainFrameHTTPFailed {
+                pageStartUptime = nil
+                return
+            }
             // A clean load means the (possibly just-reloaded) creative is healthy — restore the
             // one-shot render-recovery budget for any future web-content-process termination.
             renderRecoveryAttempted = false
             // Retained native-ad view: clear the store's render-dead flag too, so a recovered view
-            // is retained (not destroyed) on the next detach. Skipped when the main frame answered
-            // 4xx/5xx — this didFinish is the rendered ERROR page, not a healthy creative, and must
-            // not overwrite the unusable mark set in decidePolicyFor. Synchronous on main so a
-            // same-runloop detach/attach sees the updated state.
-            if retainedImpressionId != nil, !mainFrameHTTPFailed {
+            // is retained (not destroyed) on the next detach. Synchronous on main so a same-runloop
+            // detach/attach sees the updated state.
+            if retainedImpressionId != nil {
                 NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(webView))
             }
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
@@ -838,11 +854,18 @@ struct WebViewRepresentable: UIViewRepresentable {
           lockDoc(document);
           lockAll();
           try {
-            if (window.MutationObserver && document.body && !document.body.__simulaNoScrollMO) {
-              document.body.__simulaNoScrollMO = true;
-              new MutationObserver(lockAll).observe(document.body, { childList: true, subtree: true });
+            // Hook the observer on documentElement, not body: at document-start injection (Android)
+            // body is still null and no iframes exist yet, so a body-gated observer would never be
+            // installed and nothing would re-run the lock for the srcdoc iframe parsed later.
+            // documentElement exists from the first script tick; subtree:true covers body + iframes.
+            var root = document.documentElement;
+            if (window.MutationObserver && root && !root.__simulaNoScrollMO) {
+              root.__simulaNoScrollMO = true;
+              new MutationObserver(lockAll).observe(root, { childList: true, subtree: true });
             }
           } catch (e) {}
+          // Belt-and-braces: sweep once more when parsing completes.
+          try { document.addEventListener('DOMContentLoaded', lockAll); } catch (e) {}
         })();
         """
 

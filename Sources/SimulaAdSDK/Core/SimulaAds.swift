@@ -328,7 +328,9 @@ public enum SimulaAds {
     /// Clear every cached native ad (all slots).
     public static func invalidateNativeAds() {
         NativeAdCache.shared.invalidateAll()
-        NativeAdWebViewStore.shared.evictAllIdle()
+        // Idle retained views are destroyed; on-screen ones are flagged so scroll-out destroys
+        // them — with every fill dropped, none may be reattached (parity with invalidateNativeAd).
+        NativeAdWebViewStore.shared.invalidateAllSessions()
     }
     #endif
 }

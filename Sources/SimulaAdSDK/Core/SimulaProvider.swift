@@ -187,7 +187,7 @@ public final class SimulaProvider: ObservableObject {
         // Retained native-ad views baked the previous data store in at creation too: destroy the
         // idle ones now and flag on-screen ones so they're destroyed on scroll-out instead of
         // being retained/reattached under stale consent.
-        NativeAdWebViewStore.shared.evictAllForConsentChange()
+        NativeAdWebViewStore.shared.invalidateAllSessions()
         #endif
         await resyncSession()
     }

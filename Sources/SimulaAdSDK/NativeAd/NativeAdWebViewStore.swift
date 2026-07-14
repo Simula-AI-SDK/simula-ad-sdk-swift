@@ -248,7 +248,9 @@ final class NativeAdWebViewStore {
         for id in impressionIds { evict(impressionId: id) }
     }
 
-    /// Drop every idle retained session (memory warning / `invalidateNativeAds`).
+    /// Drop every idle retained session (memory warning). Attached (on-screen) sessions stay
+    /// fully usable — memory pressure doesn't invalidate their content, and they remain
+    /// retainable on scroll-out.
     func evictAllIdle() {
         // Snapshot: remove(_:) mutates accessOrder mid-loop (for-in already iterates the value
         // captured at loop start, but keep the copy explicit).
@@ -257,12 +259,12 @@ final class NativeAdWebViewStore {
         }
     }
 
-    /// The storage policy flipped (consent change): every retained view was built with the previous
-    /// `websiteDataStore`, so none may serve a creative under the new policy. Idle sessions are
-    /// destroyed now; attached (on-screen) ones are never yanked — they're flagged `unusable` so
-    /// `detach` destroys them on scroll-out instead of retaining them. Mirror of `WebViewPool.clear()`
-    /// for the retained native-ad path.
-    func evictAllForConsentChange() {
+    /// Nothing currently retained may ever be REATTACHED again — a consent change rebuilt the
+    /// storage policy every view baked in at creation, or `invalidateNativeAds` dropped every
+    /// cached fill these views render. Idle sessions are destroyed now; attached (on-screen) ones
+    /// are never yanked — they're flagged `unusable` so `detach` destroys them on scroll-out
+    /// instead of retaining them. Mirror of `WebViewPool.clear()` for the retained native-ad path.
+    func invalidateAllSessions() {
         for key in Array(accessOrder) {
             guard let session = sessions[key] else { continue }
             if session.attached {
