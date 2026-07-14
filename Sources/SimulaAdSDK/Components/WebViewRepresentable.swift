@@ -324,6 +324,12 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// One-shot guard for the reload-after-termination recovery, so a creative that reliably crashes
         /// the renderer can't spin in a reload loop. Reset on each successful load (`didFinish`).
         var renderRecoveryAttempted = false
+        /// True when the current main-frame load answered 4xx/5xx. WKWebView renders the error body
+        /// as a *successful* navigation, so without this flag the ensuing `didFinish` would mark the
+        /// retained session healthy (`noteLoadSucceeded`) right after the HTTP error marked it
+        /// unusable — letting a recycled row reattach the error page with no reload. Reset when a
+        /// new load starts.
+        private var mainFrameHTTPFailed = false
 
         /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
         /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
@@ -369,9 +375,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// No-op for ephemeral (non-retained) views.
         private func noteRetainedUnusable(_ webView: WKWebView?) {
             guard retainedImpressionId != nil, let webView else { return }
-            let viewID = ObjectIdentifier(webView)
-            // Single-call task closure — see the task-shape note in TelemetryManager.
-            Task { @MainActor in NativeAdWebViewStore.shared.noteUnusable(viewID: viewID) }
+            // Synchronous on the main thread (WebKit delivers these callbacks there) so a
+            // detach/attach in the same runloop turn can't act before the flag lands.
+            NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(webView))
         }
 
         /// Schemes that should be handled within the webview
@@ -503,6 +509,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Gate on realLoadStarted, not the URL: a native creative loaded with a nil baseURL also
             // reports webView.url == about:blank, and must NOT be skipped.
             guard realLoadStarted else { return }
+            mainFrameHTTPFailed = false // fresh load — the previous HTTP verdict no longer applies
             pageStartUptime = ProcessInfo.processInfo.systemUptime
         }
 
@@ -515,11 +522,12 @@ struct WebViewRepresentable: UIViewRepresentable {
             // one-shot render-recovery budget for any future web-content-process termination.
             renderRecoveryAttempted = false
             // Retained native-ad view: clear the store's render-dead flag too, so a recovered view
-            // is retained (not destroyed) on the next detach.
-            if retainedImpressionId != nil {
-                let viewID = ObjectIdentifier(webView)
-                // Single-call task closure — see the task-shape note in TelemetryManager.
-                Task { @MainActor in NativeAdWebViewStore.shared.noteLoadSucceeded(viewID: viewID) }
+            // is retained (not destroyed) on the next detach. Skipped when the main frame answered
+            // 4xx/5xx — this didFinish is the rendered ERROR page, not a healthy creative, and must
+            // not overwrite the unusable mark set in decidePolicyFor. Synchronous on main so a
+            // same-runloop detach/attach sees the updated state.
+            if retainedImpressionId != nil, !mainFrameHTTPFailed {
+                NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(webView))
             }
             // webview_page_load timing (best-effort; Tier 3 diagnostics).
             if let start = pageStartUptime {
@@ -594,6 +602,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                   let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
                 return
             }
+            mainFrameHTTPFailed = true // the coming didFinish is the error page — see the flag's doc
             noteRetainedUnusable(webView)
             onNavigationFailed?(NSError(domain: "SimulaWebView", code: http.statusCode))
         }

@@ -184,6 +184,10 @@ public final class SimulaProvider: ObservableObject {
         // views so the next game/ad is built with a data store matching the new consent.
         // (`acquire` also guards this lazily; this just frees stale views proactively.)
         WebViewPool.shared.clear()
+        // Retained native-ad views baked the previous data store in at creation too: destroy the
+        // idle ones now and flag on-screen ones so they're destroyed on scroll-out instead of
+        // being retained/reattached under stale consent.
+        NativeAdWebViewStore.shared.evictAllForConsentChange()
         #endif
         await resyncSession()
     }

@@ -44,6 +44,11 @@ final class NativeAdWebViewStore {
         /// is expected to retry — so the next attach discards it and rebuilds the creative.
         /// Cleared when a (recovery) load completes (`noteLoadSucceeded`).
         var unusable = false
+        /// True once a creative load actually finished (`noteLoadSucceeded`). A session detached
+        /// mid-load has a view with no rendered DOM yet — reattaching it as `alreadyLoaded` would
+        /// suppress the remount's reload and leave an empty slot, so `attach` requires this flag
+        /// for the no-reload path and rebuilds fresh otherwise.
+        var loadCompleted = false
 
         init(impressionId: String, webView: WKWebView, forwarder: WebViewMessageForwarder, loadedKey: String) {
             self.impressionId = impressionId
@@ -85,7 +90,7 @@ final class NativeAdWebViewStore {
         onMessage: @escaping (String) -> Void
     ) -> (webView: WKWebView, alreadyLoaded: Bool) {
         if let session = sessions[impressionId] {
-            if !session.attached, !session.unusable, session.loadedKey == creativeKey {
+            if !session.attached, !session.unusable, session.loadCompleted, session.loadedKey == creativeKey {
                 // Reattach the retained view with its rendered DOM intact — the flash fix.
                 touch(impressionId)
                 session.attached = true
@@ -101,8 +106,9 @@ final class NativeAdWebViewStore {
                 // returns to the pool on dismantle.
                 return (WebViewPool.shared.acquire(delegate: delegate, onMessage: onMessage), false)
             }
-            // Idle but unusable (render process died / load failed off-screen, or a different
-            // creative now lives under this id) — destroy it and rebuild fresh below.
+            // Idle but not reattachable (render process died / load failed off-screen, the load
+            // never finished before the row was dismantled, or a different creative now lives
+            // under this id) — destroy it and rebuild fresh below.
             remove(impressionId)
         }
 
@@ -149,7 +155,31 @@ final class NativeAdWebViewStore {
 
     /// A (possibly recovery) load completed cleanly on `viewID` — the view is healthy again.
     func noteLoadSucceeded(viewID: ObjectIdentifier) {
-        sessionByView(viewID)?.session.unusable = false
+        guard let session = sessionByView(viewID)?.session else { return }
+        session.unusable = false
+        session.loadCompleted = true
+    }
+
+    /// Synchronous entry to `noteUnusable` for WebKit delegate callbacks. Those arrive on the
+    /// main thread, and a `detach`/`attach` can run in the same runloop turn — a deferred
+    /// `Task { @MainActor in ... }` would let the store retain (or reattach) a dead view before
+    /// the flag lands. The main-thread check makes `assumeIsolated` trap-free; the Task fallback
+    /// covers any off-main caller (single-call closure — see the task-shape note in TelemetryManager).
+    nonisolated static func markUnusable(viewID: ObjectIdentifier) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { shared.noteUnusable(viewID: viewID) }
+        } else {
+            Task { @MainActor in shared.noteUnusable(viewID: viewID) }
+        }
+    }
+
+    /// Synchronous entry to `noteLoadSucceeded` — same rationale as `markUnusable(viewID:)`.
+    nonisolated static func markLoadSucceeded(viewID: ObjectIdentifier) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { shared.noteLoadSucceeded(viewID: viewID) }
+        } else {
+            Task { @MainActor in shared.noteLoadSucceeded(viewID: viewID) }
+        }
     }
 
     /// Drop the retained view for `impressionId` (the slot was invalidated for a fresh ad). An
@@ -160,10 +190,34 @@ final class NativeAdWebViewStore {
         remove(impressionId)
     }
 
+    /// Drop the retained views for a batch of impression ids (cache-eviction path — the fills are
+    /// gone from `NativeAdCache`, so their retained views can never be reattached again).
+    func evictAll(impressionIds: [String]) {
+        for id in impressionIds { evict(impressionId: id) }
+    }
+
     /// Drop every idle retained session (memory warning / `invalidateNativeAds`).
     func evictAllIdle() {
-        for key in accessOrder where sessions[key]?.attached == false {
+        // Snapshot: remove(_:) mutates accessOrder mid-loop (for-in already iterates the value
+        // captured at loop start, but keep the copy explicit).
+        for key in Array(accessOrder) where sessions[key]?.attached == false {
             remove(key)
+        }
+    }
+
+    /// The storage policy flipped (consent change): every retained view was built with the previous
+    /// `websiteDataStore`, so none may serve a creative under the new policy. Idle sessions are
+    /// destroyed now; attached (on-screen) ones are never yanked — they're flagged `unusable` so
+    /// `detach` destroys them on scroll-out instead of retaining them. Mirror of `WebViewPool.clear()`
+    /// for the retained native-ad path.
+    func evictAllForConsentChange() {
+        for key in Array(accessOrder) {
+            guard let session = sessions[key] else { continue }
+            if session.attached {
+                session.unusable = true
+            } else {
+                remove(key)
+            }
         }
     }
 
@@ -184,7 +238,8 @@ final class NativeAdWebViewStore {
     private func evictIfNeeded() {
         guard sessions.count > Self.maxRetained else { return }
         // Oldest idle first; attached sessions are skipped (their views are on screen).
-        for key in accessOrder where sessions.count > Self.maxRetained {
+        // Snapshot: remove(_:) mutates accessOrder mid-loop (see evictAllIdle).
+        for key in Array(accessOrder) where sessions.count > Self.maxRetained {
             if sessions[key]?.attached == false { remove(key) }
         }
     }
@@ -209,9 +264,11 @@ final class NativeAdWebViewStore {
     }
 }
 
-/// Watches detached (off-screen) retained views for web-content-process termination — their
-/// coordinator delegate was unwired on detach, so without this the death would go unobserved and
-/// the store would reattach a permanently-blank view.
+/// Watches detached (off-screen) retained views for anything that invalidates their content —
+/// web-content-process termination AND main-frame load failures (a row dismantled mid-load can
+/// still have its navigation fail while idle). Their coordinator delegate was unwired on detach,
+/// so without this the failure would go unobserved, the session would stay "usable", and the next
+/// attach would hand back a blank/error view as `alreadyLoaded` (skipping the reload).
 private final class DetachedRenderMonitor: NSObject, WKNavigationDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         Telemetry.shared.recordError(
@@ -219,9 +276,37 @@ private final class DetachedRenderMonitor: NSObject, WKNavigationDelegate {
             errorCode: "render_terminated",
             breadcrumb: "native_ad_detached"
         )
-        let viewID = ObjectIdentifier(webView)
-        // Single-call task closure — see the task-shape note in TelemetryManager.
-        Task { @MainActor in NativeAdWebViewStore.shared.noteUnusable(viewID: viewID) }
+        NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(webView))
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        noteLoadFailed(webView, error: error)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        noteLoadFailed(webView, error: error)
+    }
+
+    /// Main-frame HTTP 4xx/5xx never reaches `didFail` — WKWebView renders the error body as a
+    /// successful navigation. Mirror the coordinator's check so an idle view showing an error page
+    /// is never reattached.
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        decisionHandler(.allow)
+        guard navigationResponse.isForMainFrame,
+              let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
+            return
+        }
+        NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(webView))
+    }
+
+    private func noteLoadFailed(_ webView: WKWebView, error: Error) {
+        // A cancelled load isn't a failure (superseded navigation) — same rule as the coordinator.
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(webView))
     }
 }
 #endif
