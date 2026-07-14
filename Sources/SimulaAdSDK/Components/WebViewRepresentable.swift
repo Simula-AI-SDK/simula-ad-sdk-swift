@@ -182,6 +182,23 @@ struct WebViewRepresentable: UIViewRepresentable {
         // `isScrollEnabled` stays false (visible as a tiny rubber-band while the feed scrolls).
         configureScrollBehavior(webView, coordinator: context.coordinator)
 
+        // The slot can be recycled to a DIFFERENT serve in place (host list recycling updates
+        // props without remaking this representable). The coordinator's id — set once in
+        // makeCoordinator — must follow, or dismantle detaches under the wrong key; and the store
+        // session retained under the old id must be re-keyed before the new creative loads into
+        // its view, or a revisit of the old serve would reattach the wrong DOM.
+        if context.coordinator.retainedImpressionId != retainedImpressionId {
+            if let oldId = context.coordinator.retainedImpressionId, !oldId.isEmpty {
+                NativeAdWebViewStore.shared.rebind(
+                    webView,
+                    from: oldId,
+                    to: retainedImpressionId,
+                    creativeKey: storeCreativeKey
+                )
+            }
+            context.coordinator.retainedImpressionId = retainedImpressionId
+        }
+
         // Only load if URL/HTML changed
         let currentURL = context.coordinator.currentURL
         let currentHTML = context.coordinator.currentHTML

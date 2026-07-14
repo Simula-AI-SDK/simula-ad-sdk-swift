@@ -131,7 +131,13 @@ final class NativeAdWebViewStore {
     func detach(_ webView: WKWebView, impressionId: String) -> Bool {
         guard let session = sessions[impressionId], session.webView === webView else { return false }
         session.attached = false
-        if session.unusable {
+        if session.unusable || !session.loadCompleted {
+            // Unusable — or the creative never finished loading (fast fling past a still-loading
+            // ad). A mid-load view has no rendered DOM worth keeping, and its didFinish would land
+            // on the DetachedRenderMonitor unobserved, so `loadCompleted` could never be set —
+            // retaining it would leave a permanently-unattachable session pinning a Web Content
+            // process. Destroy it; the remount reloads from the cached fill (pre-store behavior;
+            // matches the Kotlin store).
             remove(impressionId)
             return true
         }
@@ -141,6 +147,35 @@ final class NativeAdWebViewStore {
         webView.navigationDelegate = detachedMonitor
         webView.removeFromSuperview()
         return true
+    }
+
+    /// The slot was recycled to a different serve IN PLACE (`updateUIView` saw a new impression
+    /// id on the same representable — host list recycling, e.g. RN FlashList, updates props
+    /// without remaking the view): a different creative is about to load into the web view
+    /// retained under `oldImpressionId`. Without re-keying, that session would keep its
+    /// still-matching `loadedKey` over the WRONG DOM — a later revisit of the old serve would
+    /// reattach the new serve's creative (misattributed impressions/clicks) — and, because
+    /// dismantle detaches under the NEW id, the old entry would stay `attached` forever, pinning
+    /// its Web Content process past every eviction.
+    ///
+    /// Re-keys the session to `newImpressionId` with a fresh `loadedKey` and `loadCompleted`
+    /// reset (the new creative's didFinish sets it again), so the new serve keeps the flash-fix
+    /// retention and the old serve rebuilds fresh on its next attach. When re-keying isn't
+    /// possible (blank new id, or the new serve already holds an attached session in another
+    /// slot) the view is orphaned instead: dropped from the store untouched — it lives out this
+    /// mount and deallocates on dismantle (`detach` won't match, and the pool no longer owns it).
+    func rebind(_ webView: WKWebView, from oldImpressionId: String, to newImpressionId: String?, creativeKey: String) {
+        guard let session = sessions[oldImpressionId], session.webView === webView else { return }
+        sessions.removeValue(forKey: oldImpressionId)
+        if let idx = accessOrder.firstIndex(of: oldImpressionId) { accessOrder.remove(at: idx) }
+        guard let newId = newImpressionId, !newId.isEmpty else { return }
+        if let existing = sessions[newId] {
+            if existing.attached { return } // other slot owns the retention — orphan this view
+            remove(newId) // idle duplicate for the same serve — the live in-place view supersedes it
+        }
+        let rebound = Session(impressionId: newId, webView: webView, forwarder: session.forwarder, loadedKey: creativeKey)
+        sessions[newId] = rebound
+        touch(newId)
     }
 
     /// The view behind `viewID` no longer holds a valid creative — its web content process

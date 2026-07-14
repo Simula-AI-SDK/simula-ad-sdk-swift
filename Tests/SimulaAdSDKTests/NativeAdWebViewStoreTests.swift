@@ -26,17 +26,63 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         NativeAdWebViewStore.shared.evict(impressionId: id)
     }
 
-    /// A session detached before its creative load finished must NOT reattach as `alreadyLoaded` —
-    /// the remount has to issue the load itself or the slot stays empty.
-    func testReattachRequiresCompletedLoad() {
+    /// A session detached before its creative load finished is destroyed at detach (not retained):
+    /// its didFinish while detached would go unobserved, so it could never become reattachable.
+    /// The remount must rebuild fresh so it issues the load itself.
+    func testDetachDestroysNeverLoadedSessionAndRemountRebuilds() {
         let id = UUID().uuidString
         let first = attach(id)
         XCTAssertFalse(first.alreadyLoaded)
-        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                      "store owned the view — handled by destroying it")
 
         let second = attach(id)
         XCTAssertFalse(second.alreadyLoaded, "never-finished session must be rebuilt, not reattached")
+        XCTAssertFalse(second.webView === first.webView, "the mid-load view was destroyed, not retained")
         cleanup(second.webView, id: id)
+    }
+
+    /// In-place slot recycling (updateUIView with a new serve): rebind re-keys the session so the
+    /// new serve keeps retention and the old serve can never reattach the wrong DOM.
+    func testRebindReKeysSessionToNewServe() {
+        let oldId = UUID().uuidString
+        let newId = UUID().uuidString
+        let first = attach(oldId, key: "creative-a")
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: oldId, to: newId, creativeKey: "creative-b")
+        // The new creative finishes loading in the same view.
+        NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
+
+        // The old key no longer owns the view...
+        XCTAssertFalse(NativeAdWebViewStore.shared.detach(first.webView, impressionId: oldId))
+        // ...the new key does, and retains it on detach.
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: newId))
+
+        let reattached = attach(newId, key: "creative-b")
+        XCTAssertTrue(reattached.alreadyLoaded)
+        XCTAssertTrue(reattached.webView === first.webView)
+
+        // A revisit of the old serve rebuilds fresh — never the rebound DOM.
+        let oldAgain = attach(oldId, key: "creative-a")
+        XCTAssertFalse(oldAgain.alreadyLoaded)
+        XCTAssertFalse(oldAgain.webView === first.webView)
+
+        cleanup(reattached.webView, id: newId)
+        cleanup(oldAgain.webView, id: oldId)
+    }
+
+    /// Rebinding to a blank id (serve → preview) orphans the view: the store forgets it entirely.
+    func testRebindToBlankIdOrphansView() {
+        let id = UUID().uuidString
+        let first = attach(id)
+
+        NativeAdWebViewStore.shared.rebind(first.webView, from: id, to: nil, creativeKey: "any")
+
+        XCTAssertFalse(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id),
+                       "orphaned view is no longer store-owned")
+        let again = attach(id)
+        XCTAssertFalse(again.alreadyLoaded)
+        cleanup(again.webView, id: id)
     }
 
     /// The healthy path: load finished, detached, reattached — same view, no reload.
