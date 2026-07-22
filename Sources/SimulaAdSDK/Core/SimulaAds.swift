@@ -314,14 +314,17 @@ public enum SimulaAds {
     }
 
     /// Drop the cached ad for a native slot so its next appearance fetches a fresh one. A
-    /// `NativeAdSlot` caches its resolved ad per `(adUnitId, position)` so scrolling it out and back
-    /// reuses the same serve (no duplicate request or impression); call this to force a refresh for
-    /// that slot. Use `invalidateNativeAds()` to clear them all.
+    /// `NativeAdSlot` caches its resolved ad per `(adUnitId, position)` — plus its `preloadedAdId`
+    /// when it rendered a preload — so scrolling it out and back reuses the same serve (no duplicate
+    /// request or impression); call this to force a refresh for that slot. Preload-scoped entries at
+    /// this position are dropped too (the refresh intent addresses the placement). Use
+    /// `invalidateNativeAds()` to clear them all.
     public static func invalidateNativeAd(adUnitId: String? = nil, position: Int = 0) {
-        // Drop the retained rendered web view for the invalidated serve too, so the refreshed slot
-        // can't reattach the stale creative.
-        if let impressionId = NativeAdCache.shared.invalidate(adUnitId, position) {
-            NativeAdWebViewStore.shared.evict(impressionId: impressionId)
+        // Drop the retained rendered web views for the invalidated serves too, so the refreshed slot
+        // can't reattach a stale creative.
+        let impressionIds = NativeAdCache.shared.invalidate(adUnitId, position)
+        if !impressionIds.isEmpty {
+            NativeAdWebViewStore.shared.evictAll(impressionIds: impressionIds)
         }
     }
 
