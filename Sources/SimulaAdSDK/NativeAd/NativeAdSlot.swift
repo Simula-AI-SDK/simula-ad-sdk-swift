@@ -109,8 +109,10 @@ public struct NativeAdSlot: View {
         self.onClick = onClick
 
         // Seed the initial state from the per-slot cache so a recycled row paints the SAME ad on its
-        // first frame (no shimmer flash, no refetch). A preview / preload resolves in `.task`.
-        if previewHTML == nil, preloadedAdId == nil, let entry = NativeAdCache.shared.get(adUnitId, position) {
+        // first frame (no shimmer flash, no refetch). A preview resolves in `.task`; a preloaded slot
+        // looks up its own preload-scoped entry, so this hits on remount (after the consume-once
+        // preload entry is gone) and misses on first mount (which then consumes in `.task`).
+        if previewHTML == nil, let entry = NativeAdCache.shared.get(adUnitId, position, preloadedAdId) {
             if let response = entry.response {
                 _phase = State(initialValue: .filled(response))
                 _heightPt = State(initialValue: entry.heightPt)
@@ -274,7 +276,9 @@ public struct NativeAdSlot: View {
         }
 
         // 2. Per-slot cache hit → render without a network call (no duplicate serve / impression).
-        if let entry = NativeAdCache.shared.get(adUnitId, position) {
+        // The lookup is preload-scoped: a preloaded slot replays ITS OWN serve here after step 1's
+        // consume-once entry is gone, even when other slots share this (adUnitId, position).
+        if let entry = NativeAdCache.shared.get(adUnitId, position, preloadedAdId) {
             if let response = entry.response {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
@@ -315,11 +319,14 @@ public struct NativeAdSlot: View {
         }
     }
 
-    /// Caches the outcome so the next remount of this slot reuses it (no duplicate serve).
+    /// Caches the outcome — under the slot's preload-scoped key when it has a `preloadedAdId` — so
+    /// the next remount of this slot reuses it (no duplicate serve). The scoping is what keeps
+    /// same-position preloaded slots (a host that never passes `position`) from overwriting each
+    /// other's entry and converging to one ad as rows recycle.
     @MainActor
     private func apply(_ response: NativeAdResponse, source: String, durationMs: Int? = nil) {
         if response.hasCreative {
-            NativeAdCache.shared.putFill(adUnitId, position, response)
+            NativeAdCache.shared.putFill(adUnitId, position, response, preloadedAdId: preloadedAdId)
             heightPt = 0
             impressionFired = false
             // Start the native fill→first-paint render timer for a genuine load (network/preload); a
@@ -332,7 +339,7 @@ public struct NativeAdSlot: View {
             reportLoadSuccess(response, source: source, durationMs: durationMs)
         } else {
             // No-fill: collapse the slot AND surface noFill so the publisher can react (fallback).
-            NativeAdCache.shared.putNoFill(adUnitId, position)
+            NativeAdCache.shared.putNoFill(adUnitId, position, preloadedAdId: preloadedAdId)
             phase = .empty
             reportError(.noFill)
         }
@@ -365,7 +372,7 @@ public struct NativeAdSlot: View {
         guard !impressionFired else { return }
         impressionFired = true
         // Remember it on the cache entry so a remount of the same serve never re-fires.
-        NativeAdCache.shared.get(adUnitId, position)?.impressionFired = true
+        NativeAdCache.shared.get(adUnitId, position, preloadedAdId)?.impressionFired = true
         // Dedup by impression id too, so the same served ad fires at most one impression process-wide
         // (e.g. shown in two slots, or re-composed). The callback + server beacon co-fire together; a
         // preview (empty id) always fires the callback but never a beacon.
@@ -465,7 +472,7 @@ public struct NativeAdSlot: View {
                 if abs(newHeight - heightPt) >= 1 {
                     heightPt = newHeight
                     // Persist so a recycled row sizes correctly on its first frame.
-                    NativeAdCache.shared.get(adUnitId, position)?.heightPt = newHeight
+                    NativeAdCache.shared.get(adUnitId, position, preloadedAdId)?.heightPt = newHeight
                 }
             }
         case "AD_FEEDBACK":
