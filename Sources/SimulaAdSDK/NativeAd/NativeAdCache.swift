@@ -2,10 +2,10 @@
 import Foundation
 import CoreGraphics
 
-/// Per-slot cache of resolved native ads, keyed by `"adUnitId:position"` — extended with the slot's
-/// `preloadedAdId` (`"adUnitId:position:preloadedAdId"`) when it has one, so preloaded slots that
-/// share a position (e.g. a host that never passes `position` and leaves every slot at 0) keep
-/// distinct entries instead of clobbering one another into a single ad.
+/// Per-slot cache of resolved native ads, keyed by `(adUnitId, position)` — extended with the slot's
+/// `preloadedAdId` when it has one, so preloaded slots that share a position (e.g. a host that never
+/// passes `position` and leaves every slot at 0) keep distinct entries instead of clobbering one
+/// another into a single ad.
 ///
 /// A `NativeAdSlot` lives inside a lazy stack, which disposes and recreates off-screen rows. Without
 /// this cache, scrolling a slot out and back would re-run `POST /load/native` and re-fire the
@@ -48,10 +48,10 @@ final class NativeAdCache: @unchecked Sendable {
     private let maxEntries = 64
 
     private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
+    private var entries: [Key: Entry] = [:]
     /// LRU recency for `entries`: front = least-recently used, back = most-recent. Kept in sync with
     /// `entries` under `lock` so the eldest key can be evicted once the cap is exceeded.
-    private var accessOrder: [String] = []
+    private var accessOrder: [Key] = []
     /// Impression ids whose impression already fired, so the same served ad reports at most one
     /// impression process-wide — even if shown in two slots (same cache key) or re-composed —
     /// independent of the per-slot `Entry.impressionFired` flag. Bounded: an id is dropped when its
@@ -62,14 +62,29 @@ final class NativeAdCache: @unchecked Sendable {
 
     /// The slot identity: `(adUnitId, position)` plus, for a preloaded slot, its `preloadedAdId` —
     /// the extra component that keeps same-position preloaded slots from sharing one entry.
-    private func key(_ adUnitId: String?, _ position: Int, _ preloadedAdId: String?) -> String {
-        let base = "\(adUnitId ?? ""):\(position)"
-        guard let preloadedAdId, !preloadedAdId.isEmpty else { return base }
-        return "\(base):\(preloadedAdId)"
+    ///
+    /// A structured key, NOT a delimiter-joined string: an `adUnitId` may itself contain the
+    /// would-be delimiter, which made string keys ambiguous — `("unit", 0)`'s preload prefix
+    /// `"unit:0:"` also matched `("unit:0", 5)`'s plain key `"unit:0:5"`, so invalidating one
+    /// placement could drop an unrelated slot's fill. Component equality can't collide.
+    struct Key: Hashable {
+        let adUnitId: String
+        let position: Int
+        let preloadedAdId: String?
+    }
+
+    private func key(_ adUnitId: String?, _ position: Int, _ preloadedAdId: String?) -> Key {
+        Key(
+            adUnitId: adUnitId ?? "",
+            position: position,
+            // A blank preload id (defensive: bridges normalize empty strings) addresses the plain
+            // slot key, identical to nil.
+            preloadedAdId: (preloadedAdId?.isEmpty == false) ? preloadedAdId : nil
+        )
     }
 
     /// Marks `k` as most-recently used. Caller must hold `lock`.
-    private func touch(_ k: String) {
+    private func touch(_ k: Key) {
         if let idx = accessOrder.firstIndex(of: k) { accessOrder.remove(at: idx) }
         accessOrder.append(k)
     }
@@ -140,16 +155,16 @@ final class NativeAdCache: @unchecked Sendable {
         evictRetainedWebViews(evicted)
     }
 
-    /// Drops the slot's entry — including every preload-scoped entry for that `(adUnitId, position)`
-    /// (their keys extend the slot's `"unit:pos"` key with `":preloadedAdId"`), since the publisher's
-    /// refresh intent addresses the placement, not one preload. Returns the invalidated fills'
-    /// impression ids so the caller can evict the matching retained web views from
-    /// `NativeAdWebViewStore` too.
+    /// Drops the slot's entry — including every preload-scoped entry for that `(adUnitId, position)`,
+    /// since the publisher's refresh intent addresses the placement, not one preload. Matching is by
+    /// key components (never string prefixes, which an adUnitId containing the delimiter could
+    /// alias). Returns the invalidated fills' impression ids so the caller can evict the matching
+    /// retained web views from `NativeAdWebViewStore` too.
     @discardableResult
     func invalidate(_ adUnitId: String?, _ position: Int) -> [String] {
         lock.lock(); defer { lock.unlock() }
         let base = key(adUnitId, position, nil)
-        let doomed = entries.keys.filter { $0 == base || $0.hasPrefix("\(base):") }
+        let doomed = entries.keys.filter { $0.adUnitId == base.adUnitId && $0.position == base.position }
         var invalidatedIds: [String] = []
         for k in doomed {
             // Drop the impression-id mark too so a deliberately-refreshed slot can fire again.

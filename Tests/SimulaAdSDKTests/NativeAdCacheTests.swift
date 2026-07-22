@@ -93,6 +93,28 @@ final class NativeAdCacheTests: XCTestCase {
         _ = NativeAdCache.shared.invalidate(unit, 0)
     }
 
+    /// Bugbot regression (PR #47): with delimiter-joined string keys, an adUnitId containing the
+    /// delimiter aliased another placement — ("unit:0", 5)'s plain key "unit:0:5" collided with
+    /// ("unit", 0, preload "5") and prefix-matched ("unit", 0)'s invalidation, dropping an
+    /// unrelated fill. Structured keys must keep the placements fully isolated.
+    func testInvalidateDoesNotAliasAcrossDelimiterCarryingAdUnitIds() {
+        let shortUnit = "unit-\(UUID().uuidString)"
+        let colonUnit = "\(shortUnit):0" // its (colonUnit, 5) identity string-aliased (shortUnit, 0, "5")
+
+        NativeAdCache.shared.putFill(colonUnit, 5, response("imp-colon"))
+        NativeAdCache.shared.putFill(shortUnit, 0, response("imp-plain"), preloadedAdId: "5")
+
+        XCTAssertEqual(NativeAdCache.shared.get(colonUnit, 5)?.response?.impressionId, "imp-colon")
+        XCTAssertEqual(NativeAdCache.shared.get(shortUnit, 0, "5")?.response?.impressionId, "imp-plain")
+
+        let invalidated = NativeAdCache.shared.invalidate(shortUnit, 0)
+
+        XCTAssertEqual(Set(invalidated), ["imp-plain"], "only the addressed placement's fills")
+        XCTAssertEqual(NativeAdCache.shared.get(colonUnit, 5)?.response?.impressionId, "imp-colon",
+                       "the other placement's fill must survive the invalidation")
+        _ = NativeAdCache.shared.invalidate(colonUnit, 5)
+    }
+
     /// No-fill outcomes are preload-scoped too: one slot's no-fill must not collapse a sibling
     /// slot at the same position.
     func testNoFillIsScopedPerPreloadedSlot() {
