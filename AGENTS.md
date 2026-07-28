@@ -24,13 +24,13 @@ Rules for any AI agent or developer writing code in this repository. This SDK sh
 Host app
   → SimulaProviderView (SwiftUI) | SimulaAds.initialize (imperative)
     → SimulaProvider.init        ← the single init path (cheap, main-thread):
-                                     crash guard, connection monitor, device signals,
-                                     privacy apply. Everything disk/syscall-heavy is
-                                     deferred to `start()`/`runStartup` (off-main
-                                     prewarm: IDFV/UA, shared URLSession, telemetry,
-                                     version check → session warm-up + WebView prewarm).
-                                     `ensureSession` awaits that startup — no request
-                                     can race ahead of it.
+                                     connection monitor, device signals, privacy apply.
+                                     Everything disk/syscall-heavy is deferred to
+                                     `start()`/`runStartup` (off-main prewarm: IDFV/UA,
+                                     shared URLSession, telemetry, crash-guard install,
+                                     beacon/verification drains, version check →
+                                     session warm-up + WebView prewarm). `ensureSession`
+                                     awaits that startup — no request can race ahead of it.
       → SimulaAPI (transport, models, makeHeaders chokepoint)
         → URLSession (SDK-configured session — never URLSession.shared on ad paths)
   → UI: NativeAdSlot / MiniGame / Interstitial / Rewarded

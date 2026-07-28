@@ -166,12 +166,10 @@ public final class SimulaProvider: ObservableObject {
         // in `init` on the main thread. First call still wins, and `ensureSession` gates on
         // startup completing, so the "installed before the first request" invariant is preserved.
 
-        // Capture uncaught SDK crashes (+ Swift traps / signals / hangs via MetricKit on iOS 14+)
-        // into telemetry. Gated by the same telemetry opt-out; chains to the host's existing
-        // exception handler and only reports crashes that involve SDK code. Kept inline in `init`:
-        // it is cheap (handler swap + an async MetricKit hop) and installing it early maximizes
-        // the window in which a crash during startup is captured.
-        SimulaCrashGuard.shared.install(enabled: telemetryEnabled)
+        // Crash-guard install moved to the deferred startup (`runStartupPrewarm`), right after
+        // `Telemetry.shared.initialize`: the replay of any prior-process crash records into
+        // telemetry — and telemetry is now installed there, not here. The handler still lands
+        // well inside the launch window (one background hop after `init`).
 
         // Feed the process-wide store, then re-sync the session whenever consent
         // changes (host CMP refresh or ATT result) so the backend sees current signals.
@@ -252,6 +250,20 @@ public final class SimulaProvider: ObservableObject {
             // Read the PPID live so a mid-session updatePrimaryUserID is honored; the box is Sendable.
             primaryUserIDProvider: { [ppidStore] in ppidStore.current }
         )
+
+        // Capture uncaught SDK crashes into telemetry. MUST run after `Telemetry.initialize`:
+        // the install replays any prior-process crash records into the pipeline, and a record
+        // landing before the manager exists is permanently dropped. Thread-safe (its main-thread
+        // needs — MetricKit — self-hop).
+        SimulaCrashGuard.shared.install(enabled: telemetryEnabled)
+
+        // Queue drains + beacon recovery. The first touch of these singletons constructs a
+        // `SimulaAPI` (their sender/verifier), so they MUST come after the shared-session build
+        // above — otherwise `initialize` would build `defaultSession` (URLSession + UA/IDFV
+        // headers) on the main thread. Lock-guarded; each drain runs in its own Task.
+        RewardVerificationManager.shared.triggerProcessQueue()
+        AdBeaconManager.shared.configure(apiKey: apiKey)
+        AdBeaconManager.shared.triggerProcessQueue()
 
         // SDK-upgrade bookkeeping: read + persist off-main; the beacon itself is recorded in the
         // main phase once telemetry is installed.

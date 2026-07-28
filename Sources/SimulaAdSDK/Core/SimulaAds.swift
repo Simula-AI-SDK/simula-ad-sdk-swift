@@ -133,20 +133,12 @@ public enum SimulaAds {
 
         // Deferred startup: telemetry install + UA/IDFV/session warm-up + WebView prewarm,
         // off this call's critical path. `ensureSession` awaits it, so no request can race
-        // ahead of privacy/telemetry setup.
+        // ahead of privacy/telemetry setup. Reward-verification recovery and the beacon-queue
+        // drain also run there: the first touch of those singletons constructs a `SimulaAPI`,
+        // which would otherwise build the shared `URLSession` (UA/IDFV headers) on the main
+        // thread right here.
         provider.start()
 
-        // Independently of session warm-up (each queued verification carries its own
-        // session), recover any reward verifications a prior launch left pending (e.g. a
-        // crash/kill before a verify could land) so their server-side SSV postbacks fire
-        // without waiting for the next rewarded play. This kicks off its own Task, so a
-        // slow/failed session create can't delay or skip recovery.
-        RewardVerificationManager.shared.triggerProcessQueue()
-
-        // Durable impression/click beacon queue: configure it and drain any beacons a prior process
-        // left undelivered (offline/killed). Off the telemetry pipeline; off the critical path.
-        AdBeaconManager.shared.configure(apiKey: apiKey)
-        AdBeaconManager.shared.triggerProcessQueue()
         return true
     }
 
