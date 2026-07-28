@@ -48,6 +48,19 @@ public final class SimulaProvider: ObservableObject {
     /// main thread by `NativeAdSlot` / the preload path.
     public private(set) var adContext: SimulaAdContext?
 
+    /// The host's telemetry opt-in, kept so the deferred startup can install the pipeline
+    /// (it was previously consumed only inside `init`).
+    private let telemetryEnabled: Bool
+
+    /// Monotonic marker captured at the START of `init`, so the `sdk_init` beacon (emitted by
+    /// the deferred startup once telemetry is installed) measures the full bring-up span.
+    private let initStartNanos = DispatchTime.now().uptimeNanoseconds
+
+    /// The deferred-startup task, created once by `start()`. `ensureSession` awaits it so the
+    /// first request is always built after privacy/telemetry/singleton warm-up have run, even
+    /// for a host that drives a raw provider without ever calling `start()`.
+    private var startupTask: Task<Void, Never>?
+
     // MARK: - Session State
 
     /// The server session ID, set after successful session creation
@@ -94,7 +107,13 @@ public final class SimulaProvider: ObservableObject {
 
     // MARK: - Internal
 
-    private let api: SimulaAPI
+    /// Lazily constructed so the one-time `defaultSession` build (URLSession + standard
+    /// headers, which reads the UA/IDFV lazy statics) happens on first use — inside the
+    /// deferred startup — instead of inline in `init` on the main thread. The deferred
+    /// startup additionally pre-warms `SimulaAPI.shared` off-main, so by the time this
+    /// lazy fires the expensive static is already built. All uses are `@MainActor`, so the
+    /// lazy initialization is race-free.
+    private lazy var api = SimulaAPI()
 
     /// Subscriptions to the consent store (re-sync session on CMP refresh).
     private var cancellables: Set<AnyCancellable> = []
@@ -130,7 +149,7 @@ public final class SimulaProvider: ObservableObject {
         var resolved = privacy ?? SimulaPrivacyConfig()
         if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
         self.privacyConfig = resolved
-        self.api = SimulaAPI()
+        self.telemetryEnabled = telemetryEnabled
 
         // Start the connection-type monitor before the first request so `X-Connection-Type` is
         // live from `session/create` onward. Idempotent — safe if a host recreates the provider.
@@ -142,21 +161,16 @@ public final class SimulaProvider: ObservableObject {
         // request. Idempotent and independent of telemetry, like the connection-type monitor.
         SimulaDeviceSignals.shared.start()
 
-        // Install telemetry before the first request so the /session/create call (and every
-        // subsequent SDK request) is captured. First call wins, so a re-created provider
-        // doesn't churn it; the facade re-gates PII on the live consent snapshot.
-        Telemetry.shared.initialize(
-            apiKey: apiKey,
-            devMode: devMode,
-            enabled: telemetryEnabled,
-            // Read the PPID live so a mid-session updatePrimaryUserID is honored; the box is Sendable.
-            primaryUserIDProvider: { [ppidStore = self.ppidStore] in ppidStore.current }
-        )
+        // Telemetry install moved to the deferred startup (`runStartupPrewarm`): building the
+        // manager + device context does syscalls and UserDefaults I/O that don't belong inline
+        // in `init` on the main thread. First call still wins, and `ensureSession` gates on
+        // startup completing, so the "installed before the first request" invariant is preserved.
 
         // Capture uncaught SDK crashes (+ Swift traps / signals / hangs via MetricKit on iOS 14+)
         // into telemetry. Gated by the same telemetry opt-out; chains to the host's existing
-        // exception handler and only reports crashes that involve SDK code. Installed right after the
-        // pipeline so the replay of any prior-process crash has somewhere to land.
+        // exception handler and only reports crashes that involve SDK code. Kept inline in `init`:
+        // it is cheap (handler swap + an async MetricKit hop) and installing it early maximizes
+        // the window in which a crash during startup is captured.
         SimulaCrashGuard.shared.install(enabled: telemetryEnabled)
 
         // Feed the process-wide store, then re-sync the session whenever consent
@@ -173,6 +187,100 @@ public final class SimulaProvider: ObservableObject {
                 Task { @MainActor in await self?.handleConsentChange() }
             }
             .store(in: &cancellables)
+    }
+
+    // MARK: - Deferred startup
+
+    /// Begins the deferred startup exactly once (idempotent). Called by `SimulaAds.initialize`
+    /// right after publishing `shared`, and lazily by `ensureSession` so every entry path is
+    /// covered. Returns immediately — the work runs in `startupTask`, mostly off the main actor.
+    ///
+    /// Why this exists: `init` must stay cheap enough to run inline at app launch. The one-time
+    /// costs that used to live in `init`/`SimulaAds.initialize` on the main thread — IDFV
+    /// (documented to block during the protected-data window), UA syscalls, the shared
+    /// URLSession build, telemetry-manager construction, the version-prefs check — now run
+    /// here, off the caller's critical path.
+    @MainActor
+    func start() {
+        guard startupTask == nil else { return }
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        startupTask = Task { await self.runStartup() }
+    }
+
+    /// Startup task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private func runStartup() async {
+        // Phase 1 (off-main): warm the one-time lazy costs and install telemetry.
+        let lastSeenVersion = await Self.runStartupPrewarm(
+            apiKey: apiKey, devMode: devMode, telemetryEnabled: telemetryEnabled, ppidStore: ppidStore
+        )
+        // Phase 2 (main): beacons that need telemetry installed, then a warm web view, so the
+        // first native-ad mount never builds a `WKWebView` cold inside a feed layout pass.
+        recordStartupBeacons(lastSeenVersion: lastSeenVersion)
+        #if os(iOS)
+        WebViewPool.shared.prewarm()
+        #endif
+        // Phase 3: warm the session. Ungated variant — this task IS the startup gate.
+        _ = await ensureSessionCoalesced()
+    }
+
+    /// Off-main startup phase (named method — see the task-shape note in TelemetryManager).
+    /// `nonisolated` so it runs on the cooperative pool: every singleton touched here is
+    /// lock-guarded or self-hops to the main thread for its main-only parts.
+    /// Returns the previously persisted SDK version (for the `sdk_upgrade` beacon).
+    nonisolated private static func runStartupPrewarm(
+        apiKey: String,
+        devMode: Bool,
+        telemetryEnabled: Bool,
+        ppidStore: PPIDStore
+    ) async -> String? {
+        // Warm the lazy statics OFF the main thread: `identifierForVendor` can block early in
+        // launch and UA building is syscalls; building the shared session (URLSession + standard
+        // headers) reads both, so this single touch completes all three off-main.
+        _ = SimulaUserAgent.value
+        _ = SimulaDeviceId.value
+        _ = SimulaAPI.shared
+
+        // Install telemetry before the first request so /session/create (and every subsequent
+        // SDK request) is captured. First call wins, so a re-created provider doesn't churn it;
+        // the facade re-gates PII on the live consent snapshot. Lock-guarded and its main-thread
+        // needs (battery monitor) self-hop — safe from a background context.
+        Telemetry.shared.initialize(
+            apiKey: apiKey,
+            devMode: devMode,
+            enabled: telemetryEnabled,
+            // Read the PPID live so a mid-session updatePrimaryUserID is honored; the box is Sendable.
+            primaryUserIDProvider: { [ppidStore] in ppidStore.current }
+        )
+
+        // SDK-upgrade bookkeeping: read + persist off-main; the beacon itself is recorded in the
+        // main phase once telemetry is installed.
+        let versionKey = "simula_sdk_last_version"
+        let lastVersion = UserDefaults.standard.string(forKey: versionKey)
+        if lastVersion != SIMULA_SDK_VERSION {
+            UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
+        }
+        return lastVersion
+    }
+
+    /// Main-actor startup phase (named method — see the task-shape note in TelemetryManager):
+    /// emits the `sdk_init` beacon (duration measured from the start of `init`) and the
+    /// `sdk_upgrade` beacon on a version change. No-ops when telemetry is disabled.
+    @MainActor
+    private func recordStartupBeacons(lastSeenVersion: String?) {
+        // SDK-init beacon, now that telemetry is installed. Best-effort; the config summary
+        // carries no PII.
+        let initMs = Int((DispatchTime.now().uptimeNanoseconds &- initStartNanos) / 1_000_000)
+        let snap = SimulaPrivacy.shared.currentSnapshot
+        let configSummary = "dev=\(devMode) tel=\(telemetryEnabled) consent=\(snap.hasPrivacyConsent) " +
+            "coppa=\(snap.coppaApplies) adid=\(snap.advertisingId != nil) ctx=\(adContext != nil)"
+        Telemetry.shared.recordOperation(name: "sdk_init", durationMs: initMs, success: true, breadcrumb: configSummary)
+
+        // SDK-upgrade beacon: a first install just recorded the version (no event); a changed
+        // version emits sdk_upgrade. Best-effort.
+        if let lastSeenVersion, lastSeenVersion != SIMULA_SDK_VERSION {
+            Telemetry.shared.recordOperation(name: "sdk_upgrade", durationMs: 0, success: true, breadcrumb: "from=\(lastSeenVersion);to=\(SIMULA_SDK_VERSION)")
+        }
     }
 
     /// Task body for the consent-change reaction (named method — see the task-shape note in
@@ -222,6 +330,9 @@ public final class SimulaProvider: ObservableObject {
 
     /// Returns a valid session id, creating one on demand if needed.
     ///
+    /// First awaits the deferred startup (kicking it lazily if `start()` was never called), so
+    /// the first request is always built after privacy/telemetry/warm-up have run.
+    ///
     /// - Returns the existing id immediately if a session already exists.
     /// - Coalesces concurrent callers onto a single in-flight request, so a
     ///   fast game tap during launch awaits the same session creation instead
@@ -232,6 +343,16 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func ensureSession() async -> String? {
+        start()
+        if let startupTask { await startupTask.value }
+        return await ensureSessionCoalesced()
+    }
+
+    /// Session-creation core with no startup gate. Called by `ensureSession` (after the gate)
+    /// and directly by the startup task itself (which IS the gate — routing it through
+    /// `ensureSession` would await its own task and deadlock).
+    @MainActor
+    private func ensureSessionCoalesced() async -> String? {
         // Loop so a caller that coalesces onto (or starts) a creation which is then superseded by a
         // resync retries onto the replacement, instead of returning a premature nil while a session
         // is still being created.

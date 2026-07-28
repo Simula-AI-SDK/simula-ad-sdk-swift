@@ -26,6 +26,11 @@ import Foundation
 /// Main-actor isolated: the shared mutable state (`shared`) is only ever touched
 /// on the main thread, which keeps it free of data races under strict concurrency.
 ///
+/// `initialize` is deliberately cheap: it only builds the provider and kicks the deferred
+/// startup (`SimulaProvider.start()`), which moves IDFV/UA syscalls, the shared URLSession
+/// build, telemetry install, the version check, session warm-up, and the WebView prewarm off
+/// the caller's critical path. Safe to call inline at app launch.
+///
 /// IMPORTANT: every member here — including `initialize` — is `@MainActor`-isolated, so it MUST be
 /// called on the main thread. App launch (`application(_:didFinishLaunching…)`, SwiftUI `App.init`)
 /// already runs on the main actor, so the common path needs nothing extra. Under Swift 6 strict
@@ -108,20 +113,9 @@ public enum SimulaAds {
             return false
         }
 
-        // Monotonic start marker for the sdk_init telemetry duration (emitted once setup completes).
-        let startNanos = DispatchTime.now().uptimeNanoseconds
-
-        // Construct the custom User-Agent + device id at init. They're lazy `static let`s, so
-        // touching them here forces them before the shared SimulaAPI session reads them for
-        // httpAdditionalHeaders.
-        _ = SimulaUserAgent.value
-        _ = SimulaDeviceId.value
-
-        // Begin device-signal collection so the `X-*` device headers are populated before the first
-        // request. Idempotent (also started by `SimulaProvider.init` below); starting it here keeps
-        // the first snapshot off the critical path.
-        SimulaDeviceSignals.shared.start()
-
+        // Keep this call cheap: it runs on the main thread, typically during app launch. The
+        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
+        // version check, session warm-up, WebView prewarm) is deferred to `provider.start()`.
         let provider = SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,
@@ -133,10 +127,14 @@ public enum SimulaAds {
         )
         shared = provider
 
-        // Warm the session so the first `load()` doesn't pay session creation.
-        // Inherits the main actor from the enclosing `@MainActor` context.
-        // Single-call task closure — see the task-shape note in TelemetryManager.
-        Task { await provider.createSession() }
+        // Publish readiness so observers (e.g. the React Native host views waiting to mount a
+        // native ad) can react once instead of polling `shared` on a timer.
+        NotificationCenter.default.post(name: .simulaAdsDidInitialize, object: nil)
+
+        // Deferred startup: telemetry install + UA/IDFV/session warm-up + WebView prewarm,
+        // off this call's critical path. `ensureSession` awaits it, so no request can race
+        // ahead of privacy/telemetry setup.
+        provider.start()
 
         // Independently of session warm-up (each queued verification carries its own
         // session), recover any reward verifications a prior launch left pending (e.g. a
@@ -149,25 +147,6 @@ public enum SimulaAds {
         // left undelivered (offline/killed). Off the telemetry pipeline; off the critical path.
         AdBeaconManager.shared.configure(apiKey: apiKey)
         AdBeaconManager.shared.triggerProcessQueue()
-
-        // SDK-init beacon, now that telemetry is installed (no-op when telemetry is disabled). Only the
-        // first valid initialize reaches here. Best-effort; the config summary carries no PII.
-        let initMs = Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
-        let snap = SimulaPrivacy.shared.currentSnapshot
-        let configSummary = "dev=\(devMode) tel=\(telemetryEnabled) consent=\(snap.hasPrivacyConsent) " +
-            "coppa=\(snap.coppaApplies) adid=\(snap.advertisingId != nil) ctx=\(adContext != nil)"
-        Telemetry.shared.recordOperation(name: "sdk_init", durationMs: initMs, success: true, breadcrumb: configSummary)
-
-        // SDK-upgrade beacon: compare the last-seen version to the current one. A first install just
-        // records the version (no event); a changed version emits sdk_upgrade. Best-effort.
-        let versionKey = "simula_sdk_last_version"
-        let lastVersion = UserDefaults.standard.string(forKey: versionKey)
-        if let lastVersion, lastVersion != SIMULA_SDK_VERSION {
-            Telemetry.shared.recordOperation(name: "sdk_upgrade", durationMs: 0, success: true, breadcrumb: "from=\(lastVersion);to=\(SIMULA_SDK_VERSION)")
-        }
-        if lastVersion != SIMULA_SDK_VERSION {
-            UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
-        }
         return true
     }
 
@@ -333,4 +312,13 @@ public enum SimulaAds {
         NativeAdWebViewStore.shared.invalidateAllSessions()
     }
     #endif
+}
+
+extension Notification.Name {
+    /// Posted on the main thread once per process when `SimulaAds.initialize` succeeds — i.e.
+    /// the moment `SimulaAds.shared != nil` and the imperative API is usable. A session may not
+    /// exist yet (session warm-up is part of the deferred startup); ad loads gate on it
+    /// internally. Observers that only need the provider (e.g. a host view waiting to mount a
+    /// native ad) should use this instead of polling `SimulaAds.shared`.
+    public static let simulaAdsDidInitialize = Notification.Name("ad.simula.sdk.didInitialize")
 }
