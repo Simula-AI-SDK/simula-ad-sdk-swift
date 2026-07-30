@@ -203,6 +203,14 @@ public final class SimulaProvider: ObservableObject {
         guard startupTask == nil else { return }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         startupTask = Task { await self.runStartup() }
+        #if os(iOS)
+        // WebView prewarm is deliberately NOT part of the startup task — the gate
+        // `ensureSession` awaits: the first WKWebView spins up the WebContent process (100s
+        // of ms of main-thread work) and /session/create needs no WebView, so a gated first
+        // ad load must not stall on it. Runs right after the gate completes instead; a pool
+        // acquire that somehow beats it simply builds a WebView inline, as before the pool.
+        Task { await self.prewarmWebViewAfterStartup() }
+        #endif
     }
 
     /// Startup task body (named method — see the task-shape note in TelemetryManager).
@@ -212,14 +220,25 @@ public final class SimulaProvider: ObservableObject {
         let lastSeenVersion = await Self.runStartupPrewarm(
             apiKey: apiKey, devMode: devMode, telemetryEnabled: telemetryEnabled, ppidStore: ppidStore
         )
-        // Phase 2 (main): beacons that need telemetry installed, then a warm web view, so the
-        // first native-ad mount never builds a `WKWebView` cold inside a feed layout pass.
+        // Phase 2 (main): beacons that need telemetry installed.
         recordStartupBeacons(lastSeenVersion: lastSeenVersion)
+        // Phase 3: warm the session. Ungated variant — this task IS the startup gate
+        // (`ensureSession` awaits its completion), so the task must END here: anything
+        // sequenced after the warm-up inside this task would also be awaited by every
+        // gated first ad load (see the WebView prewarm, scheduled separately in `start()`).
+        _ = await ensureSessionCoalesced()
+    }
+
+    /// WebView prewarm task body (named method — see the task-shape note in TelemetryManager):
+    /// awaits the startup gate, THEN warms a web view so the first native-ad mount never
+    /// builds a `WKWebView` cold inside a feed layout pass. Strictly after the gate so its
+    /// main-thread cost (WebContent process bring-up) is never on a gated load's critical path.
+    @MainActor
+    private func prewarmWebViewAfterStartup() async {
+        _ = await startupTask?.value
         #if os(iOS)
         WebViewPool.shared.prewarm()
         #endif
-        // Phase 3: warm the session. Ungated variant — this task IS the startup gate.
-        _ = await ensureSessionCoalesced()
     }
 
     /// Off-main startup phase (named method — see the task-shape note in TelemetryManager).
