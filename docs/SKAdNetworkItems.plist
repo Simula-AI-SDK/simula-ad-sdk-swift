@@ -20,7 +20,7 @@
         <!-- Simula Ad Network (registered with Apple, Case-ID 20487689) -->
         <dict>
             <key>SKAdNetworkIdentifier</key>
-            <string>2xg367y5gd.skadnetwork</string>
+            <string>2xg367y5gd.adattributionkit</string>
         </dict>
 
         <!--
