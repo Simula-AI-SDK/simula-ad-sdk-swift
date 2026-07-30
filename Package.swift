@@ -21,7 +21,7 @@ let package = Package(
         .binaryTarget(
             name: "SimulaAdSDK",
             url: "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/1.1.6-dev.1/SimulaAdSDK.xcframework.zip",
-            checksum: "9175d292036fa33d6aff92f285da1741154258a0842a0a01c46feeecabd79aec"
+            checksum: "f4729617a8de87986415dfff864c939fc1a53b1d4ecf297b711b9d3bf389d9fd"
         ),
     ]
 )
