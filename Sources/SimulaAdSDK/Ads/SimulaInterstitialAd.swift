@@ -198,7 +198,13 @@ public final class SimulaInterstitialAd {
 
     private var state: State = .idle
     private var loadTask: Task<Void, Never>?
-    private let api = SimulaAPI()
+    // Lazy, mirroring SimulaProvider.api: hosts construct the ad at launch right after
+    // SimulaAds.initialize, and an eager SimulaAPI() would build the one-time `defaultSession`
+    // static (URLSession + UA/IDFV headers) on the main thread before the deferred startup's
+    // off-main prewarm can run — re-introducing the launch hitch the startup moved off-main.
+    // First touch is then load(), after the prewarm already built the static. @MainActor, so
+    // the lazy initialization is race-free.
+    private lazy var api = SimulaAPI()
 
     // Dedup: the (ad unit, character, session) key of the load currently in flight or
     // ready, and when that load was initiated. Re-loads of the same key are blocked for
