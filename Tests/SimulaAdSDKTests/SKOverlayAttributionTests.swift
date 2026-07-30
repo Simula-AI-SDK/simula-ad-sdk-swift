@@ -1,0 +1,109 @@
+import XCTest
+#if os(iOS)
+import StoreKit
+#endif
+@testable import SimulaAdSDK
+
+/// Tests for the documented SKOverlay SKAN conveyance (`SKOverlay.AppConfiguration.adImpression`).
+///
+/// The view-through signature (`view_attribution_signature`, fidelity-type 0) is REQUIRED — the
+/// click signature is fidelity-type 1 and fails validation on this surface. When it's absent the
+/// presenter falls back to the legacy `setAdditionalValue` path, so `adImpression(...)` must
+/// return nil exactly then.
+final class SKOverlayAttributionTests: XCTestCase {
+
+    private func attribution(_ skanFields: String) throws -> AdAttribution {
+        let json = """
+        {"campaign_token":"camp_tok","provider_token":"prov_tok","skan":{\(skanFields)}}
+        """
+        return try JSONDecoder().decode(AdAttribution.self, from: Data(json.utf8))
+    }
+
+    // MARK: - Decode (platform-independent)
+
+    func testViewAttributionSignatureDecodes() throws {
+        let a = try attribution("""
+        "version":"4.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"n","timestamp":1784691000000,"attribution_signature":"click_sig",
+        "view_attribution_signature":"view_sig","source_id":25
+        """)
+        XCTAssertEqual(a.skan?.viewAttributionSignature, "view_sig")
+        XCTAssertEqual(a.skan?.attributionSignature, "click_sig")
+    }
+
+    func testViewAttributionSignatureAbsentOnOldPayloads() throws {
+        // Servers pre-dating the field omit it — must decode to nil, not fail.
+        let a = try attribution("""
+        "version":"4.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"n","timestamp":1784691000000,"attribution_signature":"click_sig","source_id":25
+        """)
+        XCTAssertNil(a.skan?.viewAttributionSignature)
+    }
+
+    // MARK: - SKAdImpression construction (iOS only — SKAdImpression doesn't exist on macOS)
+
+    #if os(iOS)
+    private func skan4() throws -> AdAttribution {
+        try attribution("""
+        "version":"4.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1784691000000,
+        "attribution_signature":"click_sig","view_attribution_signature":"view_sig","source_id":25
+        """)
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionBuildsWithViewSignature() async throws {
+        let built = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: try skan4())
+        let imp = try XCTUnwrap(built)
+        XCTAssertEqual(imp.version, "4.0")
+        XCTAssertEqual(imp.adNetworkIdentifier, "2xg367y5gd.adattributionkit")
+        XCTAssertEqual(imp.sourceAppStoreItemIdentifier.intValue, 1_671_705_818)
+        XCTAssertEqual(imp.advertisedAppStoreItemIdentifier.intValue, 1_575_412_509)
+        XCTAssertEqual(imp.adImpressionIdentifier, "00000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(imp.timestamp.intValue, 1_784_691_000_000)
+        // The VIEW-THROUGH signature, never the click (fidelity-1) one.
+        XCTAssertEqual(imp.signature, "view_sig")
+        if #available(iOS 16.1, *) {
+            XCTAssertEqual(imp.sourceIdentifier.intValue, 25)
+        }
+        // v4 fallback: campaign slot carries the source id when no campaign_id exists.
+        XCTAssertEqual(imp.adCampaignIdentifier.intValue, 25)
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionNilWithoutViewSignature() async throws {
+        let a = try attribution("""
+        "version":"4.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"n","timestamp":1784691000000,"attribution_signature":"click_sig","source_id":25
+        """)
+        let result = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: a)
+        XCTAssertNil(result)
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionNilWithoutSkanBlock() async throws {
+        let result = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: nil)
+        XCTAssertNil(result)
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionNilOnNonNumericAppID() async throws {
+        let result = await SKOverlayPresenter.adImpression(appID: "not-an-id", attribution: try skan4())
+        XCTAssertNil(result)
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionSkan3UsesCampaignIdentifier() async throws {
+        let a = try attribution("""
+        "version":"3.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"n","timestamp":1784691000000,"attribution_signature":"click_sig",
+        "view_attribution_signature":"view_sig","campaign_id":42
+        """)
+        let built = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: a)
+        let imp = try XCTUnwrap(built)
+        XCTAssertEqual(imp.adCampaignIdentifier.intValue, 42)
+        XCTAssertEqual(imp.signature, "view_sig")
+        XCTAssertEqual(imp.version, "3.0")
+    }
+    #endif
+}

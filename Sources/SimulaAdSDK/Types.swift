@@ -785,6 +785,11 @@ public struct SKANParameters: Sendable, Equatable, Decodable {
     public let attributionSignature: String
     public let campaignIdentifier: Int?
     public let sourceIdentifier: Int?
+    /// View-through signature (fidelity-type 0) for the documented
+    /// `SKAdImpression` API (SKOverlay's `adImpression`). Optional: servers
+    /// pre-dating the field omit it, and the overlay falls back to the
+    /// `setAdditionalValue` conveyance in that case.
+    public let viewAttributionSignature: String?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -795,6 +800,7 @@ public struct SKANParameters: Sendable, Equatable, Decodable {
         case attributionSignature = "attribution_signature"
         case campaignIdentifier = "campaign_id"
         case sourceIdentifier = "source_id"
+        case viewAttributionSignature = "view_attribution_signature"
     }
 }
 

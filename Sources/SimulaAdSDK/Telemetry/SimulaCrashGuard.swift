@@ -59,8 +59,9 @@ private let simulaMaxCrashFileBytes: UInt64 = 64 * 1024
    next `install` replays it.
 
  Gated by the same `telemetryEnabled` flag as the rest of the pipeline: host opt-out ⇒ no capture,
- no replay, no send. `install` is idempotent; call it once from `SimulaProvider.init`, right after
- `Telemetry.shared.initialize`.
+ no replay, no send. `install` is idempotent; call it once from the provider's deferred startup
+ (`runStartupPrewarm`), right after `Telemetry.shared.initialize` — the replay records into the
+ pipeline, so telemetry must exist first, and the call site is off the main thread already.
  */
 final class SimulaCrashGuard: NSObject, @unchecked Sendable {
     static let shared = SimulaCrashGuard()

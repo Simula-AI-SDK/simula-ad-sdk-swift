@@ -23,8 +23,14 @@ Rules for any AI agent or developer writing code in this repository. This SDK sh
 ```
 Host app
   → SimulaProviderView (SwiftUI) | SimulaAds.initialize (imperative)
-    → SimulaProvider.init        ← the single init path: telemetry, crash guard,
-                                    connection monitor, privacy, session all start here
+    → SimulaProvider.init        ← the single init path (cheap, main-thread):
+                                     connection monitor, device signals, privacy apply.
+                                     Everything disk/syscall-heavy is deferred to
+                                     `start()`/`runStartup` (off-main prewarm: IDFV/UA,
+                                     shared URLSession, telemetry, crash-guard install,
+                                     beacon/verification drains, version check →
+                                     session warm-up + WebView prewarm). `ensureSession`
+                                     awaits that startup — no request can race ahead of it.
       → SimulaAPI (transport, models, makeHeaders chokepoint)
         → URLSession (SDK-configured session — never URLSession.shared on ad paths)
   → UI: NativeAdSlot / MiniGame / Interstitial / Rewarded
@@ -92,7 +98,7 @@ await MainActor.run { SimulaAds.initialize(apiKey: key) }
 
 ## Non-negotiable behaviors
 
-- **Single init path**: everything funnels through `SimulaProvider.init` — telemetry, `SimulaCrashGuard`, `SimulaConnectionType`, privacy, session.
+- **Single init path**: everything funnels through `SimulaProvider.init` — but `init` must stay cheap enough to run inline at app launch. One-time disk/syscall costs (IDFV, UA, shared `URLSession` build, telemetry install, version check) belong in the deferred startup (`start()` → `runStartup`/`runStartupPrewarm`), not inline in `init`. `ensureSession` gates on that startup (and lazily kicks it), so "telemetry + privacy before the first request" holds for every entry path.
 - **Session**: `ensureSession()` coalesces concurrent callers into one Task; a failed task is cleared so the next call retries. Never re-create sessions per ad load.
 - **Feed performance**: reads that only need config use `@Environment(\.simulaProvider)` (non-observing), not `@EnvironmentObject` — prevents whole-feed re-renders on `@Published` changes.
 - **WebView pool**: `@MainActor`; consent-aware data store; release = stop loading, nil delegates, `about:blank`; script handlers use the stable-forwarder pattern (never re-register per acquire, never leak on discard).
