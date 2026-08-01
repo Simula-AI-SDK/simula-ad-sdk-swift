@@ -887,7 +887,10 @@ public struct VerifyRewardResponse: Decodable, Sendable {
 
 /// Centralized API client for all Simula endpoints (translates api.ts)
 public final class SimulaAPI: @unchecked Sendable {
-    private let session: URLSession
+    /// The SDK-configured session (tight timeouts, telemetry-metrics delegate). Internal so
+    /// SDK-owned fetchers off the API path (e.g. `GIFImage`) never fall back to
+    /// `URLSession.shared` — an AGENTS.md hard rule.
+    let session: URLSession
     private let identityHeaders: @Sendable () -> [String: String]
 
     /// Shared session tuned for the ad path. The default `URLSession.shared`

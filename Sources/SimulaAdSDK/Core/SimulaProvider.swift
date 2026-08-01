@@ -234,10 +234,16 @@ public final class SimulaProvider: ObservableObject {
     /// awaits the startup gate, THEN warms a web view so the first native-ad mount never
     /// builds a `WKWebView` cold inside a feed layout pass. Strictly after the gate so its
     /// main-thread cost (WebContent process bring-up) is never on a gated load's critical path.
+    /// Skipped at/below the `WebViewPrewarmPolicy` memory floor — a warm view would compete
+    /// with the host for scarce memory before any ad exists (normal pooling is unaffected).
     @MainActor
     private func prewarmWebViewAfterStartup() async {
         _ = await startupTask?.value
         #if os(iOS)
+        if WebViewPrewarmPolicy.shouldSkipStartupPrewarm(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory) {
+            print("[SimulaSDK] WebView startup prewarm skipped: device at/below the \(WebViewPrewarmPolicy.startupMemoryFloorBytes)-byte memory floor.")
+            return
+        }
         WebViewPool.shared.prewarm()
         #endif
     }

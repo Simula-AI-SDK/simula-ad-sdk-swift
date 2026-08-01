@@ -182,12 +182,14 @@ final class CoverImageCache: @unchecked Sendable {
         }
 
         do {
-            // Carry the SDK's standard headers (UA + device id) on this CDN fetch too.
+            // Carry the SDK's standard headers (UA + device id) on this CDN fetch too, and go
+            // through the SDK-configured session (tight timeouts, telemetry-metrics delegate)
+            // — never `URLSession.shared` on an ad path (AGENTS.md hard rule).
             var request = URLRequest(url: requestUrl)
             for (key, value) in SimulaUserAgent.standardHeaders() {
                 request.setValue(value, forHTTPHeaderField: key)
             }
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, _) = try await SimulaAPI.shared.session.data(for: request)
             let (result, cost) = decodeImage(data: data)
             store(result, cost: cost, for: url)
             return result

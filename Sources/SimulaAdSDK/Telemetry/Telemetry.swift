@@ -84,6 +84,15 @@ final class Telemetry: @unchecked Sendable {
         )
         lock.lock(); manager = mgr; lock.unlock()
         mgr.start()
+
+        #if canImport(UIKit)
+        // Persist + deliver buffered telemetry as the app heads to the background (the window
+        // where the process is most likely to be killed). Mirrors Kotlin's ON_STOP hooks.
+        // The flush hops off the posting (main) thread: flushNow persists synchronously.
+        TelemetryBackgroundFlush.shared.install(name: UIApplication.didEnterBackgroundNotification) {
+            DispatchQueue.global(qos: .utility).async { Telemetry.shared.flush() }
+        }
+        #endif
     }
 
     private var current: TelemetryManager? {
