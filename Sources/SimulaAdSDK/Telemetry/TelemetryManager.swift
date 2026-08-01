@@ -16,9 +16,12 @@ struct TelemetryContext {
 }
 
 /// Flush-time battery snapshot (level 0..1 + charging). Best-effort; nil when unavailable.
+/// `stateRaw` is the raw `UIDevice.BatteryState` value (taken on main by `BatteryMonitor`),
+/// consumed by `SimulaDeviceSignals` for the `X-Battery-State` header.
 struct BatteryInfo: Sendable {
     let level: Double
     let charging: Bool
+    let stateRaw: Int
 }
 
 /// Flush-time carrier/radio snapshot. On iOS `carrier` is nil (CTCarrier deprecated); `radio` is

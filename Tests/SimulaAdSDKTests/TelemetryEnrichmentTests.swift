@@ -173,7 +173,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
         )
         let m = build(
             store: FakeStore(), sender: sender, clock: clock,
-            battery: { BatteryInfo(level: 0.5, charging: true) },
+            battery: { BatteryInfo(level: 0.5, charging: true, stateRaw: 2) },
             carrier: { CarrierInfo(carrier: nil, radio: "5G") },
             ctx: ctx
         )

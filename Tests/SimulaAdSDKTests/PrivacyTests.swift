@@ -134,6 +134,23 @@ final class PrivacyTests: XCTestCase {
         XCTAssertFalse(store.currentSnapshot.allowsLocalStorage)
     }
 
+    func testStoreRefreshesWhenIabValuesChangeAfterInit() async {
+        let defaults = makeDefaults()
+        let store = SimulaPrivacy(defaults: defaults)
+        XCTAssertNil(store.currentSnapshot.tcString)
+
+        defaults.set("LATE_TC", forKey: "IABTCF_TCString")
+        // UserDefaults' notification carries no changed key; the store compares its
+        // six-value IAB fingerprint and recomputes only when that fingerprint changed.
+        NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: defaults)
+
+        let deadline = Date().addingTimeInterval(1)
+        while store.currentSnapshot.tcString != "LATE_TC", Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.currentSnapshot.tcString, "LATE_TC")
+    }
+
     // MARK: - Store: explicit overrides
 
     func testExplicitConfigOverridesIAB() {

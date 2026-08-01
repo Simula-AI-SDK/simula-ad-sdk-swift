@@ -100,16 +100,21 @@ public enum SimulaAds {
         do {
             try validateSimulaProviderProps(apiKey: apiKey)
         } catch {
-            // Debug: trap loudly. Release: log + return false (was a silent no-op) so the host gets
-            // a signal at the call site rather than only via later `.notInitialized` ad failures.
-            assertionFailure("[SimulaSDK] \(error.localizedDescription)")
-            print("[SimulaSDK] initialize() failed: \(error.localizedDescription). The SDK is NOT initialized — ad calls will report .notInitialized.")
+            Telemetry.shared.recordError(
+                signature: "init:invalid_config",
+                errorCode: String(describing: type(of: error)),
+                message: error.localizedDescription
+            )
             return false
         }
 
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else {
-            print("[SimulaSDK] initialize() ignored — the SDK is already initialized; the first valid configuration wins.")
+            Telemetry.shared.recordError(
+                signature: "init:duplicate",
+                errorCode: "already_initialized",
+                message: "initialize ignored; first valid configuration wins"
+            )
             return false
         }
 

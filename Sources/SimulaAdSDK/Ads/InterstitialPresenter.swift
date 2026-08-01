@@ -621,11 +621,15 @@ private struct CreativeInterstitialView: View {
     }
 
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
-    /// link) safely no-ops with a console warning.
+    /// link) safely no-ops with a telemetry note.
     private func presentSKOverlay(config: SKOverlayConfig) {
         guard !skOverlayPresented, let appID = resolvedAppID, !appID.isEmpty else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
-                print("[Simula] SKOverlay skipped: could not resolve an App Store id for this creative.")
+                Telemetry.shared.recordError(
+                    signature: "skoverlay:missing_app_id",
+                    errorCode: "unresolvable_store_url",
+                    breadcrumb: "surface=interstitial"
+                )
             }
             return
         }

@@ -55,13 +55,10 @@ final class SimulaDeviceSignals: @unchecked Sendable {
         lock.unlock()
 
         #if os(iOS)
-        // `isBatteryMonitoringEnabled` must be toggled on the main thread; batteryLevel/State read
-        // as unknown/-1 until it is. Harmless process-global flag — no permission, no host UI.
-        if Thread.isMainThread {
-            UIDevice.current.isBatteryMonitoringEnabled = true
-        } else {
-            DispatchQueue.main.async { UIDevice.current.isBatteryMonitoringEnabled = true }
-        }
+        // Battery reads go through BatteryMonitor's MAIN-thread snapshot (AGENTS.md hard rule:
+        // UIDevice battery APIs are main-thread-only — this class reads them on a utility
+        // queue). The monitor self-hops to main and enables monitoring itself; idempotent.
+        BatteryMonitor.shared.start()
         #endif
 
         launchRefresh()
@@ -119,7 +116,9 @@ final class SimulaDeviceSignals: @unchecked Sendable {
 
     private static func currentBatteryLevel() -> Float? {
         #if os(iOS)
-        return UIDevice.current.batteryLevel
+        // Main-thread snapshot via BatteryMonitor — never UIDevice off-main (AGENTS.md rule).
+        guard let info = BatteryMonitor.shared.current else { return nil }
+        return Float(info.level)
         #else
         return nil
         #endif
@@ -127,7 +126,7 @@ final class SimulaDeviceSignals: @unchecked Sendable {
 
     private static func currentBatteryStateRaw() -> Int? {
         #if os(iOS)
-        return UIDevice.current.batteryState.rawValue
+        return BatteryMonitor.shared.current?.stateRaw
         #else
         return nil
         #endif

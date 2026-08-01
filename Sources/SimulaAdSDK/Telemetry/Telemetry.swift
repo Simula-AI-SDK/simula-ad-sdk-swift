@@ -293,8 +293,9 @@ final class BatteryMonitor: @unchecked Sendable {
     private func refresh() {
         let device = UIDevice.current
         let level = device.batteryLevel
+        let stateRaw = device.batteryState.rawValue
         let charging = device.batteryState == .charging || device.batteryState == .full
-        let snap = level >= 0 ? BatteryInfo(level: Double(level), charging: charging) : nil
+        let snap = level >= 0 ? BatteryInfo(level: Double(level), charging: charging, stateRaw: stateRaw) : nil
         lock.lock(); snapshot = snap; lock.unlock()
     }
 

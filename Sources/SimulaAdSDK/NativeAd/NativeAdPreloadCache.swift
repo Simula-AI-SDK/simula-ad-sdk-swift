@@ -25,7 +25,10 @@ final class NativeAdPreloadCache {
     /// here (imperative context → `UITraitCollection`) since there's no SwiftUI environment.
     func preload(provider: SimulaProvider, adUnitId: String?, position: Int, theme: String?) -> String? {
         guard tasks.count < maxEntries else {
-            print("[SimulaSDK] preloadNativeAd ignored — at most \(maxEntries) preloaded ads are kept at once.")
+            Telemetry.shared.recordOperation(
+                name: "native_preload_capped", durationMs: 0, success: false,
+                breadcrumb: "cap=\(maxEntries)"
+            )
             return nil
         }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)

@@ -39,8 +39,11 @@ public final class SimulaPrivacy: ObservableObject {
     private var collectedAdvertisingId: String?
     private var attStatusRaw: Int?
     private var lockedSnapshot = ConsentSnapshot()
-    private var observer: NSObjectProtocol?
+    private var defaultsObserver: NSObjectProtocol?
     private var foregroundObserver: NSObjectProtocol?
+    /// Last normalized values for the six IAB keys. `didChangeNotification` carries no key,
+    /// so comparing this fingerprint filters unrelated host-defaults writes reliably.
+    private var lastIABFingerprint: IABDefaultsFingerprint?
 
     /// IAB-standard `UserDefaults` keys, written by an in-app CMP.
     private enum IABKey {
@@ -52,22 +55,35 @@ public final class SimulaPrivacy: ObservableObject {
         static let gppSid = "IABGPP_GppSID"
     }
 
+    private struct IABDefaultsFingerprint: Equatable {
+        let tcString: String?
+        let gdprApplies: String?
+        let purposeConsents: String?
+        let uspString: String?
+        let gppString: String?
+        let gppSid: String?
+    }
+
     private static let zeroUUID = "00000000-0000-0000-0000-000000000000"
 
     // MARK: - Init
-
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         recompute()
-        // CMPs write the IAB keys asynchronously and may refresh them later; pick
-        // changes up automatically. `object: nil` because the notification is not
-        // reliably posted with the defaults instance as its object.
-        observer = NotificationCenter.default.addObserver(
+        lastIABFingerprint = iabFingerprint()
+        // CMPs write IAB keys asynchronously and may refresh them later. The notification
+        // has no changed-key payload, so compare only the six normalized IAB values and
+        // recompute when that fingerprint changed — unrelated host defaults writes no-op.
+        defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.recompute()
+            guard let self else { return }
+            let fingerprint = self.iabFingerprint()
+            guard fingerprint != self.lastIABFingerprint else { return }
+            self.lastIABFingerprint = fingerprint
+            self.recompute()
         }
         #if os(iOS)
         // ATT/IDFA can change while backgrounded (Settings, GAID reset). Re-read
@@ -84,7 +100,7 @@ public final class SimulaPrivacy: ObservableObject {
     }
 
     deinit {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
+        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
         if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
     }
 
@@ -337,5 +353,17 @@ public final class SimulaPrivacy: ObservableObject {
     private func readPurpose1Consent() -> Bool? {
         guard let s = coercedString(IABKey.purposeConsents) else { return nil }
         return s.first == "1"
+    }
+
+    /// Normalized IAB-only snapshot used to filter the keyless UserDefaults notification.
+    private func iabFingerprint() -> IABDefaultsFingerprint {
+        IABDefaultsFingerprint(
+            tcString: coercedString(IABKey.tcString),
+            gdprApplies: coercedString(IABKey.gdprApplies),
+            purposeConsents: coercedString(IABKey.purposeConsents),
+            uspString: coercedString(IABKey.uspString),
+            gppString: coercedString(IABKey.gppString),
+            gppSid: readGppSid()
+        )
     }
 }

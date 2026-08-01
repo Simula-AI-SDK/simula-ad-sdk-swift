@@ -272,6 +272,12 @@ private struct MobileCarouselView: View {
                     }
             )
         }
+        .onDisappear {
+            // Halt the spring's CADisplayLink as soon as the carousel leaves the screen —
+            // it otherwise keeps ticking (retaining animator + view via the runloop) until
+            // the spring settles or deinit runs (Phase 8 hygiene).
+            animator.stopAnimation()
+        }
     }
 }
 
