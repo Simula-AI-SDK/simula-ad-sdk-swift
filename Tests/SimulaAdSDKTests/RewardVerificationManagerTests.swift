@@ -264,6 +264,53 @@ final class RewardVerificationManagerTests: XCTestCase {
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
     // applicable here, as Swift completion closures are non-throwing by type.
 
+    // MARK: - iOS-4: cap / TTL
+
+    func testQueueIsCappedAndDropsOldestOnOverflow() async {
+        let verifier = FakeVerifier()
+        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        // 500 for everything so entries stay queued and accumulate to the cap.
+        for i in 0..<maxPendingBeacons {
+            verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "srv_\(i)")
+        }
+        for i in 0..<maxPendingBeacons {
+            mgr.queueVerification(serveId: "srv_\(i)", sessionId: "s", elapsedPlayTime: 5)
+        }
+        try? await waitUntil(timeout: 3) { self.persistedQueue().count == maxPendingBeacons }
+
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "newest")
+        mgr.queueVerification(serveId: "newest", sessionId: "s", elapsedPlayTime: 5)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let queue = persistedQueue()
+        XCTAssertEqual(queue.count, maxPendingBeacons, "cap holds")
+        XCTAssertTrue(queue.contains { $0.serveId == "newest" }, "the newest is never dropped")
+        XCTAssertFalse(queue.contains { $0.serveId == "srv_0" }, "the oldest was dropped")
+    }
+
+    func testExpiredVerificationsArePrunedAtLoad() async {
+        // Seed at now = 10_000_000: one entry past the 24h TTL (expired) + one 100s old (fresh).
+        let nowTs: TimeInterval = 10_000_000
+        let stale = PendingVerification(
+            serveId: "stale", sessionId: "s", elapsedPlayTime: 5, retryCount: 0,
+            lastAttemptTimestamp: 0, createdAt: nowTs - durableQueueMaxAgeSeconds - 1
+        )
+        let fresh = PendingVerification(
+            serveId: "fresh", sessionId: "s", elapsedPlayTime: 5, retryCount: 0,
+            lastAttemptTimestamp: 0, createdAt: nowTs - 100
+        )
+        defaults.set(try! JSONEncoder().encode([stale, fresh]), forKey: queueKey)
+
+        let verifier = FakeVerifier()
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "fresh") // keep queued
+        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { nowTs })
+        mgr.triggerProcessQueue()
+        try? await waitUntil(timeout: 2) { self.persistedQueue().count == 1 }
+
+        XCTAssertEqual(persistedQueue().first?.serveId, "fresh", "the expired row is pruned at load, never retried")
+        XCTAssertEqual(verifier.callCount("stale"), 0)
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async throws {

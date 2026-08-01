@@ -126,9 +126,96 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertTrue(persistedQueue().isEmpty)
         XCTAssertEqual(sender.totalCalls, 0)
     }
+
+    // MARK: - iOS-4: cap / TTL / batched persistence
+
+    func testQueueIsCappedAndDropsOldestOnOverflow() async {
+        let sender = FakeBeaconSender()
+        // 503 for everything so entries stay queued and accumulate to the cap.
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        for i in 0..<maxPendingBeacons { sender.setCode(503, for: "imp_\(i)", "seen") }
+        for i in 0..<maxPendingBeacons { mgr.enqueue(impressionId: "imp_\(i)", action: "seen") }
+        await waitUntil(timeout: 2) { self.persistedQueue().count == maxPendingBeacons }
+
+        sender.setCode(503, for: "newest", "seen")
+        mgr.enqueue(impressionId: "newest", action: "seen")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let queue = persistedQueue()
+        XCTAssertEqual(queue.count, maxPendingBeacons, "cap holds")
+        XCTAssertTrue(queue.contains { $0.impressionId == "newest" }, "the newest is never dropped")
+        XCTAssertFalse(queue.contains { $0.impressionId == "imp_0" }, "the oldest was dropped")
+    }
+
+    func testExpiredBeaconsArePrunedAtLoad() async {
+        // Seed at now = 10_000_000: one entry past the 24h TTL (expired) + one 100s old (fresh).
+        let nowTs: TimeInterval = 10_000_000
+        let stale = PendingBeacon(impressionId: "stale", action: "seen", createdAt: nowTs - durableQueueMaxAgeSeconds - 1)
+        let fresh = PendingBeacon(impressionId: "fresh", action: "seen", createdAt: nowTs - 100)
+        defaults.set(try! JSONEncoder().encode([stale, fresh]), forKey: queueKey)
+
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "fresh", "seen") // keep the fresh one queued
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { nowTs })
+        mgr.triggerProcessQueue()
+        await waitUntil(timeout: 2) { self.persistedQueue().count == 1 }
+
+        XCTAssertEqual(persistedQueue().first?.impressionId, "fresh", "the expired row is pruned at load, never retried")
+        XCTAssertEqual(sender.callCount("stale", "seen"), 0)
+    }
+
+    func testLegacyRowsWithoutCreatedAtAreStampedAndKept() async {
+        // A pre-TTL blob has no createdAt key — it must decode (optional field), be stamped
+        // with a TTL baseline, and survive the load instead of being dropped.
+        let legacyJson = #"[{"impressionId":"old","action":"seen","retryCount":0,"lastAttemptTimestamp":0}]"#.data(using: .utf8)!
+        defaults.set(legacyJson, forKey: queueKey)
+
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "old", "seen")
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 42 })
+        mgr.triggerProcessQueue()
+        await waitUntil(timeout: 2) { !self.persistedQueue().isEmpty && self.persistedQueue()[0].createdAt != nil }
+
+        XCTAssertEqual(persistedQueue()[0].createdAt, 42, "never-attempted legacy rows get 'now' as the TTL baseline")
+    }
+
+    func testADrainPassPersistsOnceNotPerDeliveredBeacon() async {
+        let counting = CountingDefaults(suiteName: "beacon-count-\(UUID().uuidString)")!
+        defer { counting.removePersistentDomain(forName: counting.suiteNameForTests) }
+        // Seed 5 beacons WITH createdAt (so the load isn't dirty and doesn't write).
+        let nowTs: TimeInterval = 1_000
+        let seeded = (0..<5).map { PendingBeacon(impressionId: "imp_\($0)", action: "seen", createdAt: nowTs) }
+        counting.set(try! JSONEncoder().encode(seeded), forKey: queueKey)
+        let baseline = counting.setCount
+
+        let sender = FakeBeaconSender() // default 200 → everything delivers
+        let mgr = AdBeaconManager(sender: sender, defaults: counting, now: { nowTs })
+        mgr.triggerProcessQueue()
+        await waitUntil(timeout: 2) { counting.setCount > baseline }
+
+        XCTAssertEqual(counting.setCount - baseline, 1, "one batched write for a 5-beacon drain pass (was one per removal)")
+        XCTAssertEqual(sender.totalCalls, 5)
+    }
 }
 
 // MARK: - Test double
+
+/// Counts `set(_:forKey:)` calls so the batched-persist shape is observable without a seam change.
+private final class CountingDefaults: UserDefaults {
+    private let lock = NSLock()
+    private(set) var setCount = 0
+    let suiteNameForTests: String
+
+    override init?(suiteName: String?) {
+        suiteNameForTests = suiteName ?? "counting-defaults"
+        super.init(suiteName: suiteName)
+    }
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock(); setCount += 1; lock.unlock()
+        super.set(value, forKey: defaultName)
+    }
+}
 
 private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
     private let lock = NSLock()

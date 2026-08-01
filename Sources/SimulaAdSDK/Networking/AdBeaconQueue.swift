@@ -11,6 +11,25 @@ struct PendingBeacon: Codable, Equatable {
     let action: String
     var retryCount: Int = 0
     var lastAttemptTimestamp: Double = 0
+    /// Enqueue time, for the TTL prune. Optional so rows persisted before this field
+    /// existed still decode (stamped at first load).
+    var createdAt: TimeInterval? = nil
+}
+
+/// Hard cap on each durable queue (billing beacons + reward verifications). On overflow the
+/// oldest entry is dropped (and recorded) — a stuck endpoint + nonstop ads must never grow
+/// the durable blob unboundedly (AND-2/iOS-4).
+let maxPendingBeacons = 200
+
+/// TTL for durable-queue entries: a beacon/verification older than this is outside any useful
+/// attribution window and pruned at load instead of retried forever.
+let durableQueueMaxAgeSeconds: TimeInterval = 24 * 3_600
+
+/// `UserDefaults` is thread-safe (Apple docs) but not marked `Sendable` — box it so the
+/// background persist closure can carry it without tripping Swift 6 `#SendableClosureCaptures`.
+final class UncheckedSendableDefaults: @unchecked Sendable {
+    let defaults: UserDefaults
+    init(_ defaults: UserDefaults) { self.defaults = defaults }
 }
 
 // MARK: - Seam
@@ -35,6 +54,12 @@ extension SimulaAPI: BeaconSending {}
 ///   over-count risk — acceptable vs. today's silent loss, removable once the endpoint takes an
 ///   idempotency key.)
 /// - Durable: persisted to `UserDefaults`; survives relaunch, recovered on the next trigger.
+/// - Bounded: at most `maxPendingBeacons` entries (drop-oldest on overflow, recorded).
+/// - Batched + off-main persistence: the queue lives in memory after one initial load; each
+///   drain pass persists ONCE (per-mutation decode+encode+set on the main thread was O(n²)
+///   jank), and the write itself runs on a utility queue. A crash mid-drain re-sends
+///   already-accepted beacons — safe: `/seen` is deduped server-side, `/click` over-count is
+///   the same small risk the retry path already accepts.
 /// - Backed off: failed attempts retry with the shared exponential backoff (5s → 60s cap).
 ///
 /// `@unchecked Sendable` is safe: mutable state is guarded by `lock`, and `URLSession` inside
@@ -46,14 +71,21 @@ public final class AdBeaconManager: @unchecked Sendable {
     private let sender: BeaconSending
     private let defaults: UserDefaults
     private let now: @Sendable () -> TimeInterval
+    /// Executes the JSON-encode + `UserDefaults.set` persist off the calling thread
+    /// (production: a serial utility queue; tests inject a synchronous runner).
+    private let performPersist: @Sendable (@escaping @Sendable () -> Void) -> Void
     private let lock = NSLock()
     private var isProcessing = false
     private var apiKey: String?
+    /// In-memory queue — loaded lazily on first use. Guarded by `lock`.
+    private var cache: [PendingBeacon]?
 
     private init() {
         self.sender = SimulaAPI()
         self.defaults = .standard
         self.now = { Date().timeIntervalSince1970 }
+        let persistQueue = DispatchQueue(label: "com.simula.adbeacon.persist", qos: .utility)
+        self.performPersist = { work in persistQueue.async(execute: work) }
     }
 
     /// Test seam: inject a fake sender, isolated `UserDefaults`, and a controllable clock.
@@ -62,6 +94,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         self.defaults = defaults
         self.now = now
         self.apiKey = apiKey
+        self.performPersist = { work in work() }
     }
 
     /// Provide the api key (the beacon endpoints are Bearer-authed). Call once at SDK init; first wins.
@@ -86,10 +119,19 @@ public final class AdBeaconManager: @unchecked Sendable {
             break
         }
         lock.lock()
-        var list = loadQueue()
+        var list = loadQueueLocked()
         if !list.contains(where: { $0.impressionId == impressionId && $0.action == action }) {
-            list.append(PendingBeacon(impressionId: impressionId, action: action))
-            saveQueue(list)
+            if list.count >= maxPendingBeacons {
+                list.removeFirst() // drop oldest: bounded queue > an unbounded main-thread backlog
+                Telemetry.shared.recordError(
+                    signature: "beacon:queue_overflow",
+                    errorCode: "queue_full",
+                    message: "pending beacon queue at cap (\(maxPendingBeacons)) — dropped oldest"
+                )
+            }
+            list.append(PendingBeacon(impressionId: impressionId, action: action, createdAt: now()))
+            cache = list
+            persistLocked()
         }
         lock.unlock()
         triggerProcessQueue()
@@ -144,10 +186,11 @@ public final class AdBeaconManager: @unchecked Sendable {
     private func finishProcessing(reDrainIfEligible: Bool) {
         lock.lock()
         isProcessing = false
+        persistLocked() // ONE persist per drain pass (was per mutation — the O(n²) shape)
         var reDrain = false
         if reDrainIfEligible {
             let nowTs = now()
-            reDrain = loadQueue().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
+            reDrain = loadQueueLocked().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
         }
         lock.unlock()
         if reDrain { triggerProcessQueue() }
@@ -163,38 +206,66 @@ public final class AdBeaconManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let nowTs = now()
-        return loadQueue().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
+        return loadQueueLocked().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
     }
 
     private func removeTask(_ task: PendingBeacon) {
         lock.lock()
         defer { lock.unlock() }
-        var queue = loadQueue()
-        queue.removeAll { $0.impressionId == task.impressionId && $0.action == task.action }
-        saveQueue(queue)
+        // In-memory mutation only — the drain pass persists once, in finishProcessing.
+        cache?.removeAll { $0.impressionId == task.impressionId && $0.action == task.action }
     }
 
     private func recordAttempt(_ task: PendingBeacon) {
         lock.lock()
         defer { lock.unlock() }
-        var queue = loadQueue()
-        if let idx = queue.firstIndex(where: { $0.impressionId == task.impressionId && $0.action == task.action }) {
-            queue[idx].retryCount += 1
-            queue[idx].lastAttemptTimestamp = now()
-        }
-        saveQueue(queue)
+        // In-memory mutation only — persisted by the drain pass's single write.
+        guard let idx = cache?.firstIndex(where: { $0.impressionId == task.impressionId && $0.action == task.action }) else { return }
+        cache?[idx].retryCount += 1
+        cache?[idx].lastAttemptTimestamp = now()
     }
 
     // MARK: - Persistence
 
+    /// The live queue, in memory after one lazy disk load (which also stamps legacy rows and
+    /// prunes expired ones). MUST only be called under `lock`.
+    private func loadQueueLocked() -> [PendingBeacon] {
+        if let cache { return cache }
+        let nowTs = now()
+        var dirty = false
+        let list: [PendingBeacon] = loadQueue().compactMap { beacon in
+            var b = beacon
+            if b.createdAt == nil || b.createdAt == 0 {
+                // Legacy row (pre-TTL): baseline = its last attempt (or now when never
+                // attempted), so genuinely old rows expire instead of retrying forever.
+                b.createdAt = b.lastAttemptTimestamp > 0 ? b.lastAttemptTimestamp : nowTs
+                dirty = true
+            }
+            if nowTs - (b.createdAt ?? nowTs) > durableQueueMaxAgeSeconds {
+                dirty = true
+                return nil // TTL prune: outside any useful attribution window
+            }
+            return b
+        }
+        cache = list
+        if dirty { persistLocked() }
+        return list
+    }
+
+    /// Encode + write the current cache off the calling thread (snapshot is a value type).
+    /// MUST only be called under `lock`.
+    private func persistLocked() {
+        guard let cache else { return }
+        let box = UncheckedSendableDefaults(defaults)
+        performPersist { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(cache) {
+                box.defaults.set(data, forKey: userDefaultsKey)
+            }
+        }
+    }
+
     private func loadQueue() -> [PendingBeacon] {
         guard let data = defaults.data(forKey: userDefaultsKey) else { return [] }
         return (try? JSONDecoder().decode([PendingBeacon].self, from: data)) ?? []
-    }
-
-    private func saveQueue(_ queue: [PendingBeacon]) {
-        if let data = try? JSONEncoder().encode(queue) {
-            defaults.set(data, forKey: userDefaultsKey)
-        }
     }
 }

@@ -346,9 +346,11 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// web-content process is terminated (`reload()` can't restore a `loadHTMLString` load — its URL
         /// is the baseURL, not the content).
         var currentBaseURL: URL?
-        /// One-shot guard for the reload-after-termination recovery, so a creative that reliably crashes
-        /// the renderer can't spin in a reload loop. Reset on each successful load (`didFinish`).
-        var renderRecoveryAttempted = false
+        /// CUMULATIVE count of reload-after-termination recoveries for this creative, never
+        /// reset — the old one-shot flag reset on every clean `didFinish`, so a creative that
+        /// loads and then repeatedly kills its renderer (memory bomb, repeated OS jettison)
+        /// cycled terminate→reload→reset forever (iOS-6). Capped at `maxRenderRecoveries`.
+        var renderRecoveryCount = 0
         /// True when the current main-frame load answered 4xx/5xx. WKWebView renders the error body
         /// as a *successful* navigation, so without this flag the ensuing `didFinish` would mark the
         /// retained session healthy (`noteLoadSucceeded`) right after the HTTP error marked it
@@ -553,12 +555,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 pageStartUptime = nil
                 return
             }
-            // A clean load means the (possibly just-reloaded) creative is healthy — restore the
-            // one-shot render-recovery budget for any future web-content-process termination.
-            renderRecoveryAttempted = false
             // Retained native-ad view: clear the store's render-dead flag too, so a recovered view
             // is retained (not destroyed) on the next detach. Synchronous on main so a same-runloop
-            // detach/attach sees the updated state.
+            // detach/attach sees the updated state. (The render-recovery COUNT is deliberately
+            // NOT restored here — it is cumulative per creative; see webViewWebContentProcessDidTerminate.)
             if retainedImpressionId != nil {
                 NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(webView))
             }
@@ -597,17 +597,23 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Recover in place: a WKWebView is reusable after a termination, so re-issue the SAME
             // creative so the slot comes back instead of collapsing. reload() can't restore a
             // loadHTMLString load (its URL is the baseURL, not the content), so re-load the stored
-            // content. One-shot per successful load (reset in didFinish) so a creative that reliably
-            // crashes the renderer can't spin a reload loop.
-            if !renderRecoveryAttempted {
+            // content — with a BACKOFF and a CUMULATIVE cap: a creative that reliably kills the
+            // renderer gets at most `maxRenderRecoveries` tries, ever (never reset in didFinish),
+            // so it can't spin a reload→crash→reload loop (iOS-6).
+            if renderRecoveryCount < maxRenderRecoveries {
+                renderRecoveryCount += 1
+                let delaySeconds = renderRecoveryBackoff(attempt: renderRecoveryCount)
                 if let html = currentHTML {
-                    renderRecoveryAttempted = true
-                    webView.loadHTMLString(html, baseURL: currentBaseURL)
+                    let baseURL = currentBaseURL
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { [weak webView] in
+                        webView?.loadHTMLString(html, baseURL: baseURL)
+                    }
                     return
                 }
                 if let url = currentURL {
-                    renderRecoveryAttempted = true
-                    webView.load(URLRequest(url: url))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { [weak webView] in
+                        webView?.load(URLRequest(url: url))
+                    }
                     return
                 }
             }

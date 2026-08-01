@@ -15,6 +15,9 @@ struct PendingVerification: Codable, Equatable {
     /// queue entries persisted before this field existed still decode (as `nil`) instead of being
     /// dropped — which would lose the pending reward.
     var adUnitId: String?
+    /// Enqueue time, for the TTL prune. Optional so rows persisted before this field existed
+    /// still decode (stamped at first load).
+    var createdAt: TimeInterval? = nil
 }
 
 // MARK: - Seams (injected so the queue is unit-testable without the network/clock)
@@ -70,6 +73,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private let sleep: @Sendable (TimeInterval) async -> Void
     private let lock = NSLock()
     private var isProcessing = false
+    /// In-memory queue — loaded lazily on first use. Guarded by `lock`.
+    private var cache: [PendingVerification]?
+    /// Executes the JSON-encode + `UserDefaults.set` persist off the calling thread
+    /// (production: a serial utility queue; tests inject a synchronous runner).
+    private let performPersist: @Sendable (@escaping @Sendable () -> Void) -> Void
 
     /// A scheduled wake-up for the earliest backed-off task after a retryable failure (e.g. a
     /// server 5xx). Without it the backoff computed eligibility but nothing ever re-triggered
@@ -90,6 +98,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.sleep = { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
+        let persistQueue = DispatchQueue(label: "com.simula.rewardverify.persist", qos: .utility)
+        self.performPersist = { work in persistQueue.async(execute: work) }
     }
 
     /// Test seam: inject a fake verifier, an isolated `UserDefaults`, a controllable
@@ -107,6 +117,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.sleep = sleep ?? { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
+        self.performPersist = { work in work() }
     }
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
@@ -126,8 +137,16 @@ public final class RewardVerificationManager: @unchecked Sendable {
         if let completion = completion {
             activeCallbacks[serveId] = completion
         }
-        var list = loadQueue()
+        var list = loadQueueLocked()
         if !list.contains(where: { $0.serveId == serveId }) {
+            if list.count >= maxPendingBeacons {
+                list.removeFirst() // drop oldest: bounded queue > an unbounded main-thread backlog
+                Telemetry.shared.recordError(
+                    signature: "reward:queue_overflow",
+                    errorCode: "queue_full",
+                    message: "pending verification queue at cap (\(maxPendingBeacons)) — dropped oldest"
+                )
+            }
             list.append(
                 PendingVerification(
                     serveId: serveId,
@@ -135,10 +154,12 @@ public final class RewardVerificationManager: @unchecked Sendable {
                     elapsedPlayTime: elapsedPlayTime,
                     retryCount: 0,
                     lastAttemptTimestamp: 0,
-                    adUnitId: adUnitId
+                    adUnitId: adUnitId,
+                    createdAt: now()
                 )
             )
-            saveQueue(list)
+            cache = list
+            persistLocked()
         }
         lock.unlock()
 
@@ -212,18 +233,19 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private func finishProcessing(reDrainIfEligible: Bool) {
         lock.lock()
         isProcessing = false
+        persistLocked() // ONE persist per drain pass (was per mutation — the O(n²) shape)
         var reDrain = false
         var retryDelay: TimeInterval?
         let nowTs = now()
         if reDrainIfEligible {
-            reDrain = loadQueue().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
+            reDrain = loadQueueLocked().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
         } else {
             // Bailed on a retryable failure: schedule a wake at the earliest remaining backoff so
             // the retry actually happens in-session, instead of waiting for the next enqueue or
             // launch. Scheduled ONLY from the bail path (not from every pass with pending tasks),
             // so a wake that finds nothing eligible — e.g. under a frozen test clock — terminates
             // instead of rescheduling itself forever.
-            let queue = loadQueue()
+            let queue = loadQueueLocked()
             if !queue.isEmpty {
                 let soonest = queue
                     .map { rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp) }
@@ -261,38 +283,66 @@ public final class RewardVerificationManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let nowTs = now()
-        return loadQueue().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
+        return loadQueueLocked().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
     }
 
     private func removeTask(serveId: String) {
         lock.lock()
         defer { lock.unlock() }
-        var queue = loadQueue()
-        queue.removeAll { $0.serveId == serveId }
-        saveQueue(queue)
+        // In-memory mutation only — the drain pass persists once, in finishProcessing.
+        cache?.removeAll { $0.serveId == serveId }
     }
 
     private func recordAttempt(serveId: String) {
         lock.lock()
         defer { lock.unlock() }
-        var queue = loadQueue()
-        if let idx = queue.firstIndex(where: { $0.serveId == serveId }) {
-            queue[idx].retryCount += 1
-            queue[idx].lastAttemptTimestamp = now()
-        }
-        saveQueue(queue)
+        // In-memory mutation only — persisted by the drain pass's single write.
+        guard let idx = cache?.firstIndex(where: { $0.serveId == serveId }) else { return }
+        cache?[idx].retryCount += 1
+        cache?[idx].lastAttemptTimestamp = now()
     }
 
     // MARK: - Persistence
 
+    /// The live queue, in memory after one lazy disk load (which also stamps legacy rows and
+    /// prunes expired ones). MUST only be called under `lock`.
+    private func loadQueueLocked() -> [PendingVerification] {
+        if let cache { return cache }
+        let nowTs = now()
+        var dirty = false
+        let list: [PendingVerification] = loadQueue().compactMap { verification in
+            var v = verification
+            if v.createdAt == nil || v.createdAt == 0 {
+                // Legacy row (pre-TTL): baseline = its last attempt (or now when never
+                // attempted), so genuinely old rows expire instead of retrying forever.
+                v.createdAt = v.lastAttemptTimestamp > 0 ? v.lastAttemptTimestamp : nowTs
+                dirty = true
+            }
+            if nowTs - (v.createdAt ?? nowTs) > durableQueueMaxAgeSeconds {
+                dirty = true
+                return nil // TTL prune: outside any useful attribution window
+            }
+            return v
+        }
+        cache = list
+        if dirty { persistLocked() }
+        return list
+    }
+
+    /// Encode + write the current cache off the calling thread (snapshot is a value type).
+    /// MUST only be called under `lock`.
+    private func persistLocked() {
+        guard let cache else { return }
+        let box = UncheckedSendableDefaults(defaults)
+        performPersist { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(cache) {
+                box.defaults.set(data, forKey: userDefaultsKey)
+            }
+        }
+    }
+
     private func loadQueue() -> [PendingVerification] {
         guard let data = defaults.data(forKey: userDefaultsKey) else { return [] }
         return (try? JSONDecoder().decode([PendingVerification].self, from: data)) ?? []
-    }
-
-    private func saveQueue(_ queue: [PendingVerification]) {
-        if let data = try? JSONEncoder().encode(queue) {
-            defaults.set(data, forKey: userDefaultsKey)
-        }
     }
 }

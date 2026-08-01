@@ -485,7 +485,13 @@ final class TelemetryManager: @unchecked Sendable {
             result = (false, true)
         }
         lock.unlock()
-        persistSync(snapshot)
+        // Async persist (iOS-7): flush() runs on the cooperative pool, and persistSync would
+        // block one of its few threads behind the utility-QoS persist backlog under an error
+        // storm (QoS inversion). Ordering is still preserved — every write serializes on
+        // persistQueue — and the reconcile already landed in memory under the lock, so a
+        // later snapshot can't miss it. Sync durability stays on the app-background path
+        // (persistNow), where the write must complete before suspension.
+        persistAsync(snapshot)
         return result
     }
 

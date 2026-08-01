@@ -49,8 +49,17 @@ final class CoverImageCache: @unchecked Sendable {
     private static let maxPixelSize: CGFloat = 800
     /// Sample frames of very long GIFs so frame count can't blow up memory/CPU.
     private static let maxFrames = 60
-    /// ~96 MB ceiling for all decoded covers combined; NSCache evicts past this.
-    private static let totalCostLimit = 96 * 1024 * 1024
+    /// Per-decode byte budget: stop sampling frames once a single GIF's decoded bitmaps pass
+    /// this — the animation plays truncated (durations are folded) instead of spiking the
+    /// heap (60 frames at the 800 px cap ≈ 146 MB unbounded). Worst concurrent decode spike
+    /// is then `maxConcurrentPreloads × maxDecodeBudgetBytes` (iOS-5).
+    private static let maxDecodeBudgetBytes = 24 * 1024 * 1024
+    /// Concurrent preload loads — one task per catalog cover otherwise multiplies the
+    /// per-decode peak above and hammers the network on first open.
+    private static let maxConcurrentPreloads = 3
+    /// ~32 MB ceiling for all decoded covers combined; NSCache evicts past this (was 96 MB —
+    /// lowered now that per-decode peaks are bounded, so steady-state pressure drops too).
+    private static let totalCostLimit = 32 * 1024 * 1024
 
     /// Boxes the enum so it can live in NSCache (which requires class values).
     private final class Entry {
@@ -95,15 +104,32 @@ final class CoverImageCache: @unchecked Sendable {
         #endif
     }
 
-    /// Preload multiple URLs in parallel. Completes when all are cached.
+    /// Preload multiple URLs, at most `maxConcurrentPreloads` in flight at once. Completes
+    /// when all are cached.
     func preload(urls: [String]) async {
-        await withTaskGroup(of: Void.self) { group in
-            for url in urls {
-                guard cache.object(forKey: url as NSString) == nil else { continue }
-                // Single-call task closure — see the task-shape note in TelemetryManager.
-                group.addTask { [weak self] in _ = await self?.load(url: url) }
+        for chunk in CoverImageCache.chunks(urls, size: CoverImageCache.maxConcurrentPreloads) {
+            await withTaskGroup(of: Void.self) { group in
+                for url in chunk {
+                    guard cache.object(forKey: url as NSString) == nil else { continue }
+                    // Single-call task closure — see the task-shape note in TelemetryManager.
+                    group.addTask { [weak self] in _ = await self?.load(url: url) }
+                }
             }
         }
+    }
+
+    /// Splits `urls` into consecutive chunks of `size` (the preload fan-out bound; pure so
+    /// the chunking is unit-testable).
+    static func chunks(_ urls: [String], size: Int) -> [[String]] {
+        guard size > 0 else { return [urls] }
+        var out: [[String]] = []
+        out.reserveCapacity((urls.count + size - 1) / size)
+        var i = 0
+        while i < urls.count {
+            out.append(Array(urls[i..<min(i + size, urls.count)]))
+            i += size
+        }
+        return out
     }
 
     /// Load a single URL, returning the cached result if available. Concurrent
@@ -254,6 +280,9 @@ final class CoverImageCache: @unchecked Sendable {
         var cost = 0
         var i = 0
         while i < count {
+            // Per-decode budget: truncate (durations are folded, so the animation still
+            // plays at reduced fidelity) instead of spiking the heap on a huge source.
+            if cost >= CoverImageCache.maxDecodeBudgetBytes { break }
             if let cgImage = downsample(source: source, index: i) {
                 // Fold the durations of any skipped frames into this one so the
                 // overall animation length is preserved.
