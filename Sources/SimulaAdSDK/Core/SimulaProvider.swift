@@ -241,7 +241,12 @@ public final class SimulaProvider: ObservableObject {
         _ = await startupTask?.value
         #if os(iOS)
         if WebViewPrewarmPolicy.shouldSkipStartupPrewarm(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory) {
-            print("[SimulaSDK] WebView startup prewarm skipped: device at/below the \(WebViewPrewarmPolicy.startupMemoryFloorBytes)-byte memory floor.")
+            // Telemetry, not console (rule): contract event name, outcome in the existing
+            // breadcrumb field — no new envelope fields.
+            Telemetry.shared.recordOperation(
+                name: "webview_prewarm", durationMs: 0, success: true,
+                breadcrumb: "outcome=skipped;reason=memory_floor"
+            )
             return
         }
         WebViewPool.shared.prewarm()

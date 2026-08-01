@@ -271,19 +271,22 @@ enum CreativeCTARouter {
     private static var safariDelegateAssocKey: UInt8 = 0
 
     /// Guards against stacking a second in-app sheet (store OR Safari) on top of one
-    /// already showing — only one external surface should be up at a time. Set `true`
-    /// only after a confirmed present (and never set on a failed present), so a
-    /// no-window early-return can't wedge all future CTAs shut. Each sheet's delegate
-    /// resets it on dismiss.
-    private static var isPresentingExternal = false
+    /// already showing — only one external surface should be up at a time. Weak slot, not a
+    /// boolean: a sheet destroyed WITHOUT its dismissal delegate firing (the presenter tears
+    /// down its window, the host dismisses its own VC under the sheet, or StoreKit's
+    /// swipe-down misses `productViewControllerDidFinish`) clears itself, so future CTAs are
+    /// never wedged shut. Occupied only after a confirmed present (never on a failed
+    /// present), so a no-window early-return can't block future CTAs either. Each sheet's
+    /// delegate clears it on dismissal.
+    private static let externalSheetSlot = WeakPresentationSlot<UIViewController>()
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
     /// campaign/provider/SKAN [attribution] tokens so the install it drives is credited to the campaign.
     static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) {
-        guard !isPresentingExternal else { return }
+        guard !externalSheetSlot.isOccupied else { return }
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
-            isPresentingExternal = false
+            externalSheetSlot.clear()
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         storeVC.delegate = delegate
@@ -296,9 +299,9 @@ enum CreativeCTARouter {
         )
         storeVC.loadProduct(withParameters: storeProductParameters(appID: appID, attribution: attribution))
         // Only mark "showing" once the present actually succeeds; otherwise the
-        // guard would stick true forever on a no-window early-return.
+        // guard would stick occupied forever on a no-window early-return.
         if presentViewController(storeVC) {
-            isPresentingExternal = true
+            externalSheetSlot.occupy(storeVC)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }
@@ -360,10 +363,10 @@ enum CreativeCTARouter {
 
     /// Presents `SFSafariViewController` for external links.
     static func presentSafari(url: URL) {
-        guard !isPresentingExternal else { return }
+        guard !externalSheetSlot.isOccupied else { return }
         let safariVC = SFSafariViewController(url: url)
         let delegate = SafariDelegate {
-            isPresentingExternal = false
+            externalSheetSlot.clear()
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         safariVC.delegate = delegate
@@ -373,7 +376,7 @@ enum CreativeCTARouter {
         )
         // Only mark "presenting" once the present actually succeeds.
         if presentViewController(safariVC) {
-            isPresentingExternal = true
+            externalSheetSlot.occupy(safariVC)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }

@@ -40,6 +40,7 @@ Create and manage ad units, view analytics, and configure server-side verificati
 ## Support
 
 - Documentation: [docs.simula.ad](https://docs.simula.ad)
+- Telemetry wire contract: [docs/TELEMETRY_CONTRACT_V3.md](docs/TELEMETRY_CONTRACT_V3.md)
 - Email: admin@simula.ad
 - Website: [simula.ad](https://simula.ad)
 
