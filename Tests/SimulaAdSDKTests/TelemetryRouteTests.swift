@@ -3,9 +3,23 @@ import XCTest
 
 final class TelemetryRouteTests: XCTestCase {
     func testStaticFirstPartyRoutesPassThrough() {
-        XCTAssertEqual(normalizedTelemetryRoute("/session/create"), "/session/create")
-        XCTAssertEqual(normalizedTelemetryRoute("/load/native"), "/load/native")
-        XCTAssertEqual(normalizedTelemetryRoute("/minigames/catalog"), "/minigames/catalog")
+        // The full registered static allowlist — keep in sync with TelemetryURLSessionDelegate
+        // and the Kotlin SimulaHttp route registry (contract: same templates and tests).
+        let staticRoutes = [
+            "/session/create",
+            "/frequency-cap/status",
+            "/minigames/catalog",
+            "/character-selector",
+            "/load/interstitial",
+            "/load/native",
+            "/load/rewarded",
+            "/minigames/verify-reward",
+            "/minigames/init",
+            "/minigames/menu/track/click",
+        ]
+        for route in staticRoutes {
+            XCTAssertEqual(normalizedTelemetryRoute(route), route)
+        }
     }
 
     func testDynamicIdentifiersAreNormalized() {

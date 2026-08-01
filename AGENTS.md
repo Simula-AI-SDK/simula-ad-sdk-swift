@@ -47,7 +47,7 @@ Never introduce:
 - `try!`, `as!`, or force-unwrap (`!`) outside tests
 - `URLSession.shared` on ad or telemetry paths — use the `SimulaAPI` session
 - Holding `NSLock` across `await` or blocking I/O
-- `UIDevice` battery/idiom reads off the main thread — snapshot those on main and read the snapshot under lock. IDFV is the sole exception: its synchronous LaunchServices IPC runs only in `SimulaDeviceId.resolve()` during deferred off-main startup; public getters read the cache.
+- `UIDevice` battery/idiom reads off the main thread — snapshot those on main and read the snapshot under lock. IDFV is the sole exception: its synchronous LaunchServices IPC runs only in `SimulaDeviceId.resolve()` — during deferred off-main startup, or a cooldown-gated (30 s), background-dispatched request-path retry via `SimulaDeviceId.retryIfNeeded()`; public getters read the cache.
 - POSIX signal handlers (conflicts with host crash reporters; MetricKit + NSSetUncaughtExceptionHandler only)
 - A second initialization path bypassing `SimulaProvider.init`
 - New dependencies in `Package.swift` / the podspec

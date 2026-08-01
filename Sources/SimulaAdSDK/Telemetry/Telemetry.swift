@@ -16,7 +16,7 @@ let SIMULA_SDK_VERSION = "1.1.7"
 /// host opts out (`telemetryEnabled = false`) — the lowest-overhead path.
 ///
 /// The manager is decoupled from the network layer: `TelemetryURLSessionDelegate` and the ad
-/// lifecycle just call these methods; this object owns the device context + consent-gated PII
+/// lifecycle just call these methods; this object owns the device context + live-read PII
 /// wiring. `@unchecked Sendable` is safe — the single mutable reference is guarded by `lock`.
 final class Telemetry: @unchecked Sendable {
     static let shared = Telemetry()
@@ -32,7 +32,10 @@ final class Telemetry: @unchecked Sendable {
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
     /// doesn't churn the buffer.
     /// `primaryUserIDProvider` is read live on every flush so a mid-session `updatePrimaryUserID`
-    /// is honored, and it is additionally gated by the live consent snapshot.
+    /// is honored. Note the PPID is NOT consent-gated in the telemetry pipeline today —
+    /// consent/COPPA gating applies to the advertising id only (see `SimulaPrivacy`). Suppressing
+    /// the PPID without consent would also have to cover `/session/create` and the ppid PATCH,
+    /// which is a pending product/privacy decision, not a telemetry-local change.
     func initialize(apiKey: String, devMode: Bool, enabled: Bool, primaryUserIDProvider: @escaping @Sendable () -> String?) {
         lock.lock()
         if initialized { lock.unlock(); return }

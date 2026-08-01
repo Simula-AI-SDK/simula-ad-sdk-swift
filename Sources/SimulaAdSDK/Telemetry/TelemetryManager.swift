@@ -501,7 +501,9 @@ final class TelemetryManager: @unchecked Sendable {
             events: events
         )
         env.sessionId = sessionId
-        // Providers are already consent-gated by the facade (re-checked at send time).
+        // PII providers are re-read live at flush time (a mid-session updatePrimaryUserID is
+        // honored). They are not consent-gated here: consent/COPPA gate the advertising id
+        // upstream in SimulaPrivacy, not the PPID.
         env.primaryUserId = primaryUserIdProvider()
         env.advertisingId = advertisingIdProvider()
         env.connectionType = connectionTypeProvider()

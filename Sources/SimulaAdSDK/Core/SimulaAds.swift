@@ -135,7 +135,7 @@ public enum SimulaAds {
         // off this call's critical path. `ensureSession` awaits it, so no request can race
         // ahead of privacy/telemetry setup. Reward-verification recovery and the beacon-queue
         // drain also run there: the first touch of those singletons constructs a `SimulaAPI`,
-        // which would otherwise build the shared `URLSession` (UA/IDFV headers) on the main
+        // which would otherwise build the one-time shared `URLSession` static on the main
         // thread right here.
         provider.start()
 

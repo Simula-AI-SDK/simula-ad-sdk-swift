@@ -930,6 +930,10 @@ public final class SimulaAPI: @unchecked Sendable {
     // MARK: - Common Headers
 
     func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
+        // Nudge a background re-resolution after a failed startup IDFV read (cooldown-gated,
+        // never inline — see `SimulaDeviceId.retryIfNeeded`). This request still uses the
+        // current snapshot below; a successful retry lands on later requests.
+        SimulaDeviceId.retryIfNeeded()
         var headers = identityHeaders()
         headers.merge([
             "Content-Type": "application/json",

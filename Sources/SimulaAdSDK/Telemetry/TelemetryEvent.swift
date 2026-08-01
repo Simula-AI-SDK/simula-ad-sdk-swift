@@ -98,7 +98,8 @@ struct TelemetryEnvelope: Codable {
     let hostAppId: String
     let devMode: Bool
     var sessionId: String?
-    // Consent-gated: only populated when the resolved ConsentSnapshot allows.
+    // Re-read live at flush (mid-session updates honored). Not consent-gated in the pipeline
+    // today — consent/COPPA gating applies to `advertisingId` (see SimulaPrivacy).
     var primaryUserId: String?
     var advertisingId: String?
     // Resolved at flush time: wifi | cellular | none | unknown. Best-effort; never blocks.

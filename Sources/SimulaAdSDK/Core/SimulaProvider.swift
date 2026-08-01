@@ -107,9 +107,10 @@ public final class SimulaProvider: ObservableObject {
 
     // MARK: - Internal
 
-    /// Lazily constructed so the one-time `defaultSession` build (URLSession + standard
-    /// headers, which reads the UA/IDFV lazy statics) happens on first use — inside the
-    /// deferred startup — instead of inline in `init` on the main thread. The deferred
+    /// Lazily constructed so the one-time `defaultSession` build happens on first use — inside
+    /// the deferred startup — instead of inline in `init` on the main thread. (Identity headers
+    /// are NOT part of the session build: `makeHeaders` reads the UA/IDFV caches live per
+    /// request.) The deferred
     /// startup additionally pre-warms `SimulaAPI.shared` off-main, so by the time this
     /// lazy fires the expensive static is already built. All uses are `@MainActor`, so the
     /// lazy initialization is race-free.
@@ -278,8 +279,8 @@ public final class SimulaProvider: ObservableObject {
 
         // Queue drains + beacon recovery. The first touch of these singletons constructs a
         // `SimulaAPI` (their sender/verifier), so they MUST come after the shared-session build
-        // above — otherwise `initialize` would build `defaultSession` (URLSession + UA/IDFV
-        // headers) on the main thread. Lock-guarded; each drain runs in its own Task.
+        // above — otherwise `initialize` would build the one-time `defaultSession` static on
+        // the main thread. Lock-guarded; each drain runs in its own Task.
         RewardVerificationManager.shared.triggerProcessQueue()
         AdBeaconManager.shared.configure(apiKey: apiKey)
         AdBeaconManager.shared.triggerProcessQueue()
