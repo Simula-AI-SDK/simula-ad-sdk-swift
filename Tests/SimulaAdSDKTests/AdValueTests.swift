@@ -48,6 +48,17 @@ final class AdValueTests: XCTestCase {
         }
     }
 
+    func testOutOfRangeBidsClampToZeroInsteadOfTrapping() {
+        // Regression: `Int64(Double)` traps when the scaled value exceeds Int64.max — a backend
+        // units bug (e.g. bid_amt: 1e16) must degrade to $0, not crash the host at the paid event.
+        for absurd in [1e16, 9.3e15, 1e100, 1e308] {
+            let v = AdValue.fromBidCpm(absurd)
+            XCTAssertEqual(v.valueMicros, 0, "bid=\(absurd) should clamp to 0 micros, not trap")
+        }
+        // Largest in-range values still convert (just under the trap boundary).
+        XCTAssertGreaterThan(AdValue.fromBidCpm(9.0e15).valueMicros, 0)
+    }
+
     func testRespectsNonDefaultCurrency() {
         XCTAssertEqual(AdValue.fromBidCpm(3.0, currencyCode: "EUR").currencyCode, "EUR")
     }

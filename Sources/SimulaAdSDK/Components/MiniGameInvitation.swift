@@ -319,8 +319,16 @@ public struct MiniGameInvitation: View {
         }
     }
 
+    /// Sanitizes the host-supplied auto-close duration: nil/non-finite/non-positive → nil (no
+    /// auto-close). `.infinity` is a plausible host choice for "never auto-close" but would
+    /// trap the `UInt64(duration * 1_000_000)` conversion in `runAutoClose`.
+    static func sanitizedAutoCloseDuration(_ duration: TimeInterval?) -> TimeInterval? {
+        guard let duration, duration.isFinite, duration > 0 else { return nil }
+        return duration
+    }
+
     private func setupAutoClose() {
-        guard let duration = autoCloseDuration, duration > 0 else { return }
+        guard let duration = Self.sanitizedAutoCloseDuration(autoCloseDuration) else { return }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         autoCloseTask = Task { await runAutoClose(duration: duration) }
     }

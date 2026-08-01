@@ -244,4 +244,21 @@ final class NativeAdParsingTests: XCTestCase {
         let a = try XCTUnwrap(r.skanAttribution)
         XCTAssertFalse(a.hasUsableTokens)
     }
+
+    // MARK: - SKOverlayConfig clamping
+
+    func testSKOverlayDelaySecondsClampsOversizedPayloadValue() throws {
+        // Regression: an absurd delay_seconds (e.g. 99999999999) used to decode fine and then
+        // trap the checked UInt64 nanoseconds multiply at the presenter's sleep site.
+        let json = #"{"enabled":true,"timing":"during_play","delay_seconds":99999999999}"#
+        let config = try JSONDecoder().decode(SKOverlayConfig.self, from: data(json))
+        XCTAssertEqual(config.delaySeconds, maxSKOverlayDelaySeconds)
+    }
+
+    func testSKOverlayDelaySecondsClampsNegativeAndKeepsValid() throws {
+        let negative = try JSONDecoder().decode(SKOverlayConfig.self, from: data(#"{"delay_seconds":-3}"#))
+        XCTAssertEqual(negative.delaySeconds, 0)
+        let valid = try JSONDecoder().decode(SKOverlayConfig.self, from: data(#"{"delay_seconds":12}"#))
+        XCTAssertEqual(valid.delaySeconds, 12)
+    }
 }
