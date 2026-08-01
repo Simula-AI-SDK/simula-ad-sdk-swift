@@ -47,11 +47,12 @@ Never introduce:
 - `try!`, `as!`, or force-unwrap (`!`) outside tests
 - `URLSession.shared` on ad or telemetry paths — use the `SimulaAPI` session
 - Holding `NSLock` across `await` or blocking I/O
-- `UIDevice` (battery, etc.) reads off the main thread — snapshot on main, read the snapshot under lock
+- `UIDevice` battery/idiom reads off the main thread — snapshot those on main and read the snapshot under lock. IDFV is the sole exception: its synchronous LaunchServices IPC runs only in `SimulaDeviceId.resolve()` during deferred off-main startup; public getters read the cache.
 - POSIX signal handlers (conflicts with host crash reporters; MetricKit + NSSetUncaughtExceptionHandler only)
 - A second initialization path bypassing `SimulaProvider.init`
 - New dependencies in `Package.swift` / the podspec
 - Query strings, tokens, or PII in telemetry `message`/`breadcrumb`/paths
+- Telemetry wire fields or semantics not defined in `docs/TELEMETRY_CONTRACT_V3.md`; keep that contract and its golden fixture byte-identical across the Swift, Kotlin, and React Native repositories
 - iOS-only APIs without `#if os(iOS)` / `#if canImport(UIKit)` guards (tests build on macOS)
 
 ## Copy an existing pattern (golden examples)

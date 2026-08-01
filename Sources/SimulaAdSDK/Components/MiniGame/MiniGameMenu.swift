@@ -77,7 +77,13 @@ public struct MiniGameMenu: View {
     private var isCompact: Bool { false }
     #endif
 
-    private let api = SimulaAPI()
+    // Computed, not stored (struct counterpart of the fullscreen ads' `lazy var api`): an eager
+    // `SimulaAPI()` at struct init builds the one-time `defaultSession` static (URLSession +
+    // UA/IDFV headers) wherever the view is first constructed — the main thread during body
+    // evaluation right after initialize, before the deferred startup's off-main prewarm can
+    // run. Every use below is an async load that only runs after ensureSession() (which awaits
+    // that prewarm), so the static is already built by first use.
+    private var api: SimulaAPI { .shared }
 
     // MARK: - Computed
 

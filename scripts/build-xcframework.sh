@@ -29,6 +29,11 @@ cd "$(dirname "$0")/.."
 SCHEME="SimulaAdSDK"
 BUILD_DIR="$PWD/build"
 BUNDLE_NAME="SimulaAdSDK_SimulaAdSDK.bundle"
+SDK_VERSION="$(ruby -ne 'puts $1 if $_ =~ /s\.version\s*=\s*"([^"]+)"/' SimulaAdSDK.podspec)"
+BUILD_NUMBER="${SIMULA_BUILD_NUMBER:-1}"
+
+[[ -n "$SDK_VERSION" ]] || { echo "ERROR: unable to read SDK version from podspec"; exit 1; }
+[[ "$BUILD_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: SIMULA_BUILD_NUMBER must be numeric"; exit 1; }
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -50,6 +55,8 @@ archive_slice() {
     -archivePath "$archive" \
     -derivedDataPath "$dd" \
     BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+    MARKETING_VERSION="$SDK_VERSION" \
+    CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
     SKIP_INSTALL=NO \
     CODE_SIGNING_ALLOWED=NO \
     | tail -2
@@ -88,6 +95,13 @@ archive_slice() {
   done
   [[ -f "$fw/PrivacyInfo.xcprivacy" ]] \
     || { echo "ERROR: PrivacyInfo.xcprivacy missing from framework root in $slice slice"; exit 1; }
+  local marketing_version build_number
+  marketing_version="$(plutil -extract CFBundleShortVersionString raw -o - "$fw/Info.plist")"
+  build_number="$(plutil -extract CFBundleVersion raw -o - "$fw/Info.plist")"
+  [[ "$marketing_version" == "$SDK_VERSION" ]] \
+    || { echo "ERROR: framework version $marketing_version != $SDK_VERSION in $slice slice"; exit 1; }
+  [[ "$build_number" == "$BUILD_NUMBER" ]] \
+    || { echo "ERROR: framework build $build_number != $BUILD_NUMBER in $slice slice"; exit 1; }
 }
 
 archive_slice "generic/platform=iOS"           "ios"           "Release-iphoneos"

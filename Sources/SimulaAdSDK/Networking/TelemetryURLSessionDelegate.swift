@@ -29,11 +29,8 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
         let metrics = metricsByTask.removeValue(forKey: task.taskIdentifier)
         lock.unlock()
 
-        guard let url = task.originalRequest?.url else { return }
-        // Recursion guard: never record the telemetry delivery request itself.
-        if url.path.hasPrefix("/telemetry") { return }
-        // Never record the ppid-update request — its path embeds the PPID (consent-gated PII).
-        if url.path.contains("/ppid/") { return }
+        guard let url = task.originalRequest?.url,
+              let route = normalizedTelemetryRoute(url.path) else { return }
 
         let method = task.originalRequest?.httpMethod ?? "GET"
         let status = (task.response as? HTTPURLResponse)?.statusCode
@@ -48,7 +45,7 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
             }
         }
         Telemetry.shared.recordNetwork(
-            path: url.path,
+            path: route,
             method: method,
             statusCode: status,
             durationMs: durationMs,
@@ -57,6 +54,40 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
             failureClass: telemetryFailureClass(statusCode: status, error: error)
         )
     }
+}
+
+/// Low-cardinality route registry for first-party network telemetry. Dynamic identifiers are
+/// replaced with templates, sensitive/recursive routes are dropped, and an unregistered route
+/// fails closed to `/unknown` rather than sending its raw path.
+func normalizedTelemetryRoute(_ path: String) -> String? {
+    let segments = path.split(separator: "/").map(String.init)
+    guard !segments.isEmpty else { return "/unknown" }
+    if segments.first == "telemetry" ||
+        (segments.count >= 2 && segments[0] == "v1" && segments[1] == "telemetry") ||
+        segments.contains("ppid") { return nil }
+
+    if segments.count == 3, segments[0] == "load", segments[1] == "fallbacks" {
+        return "/load/fallbacks/:id"
+    }
+    if segments.count == 3, segments[0] == "impressions" {
+        let allowedActions = Set(["shown", "seen", "click", "interest", "report"])
+        guard allowedActions.contains(segments[2]) else { return "/unknown" }
+        return "/impressions/:id/\(segments[2])"
+    }
+
+    let exactRoutes = Set([
+        "/session/create",
+        "/frequency-cap/status",
+        "/minigames/catalog",
+        "/character-selector",
+        "/load/interstitial",
+        "/load/native",
+        "/load/rewarded",
+        "/minigames/verify-reward",
+        "/minigames/init",
+        "/minigames/menu/track/click",
+    ])
+    return exactRoutes.contains(path) ? path : "/unknown"
 }
 
 /// Maps a transport error / HTTP status to a low-cardinality failure class for telemetry.

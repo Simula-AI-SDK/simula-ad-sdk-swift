@@ -116,7 +116,12 @@ public struct CharacterSelector: View {
     @State private var appeared = false
 
     @EnvironmentObject private var provider: SimulaProvider
-    private let api = SimulaAPI()
+    // Computed, not stored (see MiniGameMenu for the full note): an eager `SimulaAPI()` at
+    // struct init builds the one-time `defaultSession` static on the main thread during body
+    // evaluation right after initialize — before the deferred startup's off-main prewarm.
+    // The only use (fetchCharacters) is an async load that runs after ensureSession(), which
+    // awaits that prewarm, so the static is already built by first use.
+    private var api: SimulaAPI { .shared }
 
     private var isVisible: Bool { isOpen && !closedInternally }
     private var active: Bool { selectedId != nil }

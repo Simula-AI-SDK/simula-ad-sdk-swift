@@ -47,13 +47,13 @@ public enum SimulaAds {
     /// any network call when the host forgot to initialize).
     public static var isInitialized: Bool { shared != nil }
 
-    /// The custom User-Agent the SDK sets on its native HTTP requests (PRD). Exposed so a React
-    /// Native bridge can retrieve the native string rather than reconstructing it in JS.
+    /// The custom User-Agent the SDK sets on its native HTTP requests (PRD). This is a non-forcing
+    /// snapshot: before deferred startup resolves the full value it returns a valid minimal fallback.
     public static var userAgent: String { SimulaUserAgent.value }
 
     /// The device identifier the SDK sends as the `X-Device-Id` header on its native HTTP requests
-    /// (`identifierForVendor`). nil when the platform supplies none. Exposed so a React Native bridge
-    /// can retrieve the native value.
+    /// (`identifierForVendor`). This never performs the synchronous lookup and returns nil while
+    /// deferred startup is still resolving it or when the platform supplies none.
     public static var deviceId: String? { SimulaDeviceId.value }
 
     // Character context is no longer global: pass charId/charName/charImage/charDesc

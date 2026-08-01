@@ -254,8 +254,8 @@ public final class SimulaProvider: ObservableObject {
         // Warm the lazy statics OFF the main thread: `identifierForVendor` can block early in
         // launch and UA building is syscalls; building the shared session (URLSession + standard
         // headers) reads both, so this single touch completes all three off-main.
-        _ = SimulaUserAgent.value
-        _ = SimulaDeviceId.value
+        _ = SimulaUserAgent.resolve()
+        _ = SimulaDeviceId.resolve()
         _ = SimulaAPI.shared
 
         // Install telemetry before the first request so /session/create (and every subsequent

@@ -12,13 +12,21 @@ import UIKit
 ///
 /// e.g. `Simula-SDK/1.0.2 (iOS 17.2; en_US; iPhone16,1; Build/21C52; com.publisher.app)`
 ///
-/// Every field comes from `Foundation` / `Bundle` / `uname` / `sysctl` — no permissions, no UIKit.
-/// `value` is a lazily-initialized `static let`, so it self-constructs on first access (the
-/// `SimulaAPI` shared session config reads it, and the SDK forces it eagerly at `SimulaAds.initialize`).
+/// Every field comes from `Foundation` / `Bundle` / `uname` / `sysctl` — no permissions. Public
+/// reads never force those syscalls: `value` returns a valid fallback until deferred startup calls
+/// `resolve()`, then returns the full cached value.
 enum SimulaUserAgent {
 
-    /// The composed UA string. Computed once, thread-safe via `static let` lazy init.
-    static let value: String = build()
+    private static let cache = SimulaUserAgentCache(
+        fallback: "Simula-SDK/\(SIMULA_SDK_VERSION) (iOS unknown; und; unknown; Build/; unknown)",
+        resolver: { build() }
+    )
+
+    /// Non-forcing snapshot. Always returns a syntactically valid SDK User-Agent.
+    static var value: String { cache.value }
+
+    @discardableResult
+    static func resolve() -> String { cache.resolve() }
 
     /// The SDK's standard request headers stamped on every outbound request: the custom User-Agent
     /// plus the `X-Device-Id` device identifier (omitted when the platform supplies none).
@@ -189,5 +197,49 @@ enum SimulaUserAgent {
         var buf = [CChar](repeating: 0, count: size)
         guard sysctlbyname("kern.osversion", &buf, &size, nil, 0) == 0 else { return "" }
         return String(cString: buf)
+    }
+}
+
+/// Non-waiting cache used by the public User-Agent getter. A reader racing deferred resolution gets
+/// the stable fallback rather than waiting on sysctl/Bundle work or a once-initialization lock.
+final class SimulaUserAgentCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fallback: String
+    private let resolver: @Sendable () -> String
+    private var cachedValue: String?
+    private var resolving = false
+
+    init(fallback: String, resolver: @escaping @Sendable () -> String) {
+        self.fallback = fallback
+        self.resolver = resolver
+    }
+
+    var value: String {
+        lock.lock(); defer { lock.unlock() }
+        return cachedValue ?? fallback
+    }
+
+    @discardableResult
+    func resolve() -> String {
+        lock.lock()
+        if let cachedValue {
+            lock.unlock()
+            return cachedValue
+        }
+        if resolving {
+            lock.unlock()
+            return fallback
+        }
+        resolving = true
+        lock.unlock()
+
+        let resolved = resolver()
+
+        lock.lock()
+        if cachedValue == nil { cachedValue = resolved.isEmpty ? fallback : resolved }
+        resolving = false
+        let snapshot = cachedValue ?? fallback
+        lock.unlock()
+        return snapshot
     }
 }

@@ -888,6 +888,7 @@ public struct VerifyRewardResponse: Decodable, Sendable {
 /// Centralized API client for all Simula endpoints (translates api.ts)
 public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
+    private let identityHeaders: @Sendable () -> [String: String]
 
     /// Shared session tuned for the ad path. The default `URLSession.shared`
     /// uses a 60s request timeout, which would let a hung ad/init request stall
@@ -897,9 +898,9 @@ public final class SimulaAPI: @unchecked Sendable {
         config.timeoutIntervalForRequest = 10   // per-request inactivity timeout
         config.timeoutIntervalForResource = 20  // overall ceiling for one resource
         config.waitsForConnectivity = false     // fail fast when offline
-        // Custom UA + device id on every request through this session. Per-request headers never
-        // set these, so the session-wide values apply to all API + telemetry calls.
-        config.httpAdditionalHeaders = SimulaUserAgent.standardHeaders()
+        // Identity headers are applied per request in `makeHeaders`, from non-forcing live cache
+        // snapshots. An API client built before deferred startup therefore cannot freeze a missing
+        // device ID or fallback User-Agent into this process-wide session forever.
         // Session-wide task delegate harvests URLSessionTaskMetrics into telemetry for every
         // request (skipping the telemetry endpoint itself). Async `data(for:)` still works.
         return URLSession(
@@ -911,6 +912,14 @@ public final class SimulaAPI: @unchecked Sendable {
 
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
+        self.identityHeaders = { SimulaUserAgent.standardHeaders() }
+    }
+
+    /// Test seam for proving identity headers are read live per request rather than frozen into the
+    /// process-wide URLSession configuration.
+    init(session: URLSession, identityHeaders: @escaping @Sendable () -> [String: String]) {
+        self.session = session
+        self.identityHeaders = identityHeaders
     }
 
     /// Shared instance for the per-event tracking calls (impressions, clicks, interest, reportAd,
@@ -920,11 +929,12 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Common Headers
 
-    private func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
-        var headers: [String: String] = [
+    func makeHeaders(apiKey: String? = nil, consent: ConsentSnapshot? = nil) -> [String: String] {
+        var headers = identityHeaders()
+        headers.merge([
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "1",
-        ]
+        ], uniquingKeysWith: { _, new in new })
         if let apiKey = apiKey {
             headers["Authorization"] = "Bearer \(apiKey)"
         }
