@@ -587,7 +587,7 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
         position: ClosePosition = .topRight,
         progressBarColor: String = "#FFFFFF"
     ) {
-        self.delaySeconds = delaySeconds
+        self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
         self.treatment = treatment
         // Every treatment honors the configured corner. (`progress_bar` renders its bar at the top
         // edge regardless; only its resolved close ✕ follows `position`.)
@@ -704,7 +704,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     ) {
         self.enabled = enabled
         self.timing = timing
-        self.delaySeconds = max(0, delaySeconds)
+        self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
         self.position = position
         self.dismissible = dismissible
     }
@@ -719,7 +719,10 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
         self.timing = .from(try? c.decode(String.self, forKey: .timing))
-        self.delaySeconds = max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        self.delaySeconds = min(
+            maxCloseDelaySeconds,
+            max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        )
         self.position = .from(try? c.decode(String.self, forKey: .position))
         self.dismissible = (try? c.decode(Bool.self, forKey: .dismissible)) ?? true
     }
@@ -1299,8 +1302,10 @@ public struct AdValue: Sendable, Equatable {
     /// Tolerant: a non-finite or negative bid clamps to 0, so a missing/garbage field yields a $0
     /// estimate rather than trapping — surfacing the paid event must never crash the host app.
     static func fromBidCpm(_ bidCpm: Double, currencyCode: String = "USD") -> AdValue {
-        let safeBid = (bidCpm.isFinite && bidCpm > 0) ? bidCpm : 0
-        let valueMicros = Int64((safeBid * 1_000).rounded())
+        let roundedMicros = (bidCpm * 1_000).rounded()
+        let valueMicros = (bidCpm.isFinite && bidCpm >= 0)
+            ? (Int64(exactly: roundedMicros) ?? 0)
+            : 0
         return AdValue(
             valueMicros: valueMicros,
             currencyCode: currencyCode,

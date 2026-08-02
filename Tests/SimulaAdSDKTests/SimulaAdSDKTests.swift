@@ -748,6 +748,21 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertFalse(o.dismissible)
     }
 
+    func testSKOverlayDelayClampsInDirectInitializer() {
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: -1).delaySeconds, 0)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 12).delaySeconds, 12)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxCloseDelaySeconds)
+    }
+
+    func testSKOverlayOversizedDecodedDelayClampsToMax() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"skoverlay":{"delay_seconds":\(Int.max)}}}
+        """
+        let overlay = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).skoverlay)
+        XCTAssertEqual(overlay.delaySeconds, maxCloseDelaySeconds)
+    }
+
     func testAdUnitTypeFallsBackToLegacyFlags() throws {
         // No creative node: adUnitType derives from the legacy `rendered_format` (the imperative
         // HTML model dropped the flat `rewarded` flag, so a stray `rewarded` key is ignored).
@@ -792,6 +807,12 @@ final class SimulaAdSDKTests: XCTestCase {
             try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds,
             maxCloseDelaySeconds
         )
+    }
+
+    func testCloseBehaviorDelayClampsInDirectInitializer() {
+        XCTAssertEqual(CloseBehavior(delaySeconds: -1).delaySeconds, 0)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 12).delaySeconds, 12)
+        XCTAssertEqual(CloseBehavior(delaySeconds: Int.max).delaySeconds, maxCloseDelaySeconds)
     }
 
     func testDeviceCapabilitiesEncodesHandshakeKeys() throws {

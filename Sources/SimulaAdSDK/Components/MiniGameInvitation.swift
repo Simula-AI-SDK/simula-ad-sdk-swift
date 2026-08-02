@@ -320,7 +320,7 @@ public struct MiniGameInvitation: View {
     }
 
     private func setupAutoClose() {
-        guard let duration = autoCloseDuration, duration > 0 else { return }
+        guard let duration = autoCloseDuration, duration.isFinite, duration > 0 else { return }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         autoCloseTask = Task { await runAutoClose(duration: duration) }
     }
@@ -329,8 +329,10 @@ public struct MiniGameInvitation: View {
     /// `@MainActor` so `handleDismiss()` stays a main-thread call (was `MainActor.run`).
     @MainActor
     private func runAutoClose(duration: TimeInterval) async {
+        let sleepNs = duration * 1_000_000
+        guard sleepNs.isFinite, sleepNs > 0, sleepNs < Double(UInt64.max) else { return }
         // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-        do { try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000)) } catch { return } // ms to ns
+        do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return } // ms to ns
         guard !Task.isCancelled else { return }
         handleDismiss()
     }
