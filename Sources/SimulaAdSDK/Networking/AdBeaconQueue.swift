@@ -217,6 +217,9 @@ public final class AdBeaconManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         var queue = loadQueue()
+        // Remove only the snapshot that was sent. If metadata was merged while this request was in
+        // flight, the newer snapshot must stay queued for one more idempotent `/seen`; removing by
+        // `(impressionId, action)` alone would silently discard metadata the server never received.
         queue.removeAll {
             $0.impressionId == task.impressionId &&
                 $0.action == task.action &&

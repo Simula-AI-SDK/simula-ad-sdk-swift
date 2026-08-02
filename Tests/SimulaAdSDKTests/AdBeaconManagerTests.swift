@@ -137,6 +137,26 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(persistedQueue().first?.metadata?.count, 10)
     }
 
+    func testMetadataMergedDuringSuccessfulSendIsDeliveredThenQueueDrains() async {
+        let sender = BlockingBeaconSender()
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
+        await sender.waitForFirstCall()
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
+        await waitUntil(timeout: 2) {
+            self.persistedQueue().first?.metadata == ["page_name": "Search", "surface": "chat"]
+        }
+
+        await sender.releaseFirstCall()
+        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+
+        let metadata = await sender.metadataSnapshots()
+        XCTAssertEqual(metadata.count, 2)
+        XCTAssertEqual(metadata[0], ["page_name": "Search"])
+        XCTAssertEqual(metadata[1], ["page_name": "Search", "surface": "chat"])
+    }
+
     func testDistinctActionsAreIndependent() async {
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
@@ -218,4 +238,36 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
         if let error { throw error }
         return code
     }
+}
+
+private actor BlockingBeaconSender: BeaconSending {
+    private var metadata: [[String: String]?] = []
+    private var firstCallWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstCallContinuation: CheckedContinuation<Void, Never>?
+
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]?
+    ) async throws -> Int {
+        self.metadata.append(metadata)
+        guard self.metadata.count == 1 else { return 200 }
+        firstCallWaiters.forEach { $0.resume() }
+        firstCallWaiters.removeAll()
+        await withCheckedContinuation { firstCallContinuation = $0 }
+        return 200
+    }
+
+    func waitForFirstCall() async {
+        if !metadata.isEmpty { return }
+        await withCheckedContinuation { firstCallWaiters.append($0) }
+    }
+
+    func releaseFirstCall() {
+        firstCallContinuation?.resume()
+        firstCallContinuation = nil
+    }
+
+    func metadataSnapshots() -> [[String: String]?] { metadata }
 }
