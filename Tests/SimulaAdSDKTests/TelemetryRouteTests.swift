@@ -43,4 +43,14 @@ final class TelemetryRouteTests: XCTestCase {
         XCTAssertEqual(normalizedTelemetryRoute("/impressions/id/unbounded-action"), "/unknown")
         XCTAssertEqual(normalizedTelemetryRoute("/"), "/unknown")
     }
+
+    func testFirstPartyGateAcceptsOnlyTheApiHost() {
+        // The shared session also carries third-party traffic (cover CDN fetches); only the
+        // API host may emit network telemetry — everything else would be `GET /unknown` spam.
+        XCTAssertTrue(isFirstPartyTelemetryURL(URL(string: "https://simula-api-701226639755.us-central1.run.app/session/create")!))
+        XCTAssertFalse(isFirstPartyTelemetryURL(URL(string: "https://cdn.example.com/covers/a.gif")!))
+        // Lookalike hosts must not sneak through (suffix match would admit these).
+        XCTAssertFalse(isFirstPartyTelemetryURL(URL(string: "https://simula-api-701226639755.us-central1.run.app.evil.com/session/create")!))
+        XCTAssertFalse(isFirstPartyTelemetryURL(URL(string: "http://simula-api-701226639755.us-central1.run.app/session/create")!))
+    }
 }

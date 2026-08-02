@@ -205,6 +205,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             // loadCompleted, so the new serve is retained (not destroyed) on scroll-out.
             context.coordinator.currentHTML = nil
             context.coordinator.currentURL = nil
+            // The render-recovery budget is per creative: the new serve gets its own
+            // `maxRenderRecoveries` attempts instead of inheriting the old creative's
+            // (which could collapse a healthy creative after the old one's churn).
+            context.coordinator.renderRecoveryCount = 0
         }
 
         // Only load if URL/HTML changed
@@ -212,12 +216,18 @@ struct WebViewRepresentable: UIViewRepresentable {
         let currentHTML = context.coordinator.currentHTML
 
         if let html = htmlString, html != currentHTML {
+            // A fresh load supersedes any pending render-recovery reload of the old creative.
+            context.coordinator.pendingRecovery?.cancel()
+            context.coordinator.pendingRecovery = nil
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
             context.coordinator.currentBaseURL = baseURL
             context.coordinator.realLoadStarted = true
             webView.loadHTMLString(html, baseURL: baseURL)
         } else if let url = url, url != currentURL {
+            // A fresh load supersedes any pending render-recovery reload of the old creative.
+            context.coordinator.pendingRecovery?.cancel()
+            context.coordinator.pendingRecovery = nil
             context.coordinator.currentURL = url
             context.coordinator.currentHTML = nil
             context.coordinator.realLoadStarted = true
@@ -264,6 +274,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.unlockContentOffset()
         // Stop forwarding visibility into a view that's about to be recycled/retained.
         coordinator.visibilityRelay?.bind(nil)
+        // A pending render-recovery reload must not fire into a view that's being pooled
+        // for another slot — the delayed block would stomp the next acquirer's creative.
+        coordinator.pendingRecovery?.cancel()
+        coordinator.pendingRecovery = nil
         if let impressionId = coordinator.retainedImpressionId,
            NativeAdWebViewStore.shared.detach(uiView, impressionId: impressionId) {
             return // retained (or destroyed if render-dead) — never pool-released
@@ -346,11 +360,19 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// web-content process is terminated (`reload()` can't restore a `loadHTMLString` load — its URL
         /// is the baseURL, not the content).
         var currentBaseURL: URL?
-        /// CUMULATIVE count of reload-after-termination recoveries for this creative, never
-        /// reset — the old one-shot flag reset on every clean `didFinish`, so a creative that
-        /// loads and then repeatedly kills its renderer (memory bomb, repeated OS jettison)
-        /// cycled terminate→reload→reset forever (iOS-6). Capped at `maxRenderRecoveries`.
+        /// CUMULATIVE count of reload-after-termination recoveries for this creative —
+        /// never reset by a clean `didFinish` (the old one-shot flag reset on every
+        /// successful load, so a creative that loads and then repeatedly kills its renderer
+        /// — memory bomb, repeated OS jettison — cycled terminate→reload→reset forever
+        /// (iOS-6). Capped at `maxRenderRecoveries`. Reset only when a DIFFERENT serve is
+        /// bound in `updateUIView` — the budget is per creative, not per recycled slot.
         var renderRecoveryCount = 0
+        /// Pending render-process recovery reload, cancelled the moment any newer load is
+        /// issued (serve swap / fresh creative) or the view is dismantled. Without the
+        /// cancel, a delayed recovery fired after a rebind would reload the OLD creative's
+        /// HTML/URL into a view now bound to the NEW serve — showing stale DOM while
+        /// beacons and clicks carry the new impression id.
+        var pendingRecovery: DispatchWorkItem?
         /// True when the current main-frame load answered 4xx/5xx. WKWebView renders the error body
         /// as a *successful* navigation, so without this flag the ensuing `didFinish` would mark the
         /// retained session healthy (`noteLoadSucceeded`) right after the HTTP error marked it
@@ -599,21 +621,30 @@ struct WebViewRepresentable: UIViewRepresentable {
             // loadHTMLString load (its URL is the baseURL, not the content), so re-load the stored
             // content — with a BACKOFF and a CUMULATIVE cap: a creative that reliably kills the
             // renderer gets at most `maxRenderRecoveries` tries, ever (never reset in didFinish),
-            // so it can't spin a reload→crash→reload loop (iOS-6).
+            // so it can't spin a reload→crash→reload loop (iOS-6). The delayed reload is a
+            // CANCELLABLE work item: a serve swap or dismantle before it fires must not let it
+            // stomp the creative now bound to the view.
             if renderRecoveryCount < maxRenderRecoveries {
                 renderRecoveryCount += 1
                 let delaySeconds = renderRecoveryBackoff(attempt: renderRecoveryCount)
+                let reload: (WKWebView) -> Void
                 if let html = currentHTML {
                     let baseURL = currentBaseURL
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { [weak webView] in
-                        webView?.loadHTMLString(html, baseURL: baseURL)
-                    }
-                    return
+                    reload = { $0.loadHTMLString(html, baseURL: baseURL) }
+                } else if let url = currentURL {
+                    reload = { $0.load(URLRequest(url: url)) }
+                } else {
+                    reload = { _ in }
                 }
-                if let url = currentURL {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { [weak webView] in
-                        webView?.load(URLRequest(url: url))
+                if currentHTML != nil || currentURL != nil {
+                    let work = DispatchWorkItem { [weak self, weak webView] in
+                        guard let self, let webView else { return }
+                        self.pendingRecovery = nil
+                        reload(webView)
                     }
+                    pendingRecovery?.cancel()
+                    pendingRecovery = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds, execute: work)
                     return
                 }
             }

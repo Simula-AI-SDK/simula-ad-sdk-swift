@@ -319,12 +319,17 @@ public struct MiniGameInvitation: View {
         }
     }
 
+    /// Longest auto-close honored (1 h in ms): far past any real mini-game session and far
+    /// below the point where `UInt64(duration * 1_000_000)` would overflow and trap.
+    static let maxAutoCloseDuration: TimeInterval = 3_600_000
+
     /// Sanitizes the host-supplied auto-close duration: nil/non-finite/non-positive → nil (no
-    /// auto-close). `.infinity` is a plausible host choice for "never auto-close" but would
+    /// auto-close); anything above `maxAutoCloseDuration` is clamped. `.infinity` is a
+    /// plausible host choice for "never auto-close" and a huge finite value would otherwise
     /// trap the `UInt64(duration * 1_000_000)` conversion in `runAutoClose`.
     static func sanitizedAutoCloseDuration(_ duration: TimeInterval?) -> TimeInterval? {
         guard let duration, duration.isFinite, duration > 0 else { return nil }
-        return duration
+        return min(duration, maxAutoCloseDuration)
     }
 
     private func setupAutoClose() {

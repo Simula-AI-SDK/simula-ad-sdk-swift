@@ -86,15 +86,32 @@ public final class AdBeaconManager: @unchecked Sendable {
         self.now = { Date().timeIntervalSince1970 }
         let persistQueue = DispatchQueue(label: "com.simula.adbeacon.persist", qos: .utility)
         self.performPersist = { work in persistQueue.async(execute: work) }
+        #if canImport(UIKit)
+        // Sync-persist as the app heads to the background: enqueues mutate the in-memory
+        // queue and persist on a utility queue, so a beacon fired moments before the
+        // process is suspended/killed could otherwise be lost (the durability window the
+        // in-memory cache re-opens). Mirrors the telemetry pipeline's background flush;
+        // `UserDefaults.set` is a non-blocking cfprefsd handoff, safe on the posting thread.
+        backgroundFlushObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+        ) { [weak self] _ in self?.persistNowSync() }
+        #endif
     }
 
+    #if canImport(UIKit)
+    /// Token for the app-background persist hook (retained for the process lifetime by design).
+    private var backgroundFlushObserver: NSObjectProtocol?
+    #endif
+
     /// Test seam: inject a fake sender, isolated `UserDefaults`, and a controllable clock.
-    init(sender: BeaconSending, defaults: UserDefaults, now: @escaping @Sendable () -> TimeInterval, apiKey: String? = "test") {
+    /// `performPersist` defaults to synchronous; inject a swallowing runner to simulate a
+    /// pending utility-queue write that never lands before a process kill.
+    init(sender: BeaconSending, defaults: UserDefaults, now: @escaping @Sendable () -> TimeInterval, apiKey: String? = "test", performPersist: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil) {
         self.sender = sender
         self.defaults = defaults
         self.now = now
         self.apiKey = apiKey
-        self.performPersist = { work in work() }
+        self.performPersist = performPersist ?? { work in work() }
     }
 
     /// Provide the api key (the beacon endpoints are Bearer-authed). Call once at SDK init; first wins.
@@ -262,6 +279,18 @@ public final class AdBeaconManager: @unchecked Sendable {
                 box.defaults.set(data, forKey: userDefaultsKey)
             }
         }
+    }
+
+    /// Synchronously persist the in-memory queue NOW (app-background path). Closes the
+    /// durability window between an in-memory enqueue and the async utility-queue write:
+    /// without it, a beacon fired just before the process is suspended/killed is lost.
+    func persistNowSync() {
+        lock.lock()
+        let snapshot = cache
+        lock.unlock()
+        guard let snapshot,
+              let data = try? JSONEncoder().encode(snapshot) else { return }
+        defaults.set(data, forKey: userDefaultsKey)
     }
 
     private func loadQueue() -> [PendingBeacon] {

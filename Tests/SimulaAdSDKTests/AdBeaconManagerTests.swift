@@ -196,6 +196,24 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(counting.setCount - baseline, 1, "one batched write for a 5-beacon drain pass (was one per removal)")
         XCTAssertEqual(sender.totalCalls, 5)
     }
+
+    func testPersistNowSyncFlushesInMemoryOnlyQueue() {
+        // The app-background durability hook: with the async utility write swallowed (as if
+        // the process were killed before it landed), an enqueued beacon exists only in
+        // memory — persistNowSync (the didEnterBackground path) must still make it durable.
+        let sender = FakeBeaconSender()
+        let mgr = AdBeaconManager(
+            sender: sender,
+            defaults: defaults,
+            now: { 0 },
+            apiKey: nil, // pre-config: the drain bails immediately, leaving the row pending
+            performPersist: { _ in /* the utility-queue write never runs (process kill) */ }
+        )
+        mgr.enqueue(impressionId: "imp", action: "seen")
+        XCTAssertTrue(persistedQueue().isEmpty, "async persist never ran — in-memory only")
+        mgr.persistNowSync()
+        XCTAssertEqual(persistedQueue().map(\.impressionId), ["imp"])
+    }
 }
 
 // MARK: - Test double

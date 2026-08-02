@@ -22,6 +22,11 @@ struct PendingVerification: Codable, Equatable {
 
 // MARK: - Seams (injected so the queue is unit-testable without the network/clock)
 
+/// Delivered to the registered completion of a pending verification that was dropped at the
+/// queue cap (oldest-out overflow) before its first attempt — so the host's reward flow gets
+/// a terminal signal instead of hanging on a result that can never arrive.
+struct VerificationQueueOverflowError: Error {}
+
 /// Performs one `verify-reward` call. `SimulaAPI` is the production implementation;
 /// tests substitute a fake. Mirrors the Kotlin `RewardVerifier`.
 protocol RewardVerifying: Sendable {
@@ -137,10 +142,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
         if let completion = completion {
             activeCallbacks[serveId] = completion
         }
+        var droppedServeId: String?
         var list = loadQueueLocked()
         if !list.contains(where: { $0.serveId == serveId }) {
             if list.count >= maxPendingBeacons {
-                list.removeFirst() // drop oldest: bounded queue > an unbounded main-thread backlog
+                droppedServeId = list.removeFirst().serveId // drop oldest: bounded queue > an unbounded main-thread backlog
                 Telemetry.shared.recordError(
                     signature: "reward:queue_overflow",
                     errorCode: "queue_full",
@@ -162,6 +168,13 @@ public final class RewardVerificationManager: @unchecked Sendable {
             persistLocked()
         }
         lock.unlock()
+
+        // The dropped play's one-shot must still fire — otherwise its registered callback
+        // leaks in `activeCallbacks` and the host's reward flow hangs waiting on a result
+        // that can never arrive. Delivered off the lock, like every other outcome.
+        if let droppedServeId {
+            invokeCallback(serveId: droppedServeId, .failure(VerificationQueueOverflowError()))
+        }
 
         triggerProcessQueue()
     }

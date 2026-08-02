@@ -209,9 +209,16 @@ final class CoverImageCache: @unchecked Sendable {
 
         do {
             // Carry the SDK's standard headers (UA + device id) on this CDN fetch too, and go
-            // through the SDK-configured session (tight timeouts, telemetry-metrics delegate)
-            // — never `URLSession.shared` on an ad path (AGENTS.md hard rule).
+            // through the SDK-configured session (telemetry-metrics delegate) — never
+            // `URLSession.shared` on an ad path (AGENTS.md hard rule). Nudge a background
+            // device-id re-resolve first (cooldown-gated, mirrors `SimulaAPI.makeHeaders`):
+            // an early cover load racing deferred startup otherwise stamps the fallback
+            // identity for the whole session.
+            SimulaDeviceId.retryIfNeeded()
             var request = URLRequest(url: requestUrl)
+            // Covers are large animated payloads: allow a longer inactivity window than the
+            // API session's 10 s default (the 20 s resource ceiling still bounds the total).
+            request.timeoutInterval = 30
             for (key, value) in SimulaUserAgent.standardHeaders() {
                 request.setValue(value, forHTTPHeaderField: key)
             }
@@ -224,7 +231,10 @@ final class CoverImageCache: @unchecked Sendable {
             // e.g. the menu closed mid-load), don't poison the cache with a
             // failure — leave the URL uncached so it retries when next requested.
             if Task.isCancelled { return .failed }
-            store(.failed, cost: 1, for: url)
+            // Transport failure (timeout / offline / unreachable): do NOT cache — the next
+            // request must retry instead of pinning a broken cover until cache eviction.
+            // Only DECODE failures (bad bytes, including HTTP error pages) are cached above:
+            // re-downloading those can never succeed.
             return .failed
         }
     }

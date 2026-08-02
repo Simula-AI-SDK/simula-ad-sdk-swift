@@ -302,6 +302,7 @@ enum CreativeCTARouter {
         // guard would stick occupied forever on a no-window early-return.
         if presentViewController(storeVC) {
             externalSheetSlot.occupy(storeVC)
+            delegate.arm() // a silent sheet teardown may now emit the dismiss (see SheetFinishRelay)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }
@@ -377,6 +378,7 @@ enum CreativeCTARouter {
         // Only mark "presenting" once the present actually succeeds.
         if presentViewController(safariVC) {
             externalSheetSlot.occupy(safariVC)
+            delegate.arm() // a silent sheet teardown may now emit the dismiss (see SheetFinishRelay)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
     }
@@ -488,6 +490,56 @@ enum CreativeCTARouter {
     }
 }
 
+// MARK: - SheetFinishRelay
+
+/// Once-only relay for a presented sheet's dismissal side effects (clear the occupancy slot +
+/// post `simulaAdExternalSheetDidDismiss`). Fires from the sheet's dismissal delegate on the
+/// normal path — and from the relay's `deinit` when the sheet is destroyed WITHOUT its
+/// dismissal delegate running (the presenter tears down its window, the host dismisses its own
+/// VC under the sheet, or StoreKit's swipe-down misses `productViewControllerDidFinish`). The
+/// delegate is retained on the sheet via an associated object, so silent teardown always
+/// reaches `deinit`. Without this, the interstitial/rewarded presenters' close-delay gate
+/// would stay paused forever (no dismiss notification ever arrives) and the close button
+/// would never enable. `armed` is set only after a confirmed present, so a failed-present
+/// delegate being released can't emit a spurious dismiss.
+private final class SheetFinishRelay {
+    private let onFinish: @MainActor () -> Void
+    private let lock = NSLock()
+    private var armed = false
+    private var fired = false
+
+    init(onFinish: @escaping @MainActor () -> Void) { self.onFinish = onFinish }
+
+    /// Marks the relay live — call only once the sheet is actually on screen.
+    func arm() {
+        lock.lock(); armed = true; lock.unlock()
+    }
+
+    /// Normal dismissal path (delegate-driven). Idempotent.
+    func fire() {
+        lock.lock()
+        let already = fired
+        fired = true
+        lock.unlock()
+        guard !already else { return }
+        let onFinish = self.onFinish
+        Task { @MainActor in onFinish() }
+    }
+
+    deinit {
+        // Silent-teardown path: the sheet is gone (so we are too) but no dismissal delegate
+        // ever ran. Only an armed, never-fired relay may emit — anything else is the
+        /// failed-present / already-dismissed case and must stay silent.
+        lock.lock()
+        let shouldFire = armed && !fired
+        fired = true
+        lock.unlock()
+        guard shouldFire else { return }
+        let onFinish = self.onFinish
+        Task { @MainActor in onFinish() }
+    }
+}
+
 // MARK: - StoreProductDelegate
 
 /// Minimal `SKStoreProductViewControllerDelegate` that dismisses the store sheet
@@ -495,16 +547,17 @@ enum CreativeCTARouter {
 /// satisfy the (nonisolated) delegate requirement; StoreKit always calls this on
 /// the main thread, so the hop in the body is effectively a no-op.
 private final class StoreProductDelegate: NSObject, SKStoreProductViewControllerDelegate {
-    private let onFinish: @MainActor () -> Void
+    private let finishRelay: SheetFinishRelay
 
     init(onFinish: @escaping @MainActor () -> Void) {
-        self.onFinish = onFinish
+        self.finishRelay = SheetFinishRelay(onFinish: onFinish)
     }
+
+    func arm() { finishRelay.arm() }
 
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
         viewController.dismiss(animated: true)
-        let onFinish = self.onFinish
-        Task { @MainActor in onFinish() }
+        finishRelay.fire()
     }
 }
 
@@ -514,15 +567,16 @@ private final class StoreProductDelegate: NSObject, SKStoreProductViewController
 /// per-sheet via an associated object (like `StoreProductDelegate`). `SFSafariViewController`
 /// dismisses itself, so this only resets the guard. Delivered on the main thread.
 private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate {
-    private let onFinish: @MainActor () -> Void
+    private let finishRelay: SheetFinishRelay
 
     init(onFinish: @escaping @MainActor () -> Void) {
-        self.onFinish = onFinish
+        self.finishRelay = SheetFinishRelay(onFinish: onFinish)
     }
 
+    func arm() { finishRelay.arm() }
+
     func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-        let onFinish = self.onFinish
-        Task { @MainActor in onFinish() }
+        finishRelay.fire()
     }
 }
 

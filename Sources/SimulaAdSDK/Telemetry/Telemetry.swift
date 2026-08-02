@@ -24,6 +24,12 @@ final class Telemetry: @unchecked Sendable {
     private let lock = NSLock()
     private var manager: TelemetryManager?
     private var initialized = false
+    /// Errors recorded before `initialize` installs the pipeline (e.g. `SimulaAds.initialize`
+    /// rejecting an invalid API key). Without the buffer those calls vanished silently — the
+    /// exact misconfiguration feedback an integrator needs. Bounded; drained once on install
+    /// (and dropped forever on a host opt-out, since no manager is ever created).
+    private var preInstallErrors: [(signature: String, errorCode: String?, message: String?, breadcrumb: String?, stack: [String]?)] = []
+    private let maxPreInstallErrors = 10
 
     private init() {}
 
@@ -84,6 +90,15 @@ final class Telemetry: @unchecked Sendable {
         )
         lock.lock(); manager = mgr; lock.unlock()
         mgr.start()
+
+        // Drain anything recorded ahead of install (invalid-config init errors, etc.).
+        lock.lock()
+        let pending = preInstallErrors
+        preInstallErrors.removeAll()
+        lock.unlock()
+        for error in pending {
+            mgr.recordError(signature: error.signature, errorCode: error.errorCode, message: error.message, breadcrumb: error.breadcrumb, stack: error.stack)
+        }
 
         #if canImport(UIKit)
         // Persist + deliver buffered telemetry as the app heads to the background (the window
@@ -146,7 +161,15 @@ final class Telemetry: @unchecked Sendable {
     }
 
     func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
-        current?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb, stack: stack)
+        lock.lock()
+        let currentManager = manager
+        if currentManager == nil, !initialized, preInstallErrors.count < maxPreInstallErrors {
+            // Pre-install (e.g. an invalid-API-key `initialize`): buffer instead of dropping —
+            // drained into the manager the moment the pipeline is installed.
+            preInstallErrors.append((signature, errorCode, message, breadcrumb, stack))
+        }
+        lock.unlock()
+        currentManager?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb, stack: stack)
     }
 
     /// Persist + attempt delivery now (e.g. app background).

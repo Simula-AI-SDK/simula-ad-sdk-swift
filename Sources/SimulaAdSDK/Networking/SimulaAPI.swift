@@ -2,8 +2,9 @@ import Foundation
 
 // MARK: - API Constants
 
-/// Base URL for all Simula API endpoints (from api.ts)
-private let API_BASE_URL = "https://simula-api-701226639755.us-central1.run.app"
+/// Base URL for all Simula API endpoints (from api.ts). Internal (not `private`) so the
+/// telemetry-metrics delegate can gate first-party traffic by its host.
+let API_BASE_URL = "https://simula-api-701226639755.us-central1.run.app"
 
 // MARK: - API Error
 

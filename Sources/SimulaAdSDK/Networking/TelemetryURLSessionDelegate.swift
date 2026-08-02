@@ -30,6 +30,7 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
         lock.unlock()
 
         guard let url = task.originalRequest?.url,
+              isFirstPartyTelemetryURL(url),
               let route = normalizedTelemetryRoute(url.path) else { return }
 
         let method = task.originalRequest?.httpMethod ?? "GET"
@@ -54,6 +55,17 @@ final class TelemetryURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unch
             failureClass: telemetryFailureClass(statusCode: status, error: error)
         )
     }
+}
+
+/// First-party gate for network telemetry: the SDK's shared session also carries third-party
+/// traffic (mini-game cover CDN fetches), and those paths aren't in the route registry — each
+/// one would otherwise emit a low-value `GET /unknown` event and crowd the bounded buffer.
+/// Only requests to the API's own host are recorded. Pure so it's unit-testable.
+func isFirstPartyTelemetryURL(_ url: URL) -> Bool {
+    guard let base = URL(string: API_BASE_URL),
+          let apiHost = base.host?.lowercased(),
+          let apiScheme = base.scheme?.lowercased() else { return false }
+    return url.scheme?.lowercased() == apiScheme && url.host?.lowercased() == apiHost
 }
 
 /// Low-cardinality route registry for first-party network telemetry. Dynamic identifiers are
