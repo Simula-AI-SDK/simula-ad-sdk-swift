@@ -178,6 +178,8 @@ public final class SimulaInterstitialAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
+    private let extraParameters = ExtraParametersStore()
+
     // Character context is passed per `load()` call (see below); there is no global
     // character state to keep in sync.
 
@@ -243,6 +245,16 @@ public final class SimulaInterstitialAd {
         self.adUnitId = adUnitId
     }
 
+    /// Upserts one publisher metadata entry for future loads. Invalid entries are ignored safely.
+    public func setExtraParameter(_ key: String, _ value: String) {
+        extraParameters.set(key: key, value: value)
+    }
+
+    /// Replaces publisher metadata for future loads. Passing an empty dictionary clears it.
+    public func setExtraParameters(_ parameters: [String: String]) {
+        extraParameters.replace(with: parameters)
+    }
+
     // MARK: - Load
 
     /// Preloads an ad for the given character context.
@@ -299,8 +311,18 @@ public final class SimulaInterstitialAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
+        let metadata = extraParameters.snapshot()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        loadTask = Task { [weak self] in await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc) }
+        loadTask = Task { [weak self] in
+            await self?.runLoad(
+                provider: provider,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc,
+                metadata: metadata
+            )
+        }
     }
 
     /// Load task body (named method — see the task-shape note in TelemetryManager).
@@ -309,7 +331,8 @@ public final class SimulaInterstitialAd {
         charId: String?,
         charName: String?,
         charImage: String?,
-        charDesc: String?
+        charDesc: String?,
+        metadata: [String: String]?
     ) async {
         let sessionId = await provider.ensureSession()
         if Task.isCancelled { return }
@@ -333,7 +356,8 @@ public final class SimulaInterstitialAd {
                 charDesc: charDesc,
                 // AdContext (contextual targeting) now rides on the full-screen request too, read
                 // from the same provider-level store the native surface uses.
-                context: provider.adContext
+                context: provider.adContext,
+                metadata: metadata
             )
             if Task.isCancelled { return }
             // Fillable only when the payload carries a non-blank `rendered_html`

@@ -91,6 +91,52 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(persistedQueue().count, 1)
     }
 
+    func testSeenMetadataIsPersistedAndForwarded() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+
+        mgr.enqueue(
+            impressionId: "imp",
+            action: "seen",
+            metadata: ["page_name": "Search", "surface": "chat"]
+        )
+
+        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        XCTAssertEqual(persistedQueue().first?.metadata, ["page_name": "Search", "surface": "chat"])
+        XCTAssertEqual(sender.lastMetadata("imp", "seen"), ["page_name": "Search", "surface": "chat"])
+    }
+
+    func testDuplicateSeenMergesMetadataWithoutResettingRetry() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
+        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
+
+        await waitUntil(timeout: 2) { self.persistedQueue().first?.metadata?["surface"] == "chat" }
+        let queued = persistedQueue().first
+        XCTAssertEqual(queued?.metadata, ["page_name": "Search", "surface": "chat"])
+        XCTAssertEqual(queued?.retryCount, 1)
+    }
+
+    func testDuplicateSeenMergeRemainsBounded() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+        let first = Dictionary(uniqueKeysWithValues: (0..<6).map { ("a\($0)", "v") })
+        let second = Dictionary(uniqueKeysWithValues: (0..<6).map { ("b\($0)", "v") })
+
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: first)
+        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: second)
+
+        await waitUntil(timeout: 2) { self.persistedQueue().first?.metadata?["b0"] == "v" }
+        XCTAssertEqual(persistedQueue().first?.metadata?.count, 10)
+    }
+
     func testDistinctActionsAreIndependent() async {
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
@@ -117,6 +163,15 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
+    func testLegacyPersistedBeaconWithoutMetadataDecodes() throws {
+        let legacy = #"[{"impressionId":"imp","action":"seen","retryCount":0,"lastAttemptTimestamp":0}]"#
+        defaults.set(Data(legacy.utf8), forKey: queueKey)
+
+        let queue = persistedQueue()
+        XCTAssertEqual(queue.count, 1)
+        XCTAssertNil(queue.first?.metadata)
+    }
+
     func testBlankImpressionIdIgnored() async {
         let sender = FakeBeaconSender()
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
@@ -135,6 +190,7 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
     private var codes: [String: Int] = [:]
     private var errors: [String: Error] = [:]
     private var counts: [String: Int] = [:]
+    private var metadataByKey: [String: [String: String]] = [:]
 
     private func key(_ id: String, _ action: String) -> String { "\(id):\(action)" }
 
@@ -142,11 +198,20 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
     func setError(_ error: Error, for id: String, _ action: String) { lock.lock(); errors[key(id, action)] = error; lock.unlock() }
     func callCount(_ id: String, _ action: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[key(id, action)] ?? 0 }
     var totalCalls: Int { lock.lock(); defer { lock.unlock() }; return counts.values.reduce(0, +) }
+    func lastMetadata(_ id: String, _ action: String) -> [String: String]? {
+        lock.lock(); defer { lock.unlock() }; return metadataByKey[key(id, action)]
+    }
 
-    func sendImpressionBeacon(adId: String, action: String, apiKey: String) async throws -> Int {
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]?
+    ) async throws -> Int {
         lock.lock()
         let k = key(adId, action)
         counts[k, default: 0] += 1
+        metadataByKey[k] = metadata
         let error = errors[k]
         let code = codes[k] ?? 200
         lock.unlock()

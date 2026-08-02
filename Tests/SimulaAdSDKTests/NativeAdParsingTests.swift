@@ -37,6 +37,36 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertNil(obj["theme"]) // omitted entirely → backend defaults to light
     }
 
+    func testMetadataEncodesAtTopLevelAndIsOmittedByDefault() throws {
+        let encoded = try JSONEncoder().encode(
+            NativeAdRequest(
+                position: 0,
+                sessionId: "s",
+                metadata: ["page_name": "Search", "surface": "chat"]
+            )
+        )
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(obj["metadata"] as? [String: String], ["page_name": "Search", "surface": "chat"])
+        XCTAssertNil(obj["extra_parameters"])
+
+        let defaultObj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(NativeAdRequest(position: 0, sessionId: "s"))) as? [String: Any]
+        )
+        XCTAssertNil(defaultObj["metadata"])
+    }
+
+    func testPublicRequestInitializerNormalizesMetadata() throws {
+        let raw = Dictionary(uniqueKeysWithValues: (0..<11).map { ("k\($0)", "v") })
+            .merging(["has.dot": "invalid"]) { current, _ in current }
+        let request = NativeAdRequest(position: 0, sessionId: "s", metadata: raw)
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual((obj["metadata"] as? [String: String])?.count, 10)
+        XCTAssertNil((obj["metadata"] as? [String: String])?["has.dot"])
+    }
+
     func testContextEncodesCamelCaseWireKeys() throws {
         let ctx = SimulaAdContext(
             searchTerm: "fantasy rpg",
