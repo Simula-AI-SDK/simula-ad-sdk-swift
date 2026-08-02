@@ -68,9 +68,8 @@ final class TelemetryManager: @unchecked Sendable {
     private let flushInterval: TimeInterval
 
     // Serial queue so the UserDefaults encode + write never runs on the caller's thread
-    // (often the main thread during ad-failure callbacks). Writes stay ordered: errors
-    // persist via `persistAsync` (prompt, non-blocking) while the background / flush
-    // paths persist via `persistSync` (must complete before returning).
+    // (often the main thread during ad-failure callbacks). Writes are enqueued while holding
+    // `lock`, preserving snapshot order; explicit durability paths wait after releasing it.
     private let persistQueue = DispatchQueue(label: "ad.simula.telemetry.persist", qos: .utility)
 
     private let lock = NSLock()
@@ -283,12 +282,12 @@ final class TelemetryManager: @unchecked Sendable {
         }
         let logEvent = errorAgg[signature]
         let snapshot = snapshotLocked()
+        persistAsync(snapshot)
         lock.unlock()
         // Persist off the caller's thread (often the main thread during ad-failure
         // callbacks). The serial queue keeps the write ordered and prompt, so the error
         // still lands quickly before a possible crash without blocking the caller on a
         // JSON encode + UserDefaults write.
-        persistAsync(snapshot)
         if let logEvent { debugLog?(formatForLog(logEvent)) }
         Task { [weak self] in await self?.flush() } // eager — an error may precede a crash/kill
     }
@@ -328,10 +327,12 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     private func persistNow() {
-        // App-background path: snapshot under lock, then block until the write lands
-        // (ordered after any pending async writes) so nothing is lost on suspension.
-        lock.lock(); let snapshot = snapshotLocked(); lock.unlock()
-        persistSync(snapshot)
+        // App-background path: enqueue the snapshot in state-mutation order, then release the
+        // lock before waiting for it to land so nothing is lost on suspension.
+        lock.lock()
+        let persistence = persistAsync(snapshotLocked())
+        lock.unlock()
+        persistence.wait()
     }
 
     // MARK: - Internals
@@ -396,15 +397,13 @@ final class TelemetryManager: @unchecked Sendable {
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
     private func snapshotLocked() -> [TelemetryEvent] { buffer + Array(errorAgg.values) }
 
-    /// Persist off the caller's thread (non-blocking), ordered via the serial queue.
-    private func persistAsync(_ events: [TelemetryEvent]) {
-        persistQueue.async { [store] in store.save(events) }
-    }
-
-    /// Persist and block until written, ordered after any pending async writes — used
-    /// where durability must complete before returning (app background, flush reconcile).
-    private func persistSync(_ events: [TelemetryEvent]) {
-        persistQueue.sync { [store] in store.save(events) }
+    /// Enqueue while holding `lock` so queue order matches the state transitions that produced
+    /// each snapshot. The returned work item lets explicit durability paths wait off the lock.
+    @discardableResult
+    private func persistAsync(_ events: [TelemetryEvent]) -> DispatchWorkItem {
+        let persistence = DispatchWorkItem { [store] in store.save(events) }
+        persistQueue.async(execute: persistence)
+        return persistence
     }
 
     /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
@@ -455,9 +454,8 @@ final class TelemetryManager: @unchecked Sendable {
     /// Reconciles the buffer with the send outcome under `lock`; returns whether to re-drain
     /// immediately (accepted) or schedule a backoff retry (transient failure).
     private func completeFlush(ack: TelemetryAck, batch: FlushBatch) -> (reFlush: Bool, needRetry: Bool) {
-        // Reconcile + snapshot under the lock, then RELEASE before persisting: persistSync blocks on
-        // the serial persist queue, and holding the NSLock across that dispatch can stall any thread
-        // doing recordError/recordOperation (e.g. under an error storm). Mirrors persistNow().
+        // Reconcile + enqueue the snapshot under the lock so a newer recording cannot submit its
+        // snapshot first. The serial queue performs the actual persistence after the lock is released.
         lock.lock()
         let snapshot: [TelemetryEvent]
         let result: (reFlush: Bool, needRetry: Bool)
@@ -484,8 +482,8 @@ final class TelemetryManager: @unchecked Sendable {
             isFlushing = false
             result = (false, true)
         }
+        persistAsync(snapshot)
         lock.unlock()
-        persistSync(snapshot)
         return result
     }
 
