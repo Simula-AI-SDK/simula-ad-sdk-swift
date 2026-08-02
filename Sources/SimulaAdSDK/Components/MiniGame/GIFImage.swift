@@ -27,6 +27,12 @@ extension Image {
 
 // MARK: - CoverImageCache
 
+/// Only successful HTTP responses contain cacheable cover bytes. Error bodies are transient
+/// transport outcomes from the cache's perspective and must remain retryable.
+func isSuccessfulCoverHTTPStatus(_ statusCode: Int) -> Bool {
+    (200...299).contains(statusCode)
+}
+
 /// In-memory image cache with GIF support using ImageIO (no external dependencies).
 /// Downloads and decodes images, caching results for reuse across carousel scrolls.
 ///
@@ -222,7 +228,11 @@ final class CoverImageCache: @unchecked Sendable {
             for (key, value) in SimulaUserAgent.standardHeaders() {
                 request.setValue(value, forHTTPHeaderField: key)
             }
-            let (data, _) = try await SimulaAPI.shared.session.data(for: request)
+            let (data, response) = try await SimulaAPI.shared.session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  isSuccessfulCoverHTTPStatus(http.statusCode) else {
+                return .failed
+            }
             let (result, cost) = decodeImage(data: data)
             store(result, cost: cost, for: url)
             return result
@@ -233,8 +243,8 @@ final class CoverImageCache: @unchecked Sendable {
             if Task.isCancelled { return .failed }
             // Transport failure (timeout / offline / unreachable): do NOT cache — the next
             // request must retry instead of pinning a broken cover until cache eviction.
-            // Only DECODE failures (bad bytes, including HTTP error pages) are cached above:
-            // re-downloading those can never succeed.
+            // Only decode failures from a successful response are cached above; transport and
+            // non-2xx responses remain uncached so a later request retries.
             return .failed
         }
     }

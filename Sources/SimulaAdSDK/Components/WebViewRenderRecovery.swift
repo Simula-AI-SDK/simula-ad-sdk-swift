@@ -14,3 +14,11 @@ func renderRecoveryBackoff(attempt: Int) -> TimeInterval {
     let clamped = min(max(attempt, 1), maxRenderRecoveries)
     return pow(2.0, Double(clamped - 1)) // 1, 2, 4
 }
+
+/// Returns the next recovery attempt only when there is content to reload and budget remains.
+/// Keeping this decision pure prevents a renderer termination before the first real load from
+/// consuming one of the creative's cumulative recovery attempts.
+func nextRenderRecoveryAttempt(currentCount: Int, hasReloadableContent: Bool) -> Int? {
+    guard hasReloadableContent, currentCount < maxRenderRecoveries else { return nil }
+    return max(currentCount, 0) + 1
+}

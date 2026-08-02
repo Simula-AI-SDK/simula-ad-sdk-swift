@@ -33,8 +33,20 @@ final class Telemetry: @unchecked Sendable {
     /// (and dropped forever on a host opt-out, since no manager is ever created).
     private var preInstallErrors: [(signature: String, errorCode: String?, message: String?, breadcrumb: String?, stack: [String]?)] = []
     private let maxPreInstallErrors = 10
+    /// Non-error events can also race the deferred manager construction after `initialized` flips.
+    /// Keep a small bounded replay list so those events are delivered without making pre-init
+    /// telemetry an unbounded lifetime buffer.
+    private var preInstallEvents: [@Sendable (TelemetryManager) -> Void] = []
+    private let maxPreInstallEvents = 20
+    /// A did-enter-background request received after initialization begins but before persisted
+    /// recovery publishes the manager. The hook coalesces notifications, so one slot is sufficient.
+    private var pendingBackgroundFlush: BackgroundFlushRequest?
 
-    private init() {}
+    init(installBackgroundObserver: Bool = true) {
+        #if canImport(UIKit)
+        if installBackgroundObserver { installBackgroundFlushObserver() }
+        #endif
+    }
 
     /// Install the telemetry pipeline. Called once from `SimulaProvider.init` (the choke point
     /// both the imperative and declarative entry points funnel through). First call wins, so the
@@ -52,6 +64,7 @@ final class Telemetry: @unchecked Sendable {
         if !enabled {
             disabled = true
             preInstallErrors.removeAll()
+            preInstallEvents.removeAll()
             lock.unlock()
             return
         }
@@ -95,26 +108,83 @@ final class Telemetry: @unchecked Sendable {
             carrierProvider: { Telemetry.resolveCarrier() },
             debugLog: consoleLog
         )
-        lock.lock(); manager = mgr; lock.unlock()
-        mgr.start()
+        completeInstallation(with: mgr)
+    }
 
-        // Drain anything recorded ahead of install (invalid-config init errors, etc.).
+    /// Completes persisted recovery synchronously on `runStartupPrewarm`'s off-main executor,
+    /// publishes/replays, then schedules only network delivery asynchronously. `initialize` does
+    /// not return until the manager is live, so the first request can safely apply session/config.
+    func completeInstallation(with mgr: TelemetryManager) {
+        mgr.recoverPersistedEvents()
+        publishRecoveredManager(mgr)
+        mgr.flushAsync()
+    }
+
+    private func publishRecoveredManager(_ mgr: TelemetryManager) {
         lock.lock()
+        manager = mgr
+        let events = preInstallEvents
+        preInstallEvents.removeAll()
         let pending = preInstallErrors
         preInstallErrors.removeAll()
+        let backgroundRequest = pendingBackgroundFlush
+        pendingBackgroundFlush = nil
         lock.unlock()
+        for replay in events { replay(mgr) }
         for error in pending {
             mgr.recordError(signature: error.signature, errorCode: error.errorCode, message: error.message, breadcrumb: error.breadcrumb, stack: error.stack)
         }
-
-        #if canImport(UIKit)
-        // Persist + deliver buffered telemetry as the app heads to the background (the window
-        // where the process is most likely to be killed). Mirrors Kotlin's ON_STOP hooks.
-        // The flush hops off the posting (main) thread: flushNow persists synchronously.
-        TelemetryBackgroundFlush.shared.install(name: UIApplication.didEnterBackgroundNotification) {
-            DispatchQueue.global(qos: .utility).async { Telemetry.shared.flush() }
+        if let backgroundRequest, !backgroundRequest.isFinished {
+            mgr.flushNow { backgroundRequest.finish() }
         }
-        #endif
+    }
+
+    /// Opens the same manager-construction window as `initialize`, without constructing production
+    /// collaborators. Used only by tests of the bounded non-error replay behavior.
+    func beginInstallationForTesting() {
+        lock.lock(); initialized = true; lock.unlock()
+    }
+
+    #if canImport(UIKit)
+    /// Installed when the facade is created, before deferred manager construction can begin. The
+    /// observer itself is cheap; UIKit work happens only when the lifecycle notification fires.
+    private func installBackgroundFlushObserver() {
+        TelemetryBackgroundFlush.shared.install(
+            name: UIApplication.didEnterBackgroundNotification,
+            beginBackgroundTask: { expiration in
+                TelemetryBackgroundFlush.beginUIKitBackgroundTask(expirationHandler: expiration)
+            }
+        ) { [weak self] request in
+            DispatchQueue.global(qos: .utility).async {
+                guard let self else { request.finish(); return }
+                self.requestBackgroundFlush(request)
+            }
+        }
+    }
+    #endif
+
+    /// Defers one background request while recovery is in progress. Once a recovered manager is
+    /// published, `flushNow` joins any active send and finishes the request after that send/drain.
+    func requestBackgroundFlush(_ request: BackgroundFlushRequest) {
+        lock.lock()
+        let currentManager = manager
+        var finishWithoutFlush = false
+        if currentManager == nil, initialized, !disabled, !request.isFinished {
+            if pendingBackgroundFlush == nil {
+                pendingBackgroundFlush = request
+            } else {
+                finishWithoutFlush = true
+            }
+        } else if currentManager == nil {
+            finishWithoutFlush = true
+        }
+        lock.unlock()
+
+        if let currentManager {
+            currentManager.flushNow { request.finish() }
+        } else if finishWithoutFlush {
+            request.finish()
+        }
     }
 
     private var current: TelemetryManager? {
@@ -138,14 +208,21 @@ final class Telemetry: @unchecked Sendable {
         responseBytes: Int64,
         failureClass: String?
     ) {
-        current?.recordNetwork(
-            path: path, method: method, statusCode: statusCode, durationMs: durationMs,
-            requestBytes: requestBytes, responseBytes: responseBytes, failureClass: failureClass
-        )
+        bufferOrRecord { manager in
+            manager.recordNetwork(
+                path: path, method: method, statusCode: statusCode, durationMs: durationMs,
+                requestBytes: requestBytes, responseBytes: responseBytes, failureClass: failureClass
+            )
+        }
     }
 
     func recordOperation(name: String, durationMs: Int, success: Bool, failureClass: String? = nil, breadcrumb: String? = nil) {
-        current?.recordOperation(name: name, durationMs: durationMs, success: success, failureClass: failureClass, breadcrumb: breadcrumb)
+        bufferOrRecord { manager in
+            manager.recordOperation(
+                name: name, durationMs: durationMs, success: success,
+                failureClass: failureClass, breadcrumb: breadcrumb
+            )
+        }
     }
 
     func recordLifecycle(
@@ -160,11 +237,24 @@ final class Telemetry: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil
     ) {
-        current?.recordLifecycle(
-            stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: serveId, durationMs: durationMs, errorCode: errorCode,
-            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb
-        )
+        bufferOrRecord { manager in
+            manager.recordLifecycle(
+                stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
+                serveId: serveId, durationMs: durationMs, errorCode: errorCode,
+                trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb
+            )
+        }
+    }
+
+    private func bufferOrRecord(_ replay: @escaping @Sendable (TelemetryManager) -> Void) {
+        lock.lock()
+        let currentManager = manager
+        if currentManager == nil, initialized, !disabled,
+           preInstallEvents.count < maxPreInstallEvents {
+            preInstallEvents.append(replay)
+        }
+        lock.unlock()
+        if let currentManager { replay(currentManager) }
     }
 
     func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
@@ -181,7 +271,10 @@ final class Telemetry: @unchecked Sendable {
     }
 
     /// Persist + attempt delivery now (e.g. app background).
-    func flush() { current?.flushNow() }
+    func flush(completion: (@Sendable () -> Void)? = nil) {
+        let request = BackgroundFlushRequest(onFinish: completion ?? {})
+        requestBackgroundFlush(request)
+    }
 
     /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
     func setExperiment(experimentId: String?, variantId: String?) {

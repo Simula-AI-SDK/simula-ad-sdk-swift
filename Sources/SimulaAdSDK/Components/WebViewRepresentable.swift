@@ -628,29 +628,30 @@ struct WebViewRepresentable: UIViewRepresentable {
             // so it can't spin a reload→crash→reload loop (iOS-6). The delayed reload is a
             // CANCELLABLE work item: a serve swap or dismantle before it fires must not let it
             // stomp the creative now bound to the view.
-            if renderRecoveryCount < maxRenderRecoveries {
-                renderRecoveryCount += 1
-                let delaySeconds = renderRecoveryBackoff(attempt: renderRecoveryCount)
-                let reload: (WKWebView) -> Void
-                if let html = currentHTML {
-                    let baseURL = currentBaseURL
-                    reload = { $0.loadHTMLString(html, baseURL: baseURL) }
-                } else if let url = currentURL {
-                    reload = { $0.load(URLRequest(url: url)) }
-                } else {
-                    reload = { _ in }
+            let reload: ((WKWebView) -> Void)?
+            if let html = currentHTML {
+                let baseURL = currentBaseURL
+                reload = { $0.loadHTMLString(html, baseURL: baseURL) }
+            } else if let url = currentURL {
+                reload = { $0.load(URLRequest(url: url)) }
+            } else {
+                reload = nil
+            }
+            if let reload,
+               let attempt = nextRenderRecoveryAttempt(
+                   currentCount: renderRecoveryCount, hasReloadableContent: true
+               ) {
+                renderRecoveryCount = attempt
+                let delaySeconds = renderRecoveryBackoff(attempt: attempt)
+                let work = DispatchWorkItem { [weak self, weak webView] in
+                    guard let self, let webView else { return }
+                    self.pendingRecovery = nil
+                    reload(webView)
                 }
-                if currentHTML != nil || currentURL != nil {
-                    let work = DispatchWorkItem { [weak self, weak webView] in
-                        guard let self, let webView else { return }
-                        self.pendingRecovery = nil
-                        reload(webView)
-                    }
-                    pendingRecovery?.cancel()
-                    pendingRecovery = work
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds, execute: work)
-                    return
-                }
+                pendingRecovery?.cancel()
+                pendingRecovery = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds, execute: work)
+                return
             }
             // Already retried (or nothing to reload): for the native, content-sized slot, collapse to
             // zero height (parity with a load failure) instead of holding a blank provisional block.

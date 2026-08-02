@@ -285,8 +285,9 @@ enum CreativeCTARouter {
     static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) {
         guard !externalSheetSlot.isOccupied else { return }
         let storeVC = SKStoreProductViewController()
+        let sheetIdentity = PresentationIdentity()
         let delegate = StoreProductDelegate {
-            externalSheetSlot.clear()
+            guard externalSheetSlot.clear(ifMatches: sheetIdentity) else { return }
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         storeVC.delegate = delegate
@@ -301,7 +302,7 @@ enum CreativeCTARouter {
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick occupied forever on a no-window early-return.
         if presentViewController(storeVC) {
-            externalSheetSlot.occupy(storeVC)
+            externalSheetSlot.occupy(storeVC, identity: sheetIdentity)
             delegate.arm() // a silent sheet teardown may now emit the dismiss (see SheetFinishRelay)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }
@@ -366,8 +367,9 @@ enum CreativeCTARouter {
     static func presentSafari(url: URL) {
         guard !externalSheetSlot.isOccupied else { return }
         let safariVC = SFSafariViewController(url: url)
+        let sheetIdentity = PresentationIdentity()
         let delegate = SafariDelegate {
-            externalSheetSlot.clear()
+            guard externalSheetSlot.clear(ifMatches: sheetIdentity) else { return }
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         safariVC.delegate = delegate
@@ -377,7 +379,7 @@ enum CreativeCTARouter {
         )
         // Only mark "presenting" once the present actually succeeds.
         if presentViewController(safariVC) {
-            externalSheetSlot.occupy(safariVC)
+            externalSheetSlot.occupy(safariVC, identity: sheetIdentity)
             delegate.arm() // a silent sheet teardown may now emit the dismiss (see SheetFinishRelay)
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
         }

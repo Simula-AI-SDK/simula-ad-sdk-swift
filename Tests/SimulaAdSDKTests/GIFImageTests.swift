@@ -18,4 +18,14 @@ final class GIFImageTests: XCTestCase {
         // A non-positive size must not loop forever — falls back to one group.
         XCTAssertEqual(CoverImageCache.chunks(["a", "b"], size: 0), [["a", "b"]])
     }
+
+    func testOnly2xxCoverResponsesAreAccepted() {
+        XCTAssertFalse(isSuccessfulCoverHTTPStatus(199))
+        XCTAssertTrue(isSuccessfulCoverHTTPStatus(200))
+        XCTAssertTrue(isSuccessfulCoverHTTPStatus(204))
+        XCTAssertTrue(isSuccessfulCoverHTTPStatus(299))
+        XCTAssertFalse(isSuccessfulCoverHTTPStatus(300))
+        XCTAssertFalse(isSuccessfulCoverHTTPStatus(404))
+        XCTAssertFalse(isSuccessfulCoverHTTPStatus(503))
+    }
 }

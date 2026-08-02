@@ -19,4 +19,15 @@ final class WebViewRenderRecoveryTests: XCTestCase {
         // (parity with the load-failure path) instead of looping WebContent process churn.
         XCTAssertEqual(maxRenderRecoveries, 3)
     }
+
+    func testNoReloadableContentDoesNotConsumeRecoveryBudget() {
+        XCTAssertNil(nextRenderRecoveryAttempt(currentCount: 0, hasReloadableContent: false))
+        XCTAssertNil(nextRenderRecoveryAttempt(currentCount: 2, hasReloadableContent: false))
+    }
+
+    func testReloadableContentAdvancesUntilCap() {
+        XCTAssertEqual(nextRenderRecoveryAttempt(currentCount: 0, hasReloadableContent: true), 1)
+        XCTAssertEqual(nextRenderRecoveryAttempt(currentCount: 2, hasReloadableContent: true), 3)
+        XCTAssertNil(nextRenderRecoveryAttempt(currentCount: 3, hasReloadableContent: true))
+    }
 }

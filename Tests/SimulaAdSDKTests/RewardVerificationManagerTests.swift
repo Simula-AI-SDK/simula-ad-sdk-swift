@@ -317,11 +317,15 @@ final class RewardVerificationManagerTests: XCTestCase {
         // memory until the didEnterBackground path calls persistNowSync().
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "reward")
+        let deferred = DeferredRewardPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "reward-persist-deferred", deferAsyncSubmission: { deferred.hold($0) }
+        )
         let mgr = RewardVerificationManager(
             verifier: verifier,
             defaults: defaults,
             now: { 0 },
-            performPersist: { _ in /* pending utility write never runs */ }
+            persistence: persistence
         )
         mgr.queueVerification(serveId: "reward", sessionId: "s", elapsedPlayTime: 5)
         XCTAssertTrue(persistedQueue().isEmpty, "async persist never ran — in-memory only")
@@ -329,6 +333,49 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.persistNowSync()
 
         XCTAssertEqual(persistedQueue().map(\.serveId), ["reward"])
+    }
+
+    func testOlderAsyncSnapshotCannotLoseANewerRewardAfterBackgroundPersist() async {
+        let deferred = DeferredRewardPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "reward-persist-loss", deferAsyncSubmission: { deferred.hold($0) }
+        )
+        let verifier = FakeVerifier()
+        verifier.gate("old") // keep the first reward in memory without creating retry tasks
+        let mgr = RewardVerificationManager(
+            verifier: verifier, defaults: defaults, now: { 0 }, persistence: persistence
+        )
+
+        mgr.queueVerification(serveId: "old", sessionId: "s", elapsedPlayTime: 5)
+        await verifier.waitUntilEntered("old")
+        mgr.persistNowSync()
+        mgr.queueVerification(serveId: "new", sessionId: "s", elapsedPlayTime: 5)
+
+        deferred.runNewestFirst()
+        persistence.waitForPendingWrites()
+
+        XCTAssertEqual(Set(persistedQueue().map(\.serveId)), ["old", "new"])
+        verifier.release("old")
+    }
+
+    func testOlderAsyncSnapshotCannotResurrectVerifiedRewardAfterBackgroundPersist() async {
+        let deferred = DeferredRewardPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "reward-persist-resurrection", deferAsyncSubmission: { deferred.hold($0) }
+        )
+        let verifier = FakeVerifier() // success removes the reward
+        let mgr = RewardVerificationManager(
+            verifier: verifier, defaults: defaults, now: { 0 }, persistence: persistence
+        )
+
+        mgr.queueVerification(serveId: "verified", sessionId: "s", elapsedPlayTime: 5)
+        try? await waitUntil(timeout: 2) { deferred.count >= 2 } // enqueue + empty drain snapshot
+        mgr.persistNowSync()
+
+        deferred.runOldestFirst()
+        persistence.waitForPendingWrites()
+
+        XCTAssertTrue(persistedQueue().isEmpty, "held stale snapshots must not resurrect verified work")
     }
 
     // MARK: - Helpers
@@ -415,6 +462,31 @@ private final class ControllableSleep: @unchecked Sendable {
         releaseCont = nil
         lock.unlock()
         cont?.resume()
+    }
+}
+
+private final class DeferredRewardPersistenceSubmissions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var submissions: [@Sendable () -> Void] = []
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return submissions.count
+    }
+
+    func hold(_ submission: @escaping @Sendable () -> Void) {
+        lock.lock(); submissions.append(submission); lock.unlock()
+    }
+
+    func runOldestFirst() { run(reversed: false) }
+    func runNewestFirst() { run(reversed: true) }
+
+    private func run(reversed: Bool) {
+        lock.lock()
+        let pending = reversed ? Array(submissions.reversed()) : submissions
+        submissions.removeAll()
+        lock.unlock()
+        pending.forEach { $0() }
     }
 }
 

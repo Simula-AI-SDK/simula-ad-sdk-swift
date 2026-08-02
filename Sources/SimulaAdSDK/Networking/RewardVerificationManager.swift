@@ -83,9 +83,10 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private var isProcessing = false
     /// In-memory queue — loaded lazily on first use. Guarded by `lock`.
     private var cache: [PendingVerification]?
-    /// Executes the JSON-encode + `UserDefaults.set` persist off the calling thread
-    /// (production: a serial utility queue; tests inject a synchronous runner).
-    private let performPersist: @Sendable (@escaping @Sendable () -> Void) -> Void
+    /// Orders normal async and app-background sync writes on one revision-aware serial writer.
+    private let persistence: OrderedPersistenceExecutor
+    /// Monotonic snapshot identity. Guarded by `lock`.
+    private var persistenceRevision: UInt64 = 0
 
     /// A scheduled wake-up for the earliest backed-off task after a retryable failure (e.g. a
     /// server 5xx). Without it the backoff computed eligibility but nothing ever re-triggered
@@ -106,8 +107,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.sleep = { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
-        let persistQueue = DispatchQueue(label: "com.simula.rewardverify.persist", qos: .utility)
-        self.performPersist = { work in persistQueue.async(execute: work) }
+        self.persistence = OrderedPersistenceExecutor(label: "com.simula.rewardverify.persist")
         #if canImport(UIKit)
         // Reward completion commonly happens immediately before backgrounding. Persist the
         // in-memory queue synchronously as the app leaves the foreground so suspension/kill
@@ -131,7 +131,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         defaults: UserDefaults,
         now: @escaping @Sendable () -> TimeInterval,
         sleep: (@Sendable (TimeInterval) async -> Void)? = nil,
-        performPersist: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil
+        persistence: OrderedPersistenceExecutor? = nil
     ) {
         self.verifier = verifier
         self.defaults = defaults
@@ -139,7 +139,9 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.sleep = sleep ?? { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
-        self.performPersist = performPersist ?? { work in work() }
+        self.persistence = persistence ?? OrderedPersistenceExecutor(
+            label: "com.simula.rewardverify.persist.tests", asyncWrites: false
+        )
     }
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
@@ -362,10 +364,12 @@ public final class RewardVerificationManager: @unchecked Sendable {
     /// Encode + write the current cache off the calling thread (snapshot is a value type).
     /// MUST only be called under `lock`.
     private func persistLocked() {
-        guard let cache else { return }
+        guard let snapshot = cache else { return }
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
         let box = UncheckedSendableDefaults(defaults)
-        performPersist { [userDefaultsKey] in
-            if let data = try? JSONEncoder().encode(cache) {
+        persistence.submitAsync(revision: revision) { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(snapshot) {
                 box.defaults.set(data, forKey: userDefaultsKey)
             }
         }
@@ -377,10 +381,16 @@ public final class RewardVerificationManager: @unchecked Sendable {
     func persistNowSync() {
         lock.lock()
         let snapshot = cache
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
         lock.unlock()
-        guard let snapshot,
-              let data = try? JSONEncoder().encode(snapshot) else { return }
-        defaults.set(data, forKey: userDefaultsKey)
+        guard let snapshot else { return }
+        let box = UncheckedSendableDefaults(defaults)
+        persistence.submitSync(revision: revision) { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(snapshot) {
+                box.defaults.set(data, forKey: userDefaultsKey)
+            }
+        }
     }
 
     private func loadQueue() -> [PendingVerification] {

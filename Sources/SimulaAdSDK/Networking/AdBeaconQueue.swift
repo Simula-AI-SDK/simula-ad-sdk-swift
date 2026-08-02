@@ -35,6 +35,53 @@ final class UncheckedSendableDefaults: @unchecked Sendable {
     init(_ defaults: UserDefaults) { self.defaults = defaults }
 }
 
+/// Serializes durable-queue snapshots and rejects a snapshot older than one already written.
+/// `deferAsyncSubmission` is immediate in production; tests can hold/reorder submissions to
+/// deterministically exercise races between normal async writes and a background sync write.
+final class OrderedPersistenceExecutor: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let asyncWrites: Bool
+    private let deferAsyncSubmission: @Sendable (@escaping @Sendable () -> Void) -> Void
+    /// Accessed only on `queue`.
+    private var latestRevision: UInt64 = 0
+
+    init(
+        label: String,
+        asyncWrites: Bool = true,
+        deferAsyncSubmission: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { $0() }
+    ) {
+        self.queue = DispatchQueue(label: label, qos: .utility)
+        self.asyncWrites = asyncWrites
+        self.deferAsyncSubmission = deferAsyncSubmission
+    }
+
+    func submitAsync(revision: UInt64, work: @escaping @Sendable () -> Void) {
+        if !asyncWrites {
+            queue.sync { perform(revision: revision, work: work) }
+            return
+        }
+        let enqueue: @Sendable () -> Void = { [self] in
+            queue.async { [self] in perform(revision: revision, work: work) }
+        }
+        deferAsyncSubmission(enqueue)
+    }
+
+    func submitSync(revision: UInt64, work: @escaping @Sendable () -> Void) {
+        queue.sync { perform(revision: revision, work: work) }
+    }
+
+    /// Test/barrier seam: waits until every submission already enqueued on the writer has run.
+    func waitForPendingWrites() {
+        queue.sync {}
+    }
+
+    private func perform(revision: UInt64, work: @escaping @Sendable () -> Void) {
+        guard revision > latestRevision else { return }
+        work()
+        latestRevision = revision
+    }
+}
+
 // MARK: - Seam
 
 /// Sends one impression-action beacon, returning the HTTP status (or throwing on connectivity).
@@ -74,21 +121,21 @@ public final class AdBeaconManager: @unchecked Sendable {
     private let sender: BeaconSending
     private let defaults: UserDefaults
     private let now: @Sendable () -> TimeInterval
-    /// Executes the JSON-encode + `UserDefaults.set` persist off the calling thread
-    /// (production: a serial utility queue; tests inject a synchronous runner).
-    private let performPersist: @Sendable (@escaping @Sendable () -> Void) -> Void
+    /// Orders normal async and app-background sync writes on one revision-aware serial writer.
+    private let persistence: OrderedPersistenceExecutor
     private let lock = NSLock()
     private var isProcessing = false
     private var apiKey: String?
     /// In-memory queue — loaded lazily on first use. Guarded by `lock`.
     private var cache: [PendingBeacon]?
+    /// Monotonic snapshot identity. Guarded by `lock`.
+    private var persistenceRevision: UInt64 = 0
 
     private init() {
         self.sender = SimulaAPI()
         self.defaults = .standard
         self.now = { Date().timeIntervalSince1970 }
-        let persistQueue = DispatchQueue(label: "com.simula.adbeacon.persist", qos: .utility)
-        self.performPersist = { work in persistQueue.async(execute: work) }
+        self.persistence = OrderedPersistenceExecutor(label: "com.simula.adbeacon.persist")
         #if canImport(UIKit)
         // Sync-persist as the app heads to the background: enqueues mutate the in-memory
         // queue and persist on a utility queue, so a beacon fired moments before the
@@ -107,14 +154,22 @@ public final class AdBeaconManager: @unchecked Sendable {
     #endif
 
     /// Test seam: inject a fake sender, isolated `UserDefaults`, and a controllable clock.
-    /// `performPersist` defaults to synchronous; inject a swallowing runner to simulate a
-    /// pending utility-queue write that never lands before a process kill.
-    init(sender: BeaconSending, defaults: UserDefaults, now: @escaping @Sendable () -> TimeInterval, apiKey: String? = "test", performPersist: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil) {
+    /// Persistence defaults to synchronous for deterministic tests; production uses its utility
+    /// writer above. Tests may inject a writer that defers async submissions to force races.
+    init(
+        sender: BeaconSending,
+        defaults: UserDefaults,
+        now: @escaping @Sendable () -> TimeInterval,
+        apiKey: String? = "test",
+        persistence: OrderedPersistenceExecutor? = nil
+    ) {
         self.sender = sender
         self.defaults = defaults
         self.now = now
         self.apiKey = apiKey
-        self.performPersist = performPersist ?? { work in work() }
+        self.persistence = persistence ?? OrderedPersistenceExecutor(
+            label: "com.simula.adbeacon.persist.tests", asyncWrites: false
+        )
     }
 
     /// Provide the api key (the beacon endpoints are Bearer-authed). Call once at SDK init; first wins.
@@ -275,10 +330,12 @@ public final class AdBeaconManager: @unchecked Sendable {
     /// Encode + write the current cache off the calling thread (snapshot is a value type).
     /// MUST only be called under `lock`.
     private func persistLocked() {
-        guard let cache else { return }
+        guard let snapshot = cache else { return }
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
         let box = UncheckedSendableDefaults(defaults)
-        performPersist { [userDefaultsKey] in
-            if let data = try? JSONEncoder().encode(cache) {
+        persistence.submitAsync(revision: revision) { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(snapshot) {
                 box.defaults.set(data, forKey: userDefaultsKey)
             }
         }
@@ -290,10 +347,16 @@ public final class AdBeaconManager: @unchecked Sendable {
     func persistNowSync() {
         lock.lock()
         let snapshot = cache
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
         lock.unlock()
-        guard let snapshot,
-              let data = try? JSONEncoder().encode(snapshot) else { return }
-        defaults.set(data, forKey: userDefaultsKey)
+        guard let snapshot else { return }
+        let box = UncheckedSendableDefaults(defaults)
+        persistence.submitSync(revision: revision) { [userDefaultsKey] in
+            if let data = try? JSONEncoder().encode(snapshot) {
+                box.defaults.set(data, forKey: userDefaultsKey)
+            }
+        }
     }
 
     private func loadQueue() -> [PendingBeacon] {

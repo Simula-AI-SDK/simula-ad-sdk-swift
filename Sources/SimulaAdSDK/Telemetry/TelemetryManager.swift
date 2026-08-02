@@ -81,6 +81,9 @@ final class TelemetryManager: @unchecked Sendable {
     private var errorAgg: [String: TelemetryEvent] = [:]
     private var droppedCount = 0
     private var isFlushing = false
+    /// Background flushes waiting for an already-active send. Resumed after reconciliation;
+    /// `Bool` is false for retry outcomes so a waiter does not bypass backoff.
+    private var flushWaiters: [CheckedContinuation<Bool, Never>] = []
     private var flushScheduled = false
     private var retryCount = 0
     private var isEnabled: Bool
@@ -139,24 +142,33 @@ final class TelemetryManager: @unchecked Sendable {
         self.perfSampledIn = enabled && random() < sampleRate
     }
 
-    /// Recover any buffer left by a prior process, then attempt a flush.
+    /// Standalone asynchronous startup used by engine tests. Production installation calls
+    /// `recoverPersistedEvents()` synchronously on its already-off-main startup path, publishes
+    /// the manager, then calls `flushAsync()` so first SDK requests cannot outrun publication.
     func start() {
-        Task { [weak self] in await self?.recoverAndFlush() }
+        Task { await self.recoverAndFlush() }
     }
 
     private func recoverAndFlush() async {
-        recover()
+        recoverPersistedEvents()
         await flush()
     }
 
-    /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6).
-    private func recover() {
+    /// Synchronous disk recovery. Production invokes this from `runStartupPrewarm`, which is
+    /// explicitly off-main. The store load stays outside `lock`; only the in-memory merge is locked.
+    func recoverPersistedEvents() {
+        let recovered = store.load()
         lock.lock()
-        for e in store.load() {
+        for e in recovered {
             if e.type == TelemetryType.error, !e.name.isEmpty { errorAgg[e.name] = e }
             else { buffer.append(e) }
         }
         lock.unlock()
+    }
+
+    /// Network delivery remains asynchronous after synchronous recovery + publication.
+    func flushAsync() {
+        Task { await self.flush() }
     }
 
     /// Push the live session id (from `SimulaProvider`) so the envelope can carry it without
@@ -297,12 +309,17 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     /// Persist + attempt a flush now (e.g. app background).
-    func flushNow() {
+    func flushNow(completion: (@Sendable () -> Void)? = nil) {
         // Emit the session funnel deltas + a diagnostics sample as part of this (background) flush.
         emitFunnelSummary()
         emitDiagnostics()
         persistNow()
-        Task { [weak self] in await self?.flush() }
+        Task { await self.flushAndComplete(completion) }
+    }
+
+    private func flushAndComplete(_ completion: (@Sendable () -> Void)?) async {
+        await flush(waitForActive: true)
+        completion?()
     }
 
     /// Emit one `funnel_summary` operation per active format (cumulative since the last emit), then
@@ -412,11 +429,46 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
     /// reconcile (sync, under lock). All `NSLock` use stays in the synchronous helpers.
-    private func flush() async {
-        guard let batch = beginFlush() else { return }
+    private func flush(waitForActive: Bool = false) async {
+        guard let batch = beginFlush() else {
+            guard waitForActive else { return }
+            let mayContinue = await waitForActiveFlush()
+            if mayContinue, hasPendingEvents() { await flush(waitForActive: true) }
+            return
+        }
         let ack: TelemetryAck = batch.body.isEmpty ? .retry : await sender.send(batch.body)
         let outcome = completeFlush(ack: ack, batch: batch)
-        if outcome.needRetry { scheduleRetry() } else if outcome.reFlush { await flush() }
+        if outcome.needRetry {
+            scheduleRetry()
+        } else if outcome.reFlush || (waitForActive && hasPendingEvents()) {
+            await flush(waitForActive: waitForActive)
+        }
+    }
+
+    /// Suspends only when a send is active. Registration and the active-state check are atomic
+    /// under `lock`; continuations are resumed after the lock is released by `completeFlush`.
+    private func waitForActiveFlush() async -> Bool {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isFlushing {
+                flushWaiters.append(continuation)
+                lock.unlock()
+            } else {
+                lock.unlock()
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    private func hasPendingEvents() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !buffer.isEmpty || !errorAgg.isEmpty
+    }
+
+    /// Observable synchronization seam for deterministic active-send join tests.
+    var pendingFlushWaiterCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return flushWaiters.count
     }
 
     private struct FlushBatch {
@@ -464,6 +516,7 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         let snapshot: [TelemetryEvent]
         let result: (reFlush: Bool, needRetry: Bool)
+        let waiters: [CheckedContinuation<Bool, Never>]
         switch ack {
         case .accepted, .drop:
             let ids = Set(batch.pendingBuffer.map { $0.eventId })
@@ -487,6 +540,8 @@ final class TelemetryManager: @unchecked Sendable {
             isFlushing = false
             result = (false, true)
         }
+        waiters = flushWaiters
+        flushWaiters.removeAll()
         lock.unlock()
         // Async persist (iOS-7): flush() runs on the cooperative pool, and persistSync would
         // block one of its few threads behind the utility-QoS persist backlog under an error
@@ -495,6 +550,7 @@ final class TelemetryManager: @unchecked Sendable {
         // later snapshot can't miss it. Sync durability stays on the app-background path
         // (persistNow), where the write must complete before suspension.
         persistAsync(snapshot)
+        for waiter in waiters { waiter.resume(returning: !result.needRetry) }
         return result
     }
 

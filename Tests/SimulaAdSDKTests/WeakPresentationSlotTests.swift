@@ -35,4 +35,29 @@ final class WeakPresentationSlotTests: XCTestCase {
         slot.occupy(second)
         XCTAssertTrue(slot.isOccupied)
     }
+
+    func testStaleFinishCannotClearNewerPresentation() {
+        let slot = WeakPresentationSlot<Sheet>()
+        var first: Sheet? = Sheet()
+        let firstIdentity = slot.occupy(first!)
+        first = nil // weak occupancy opens, but the first relay may finish later
+
+        let second = Sheet()
+        let secondIdentity = slot.occupy(second)
+
+        XCTAssertFalse(slot.clear(ifMatches: firstIdentity))
+        XCTAssertTrue(slot.isOccupied, "a stale relay must leave the newer sheet tracked")
+        XCTAssertTrue(slot.clear(ifMatches: secondIdentity))
+        XCTAssertFalse(slot.isOccupied)
+    }
+
+    func testSilentTeardownIdentityCanFinishBeforeAReplacementAppears() {
+        let slot = WeakPresentationSlot<Sheet>()
+        var sheet: Sheet? = Sheet()
+        let identity = slot.occupy(sheet!)
+        sheet = nil
+
+        XCTAssertTrue(slot.clear(ifMatches: identity))
+        XCTAssertFalse(slot.isOccupied)
+    }
 }

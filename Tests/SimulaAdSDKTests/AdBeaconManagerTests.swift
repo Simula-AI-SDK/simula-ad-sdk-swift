@@ -202,17 +202,61 @@ final class AdBeaconManagerTests: XCTestCase {
         // the process were killed before it landed), an enqueued beacon exists only in
         // memory — persistNowSync (the didEnterBackground path) must still make it durable.
         let sender = FakeBeaconSender()
+        let deferred = DeferredPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "beacon-persist-deferred", deferAsyncSubmission: { deferred.hold($0) }
+        )
         let mgr = AdBeaconManager(
             sender: sender,
             defaults: defaults,
             now: { 0 },
             apiKey: nil, // pre-config: the drain bails immediately, leaving the row pending
-            performPersist: { _ in /* the utility-queue write never runs (process kill) */ }
+            persistence: persistence
         )
         mgr.enqueue(impressionId: "imp", action: "seen")
         XCTAssertTrue(persistedQueue().isEmpty, "async persist never ran — in-memory only")
         mgr.persistNowSync()
         XCTAssertEqual(persistedQueue().map(\.impressionId), ["imp"])
+    }
+
+    func testOlderAsyncSnapshotCannotLoseANewerBeaconAfterBackgroundPersist() {
+        let deferred = DeferredPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "beacon-persist-loss", deferAsyncSubmission: { deferred.hold($0) }
+        )
+        let mgr = AdBeaconManager(
+            sender: FakeBeaconSender(), defaults: defaults, now: { 0 }, apiKey: nil,
+            persistence: persistence
+        )
+
+        mgr.enqueue(impressionId: "old", action: "seen") // revision 1, held
+        mgr.persistNowSync() // revision 2 writes [old]
+        mgr.enqueue(impressionId: "new", action: "seen") // revision 3, held
+
+        deferred.runNewestFirst() // force revision 3 to land before stale revision 1
+        persistence.waitForPendingWrites()
+
+        XCTAssertEqual(Set(persistedQueue().map(\.impressionId)), ["old", "new"])
+    }
+
+    func testOlderAsyncSnapshotCannotResurrectDeliveredBeaconAfterBackgroundPersist() async {
+        let deferred = DeferredPersistenceSubmissions()
+        let persistence = OrderedPersistenceExecutor(
+            label: "beacon-persist-resurrection", deferAsyncSubmission: { deferred.hold($0) }
+        )
+        let sender = FakeBeaconSender() // 200: enqueue snapshot becomes stale after delivery
+        let mgr = AdBeaconManager(
+            sender: sender, defaults: defaults, now: { 0 }, persistence: persistence
+        )
+
+        mgr.enqueue(impressionId: "delivered", action: "seen")
+        await waitUntil(timeout: 2) { deferred.count >= 2 } // enqueue + empty drain snapshot
+        mgr.persistNowSync() // newest empty snapshot lands synchronously
+
+        deferred.runOldestFirst()
+        persistence.waitForPendingWrites()
+
+        XCTAssertTrue(persistedQueue().isEmpty, "held stale snapshots must not resurrect delivered work")
     }
 }
 
@@ -232,6 +276,31 @@ private final class CountingDefaults: UserDefaults {
     override func set(_ value: Any?, forKey defaultName: String) {
         lock.lock(); setCount += 1; lock.unlock()
         super.set(value, forKey: defaultName)
+    }
+}
+
+private final class DeferredPersistenceSubmissions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var submissions: [@Sendable () -> Void] = []
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return submissions.count
+    }
+
+    func hold(_ submission: @escaping @Sendable () -> Void) {
+        lock.lock(); submissions.append(submission); lock.unlock()
+    }
+
+    func runOldestFirst() { run(reversed: false) }
+    func runNewestFirst() { run(reversed: true) }
+
+    private func run(reversed: Bool) {
+        lock.lock()
+        let pending = reversed ? Array(submissions.reversed()) : submissions
+        submissions.removeAll()
+        lock.unlock()
+        pending.forEach { $0() }
     }
 }
 
