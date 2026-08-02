@@ -219,6 +219,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             // A fresh load supersedes any pending render-recovery reload of the old creative.
             context.coordinator.pendingRecovery?.cancel()
             context.coordinator.pendingRecovery = nil
+            // Content identity changed even when retainedImpressionId did not (plain/fullscreen
+            // swaps, host-driven creative refresh): this is a new creative with a fresh budget.
+            context.coordinator.renderRecoveryCount = 0
             context.coordinator.currentHTML = html
             context.coordinator.currentURL = nil
             context.coordinator.currentBaseURL = baseURL
@@ -228,6 +231,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // A fresh load supersedes any pending render-recovery reload of the old creative.
             context.coordinator.pendingRecovery?.cancel()
             context.coordinator.pendingRecovery = nil
+            context.coordinator.renderRecoveryCount = 0
             context.coordinator.currentURL = url
             context.coordinator.currentHTML = nil
             context.coordinator.realLoadStarted = true

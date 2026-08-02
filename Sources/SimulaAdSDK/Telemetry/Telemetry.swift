@@ -24,6 +24,9 @@ final class Telemetry: @unchecked Sendable {
     private let lock = NSLock()
     private var manager: TelemetryManager?
     private var initialized = false
+    /// True only when the first-wins install explicitly opted telemetry out. Distinguishes
+    /// "install in progress" (buffer errors) from "disabled forever" (drop them cheaply).
+    private var disabled = false
     /// Errors recorded before `initialize` installs the pipeline (e.g. `SimulaAds.initialize`
     /// rejecting an invalid API key). Without the buffer those calls vanished silently — the
     /// exact misconfiguration feedback an integrator needs. Bounded; drained once on install
@@ -46,9 +49,13 @@ final class Telemetry: @unchecked Sendable {
         lock.lock()
         if initialized { lock.unlock(); return }
         initialized = true
+        if !enabled {
+            disabled = true
+            preInstallErrors.removeAll()
+            lock.unlock()
+            return
+        }
         lock.unlock()
-
-        guard enabled else { return } // host opt-out: no manager is ever created
 
         // `SimulaConnectionType` is started independently (from `SimulaProvider.init`, ahead of
         // telemetry install) since the `X-Connection-Type` header must work even when telemetry is
@@ -163,9 +170,10 @@ final class Telemetry: @unchecked Sendable {
     func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
         lock.lock()
         let currentManager = manager
-        if currentManager == nil, !initialized, preInstallErrors.count < maxPreInstallErrors {
-            // Pre-install (e.g. an invalid-API-key `initialize`): buffer instead of dropping —
-            // drained into the manager the moment the pipeline is installed.
+        if currentManager == nil, !disabled, preInstallErrors.count < maxPreInstallErrors {
+            // Pre-install OR install-in-progress (e.g. an invalid-API-key `initialize` racing
+            // the manager build): buffer instead of dropping — drained once install completes.
+            // An explicit host opt-out sets `disabled`, keeping this a permanent no-op.
             preInstallErrors.append((signature, errorCode, message, breadcrumb, stack))
         }
         lock.unlock()

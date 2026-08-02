@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - PendingVerification
 
@@ -105,7 +108,20 @@ public final class RewardVerificationManager: @unchecked Sendable {
         }
         let persistQueue = DispatchQueue(label: "com.simula.rewardverify.persist", qos: .utility)
         self.performPersist = { work in persistQueue.async(execute: work) }
+        #if canImport(UIKit)
+        // Reward completion commonly happens immediately before backgrounding. Persist the
+        // in-memory queue synchronously as the app leaves the foreground so suspension/kill
+        // cannot lose the reward + SSV postback while the utility write is still pending.
+        backgroundFlushObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+        ) { [weak self] _ in self?.persistNowSync() }
+        #endif
     }
+
+    #if canImport(UIKit)
+    /// Token for the app-background persist hook (retained for the process lifetime by design).
+    private var backgroundFlushObserver: NSObjectProtocol?
+    #endif
 
     /// Test seam: inject a fake verifier, an isolated `UserDefaults`, a controllable
     /// clock, and (optionally) a controllable sleeper so the draining + retry-wake logic
@@ -114,7 +130,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
         verifier: RewardVerifying,
         defaults: UserDefaults,
         now: @escaping @Sendable () -> TimeInterval,
-        sleep: (@Sendable (TimeInterval) async -> Void)? = nil
+        sleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        performPersist: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil
     ) {
         self.verifier = verifier
         self.defaults = defaults
@@ -122,7 +139,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         self.sleep = sleep ?? { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
-        self.performPersist = { work in work() }
+        self.performPersist = performPersist ?? { work in work() }
     }
 
     /// Enqueues a verification, persists it, and starts draining the queue. The
@@ -352,6 +369,18 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 box.defaults.set(data, forKey: userDefaultsKey)
             }
         }
+    }
+
+    /// Synchronously persist the in-memory queue NOW (app-background path). Closes the
+    /// durability window between an earned reward entering memory and the async utility
+    /// write: suspension/kill in that window would lose both the reward and SSV postback.
+    func persistNowSync() {
+        lock.lock()
+        let snapshot = cache
+        lock.unlock()
+        guard let snapshot,
+              let data = try? JSONEncoder().encode(snapshot) else { return }
+        defaults.set(data, forKey: userDefaultsKey)
     }
 
     private func loadQueue() -> [PendingVerification] {

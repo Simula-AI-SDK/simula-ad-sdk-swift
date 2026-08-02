@@ -311,6 +311,26 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(verifier.callCount("stale"), 0)
     }
 
+    func testPersistNowSyncFlushesInMemoryOnlyReward() {
+        // Reward completion commonly happens immediately before backgrounding. Simulate the
+        // async utility write never landing before suspension/kill: the row exists only in
+        // memory until the didEnterBackground path calls persistNowSync().
+        let verifier = FakeVerifier()
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "reward")
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            defaults: defaults,
+            now: { 0 },
+            performPersist: { _ in /* pending utility write never runs */ }
+        )
+        mgr.queueVerification(serveId: "reward", sessionId: "s", elapsedPlayTime: 5)
+        XCTAssertTrue(persistedQueue().isEmpty, "async persist never ran — in-memory only")
+
+        mgr.persistNowSync()
+
+        XCTAssertEqual(persistedQueue().map(\.serveId), ["reward"])
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async throws {
