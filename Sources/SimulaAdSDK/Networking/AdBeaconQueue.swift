@@ -9,8 +9,23 @@ import Foundation
 struct PendingBeacon: Codable, Equatable {
     let impressionId: String
     let action: String
+    let metadata: [String: String]?
     var retryCount: Int = 0
     var lastAttemptTimestamp: Double = 0
+
+    init(
+        impressionId: String,
+        action: String,
+        metadata: [String: String]? = nil,
+        retryCount: Int = 0,
+        lastAttemptTimestamp: Double = 0
+    ) {
+        self.impressionId = impressionId
+        self.action = action
+        self.metadata = metadata
+        self.retryCount = retryCount
+        self.lastAttemptTimestamp = lastAttemptTimestamp
+    }
 }
 
 // MARK: - Seam
@@ -18,7 +33,12 @@ struct PendingBeacon: Codable, Equatable {
 /// Sends one impression-action beacon, returning the HTTP status (or throwing on connectivity).
 /// `SimulaAPI` is the production implementation; tests substitute a fake.
 protocol BeaconSending: Sendable {
-    func sendImpressionBeacon(adId: String, action: String, apiKey: String) async throws -> Int
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]?
+    ) async throws -> Int
 }
 
 extension SimulaAPI: BeaconSending {}
@@ -75,8 +95,15 @@ public final class AdBeaconManager: @unchecked Sendable {
     /// lifecycle event for the billing-relevant ones. A no-op for a blank id. Kept OFF the telemetry
     /// pipeline; the diagnostic events are interim visibility into beacon firing, separate from the
     /// durable beacon itself.
-    public func enqueue(impressionId: String, action: String, adFormat: String? = nil, adUnitId: String? = nil) {
+    public func enqueue(
+        impressionId: String,
+        action: String,
+        adFormat: String? = nil,
+        adUnitId: String? = nil,
+        metadata: [String: String]? = nil
+    ) {
         guard !impressionId.isEmpty else { return }
+        let normalizedMetadata = action == "seen" ? metadata.flatMap { normalizeExtraParameters($0) } : nil
         switch action {
         case "seen":
             Telemetry.shared.recordLifecycle(stage: "impression_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId)
@@ -85,13 +112,28 @@ public final class AdBeaconManager: @unchecked Sendable {
         default:
             break
         }
+        var shouldWarnForMergedMetadata = false
         lock.lock()
         var list = loadQueue()
-        if !list.contains(where: { $0.impressionId == impressionId && $0.action == action }) {
-            list.append(PendingBeacon(impressionId: impressionId, action: action))
+        if let index = list.firstIndex(where: { $0.impressionId == impressionId && $0.action == action }) {
+            if let normalizedMetadata {
+                var merged = list[index].metadata ?? [:]
+                merged.merge(normalizedMetadata) { _, new in new }
+                list[index] = PendingBeacon(
+                    impressionId: list[index].impressionId,
+                    action: list[index].action,
+                    metadata: normalizeExtraParameters(merged, warn: { shouldWarnForMergedMetadata = true }),
+                    retryCount: list[index].retryCount,
+                    lastAttemptTimestamp: list[index].lastAttemptTimestamp
+                )
+                saveQueue(list)
+            }
+        } else {
+            list.append(PendingBeacon(impressionId: impressionId, action: action, metadata: normalizedMetadata))
             saveQueue(list)
         }
         lock.unlock()
+        if shouldWarnForMergedMetadata { warnInvalidExtraParameters() }
         triggerProcessQueue()
     }
 
@@ -119,7 +161,12 @@ public final class AdBeaconManager: @unchecked Sendable {
         while let task = nextEligibleTask() {
             let delivered: Bool
             do {
-                let code = try await sender.sendImpressionBeacon(adId: task.impressionId, action: task.action, apiKey: key)
+                let code = try await sender.sendImpressionBeacon(
+                    adId: task.impressionId,
+                    action: task.action,
+                    apiKey: key,
+                    metadata: task.metadata
+                )
                 if (200...299).contains(code) {
                     delivered = true // accepted
                 } else if (400...499).contains(code) && code != 408 && code != 429 {
@@ -170,7 +217,14 @@ public final class AdBeaconManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         var queue = loadQueue()
-        queue.removeAll { $0.impressionId == task.impressionId && $0.action == task.action }
+        // Remove only the snapshot that was sent. If metadata was merged while this request was in
+        // flight, the newer snapshot must stay queued for one more idempotent `/seen`; removing by
+        // `(impressionId, action)` alone would silently discard metadata the server never received.
+        queue.removeAll {
+            $0.impressionId == task.impressionId &&
+                $0.action == task.action &&
+                $0.metadata == task.metadata
+        }
         saveQueue(queue)
     }
 

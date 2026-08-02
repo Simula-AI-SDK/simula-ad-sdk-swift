@@ -1091,6 +1091,7 @@ public struct NativeAdRequest: Encodable, Sendable {
     public let charId: String?
     public let charName: String?
     public let charDesc: String?
+    public let metadata: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case position
@@ -1102,6 +1103,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         case charId = "char_id"
         case charName = "char_name"
         case charDesc = "char_desc"
+        case metadata
     }
 
     public init(
@@ -1124,6 +1126,31 @@ public struct NativeAdRequest: Encodable, Sendable {
         self.charId = charId
         self.charName = charName
         self.charDesc = charDesc
+        self.metadata = nil
+    }
+
+    public init(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        theme: String? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil,
+        metadata: [String: String]?
+    ) {
+        self.position = position
+        self.sessionId = sessionId
+        self.adUnitId = adUnitId
+        self.context = context
+        self.theme = theme
+        self.width = width
+        self.charId = charId
+        self.charName = charName
+        self.charDesc = charDesc
+        self.metadata = metadata.flatMap { normalizeExtraParameters($0) }
     }
 }
 

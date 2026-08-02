@@ -498,6 +498,8 @@ public struct AdLoadRequest: Encodable, Sendable {
     public let context: SimulaAdContext?
     /// Device capability snapshot so the backend never assigns an unsupported variant.
     public let capabilities: DeviceCapabilities
+    /// Publisher metadata attached to this impression. Encoded only when non-nil.
+    public let metadata: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -508,6 +510,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         case charDesc = "char_desc"
         case context
         case capabilities
+        case metadata
     }
 
     public init(
@@ -528,6 +531,29 @@ public struct AdLoadRequest: Encodable, Sendable {
         self.charDesc = charDesc
         self.context = context
         self.capabilities = capabilities
+        self.metadata = nil
+    }
+
+    public init(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil,
+        metadata: [String: String]?,
+        capabilities: DeviceCapabilities = .current
+    ) {
+        self.adUnitId = adUnitId
+        self.sessionId = sessionId
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
+        self.context = context
+        self.capabilities = capabilities
+        self.metadata = metadata.flatMap { normalizeExtraParameters($0) }
     }
 }
 
@@ -676,6 +702,8 @@ public struct RewardedInitRequest: Encodable, Sendable {
     /// Contextual targeting signals — see ``AdLoadRequest/context``. Extended to rewarded so the
     /// full-screen formats target the same way native does. Encoded only when non-nil.
     public let context: SimulaAdContext?
+    /// Publisher metadata attached to this impression. Encoded only when non-nil.
+    public let metadata: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -685,6 +713,7 @@ public struct RewardedInitRequest: Encodable, Sendable {
         case charImage = "char_image"
         case charDesc = "char_desc"
         case context
+        case metadata
     }
 
     public init(
@@ -703,6 +732,27 @@ public struct RewardedInitRequest: Encodable, Sendable {
         self.charImage = charImage
         self.charDesc = charDesc
         self.context = context
+        self.metadata = nil
+    }
+
+    public init(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil,
+        metadata: [String: String]?
+    ) {
+        self.adUnitId = adUnitId
+        self.sessionId = sessionId
+        self.charId = charId
+        self.charName = charName
+        self.charImage = charImage
+        self.charDesc = charDesc
+        self.context = context
+        self.metadata = metadata.flatMap { normalizeExtraParameters($0) }
     }
 }
 
@@ -1167,6 +1217,28 @@ public final class SimulaAPI: @unchecked Sendable {
         charDesc: String? = nil,
         context: SimulaAdContext? = nil
     ) async throws -> AdLoadResponse {
+        try await loadAd(
+            adUnitId: adUnitId,
+            sessionId: sessionId,
+            charId: charId,
+            charName: charName,
+            charImage: charImage,
+            charDesc: charDesc,
+            context: context,
+            metadata: nil
+        )
+    }
+
+    public func loadAd(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil,
+        metadata: [String: String]?
+    ) async throws -> AdLoadResponse {
         guard let url = URL(string: "\(API_BASE_URL)/load/interstitial") else {
             throw SimulaAPIError.invalidURL
         }
@@ -1182,7 +1254,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 charName: charName,
                 charImage: charImage,
                 charDesc: charDesc,
-                context: context
+                context: context,
+                metadata: metadata
             )
         )
 
@@ -1214,6 +1287,32 @@ public final class SimulaAPI: @unchecked Sendable {
         charName: String? = nil,
         charDesc: String? = nil
     ) async throws -> NativeAdResponse {
+        try await loadNative(
+            position: position,
+            sessionId: sessionId,
+            adUnitId: adUnitId,
+            context: context,
+            theme: theme,
+            width: width,
+            charId: charId,
+            charName: charName,
+            charDesc: charDesc,
+            metadata: nil
+        )
+    }
+
+    public func loadNative(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        theme: String? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil,
+        metadata: [String: String]?
+    ) async throws -> NativeAdResponse {
         guard let url = URL(string: "\(API_BASE_URL)/load/native") else {
             throw SimulaAPIError.invalidURL
         }
@@ -1231,7 +1330,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 width: width,
                 charId: charId,
                 charName: charName,
-                charDesc: charDesc
+                charDesc: charDesc,
+                metadata: metadata
             )
         )
 
@@ -1259,6 +1359,28 @@ public final class SimulaAPI: @unchecked Sendable {
         charDesc: String? = nil,
         context: SimulaAdContext? = nil
     ) async throws -> RewardedInitResponse {
+        try await loadRewarded(
+            adUnitId: adUnitId,
+            sessionId: sessionId,
+            charId: charId,
+            charName: charName,
+            charImage: charImage,
+            charDesc: charDesc,
+            context: context,
+            metadata: nil
+        )
+    }
+
+    public func loadRewarded(
+        adUnitId: String,
+        sessionId: String = "",
+        charId: String? = nil,
+        charName: String? = nil,
+        charImage: String? = nil,
+        charDesc: String? = nil,
+        context: SimulaAdContext? = nil,
+        metadata: [String: String]?
+    ) async throws -> RewardedInitResponse {
         guard let url = URL(string: "\(API_BASE_URL)/load/rewarded") else {
             throw SimulaAPIError.invalidURL
         }
@@ -1274,7 +1396,8 @@ public final class SimulaAPI: @unchecked Sendable {
                 charName: charName,
                 charImage: charImage,
                 charDesc: charDesc,
-                context: context
+                context: context,
+                metadata: metadata
             )
         )
 
@@ -1551,13 +1674,21 @@ public final class SimulaAPI: @unchecked Sendable {
     /// helpers, this surfaces the outcome — connectivity failures propagate — so the durable
     /// `AdBeaconQueue` can decide retry vs. drop. Not for direct call-site use; ad surfaces enqueue
     /// via `AdBeaconManager`.
-    func sendImpressionBeacon(adId: String, action: String, apiKey: String) async throws -> Int {
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]? = nil
+    ) async throws -> Int {
         guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/\(action)") else {
             throw SimulaAPIError.invalidURL
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        if action == "seen", let metadata, !metadata.isEmpty {
+            request.httpBody = try JSONEncoder().encode(["metadata": metadata])
+        }
         let (_, response) = try await session.data(for: request)
         return (response as? HTTPURLResponse)?.statusCode ?? -1
     }

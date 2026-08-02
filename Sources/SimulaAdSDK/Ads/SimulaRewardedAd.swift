@@ -101,6 +101,8 @@ public final class SimulaRewardedAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaRewardedAdDelegate?
 
+    private let extraParameters = ExtraParametersStore()
+
     /// A loaded ad expires this long after it became ready (staleness).
     private static let staleAfter: TimeInterval = 60 * 60 // 1 hour
     /// Re-loads of the same dedup key are blocked for this long.
@@ -165,6 +167,16 @@ public final class SimulaRewardedAd {
         self.adUnitId = adUnitId
     }
 
+    /// Upserts one publisher metadata entry for future loads. Invalid entries are ignored safely.
+    public func setExtraParameter(_ key: String, _ value: String) {
+        extraParameters.set(key: key, value: value)
+    }
+
+    /// Replaces publisher metadata for future loads. Passing an empty dictionary clears it.
+    public func setExtraParameters(_ parameters: [String: String]) {
+        extraParameters.replace(with: parameters)
+    }
+
     // MARK: - Load
 
     /// Preloads a rewarded minigame for the given character context.
@@ -221,8 +233,18 @@ public final class SimulaRewardedAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
+        let metadata = extraParameters.snapshot()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        loadTask = Task { [weak self] in await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc) }
+        loadTask = Task { [weak self] in
+            await self?.runLoad(
+                provider: provider,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc,
+                metadata: metadata
+            )
+        }
     }
 
     /// Load task body (named method — see the task-shape note in TelemetryManager).
@@ -231,7 +253,8 @@ public final class SimulaRewardedAd {
         charId: String?,
         charName: String?,
         charImage: String?,
-        charDesc: String?
+        charDesc: String?,
+        metadata: [String: String]?
     ) async {
         let sessionId = await provider.ensureSession()
         if Task.isCancelled { return }
@@ -256,7 +279,8 @@ public final class SimulaRewardedAd {
                 charDesc: charDesc,
                 // AdContext (contextual targeting) now rides on the rewarded request too, read from
                 // the same provider-level store the native surface uses.
-                context: provider.adContext
+                context: provider.adContext,
+                metadata: metadata
             )
             if Task.isCancelled { return }
             // A rewarded ad with no iframe to render is a no-fill.

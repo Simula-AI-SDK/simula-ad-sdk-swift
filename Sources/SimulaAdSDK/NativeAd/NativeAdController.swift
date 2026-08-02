@@ -14,7 +14,8 @@ enum NativeAdController {
         provider: SimulaProvider,
         adUnitId: String?,
         position: Int,
-        theme: String? = nil
+        theme: String? = nil,
+        metadata: [String: String]? = nil
     ) async throws -> NativeAdResponse {
         // Distinguish "SDK never initialized" from "session creation failed" — both leave the session
         // nil, but the publisher's fix differs (call initialize() vs. check key/network).
@@ -28,7 +29,8 @@ enum NativeAdController {
                 sessionId: sessionId,
                 adUnitId: adUnitId,
                 context: provider.adContext,
-                theme: theme
+                theme: theme,
+                metadata: metadata
             )
         } catch let SimulaAPIError.httpError(code) where code == 401 {
             // Bad/unknown session — non-retryable (PRD).

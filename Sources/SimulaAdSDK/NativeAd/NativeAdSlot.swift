@@ -32,6 +32,7 @@ public struct NativeAdSlot: View {
     private let previewHTML: String?
     private let dimension: ParsedDimension
     private let theme: String?
+    private let extraParameters: [String: String]?
     private let onImpression: (NativeAdData) -> Void
     private let onPaid: (AdValue) -> Void
     private let onError: (NativeAdError) -> Void
@@ -40,6 +41,7 @@ public struct NativeAdSlot: View {
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
+    @State private var attachExtraParametersOnSeen = false
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
     /// Forwards the slot's live visible fraction into the creative (`window.onVisibility`); bound to
@@ -97,10 +99,40 @@ public struct NativeAdSlot: View {
         onClick: @escaping () -> Void = {},
         previewHTML: String? = nil
     ) {
+        self.init(
+            adUnitId: adUnitId,
+            position: position,
+            width: width,
+            theme: theme,
+            extraParameters: [:],
+            preloadedAdId: preloadedAdId,
+            onImpression: onImpression,
+            onPaid: onPaid,
+            onError: onError,
+            onClick: onClick,
+            previewHTML: previewHTML
+        )
+    }
+
+    /// Creates a native slot with publisher metadata scoped to the impression served by this view.
+    public init(
+        adUnitId: String? = nil,
+        position: Int = 0,
+        width: Any? = nil,
+        theme: String? = nil,
+        extraParameters: [String: String],
+        preloadedAdId: String? = nil,
+        onImpression: @escaping (NativeAdData) -> Void = { _ in },
+        onPaid: @escaping (AdValue) -> Void = { _ in },
+        onError: @escaping (NativeAdError) -> Void = { _ in },
+        onClick: @escaping () -> Void = {},
+        previewHTML: String? = nil
+    ) {
         self.adUnitId = adUnitId
         self.position = position
         self.dimension = parseDimension(width).clampMinWidth(Self.minWidthPt)
         self.theme = theme
+        self.extraParameters = normalizeExtraParameters(extraParameters)
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
@@ -115,6 +147,7 @@ public struct NativeAdSlot: View {
                 _phase = State(initialValue: .filled(response))
                 _heightPt = State(initialValue: entry.heightPt)
                 _impressionFired = State(initialValue: entry.impressionFired)
+                _attachExtraParametersOnSeen = State(initialValue: true)
             } else {
                 _phase = State(initialValue: .empty)
             }
@@ -258,6 +291,7 @@ public struct NativeAdSlot: View {
     private func load() async {
         // Preview/QA: render the supplied HTML with no network (mirrors imperative showPreview).
         if let previewHTML {
+            attachExtraParametersOnSeen = false
             phase = .filled(NativeAdResponse(
                 impressionId: nil,
                 adInserted: true,
@@ -278,6 +312,7 @@ public struct NativeAdSlot: View {
             if let response = entry.response {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
+                attachExtraParametersOnSeen = true
                 phase = .filled(response)
                 reportLoadSuccess(response, source: "cache")
             } else {
@@ -300,7 +335,8 @@ public struct NativeAdSlot: View {
                 provider: provider,
                 adUnitId: adUnitId,
                 position: position,
-                theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark)
+                theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark),
+                metadata: extraParameters
             )
             let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
             apply(response, source: "network", durationMs: ms)
@@ -322,6 +358,7 @@ public struct NativeAdSlot: View {
             NativeAdCache.shared.putFill(adUnitId, position, response)
             heightPt = 0
             impressionFired = false
+            attachExtraParametersOnSeen = source != "network"
             // Start the native fill→first-paint render timer for a genuine load (network/preload); a
             // cache re-render leaves it nil so it doesn't record a render time.
             if source != "cache" {
@@ -389,7 +426,13 @@ public struct NativeAdSlot: View {
         // on-device from load; no network round-trip.
         onPaid(adValue)
         // Durable impression beacon (was a fire-and-forget trackImpression).
-        AdBeaconManager.shared.enqueue(impressionId: impressionId, action: "seen", adFormat: adFormat, adUnitId: adUnitId)
+        AdBeaconManager.shared.enqueue(
+            impressionId: impressionId,
+            action: "seen",
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            metadata: attachExtraParametersOnSeen ? extraParameters : nil
+        )
     }
 
     /// The creative's web view failed to load (e.g. no connectivity when this row scrolled into
