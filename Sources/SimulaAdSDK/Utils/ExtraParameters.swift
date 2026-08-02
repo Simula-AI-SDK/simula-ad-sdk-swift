@@ -4,11 +4,13 @@ let maxExtraParameterEntries = 10
 let maxExtraParameterKeyLength = 64
 let maxExtraParameterValueLength = 256
 
-private let extraParametersWarning =
-    "[SimulaSDK] Some extraParameters entries were ignored because they are invalid or exceed SDK limits."
-
 func warnInvalidExtraParameters() {
-    print(extraParametersWarning)
+    Telemetry.shared.recordOperation(
+        name: "extra_parameters_invalid",
+        durationMs: 0,
+        success: false,
+        failureClass: "invalid_or_over_limit"
+    )
 }
 
 /// Returns a bounded wire snapshot. Invalid publisher input is ignored rather than failing an ad load.

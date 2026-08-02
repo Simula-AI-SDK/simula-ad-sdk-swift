@@ -220,11 +220,13 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: FakeStore(), sender: sender, sampleRate: 0.5, random: { 0.9 })
 
         mgr.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 10, failureClass: nil)
+        mgr.recordOperation(name: "expected_condition", durationMs: 0, success: false)
         mgr.recordError(signature: "api:err", errorCode: "err", message: "x")
         await waitUntil { !sender.batches.isEmpty }
 
         let events = allEvents(sender.batches)
         XCTAssertFalse(events.contains { $0.type == TelemetryType.network }, "perf suppressed by sampling")
+        XCTAssertFalse(events.contains { $0.type == TelemetryType.operation }, "operations suppressed by sampling")
         XCTAssertTrue(events.contains { $0.type == TelemetryType.error }, "errors always sent")
     }
 
