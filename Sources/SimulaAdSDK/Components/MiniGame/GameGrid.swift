@@ -274,6 +274,7 @@ private struct MobileCarouselView: View {
                     }
             )
         }
+        .onDisappear { animator.stopAnimation() }
     }
 }
 

@@ -43,7 +43,8 @@ final class TelemetryEnrichmentTests: XCTestCase {
         diagnostics: @escaping @Sendable () -> String? = { nil },
         battery: @escaping @Sendable () -> BatteryInfo? = { nil },
         carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
-        ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true)
+        ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
+        flushThreshold: Int = 20
     ) -> TelemetryManager {
         TelemetryManager(
             ctx: ctx,
@@ -60,7 +61,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             now: { clock.now },
             random: { 0.0 },
             backoff: { _ in 0 },
-            flushThreshold: 20,
+            flushThreshold: flushThreshold,
             flushInterval: 0.05
         )
     }
@@ -152,6 +153,40 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertEqual(summary?.breadcrumb, "fmt=interstitial;req=2;fill=1;nofill=1;fail=0;imp=1;clk=1")
     }
 
+    func testPeriodicFlushSendsFunnelWhenLifecycleBatchAlreadyDrained() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock, flushThreshold: 1)
+
+        m.recordLifecycle(stage: "displayed", adFormat: "rewarded", adUnitId: "u", adId: "a1", serveId: nil, durationMs: nil, errorCode: nil)
+        await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
+
+        let summaryBatches = sender.batches.filter { envelope in
+            envelope.events.contains { $0.name == "funnel_summary" }
+        }
+        XCTAssertEqual(summaryBatches.count, 1)
+        XCTAssertEqual(summaryBatches.first?.events.map(\.name), ["funnel_summary"])
+        XCTAssertEqual(summaryBatches.first?.events.first?.breadcrumb, "fmt=rewarded;req=0;fill=0;nofill=0;fail=0;imp=1;clk=0")
+    }
+
+    func testPeriodicFunnelIsNotCountedAgainByLaterExplicitFlush() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock,
+            diagnostics: { "mem_used_mb=42" }
+        )
+
+        m.recordLifecycle(stage: "click", adFormat: "native", adUnitId: "u", adId: "a1", serveId: nil, durationMs: nil, errorCode: nil)
+        await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
+        m.flushNow()
+        await waitUntil { self.allEvents(sender.batches).filter { $0.name == "diagnostics" }.count == 2 }
+
+        let summaries = allEvents(sender.batches).filter { $0.name == "funnel_summary" }
+        XCTAssertEqual(summaries.count, 1)
+        XCTAssertEqual(summaries.first?.breadcrumb, "fmt=native;req=0;fill=0;nofill=0;fail=0;imp=0;clk=1")
+    }
+
     func testDiagnosticsSampleOnFlush() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
@@ -162,6 +197,20 @@ final class TelemetryEnrichmentTests: XCTestCase {
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "diagnostics" } }
 
         XCTAssertEqual(allEvents(sender.batches).first { $0.name == "diagnostics" }?.breadcrumb, "mem_used_mb=42")
+    }
+
+    func testPeriodicDiagnosticsDoesNotScheduleAnotherTimer() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock, diagnostics: { "mem_used_mb=7" })
+
+        m.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 1, requestBytes: 0, responseBytes: 0, failureClass: nil)
+        await waitUntil { self.allEvents(sender.batches).contains { $0.name == "diagnostics" } }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        let diagnostics = allEvents(sender.batches).filter { $0.name == "diagnostics" }
+        XCTAssertEqual(diagnostics.count, 1)
+        XCTAssertEqual(diagnostics.first?.breadcrumb, "mem_used_mb=7")
     }
 
     func testDeviceDiagnosticsOnEnvelope() async {

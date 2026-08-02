@@ -249,7 +249,7 @@ final class BatteryMonitor: @unchecked Sendable {
     static let shared = BatteryMonitor()
 
     private let lock = NSLock()
-    private var snapshot: BatteryInfo?
+    private var snapshot: DeviceBatterySnapshot?
     private var started = false
 
     private init() {}
@@ -280,13 +280,18 @@ final class BatteryMonitor: @unchecked Sendable {
     /// Always invoked on the main queue (initial call from startOnMain + observers with queue: .main).
     private func refresh() {
         let device = UIDevice.current
-        let level = device.batteryLevel
-        let charging = device.batteryState == .charging || device.batteryState == .full
-        let snap = level >= 0 ? BatteryInfo(level: Double(level), charging: charging) : nil
+        let snap = DeviceBatterySnapshot(
+            level: device.batteryLevel,
+            stateRaw: device.batteryState.rawValue
+        )
         lock.lock(); snapshot = snap; lock.unlock()
     }
 
     var current: BatteryInfo? {
+        DeviceBatterySnapshot.telemetryInfo(from: currentDeviceSnapshot)
+    }
+
+    var currentDeviceSnapshot: DeviceBatterySnapshot? {
         lock.lock(); defer { lock.unlock() }; return snapshot
     }
 }

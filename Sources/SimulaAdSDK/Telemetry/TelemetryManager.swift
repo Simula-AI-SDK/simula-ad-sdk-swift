@@ -21,6 +21,20 @@ struct BatteryInfo: Sendable {
     let charging: Bool
 }
 
+/// Raw main-thread battery reading shared by telemetry and request-header snapshots.
+struct DeviceBatterySnapshot: Sendable {
+    let level: Float
+    let stateRaw: Int
+
+    static func telemetryInfo(from snapshot: DeviceBatterySnapshot?) -> BatteryInfo? {
+        guard let snapshot, snapshot.level.isFinite, snapshot.level >= 0 else { return nil }
+        return BatteryInfo(
+            level: Double(snapshot.level),
+            charging: snapshot.stateRaw == 2 || snapshot.stateRaw == 3
+        )
+    }
+}
+
 /// Flush-time carrier/radio snapshot. On iOS `carrier` is nil (CTCarrier deprecated); `radio` is
 /// best-effort via CoreTelephony.
 struct CarrierInfo: Sendable {
@@ -220,8 +234,11 @@ final class TelemetryManager: @unchecked Sendable {
         e.trigger = trigger
         e.cacheSource = cacheSource
         e.breadcrumb = breadcrumb
-        accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
+        let accumulatedFunnel = accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
         enqueuePerf(e)
+        // A threshold-triggered send can drain the lifecycle event immediately, but the derived
+        // funnel delta still needs its periodic turn even when it is then the only pending data.
+        if accumulatedFunnel { scheduleTimedFlush() }
     }
 
     /// Set the session experiment assignment for the envelope (last assignment wins).
@@ -236,16 +253,26 @@ final class TelemetryManager: @unchecked Sendable {
     /// Fold a lifecycle event into the per-format funnel and detect the first ad load. Unconditional
     /// (not perf-sampled) so the funnel reflects real activity. Cache re-renders are excluded from
     /// `filled`. `recordOperation` for time-to-first-ad is called OFF the lock (NSLock isn't reentrant).
-    private func accumulate(stage: String, adFormat: String?, cacheSource: String?, errorCode: String?) {
-        guard let fmt = adFormat else { return }
+    private func accumulate(stage: String, adFormat: String?, cacheSource: String?, errorCode: String?) -> Bool {
+        guard let fmt = adFormat else { return false }
         lock.lock()
         var c = funnel[fmt] ?? [0, 0, 0, 0, 0]
+        let accumulated: Bool
         switch stage {
-        case "load_success": if cacheSource != "cache" { c[0] += 1 }
-        case "load_fail": if errorCode == "no_fill" { c[1] += 1 } else { c[2] += 1 }
-        case "displayed": c[3] += 1
-        case "click": c[4] += 1
-        default: break
+        case "load_success":
+            accumulated = cacheSource != "cache"
+            if accumulated { c[0] += 1 }
+        case "load_fail":
+            accumulated = true
+            if errorCode == "no_fill" { c[1] += 1 } else { c[2] += 1 }
+        case "displayed":
+            accumulated = true
+            c[3] += 1
+        case "click":
+            accumulated = true
+            c[4] += 1
+        default:
+            accumulated = false
         }
         funnel[fmt] = c
         let firstAd = stage == "load_success" && !firstAdRecorded
@@ -253,6 +280,7 @@ final class TelemetryManager: @unchecked Sendable {
         let created = createdAtMs
         lock.unlock()
         if firstAd { recordOperation(name: "time_to_first_ad", durationMs: Int(now() - created), success: true) }
+        return accumulated
     }
 
     /// Record a handled error. `signature` is the dedup key (e.g. `domain:code`); identical
@@ -295,10 +323,14 @@ final class TelemetryManager: @unchecked Sendable {
     /// Persist + attempt a flush now (e.g. app background).
     func flushNow() {
         // Emit the session funnel deltas + a diagnostics sample as part of this (background) flush.
-        emitFunnelSummary()
-        emitDiagnostics()
+        emitSummaries()
         persistNow()
         Task { [weak self] in await self?.flush() }
+    }
+
+    private func emitSummaries() {
+        emitFunnelSummary()
+        emitDiagnostics()
     }
 
     /// Emit one `funnel_summary` operation per active format (cumulative since the last emit), then
@@ -310,11 +342,12 @@ final class TelemetryManager: @unchecked Sendable {
         lock.unlock()
         for (fmt, c) in snapshot {
             let requested = c[0] + c[1] + c[2]
-            recordOperation(
+            enqueueOperation(
                 name: "funnel_summary",
                 durationMs: 0,
                 success: true,
-                breadcrumb: "fmt=\(fmt);req=\(requested);fill=\(c[0]);nofill=\(c[1]);fail=\(c[2]);imp=\(c[3]);clk=\(c[4])"
+                breadcrumb: "fmt=\(fmt);req=\(requested);fill=\(c[0]);nofill=\(c[1]);fail=\(c[2]);imp=\(c[3]);clk=\(c[4])",
+                triggersFlush: false
             )
         }
     }
@@ -323,7 +356,10 @@ final class TelemetryManager: @unchecked Sendable {
     /// the provider yields nothing.
     private func emitDiagnostics() {
         guard let line = diagnosticsProvider() else { return }
-        recordOperation(name: "diagnostics", durationMs: 0, success: true, breadcrumb: line)
+        enqueueOperation(
+            name: "diagnostics", durationMs: 0, success: true, breadcrumb: line,
+            triggersFlush: false
+        )
     }
 
     private func persistNow() {
@@ -384,6 +420,24 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     private func enqueuePerf(_ event: TelemetryEvent) {
+        enqueuePerf(event, triggersFlush: true)
+    }
+
+    private func enqueueOperation(
+        name: String,
+        durationMs: Int,
+        success: Bool,
+        breadcrumb: String?,
+        triggersFlush: Bool
+    ) {
+        var event = newEvent(type: TelemetryType.operation, name: name)
+        event.durationMs = durationMs
+        event.success = success
+        event.breadcrumb = breadcrumb
+        enqueuePerf(event, triggersFlush: triggersFlush)
+    }
+
+    private func enqueuePerf(_ event: TelemetryEvent, triggersFlush: Bool) {
         lock.lock()
         guard isEnabled, perfSampledIn else { lock.unlock(); return }
         buffer.append(event)
@@ -391,7 +445,13 @@ final class TelemetryManager: @unchecked Sendable {
         let shouldFlush = buffer.count >= flushThreshold
         lock.unlock()
         debugLog?(formatForLog(event))
-        if shouldFlush { Task { [weak self] in await self?.flush() } } else { scheduleTimedFlush() }
+        if triggersFlush {
+            if shouldFlush {
+                Task { [weak self] in await self?.flush() }
+            } else {
+                scheduleTimedFlush()
+            }
+        }
     }
 
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
@@ -473,9 +533,12 @@ final class TelemetryManager: @unchecked Sendable {
             retryCount = 0
             snapshot = snapshotLocked()
             isFlushing = false
-            // Re-drain leftovers that arrived mid-send: perf once it re-hits the threshold,
-            // errors promptly (low-volume, valuable).
-            result = (buffer.count >= flushThreshold || !errorAgg.isEmpty, false)
+            // Re-drain summaries that arrived during this send even below the normal threshold;
+            // their caller may have observed this in-flight flush and cannot drain them itself.
+            let hasPendingSummary = buffer.contains {
+                $0.type == TelemetryType.operation && ($0.name == "funnel_summary" || $0.name == "diagnostics")
+            }
+            result = (buffer.count >= flushThreshold || !errorAgg.isEmpty || hasPendingSummary, false)
         case .retry:
             snapshot = snapshotLocked()
             retryCount += 1
@@ -537,6 +600,7 @@ final class TelemetryManager: @unchecked Sendable {
         // `try?`-wrapped await inside a Task closure.
         do { try await Task.sleep(nanoseconds: UInt64(flushInterval * 1_000_000_000)) } catch {}
         releaseFlushSchedule()
+        emitSummaries()
         await flush()
     }
 
