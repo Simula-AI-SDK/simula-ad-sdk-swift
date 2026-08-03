@@ -55,13 +55,9 @@ final class SimulaDeviceSignals: @unchecked Sendable {
         lock.unlock()
 
         #if os(iOS)
-        // `isBatteryMonitoringEnabled` must be toggled on the main thread; batteryLevel/State read
-        // as unknown/-1 until it is. Harmless process-global flag — no permission, no host UI.
-        if Thread.isMainThread {
-            UIDevice.current.isBatteryMonitoringEnabled = true
-        } else {
-            DispatchQueue.main.async { UIDevice.current.isBatteryMonitoringEnabled = true }
-        }
+        // The shared monitor enables and snapshots UIDevice on main; this collector only reads its
+        // lock-guarded snapshot from the utility queue below.
+        BatteryMonitor.shared.start()
         #endif
 
         launchRefresh()
@@ -93,11 +89,11 @@ final class SimulaDeviceSignals: @unchecked Sendable {
 
     /// Recompute the snapshot from live device state. Runs off the main thread (on `queue`).
     private func refresh() {
+        let battery = Self.currentBatterySnapshot()
         let built = Self.buildHeaders(
             timezone: TimeZone.current.identifier,
             memoryFreeBytes: Self.availableMemoryBytes(),
-            batteryLevel: Self.currentBatteryLevel(),
-            batteryStateRaw: Self.currentBatteryStateRaw(),
+            battery: battery,
             outputVolume: Self.currentOutputVolume()
         )
         lock.lock()
@@ -117,17 +113,9 @@ final class SimulaDeviceSignals: @unchecked Sendable {
         #endif
     }
 
-    private static func currentBatteryLevel() -> Float? {
+    private static func currentBatterySnapshot() -> DeviceBatterySnapshot? {
         #if os(iOS)
-        return UIDevice.current.batteryLevel
-        #else
-        return nil
-        #endif
-    }
-
-    private static func currentBatteryStateRaw() -> Int? {
-        #if os(iOS)
-        return UIDevice.current.batteryState.rawValue
+        return BatteryMonitor.shared.currentDeviceSnapshot
         #else
         return nil
         #endif
@@ -165,6 +153,22 @@ final class SimulaDeviceSignals: @unchecked Sendable {
         case 3: return "full"
         default: return nil
         }
+    }
+
+    /// Assembles the header map from raw signal values, omitting any that are unavailable. Pure.
+    static func buildHeaders(
+        timezone: String?,
+        memoryFreeBytes: Int64?,
+        battery: DeviceBatterySnapshot?,
+        outputVolume: Float?
+    ) -> [String: String] {
+        buildHeaders(
+            timezone: timezone,
+            memoryFreeBytes: memoryFreeBytes,
+            batteryLevel: battery?.level,
+            batteryStateRaw: battery?.stateRaw,
+            outputVolume: outputVolume
+        )
     }
 
     /// Assembles the header map from raw signal values, omitting any that are unavailable. Pure.

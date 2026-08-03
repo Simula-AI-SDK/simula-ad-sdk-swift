@@ -17,6 +17,45 @@ final class TelemetryManagerTests: XCTestCase {
         func save(_ events: [TelemetryEvent]) { lock.lock(); data = events; lock.unlock() }
     }
 
+    /// Holds the first persistence write so tests can verify that network reconciliation does not
+    /// wait for storage while preserving the order of all queued snapshots.
+    private final class SlowStore: TelemetryStoring, @unchecked Sendable {
+        private let lock = NSLock()
+        private let firstSaveGate = DispatchSemaphore(value: 0)
+        private var data: [TelemetryEvent] = []
+        private var shouldBlockFirstSave = true
+        private var _saveStarted = false
+        private var _saveCount = 0
+        private var _savedNames: [[String]] = []
+
+        var saveStarted: Bool { lock.lock(); defer { lock.unlock() }; return _saveStarted }
+        var saveCount: Int { lock.lock(); defer { lock.unlock() }; return _saveCount }
+        var savedNames: [[String]] { lock.lock(); defer { lock.unlock() }; return _savedNames }
+
+        func load() -> [TelemetryEvent] { lock.lock(); defer { lock.unlock() }; return data }
+
+        func save(_ events: [TelemetryEvent]) {
+            lock.lock()
+            _saveStarted = true
+            let shouldBlock = shouldBlockFirstSave
+            lock.unlock()
+            if shouldBlock { firstSaveGate.wait() }
+            lock.lock()
+            data = events
+            _saveCount += 1
+            _savedNames.append(events.map(\.name))
+            lock.unlock()
+        }
+
+        func release() {
+            lock.lock()
+            let shouldSignal = shouldBlockFirstSave
+            shouldBlockFirstSave = false
+            lock.unlock()
+            if shouldSignal { firstSaveGate.signal() }
+        }
+    }
+
     /// Records decoded batches; replays queued acks then falls back to `defaultAck`. Optional
     /// one-shot gate so a test can hold the first send in flight while it enqueues more work.
     private final class FakeSender: TelemetrySending, @unchecked Sendable {
@@ -26,8 +65,10 @@ final class TelemetryManagerTests: XCTestCase {
         var defaultAck: TelemetryAck = .accepted
         private var gateCont: CheckedContinuation<Void, Never>?
         private var gated = false
+        private var _attemptCount = 0
 
         var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
+        var attemptCount: Int { lock.lock(); defer { lock.unlock() }; return _attemptCount }
         func enqueueAcks(_ a: [TelemetryAck]) { lock.lock(); acks = a; lock.unlock() }
         func gateFirst() { lock.lock(); gated = true; lock.unlock() }
         func release() {
@@ -37,6 +78,7 @@ final class TelemetryManagerTests: XCTestCase {
 
         func send(_ body: Data) async -> TelemetryAck {
             lock.lock()
+            _attemptCount += 1
             let shouldGate = gated
             lock.unlock()
             if shouldGate {
@@ -118,6 +160,34 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertEqual(net.count, 3)
         XCTAssertTrue(net.allSatisfy { $0.name == "POST /load/interstitial" && $0.durationMs == 12 })
         await waitUntil { store.load().isEmpty }
+    }
+
+    func testPostSendPersistenceDoesNotDelayRedrainOrLoseInflightEvents() async {
+        let store = SlowStore()
+        let sender = FakeSender(); sender.gateFirst()
+        let mgr = build(store: store, sender: sender)
+        defer { store.release() }
+
+        mgr.recordError(signature: "api:first")
+        await waitUntil { store.saveStarted && sender.attemptCount == 1 }
+
+        mgr.recordError(signature: "api:inflight")
+        sender.release()
+
+        // The first disk write remains blocked. Reconciliation must still immediately re-drain
+        // the event recorded during the first network send instead of synchronously waiting here.
+        await waitUntil { sender.batches.count == 2 }
+        XCTAssertEqual(sender.batches.map { $0.events.filter { $0.type == TelemetryType.error }.map(\.name) }, [["api:first"], ["api:inflight"]])
+        XCTAssertEqual(store.saveCount, 0, "both sends completed while persistence was blocked")
+
+        store.release()
+        await waitUntil { store.saveCount >= 4 && store.load().isEmpty }
+        let savedNames = store.savedNames
+        XCTAssertEqual(savedNames.count, 4)
+        XCTAssertEqual(Set(savedNames[0]), ["api:first"])
+        XCTAssertEqual(Set(savedNames[1]), ["api:first", "api:inflight"])
+        XCTAssertEqual(Set(savedNames[2]), ["api:inflight"])
+        XCTAssertTrue(savedNames[3].isEmpty)
     }
 
     func testEnvelopeCarriesContextAndSessionId() async {
@@ -220,11 +290,13 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: FakeStore(), sender: sender, sampleRate: 0.5, random: { 0.9 })
 
         mgr.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 10, failureClass: nil)
+        mgr.recordOperation(name: "expected_condition", durationMs: 0, success: false)
         mgr.recordError(signature: "api:err", errorCode: "err", message: "x")
         await waitUntil { !sender.batches.isEmpty }
 
         let events = allEvents(sender.batches)
         XCTAssertFalse(events.contains { $0.type == TelemetryType.network }, "perf suppressed by sampling")
+        XCTAssertFalse(events.contains { $0.type == TelemetryType.operation }, "operations suppressed by sampling")
         XCTAssertTrue(events.contains { $0.type == TelemetryType.error }, "errors always sent")
     }
 

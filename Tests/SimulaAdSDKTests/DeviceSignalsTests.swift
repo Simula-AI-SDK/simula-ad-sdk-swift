@@ -40,6 +40,21 @@ final class DeviceSignalsTests: XCTestCase {
         XCTAssertNil(SimulaDeviceSignals.batteryStateLabel(99))
     }
 
+    func testDeviceBatterySnapshotMapsForTelemetry() {
+        let charging = DeviceBatterySnapshot.telemetryInfo(
+            from: DeviceBatterySnapshot(level: 0.42, stateRaw: 2)
+        )
+        XCTAssertEqual(charging?.level ?? -1, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(charging?.charging, true)
+
+        let unplugged = DeviceBatterySnapshot.telemetryInfo(
+            from: DeviceBatterySnapshot(level: 1, stateRaw: 1)
+        )
+        XCTAssertEqual(unplugged?.charging, false)
+        XCTAssertNil(DeviceBatterySnapshot.telemetryInfo(from: DeviceBatterySnapshot(level: -1, stateRaw: 0)))
+        XCTAssertNil(DeviceBatterySnapshot.telemetryInfo(from: nil))
+    }
+
     // MARK: - buildHeaders
 
     func testBuildHeadersEmitsEveryAvailableSignal() {
@@ -71,5 +86,25 @@ final class DeviceSignalsTests: XCTestCase {
             outputVolume: nil
         )
         XCTAssertTrue(headers.isEmpty)
+    }
+
+    func testBuildHeadersUsesUnknownBatterySnapshotWithoutInventingLevel() {
+        let headers = SimulaDeviceSignals.buildHeaders(
+            timezone: nil,
+            memoryFreeBytes: nil,
+            battery: DeviceBatterySnapshot(level: -1, stateRaw: 0),
+            outputVolume: nil
+        )
+        XCTAssertNil(headers["X-Battery-Level"])
+        XCTAssertEqual(headers["X-Battery-State"], "unknown")
+
+        let unavailable = SimulaDeviceSignals.buildHeaders(
+            timezone: nil,
+            memoryFreeBytes: nil,
+            battery: nil,
+            outputVolume: nil
+        )
+        XCTAssertNil(unavailable["X-Battery-Level"])
+        XCTAssertNil(unavailable["X-Battery-State"])
     }
 }

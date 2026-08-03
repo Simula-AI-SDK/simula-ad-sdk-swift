@@ -41,11 +41,22 @@ final class AdValueTests: XCTestCase {
     }
 
     func testNegativeAndNonFiniteBidsClampToZero() {
-        for bad in [-1.0, -0.01, Double.nan, Double.infinity, -Double.infinity] {
+        for bad in [-1.0, -0.01, -Double.greatestFiniteMagnitude, Double.nan, Double.infinity, -Double.infinity] {
             let v = AdValue.fromBidCpm(bad)
             XCTAssertEqual(v.valueMicros, 0, "bid=\(bad) should clamp to 0 micros")
             XCTAssertEqual(v.expectedRevenue, 0, accuracy: eps)
         }
+    }
+
+    func testOversizedFiniteBidFallsBackToZero() {
+        let v = AdValue.fromBidCpm(.greatestFiniteMagnitude)
+        XCTAssertEqual(v.valueMicros, 0)
+        XCTAssertEqual(v.expectedCpm, 0, accuracy: eps)
+        XCTAssertEqual(v.expectedRevenue, 0, accuracy: eps)
+    }
+
+    func testNormalFractionalBidPreservesRounding() {
+        XCTAssertEqual(AdValue.fromBidCpm(1.2345).valueMicros, 1_235)
     }
 
     func testRespectsNonDefaultCurrency() {

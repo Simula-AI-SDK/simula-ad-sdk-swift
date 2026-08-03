@@ -476,7 +476,7 @@ private struct CreativeInterstitialView: View {
     @MainActor
     private func runGate(treatment: CloseTreatment, remaining: TimeInterval) async {
         if treatment == .rewardOrCloseLabel {
-            var left = Int(ceil(remaining))
+            var left = Int(exactly: ceil(remaining)) ?? 0
             closeRemaining = left
             while left > 0 {
                 // do/catch, not `try?` — see the task-shape note in TelemetryManager.
@@ -488,7 +488,7 @@ private struct CreativeInterstitialView: View {
         } else {
             // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
             let sleepNs = remaining * 1_000_000_000
-            if sleepNs.isFinite, sleepNs > 0 {
+            if sleepNs.isFinite, sleepNs > 0, sleepNs < Double(UInt64.max) {
                 // do/catch, not `try?` — see the task-shape note in TelemetryManager.
                 do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
             }
@@ -549,7 +549,7 @@ private struct CreativeInterstitialView: View {
         // Guard the Double→UInt64 conversion (an extreme server `closeDelay` would otherwise
         // overflow and trap) — same pattern as the close-delay gate above.
         let sleepNs = Double(closeDelay) / 2 * 1_000_000_000
-        if sleepNs.isFinite, sleepNs > 0 {
+        if sleepNs.isFinite, sleepNs > 0, sleepNs < Double(UInt64.max) {
             // do/catch, not `try?` — see the task-shape note in TelemetryManager.
             do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
         }
@@ -621,11 +621,16 @@ private struct CreativeInterstitialView: View {
     }
 
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
-    /// link) safely no-ops with a console warning.
+    /// link) safely no-ops with sampled telemetry.
     private func presentSKOverlay(config: SKOverlayConfig) {
         guard !skOverlayPresented, let appID = resolvedAppID, !appID.isEmpty else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
-                print("[Simula] SKOverlay skipped: could not resolve an App Store id for this creative.")
+                Telemetry.shared.recordOperation(
+                    name: "skoverlay_skipped",
+                    durationMs: 0,
+                    success: false,
+                    failureClass: "app_id_unresolved"
+                )
             }
             return
         }
