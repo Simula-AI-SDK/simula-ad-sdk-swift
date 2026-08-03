@@ -108,7 +108,8 @@ final class TelemetryManagerTests: XCTestCase {
         random: @escaping @Sendable () -> Double = { 0.0 },
         ppid: String? = nil,
         gaid: String? = nil,
-        debugLog: (@Sendable (String) -> Void)? = nil
+        debugLog: (@Sendable (String) -> Void)? = nil,
+        persistenceWaitTimeout: TimeInterval = 0.1
     ) -> TelemetryManager {
         TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -123,7 +124,8 @@ final class TelemetryManagerTests: XCTestCase {
             backoff: { _ in 0 }, // instant retries — keep tests fast
             debugLog: debugLog,
             flushThreshold: 20,
-            flushInterval: 0.05 // sub-threshold perf flushes promptly via the timer
+            flushInterval: 0.05, // sub-threshold perf flushes promptly via the timer
+            persistenceWaitTimeout: persistenceWaitTimeout
         )
     }
 
@@ -188,6 +190,24 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertEqual(Set(savedNames[1]), ["api:first", "api:inflight"])
         XCTAssertEqual(Set(savedNames[2]), ["api:inflight"])
         XCTAssertTrue(savedNames[3].isEmpty)
+    }
+
+    func testFlushNowDoesNotWaitIndefinitelyForBlockedPersistence() async {
+        let store = SlowStore()
+        let mgr = build(
+            store: store,
+            sender: FakeSender(),
+            persistenceWaitTimeout: 0.01
+        )
+        defer { store.release() }
+        mgr.recordError(signature: "api:blocked_persistence")
+        await waitUntil { store.saveStarted }
+
+        let started = ProcessInfo.processInfo.systemUptime
+        mgr.flushNow()
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+
+        XCTAssertLessThan(elapsed, 0.25)
     }
 
     func testEnvelopeCarriesContextAndSessionId() async {

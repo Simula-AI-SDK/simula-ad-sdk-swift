@@ -134,7 +134,9 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: second)
 
         await waitUntil(timeout: 2) { self.persistedQueue().first?.metadata?["b0"] == "v" }
-        XCTAssertEqual(persistedQueue().first?.metadata?.count, 10)
+        let metadata = persistedQueue().first?.metadata
+        XCTAssertEqual(metadata?.count, 10)
+        XCTAssertTrue(second.keys.allSatisfy { metadata?[$0] == "v" }, "newest keys must survive the cap")
     }
 
     func testMetadataMergedDuringSuccessfulSendIsDeliveredThenQueueDrains() async {
@@ -154,6 +156,21 @@ final class AdBeaconManagerTests: XCTestCase {
         let metadata = await sender.metadataSnapshots()
         XCTAssertEqual(metadata.count, 2)
         XCTAssertEqual(metadata[0], ["page_name": "Search"])
+        XCTAssertEqual(metadata[1], ["page_name": "Search", "surface": "chat"])
+    }
+
+    func testMetadataReplacementDuringFailedSendContinuesWithNewestSnapshot() async {
+        let sender = BlockingBeaconSender(firstCode: 503)
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
+        await sender.waitForFirstCall()
+        mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
+        await sender.releaseFirstCall()
+        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+
+        let metadata = await sender.metadataSnapshots()
+        XCTAssertEqual(metadata.count, 2)
         XCTAssertEqual(metadata[1], ["page_name": "Search", "surface": "chat"])
     }
 
@@ -183,12 +200,37 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
+    func testStableIdentityRemovesOnlyTheDeliveredPersistedRecord() async throws {
+        let seeded = [
+            PendingBeacon(id: "click-1", impressionId: "imp", action: "click"),
+            PendingBeacon(id: "click-2", impressionId: "imp", action: "click"),
+        ]
+        defaults.set(try JSONEncoder().encode(seeded), forKey: queueKey)
+        let sender = FakeBeaconSender()
+        sender.setCode(200, for: "imp", "click")
+        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+
+        mgr.triggerProcessQueue()
+        await waitUntil(timeout: 2) { sender.callCount("imp", "click") == 2 }
+
+        XCTAssertTrue(persistedQueue().isEmpty)
+    }
+
+    func testPendingBeaconIdentitySurvivesPersistence() throws {
+        let beacon = PendingBeacon(id: "stable-id", impressionId: "imp", action: "seen")
+
+        let decoded = try JSONDecoder().decode(PendingBeacon.self, from: JSONEncoder().encode(beacon))
+
+        XCTAssertEqual(decoded.id, "stable-id")
+    }
+
     func testLegacyPersistedBeaconWithoutMetadataDecodes() throws {
         let legacy = #"[{"impressionId":"imp","action":"seen","retryCount":0,"lastAttemptTimestamp":0}]"#
         defaults.set(Data(legacy.utf8), forKey: queueKey)
 
         let queue = persistedQueue()
         XCTAssertEqual(queue.count, 1)
+        XCTAssertNil(queue.first?.id)
         XCTAssertNil(queue.first?.metadata)
     }
 
@@ -244,6 +286,11 @@ private actor BlockingBeaconSender: BeaconSending {
     private var metadata: [[String: String]?] = []
     private var firstCallWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstCallContinuation: CheckedContinuation<Void, Never>?
+    private let firstCode: Int
+
+    init(firstCode: Int = 200) {
+        self.firstCode = firstCode
+    }
 
     func sendImpressionBeacon(
         adId: String,
@@ -256,7 +303,7 @@ private actor BlockingBeaconSender: BeaconSending {
         firstCallWaiters.forEach { $0.resume() }
         firstCallWaiters.removeAll()
         await withCheckedContinuation { firstCallContinuation = $0 }
-        return 200
+        return firstCode
     }
 
     func waitForFirstCall() async {

@@ -41,7 +41,9 @@ public struct NativeAdSlot: View {
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
-    @State private var attachExtraParametersOnSeen = false
+    /// Immutable metadata from the load that produced the mounted impression. It must never be
+    /// replaced by a recycled row's current `extraParameters`.
+    @State private var impressionMetadata: [String: String]? = nil
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
     /// Forwards the slot's live visible fraction into the creative (`window.onVisibility`); bound to
@@ -115,6 +117,12 @@ public struct NativeAdSlot: View {
     }
 
     /// Creates a native slot with publisher metadata scoped to the impression served by this view.
+    /// The SDK normalizes and snapshots this dictionary when loading. That same snapshot is used for
+    /// the billable `/seen` beacon even if SwiftUI later recreates the slot with different metadata.
+    /// A `preloadedAdId` has no metadata snapshot because the current preload API accepts none;
+    /// mount-time values are not retroactively attached to that already loaded impression.
+    /// Invalid entries are ignored; at most 10 non-empty keys are accepted (64 Unicode scalars per
+    /// key, 256 per value; keys beginning with `$` or containing `.` are rejected).
     public init(
         adUnitId: String? = nil,
         position: Int = 0,
@@ -132,7 +140,9 @@ public struct NativeAdSlot: View {
         self.position = position
         self.dimension = parseDimension(width).clampMinWidth(Self.minWidthPt)
         self.theme = theme
-        self.extraParameters = normalizeExtraParameters(extraParameters)
+        // SwiftUI may recreate a View value frequently. Keep this publisher-facing warning local and
+        // process-deduped; telemetry belongs to explicit API work, not View.init.
+        self.extraParameters = normalizeExtraParameters(extraParameters, warn: warnInvalidExtraParametersLocally)
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
@@ -147,7 +157,7 @@ public struct NativeAdSlot: View {
                 _phase = State(initialValue: .filled(response))
                 _heightPt = State(initialValue: entry.heightPt)
                 _impressionFired = State(initialValue: entry.impressionFired)
-                _attachExtraParametersOnSeen = State(initialValue: true)
+                _impressionMetadata = State(initialValue: entry.metadata)
             } else {
                 _phase = State(initialValue: .empty)
             }
@@ -291,7 +301,7 @@ public struct NativeAdSlot: View {
     private func load() async {
         // Preview/QA: render the supplied HTML with no network (mirrors imperative showPreview).
         if let previewHTML {
-            attachExtraParametersOnSeen = false
+            impressionMetadata = nil
             phase = .filled(NativeAdResponse(
                 impressionId: nil,
                 adInserted: true,
@@ -303,7 +313,8 @@ public struct NativeAdSlot: View {
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
         if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
-            apply(preloaded, source: "preload")
+            // The current preload API has no metadata parameter, so its load-time snapshot is nil.
+            apply(preloaded, source: "preload", metadata: nil)
             return
         }
 
@@ -312,7 +323,7 @@ public struct NativeAdSlot: View {
             if let response = entry.response {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
-                attachExtraParametersOnSeen = true
+                impressionMetadata = entry.metadata
                 phase = .filled(response)
                 reportLoadSuccess(response, source: "cache")
             } else {
@@ -339,7 +350,7 @@ public struct NativeAdSlot: View {
                 metadata: extraParameters
             )
             let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
-            apply(response, source: "network", durationMs: ms)
+            apply(response, source: "network", durationMs: ms, metadata: extraParameters)
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
@@ -353,12 +364,17 @@ public struct NativeAdSlot: View {
 
     /// Caches the outcome so the next remount of this slot reuses it (no duplicate serve).
     @MainActor
-    private func apply(_ response: NativeAdResponse, source: String, durationMs: Int? = nil) {
+    private func apply(
+        _ response: NativeAdResponse,
+        source: String,
+        durationMs: Int? = nil,
+        metadata: [String: String]?
+    ) {
         if response.hasCreative {
-            NativeAdCache.shared.putFill(adUnitId, position, response)
+            NativeAdCache.shared.putFill(adUnitId, position, response, metadata: metadata)
             heightPt = 0
             impressionFired = false
-            attachExtraParametersOnSeen = source != "network"
+            impressionMetadata = metadata
             // Start the native fill→first-paint render timer for a genuine load (network/preload); a
             // cache re-render leaves it nil so it doesn't record a render time.
             if source != "cache" {
@@ -431,7 +447,7 @@ public struct NativeAdSlot: View {
             action: "seen",
             adFormat: adFormat,
             adUnitId: adUnitId,
-            metadata: attachExtraParametersOnSeen ? extraParameters : nil
+            metadata: impressionMetadata
         )
     }
 

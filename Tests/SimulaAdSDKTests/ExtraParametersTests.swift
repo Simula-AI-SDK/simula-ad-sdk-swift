@@ -24,6 +24,13 @@ final class ExtraParametersTests: XCTestCase {
         XCTAssertEqual(warnings, 1)
     }
 
+    func testEmptyKeyIsRejected() {
+        var warnings = 0
+
+        XCTAssertNil(normalizeExtraParameters(["": "value"], warn: { warnings += 1 }))
+        XCTAssertEqual(warnings, 1)
+    }
+
     func testLimitsAreInclusiveAndExcessKeysAreDeterministic() throws {
         var parameters = Dictionary(uniqueKeysWithValues: (0..<11).map { ("k\($0)", "v") })
         parameters[String(repeating: "z", count: 64)] = String(repeating: "v", count: 256)
@@ -57,5 +64,32 @@ final class ExtraParametersTests: XCTestCase {
 
         store.replace(with: [:])
         XCTAssertNil(store.snapshot())
+    }
+
+    func testDuplicateMergeKeepsNewestKeysWhenCombinedSetExceedsCap() throws {
+        let existing = Dictionary(uniqueKeysWithValues: (0..<10).map { ("old\($0)", "old") })
+        let newest = Dictionary(uniqueKeysWithValues: (0..<6).map { ("new\($0)", "new") })
+        var warnings = 0
+
+        let merged = try XCTUnwrap(mergeExtraParameters(
+            existing: existing,
+            newest: newest,
+            warn: { warnings += 1 }
+        ))
+
+        XCTAssertEqual(merged.count, maxExtraParameterEntries)
+        XCTAssertTrue(newest.keys.allSatisfy { merged[$0] == "new" })
+        XCTAssertEqual(merged.values.filter { $0 == "old" }.count, 4)
+        XCTAssertEqual(warnings, 1)
+    }
+
+    func testDuplicateMergeUsesNewestValueForCollidingKey() {
+        let merged = mergeExtraParameters(
+            existing: ["placement": "old", "surface": "feed"],
+            newest: ["placement": "new"],
+            warn: {}
+        )
+
+        XCTAssertEqual(merged, ["placement": "new", "surface": "feed"])
     }
 }

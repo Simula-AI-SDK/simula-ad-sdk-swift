@@ -33,9 +33,14 @@ final class NativeAdCache: @unchecked Sendable {
     /// fields off the main actor.
     final class Entry: @unchecked Sendable {
         let response: NativeAdResponse?
+        /// Immutable publisher metadata captured for the load that produced `response`.
+        let metadata: [String: String]?
         var heightPt: CGFloat = 0 // main-actor only
         var impressionFired = false // main-actor only
-        init(response: NativeAdResponse?) { self.response = response }
+        init(response: NativeAdResponse?, metadata: [String: String]? = nil) {
+            self.response = response
+            self.metadata = metadata
+        }
     }
 
     /// Hard cap on retained slot entries. Generous relative to on-screen slot count; keeps process
@@ -107,8 +112,13 @@ final class NativeAdCache: @unchecked Sendable {
     }
 
     @discardableResult
-    func putFill(_ adUnitId: String?, _ position: Int, _ response: NativeAdResponse) -> Entry {
-        let entry = Entry(response: response)
+    func putFill(
+        _ adUnitId: String?,
+        _ position: Int,
+        _ response: NativeAdResponse,
+        metadata: [String: String]?
+    ) -> Entry {
+        let entry = Entry(response: response, metadata: metadata)
         lock.lock()
         let k = key(adUnitId, position)
         entries[k] = entry

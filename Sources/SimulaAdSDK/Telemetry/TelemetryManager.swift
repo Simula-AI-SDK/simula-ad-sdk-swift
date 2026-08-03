@@ -80,10 +80,13 @@ final class TelemetryManager: @unchecked Sendable {
     private let maxErrorSignatures: Int
     private let maxMessageLen = 300
     private let flushInterval: TimeInterval
+    /// Background durability is best-effort: never block the lifecycle caller indefinitely behind a
+    /// stalled UserDefaults implementation or an earlier persistence item.
+    private let persistenceWaitTimeout: TimeInterval
 
     // Serial queue so the UserDefaults encode + write never runs on the caller's thread
     // (often the main thread during ad-failure callbacks). Writes are enqueued while holding
-    // `lock`, preserving snapshot order; explicit durability paths wait after releasing it.
+    // `lock`, preserving snapshot order; explicit durability paths wait briefly after releasing it.
     private let persistQueue = DispatchQueue(label: "ad.simula.telemetry.persist", qos: .utility)
 
     private let lock = NSLock()
@@ -125,7 +128,8 @@ final class TelemetryManager: @unchecked Sendable {
         flushThreshold: Int = 20,
         maxBuffer: Int = 200,
         maxErrorSignatures: Int = 50,
-        flushInterval: TimeInterval = 30
+        flushInterval: TimeInterval = 30,
+        persistenceWaitTimeout: TimeInterval = 0.1
     ) {
         self.ctx = ctx
         self.store = store
@@ -145,6 +149,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.maxBuffer = maxBuffer
         self.maxErrorSignatures = maxErrorSignatures
         self.flushInterval = flushInterval
+        self.persistenceWaitTimeout = max(0, persistenceWaitTimeout)
         self.isEnabled = enabled
         self.perfSampledIn = enabled && random() < sampleRate
     }
@@ -368,7 +373,7 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         let persistence = persistAsync(snapshotLocked())
         lock.unlock()
-        persistence.wait()
+        _ = persistence.wait(timeout: .now() + persistenceWaitTimeout)
     }
 
     // MARK: - Internals

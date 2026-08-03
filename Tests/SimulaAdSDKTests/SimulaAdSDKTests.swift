@@ -751,7 +751,8 @@ final class SimulaAdSDKTests: XCTestCase {
     func testSKOverlayDelayClampsInDirectInitializer() {
         XCTAssertEqual(SKOverlayConfig(delaySeconds: -1).delaySeconds, 0)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: 12).delaySeconds, 12)
-        XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxCloseDelaySeconds)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 60).delaySeconds, 60)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxSKOverlayDelaySeconds)
     }
 
     func testSKOverlayOversizedDecodedDelayClampsToMax() throws {
@@ -760,7 +761,7 @@ final class SimulaAdSDKTests: XCTestCase {
          "ad_behavior":{"skoverlay":{"delay_seconds":\(Int.max)}}}
         """
         let overlay = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).skoverlay)
-        XCTAssertEqual(overlay.delaySeconds, maxCloseDelaySeconds)
+        XCTAssertEqual(overlay.delaySeconds, maxSKOverlayDelaySeconds)
     }
 
     func testAdUnitTypeFallsBackToLegacyFlags() throws {

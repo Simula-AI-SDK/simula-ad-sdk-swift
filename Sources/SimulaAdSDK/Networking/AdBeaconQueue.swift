@@ -7,6 +7,9 @@ import Foundation
 /// couldn't land before the app was backgrounded/killed is retried (PRD → durable billing queue).
 /// `action` is the impression-action path segment: `shown` / `seen` / `click`.
 struct PendingBeacon: Codable, Equatable {
+    /// Stable identity for reconciliation. Optional so queues persisted before this field existed
+    /// still decode; all newly enqueued records receive an id.
+    let id: String?
     let impressionId: String
     let action: String
     let metadata: [String: String]?
@@ -14,12 +17,14 @@ struct PendingBeacon: Codable, Equatable {
     var lastAttemptTimestamp: Double = 0
 
     init(
+        id: String? = UUID().uuidString,
         impressionId: String,
         action: String,
         metadata: [String: String]? = nil,
         retryCount: Int = 0,
         lastAttemptTimestamp: Double = 0
     ) {
+        self.id = id
         self.impressionId = impressionId
         self.action = action
         self.metadata = metadata
@@ -112,28 +117,36 @@ public final class AdBeaconManager: @unchecked Sendable {
         default:
             break
         }
-        var shouldWarnForMergedMetadata = false
         lock.lock()
         var list = loadQueue()
         if let index = list.firstIndex(where: { $0.impressionId == impressionId && $0.action == action }) {
             if let normalizedMetadata {
-                var merged = list[index].metadata ?? [:]
-                merged.merge(normalizedMetadata) { _, new in new }
-                list[index] = PendingBeacon(
-                    impressionId: list[index].impressionId,
-                    action: list[index].action,
-                    metadata: normalizeExtraParameters(merged, warn: { shouldWarnForMergedMetadata = true }),
-                    retryCount: list[index].retryCount,
-                    lastAttemptTimestamp: list[index].lastAttemptTimestamp
+                var shouldWarnForMergedMetadata = false
+                let merged = mergeExtraParameters(
+                    existing: list[index].metadata,
+                    newest: normalizedMetadata,
+                    warn: { shouldWarnForMergedMetadata = true }
                 )
-                saveQueue(list)
+                if merged != list[index].metadata {
+                    list[index] = PendingBeacon(
+                        impressionId: list[index].impressionId,
+                        action: list[index].action,
+                        metadata: merged,
+                        retryCount: list[index].retryCount,
+                        lastAttemptTimestamp: list[index].lastAttemptTimestamp
+                    )
+                    saveQueue(list)
+                }
+                lock.unlock()
+                if shouldWarnForMergedMetadata { warnInvalidExtraParameters() }
+                triggerProcessQueue()
+                return
             }
         } else {
             list.append(PendingBeacon(impressionId: impressionId, action: action, metadata: normalizedMetadata))
             saveQueue(list)
         }
         lock.unlock()
-        if shouldWarnForMergedMetadata { warnInvalidExtraParameters() }
         triggerProcessQueue()
     }
 
@@ -180,9 +193,12 @@ public final class AdBeaconManager: @unchecked Sendable {
             if delivered {
                 removeTask(task)
             } else {
-                recordAttempt(task)
-                bailedForBackoff = true
-                break
+                if recordAttempt(task) {
+                    bailedForBackoff = true
+                    break
+                }
+                // The in-flight record was replaced by a newer metadata snapshot. Send that eligible
+                // replacement now; the enqueue trigger observed `isProcessing` and could not start it.
             }
         }
         finishProcessing(reDrainIfEligible: !bailedForBackoff)
@@ -217,26 +233,30 @@ public final class AdBeaconManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         var queue = loadQueue()
-        // Remove only the snapshot that was sent. If metadata was merged while this request was in
-        // flight, the newer snapshot must stay queued for one more idempotent `/seen`; removing by
-        // `(impressionId, action)` alone would silently discard metadata the server never received.
+        // Remove only the stable record that was sent. A metadata merge creates a replacement id, so
+        // a newer `/seen` snapshot remains queued without coupling correctness to dictionary equality.
         queue.removeAll {
-            $0.impressionId == task.impressionId &&
-                $0.action == task.action &&
-                $0.metadata == task.metadata
+            if let id = task.id { return $0.id == id }
+            // Legacy records had no id. Restrict fallback matching to other legacy records.
+            return $0.id == nil && $0.impressionId == task.impressionId && $0.action == task.action
         }
         saveQueue(queue)
     }
 
-    private func recordAttempt(_ task: PendingBeacon) {
+    /// Records backoff state only when the exact in-flight record still exists. Returns false when a
+    /// concurrent metadata merge replaced it, allowing the drain to continue with the newer record.
+    private func recordAttempt(_ task: PendingBeacon) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         var queue = loadQueue()
-        if let idx = queue.firstIndex(where: { $0.impressionId == task.impressionId && $0.action == task.action }) {
-            queue[idx].retryCount += 1
-            queue[idx].lastAttemptTimestamp = now()
-        }
+        guard let idx = queue.firstIndex(where: {
+            if let id = task.id { return $0.id == id }
+            return $0.id == nil && $0.impressionId == task.impressionId && $0.action == task.action
+        }) else { return false }
+        queue[idx].retryCount += 1
+        queue[idx].lastAttemptTimestamp = now()
         saveQueue(queue)
+        return true
     }
 
     // MARK: - Persistence

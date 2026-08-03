@@ -437,6 +437,10 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 /// so the cap is 45 to honor the largest authored value while still bounding a malformed one.
 let maxCloseDelaySeconds = 45
 
+/// Independent cap for delayed SKOverlay presentation. It intentionally does not reuse the close
+/// gate's safety constant: changing close-button experiment arms must not change install timing.
+let maxSKOverlayDelaySeconds = 300
+
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
 /// spec. Returned WITH a leading `#` so it drops straight into `Color(hex:)`.
@@ -704,7 +708,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     ) {
         self.enabled = enabled
         self.timing = timing
-        self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
+        self.delaySeconds = min(maxSKOverlayDelaySeconds, max(0, delaySeconds))
         self.position = position
         self.dismissible = dismissible
     }
@@ -720,7 +724,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
         self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
         self.timing = .from(try? c.decode(String.self, forKey: .timing))
         self.delaySeconds = min(
-            maxCloseDelaySeconds,
+            maxSKOverlayDelaySeconds,
             max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
         )
         self.position = .from(try? c.decode(String.self, forKey: .position))
