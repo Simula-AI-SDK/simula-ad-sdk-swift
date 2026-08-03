@@ -28,5 +28,21 @@ final class NativeAdCacheMetadataTests: XCTestCase {
         XCTAssertEqual(cached.metadata, loadMetadata)
         XCTAssertNotEqual(cached.metadata, ["placement": "remount"])
     }
+
+    func testPreloadedFillRetainsPreloadMetadataInsteadOfMountMetadata() throws {
+        let preloadMetadata = ["screen": "search"]
+        let response = NativeAdResponse(
+            impressionId: "preload-imp",
+            adInserted: true,
+            adFormat: "character_ad",
+            renderedHtml: "<div>ad</div>"
+        )
+
+        NativeAdCache.shared.putFill("unit", 3, response, metadata: preloadMetadata)
+        let cached = try XCTUnwrap(NativeAdCache.shared.get("unit", 3))
+
+        XCTAssertEqual(cached.metadata, preloadMetadata)
+        XCTAssertNotEqual(cached.metadata, ["screen": "mount"])
+    }
 }
 #endif

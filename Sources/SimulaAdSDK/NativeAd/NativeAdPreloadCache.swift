@@ -16,37 +16,97 @@ import Foundation
 final class NativeAdPreloadCache {
     static let shared = NativeAdPreloadCache()
 
-    private let maxEntries = 5
-    private var tasks: [String: Task<NativeAdResponse, Error>] = [:]
+    typealias Loader = @MainActor (
+        _ provider: SimulaProvider,
+        _ adUnitId: String?,
+        _ position: Int,
+        _ theme: String?,
+        _ metadata: [String: String]?
+    ) async throws -> NativeAdResponse
 
-    private init() {}
+    struct PreloadedNativeAd {
+        let response: NativeAdResponse
+        let metadata: [String: String]?
+    }
+
+    private struct Entry {
+        let task: Task<NativeAdResponse, Error>
+        let metadata: [String: String]?
+    }
+
+    private let maxEntries = 5
+    private let loader: Loader
+    private var entries: [String: Entry] = [:]
+
+    init(loader: @escaping Loader = { provider, adUnitId, position, theme, metadata in
+        try await NativeAdController.load(
+            provider: provider,
+            adUnitId: adUnitId,
+            position: position,
+            theme: theme,
+            metadata: metadata
+        )
+    }) {
+        self.loader = loader
+    }
 
     /// Fire one preload and return its id, or nil if the cap is already reached. `theme` is resolved
     /// here (imperative context → `UITraitCollection`) since there's no SwiftUI environment.
-    func preload(provider: SimulaProvider, adUnitId: String?, position: Int, theme: String?) -> String? {
-        guard tasks.count < maxEntries else {
+    func preload(
+        provider: SimulaProvider,
+        adUnitId: String?,
+        position: Int,
+        theme: String?,
+        metadata: [String: String]?
+    ) -> String? {
+        guard entries.count < maxEntries else {
             Telemetry.shared.recordOperation(name: "native_preload_capped", durationMs: 0, success: false)
             return nil
         }
+        let metadataSnapshot = metadata.flatMap { normalizeExtraParameters($0) }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)
         let id = UUID().uuidString
         // Single-call task closure — see the task-shape note in TelemetryManager.
-        tasks[id] = Task { @MainActor in try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position, theme: resolvedTheme) }
+        let task = Task { @MainActor in
+            try await runLoad(
+                provider: provider,
+                adUnitId: adUnitId,
+                position: position,
+                theme: resolvedTheme,
+                metadata: metadataSnapshot
+            )
+        }
+        entries[id] = Entry(task: task, metadata: metadataSnapshot)
         return id
+    }
+
+    /// Named task entry point required by the optimizer-safe task-shape contract.
+    private func runLoad(
+        provider: SimulaProvider,
+        adUnitId: String?,
+        position: Int,
+        theme: String?,
+        metadata: [String: String]?
+    ) async throws -> NativeAdResponse {
+        try await loader(provider, adUnitId, position, theme, metadata)
     }
 
     /// Await and remove the preloaded ad for `id`. Returns nil if the id is unknown (expired,
     /// destroyed, already consumed) or its load failed — the caller then falls back to a live
     /// request, surfacing no error (PRD).
-    func consume(_ id: String) async -> NativeAdResponse? {
-        guard let task = tasks.removeValue(forKey: id) else { return nil }
+    func consume(_ id: String) async -> PreloadedNativeAd? {
+        guard let entry = entries.removeValue(forKey: id) else { return nil }
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
-        do { return try await task.value } catch { return nil }
+        do {
+            return PreloadedNativeAd(response: try await entry.task.value, metadata: entry.metadata)
+        } catch {
+            return nil
+        }
     }
 
     /// Release a preloaded ad that was never consumed, cancelling its request if still in flight.
     func destroy(_ id: String) {
-        tasks.removeValue(forKey: id)?.cancel()
+        entries.removeValue(forKey: id)?.task.cancel()
     }
 }
 #endif

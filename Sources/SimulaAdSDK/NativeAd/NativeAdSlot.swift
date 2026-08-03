@@ -119,8 +119,8 @@ public struct NativeAdSlot: View {
     /// Creates a native slot with publisher metadata scoped to the impression served by this view.
     /// The SDK normalizes and snapshots this dictionary when loading. That same snapshot is used for
     /// the billable `/seen` beacon even if SwiftUI later recreates the slot with different metadata.
-    /// A `preloadedAdId` has no metadata snapshot because the current preload API accepts none;
-    /// mount-time values are not retroactively attached to that already loaded impression.
+    /// A `preloadedAdId` uses the snapshot supplied to `SimulaAds.preloadNativeAd`; mount-time values
+    /// are not retroactively attached to that already loaded impression.
     /// Invalid entries are ignored; at most 10 non-empty keys are accepted (64 Unicode scalars per
     /// key, 256 per value; keys beginning with `$` or containing `.` are rejected).
     public init(
@@ -313,8 +313,7 @@ public struct NativeAdSlot: View {
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
         if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
-            // The current preload API has no metadata parameter, so its load-time snapshot is nil.
-            apply(preloaded, source: "preload", metadata: nil)
+            apply(preloaded.response, source: "preload", metadata: preloaded.metadata)
             return
         }
 

@@ -44,14 +44,19 @@ NativeAdSlot(
     adUnitId: "chat",
     metadata: ["conversation_type": "group"]
 )
+
+let preloadedAdId = await SimulaAds.preloadNativeAd(
+    adUnitId: "chat",
+    metadata: ["conversation_type": "group"]
+)
 ```
 
 Metadata accepts at most 10 entries. Keys must be non-empty, at most 64 Unicode scalars, must not
 start with `$`, and must not contain `.`. Values are limited to 256 Unicode scalars. Invalid or excess
 entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the same
-`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. The current native
-preload API has no metadata argument, so mounting a `preloadedAdId` does not retroactively attach the
-slot's metadata to that already loaded impression.
+`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. Pass metadata to
+`preloadNativeAd` for preloaded ads; mounting a `preloadedAdId` never overrides its load-time
+snapshot with the slot's current metadata.
 
 ## Privacy & App Store Compliance
 
