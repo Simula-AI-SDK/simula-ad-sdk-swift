@@ -30,6 +30,7 @@ final class NativeAdPreloadCache {
     }
 
     private struct Entry {
+        let token: UUID
         let task: Task<NativeAdResponse, Error>
         let metadata: [String: String]?
     }
@@ -66,6 +67,7 @@ final class NativeAdPreloadCache {
         let metadataSnapshot = metadata.flatMap { normalizeExtraParameters($0) }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)
         let id = UUID().uuidString
+        let token = UUID()
         // Single-call task closure — see the task-shape note in TelemetryManager.
         let task = Task { @MainActor in
             try await runLoad(
@@ -76,7 +78,7 @@ final class NativeAdPreloadCache {
                 metadata: metadataSnapshot
             )
         }
-        entries[id] = Entry(task: task, metadata: metadataSnapshot)
+        entries[id] = Entry(token: token, task: task, metadata: metadataSnapshot)
         return id
     }
 
@@ -95,11 +97,20 @@ final class NativeAdPreloadCache {
     /// destroyed, already consumed) or its load failed — the caller then falls back to a live
     /// request, surfacing no error (PRD).
     func consume(_ id: String) async -> PreloadedNativeAd? {
-        guard let entry = entries.removeValue(forKey: id) else { return nil }
+        guard let entry = entries[id] else { return nil }
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
         do {
-            return PreloadedNativeAd(response: try await entry.task.value, metadata: entry.metadata)
+            let response = try await entry.task.value
+            // SwiftUI cancelled this slot while the process-owned preload continued. Leave the
+            // completed entry available for a remount instead of forcing a duplicate live request.
+            guard !Task.isCancelled else { return nil }
+            guard entries[id]?.token == entry.token else { return nil }
+            entries.removeValue(forKey: id)
+            return PreloadedNativeAd(response: response, metadata: entry.metadata)
         } catch {
+            if !Task.isCancelled, entries[id]?.token == entry.token {
+                entries.removeValue(forKey: id)
+            }
             return nil
         }
     }

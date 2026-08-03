@@ -53,5 +53,35 @@ final class NativeAdPreloadCacheTests: XCTestCase {
 
         XCTAssertNil(consumed?.metadata)
     }
+
+    func testCancelledConsumerLeavesPreloadAvailableForRemount() async throws {
+        let releaseLoad = AsyncStream<Void>.makeStream()
+        let cache = NativeAdPreloadCache { _, _, _, _, _ in
+            for await _ in releaseLoad.stream { break }
+            return NativeAdResponse(
+                impressionId: "preloaded-impression",
+                adInserted: true,
+                adFormat: "character_ad",
+                renderedHtml: "<div>ad</div>"
+            )
+        }
+        let provider = SimulaProvider(apiKey: "test-api-key")
+        let id = try XCTUnwrap(cache.preload(
+            provider: provider,
+            adUnitId: "feed",
+            position: 3,
+            theme: nil,
+            metadata: ["screen": "search"]
+        ))
+        let firstConsumer = Task { @MainActor in await cache.consume(id) }
+
+        firstConsumer.cancel()
+        releaseLoad.continuation.yield()
+        releaseLoad.continuation.finish()
+        _ = await firstConsumer.value
+        let remounted = await cache.consume(id)
+
+        XCTAssertEqual(remounted?.metadata, ["screen": "search"])
+    }
 }
 #endif
