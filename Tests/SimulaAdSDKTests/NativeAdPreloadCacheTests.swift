@@ -83,5 +83,26 @@ final class NativeAdPreloadCacheTests: XCTestCase {
 
         XCTAssertEqual(remounted?.metadata, ["screen": "search"])
     }
+
+    func testCancelledPreloadResolutionCannotFallThroughAsUnavailable() async {
+        let consumeStarted = expectation(description: "consume started")
+        let releaseConsume = AsyncStream<Void>.makeStream()
+        let resolution = Task { @MainActor in
+            await resolveNativeAdPreload("preloaded-id") { _ in
+                consumeStarted.fulfill()
+                for await _ in releaseConsume.stream { break }
+                return nil
+            }
+        }
+        await fulfillment(of: [consumeStarted], timeout: 1)
+
+        resolution.cancel()
+        releaseConsume.continuation.yield()
+        releaseConsume.continuation.finish()
+
+        guard case .cancelled = await resolution.value else {
+            return XCTFail("Cancelled preload resolution must stop the slot load")
+        }
+    }
 }
 #endif

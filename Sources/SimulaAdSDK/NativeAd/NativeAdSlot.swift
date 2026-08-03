@@ -2,6 +2,25 @@
 import SwiftUI
 import UIKit
 
+internal enum NativeAdPreloadResolution {
+    case unavailable
+    case cancelled
+    case loaded(NativeAdPreloadCache.PreloadedNativeAd)
+}
+
+@MainActor
+internal func resolveNativeAdPreload(
+    _ preloadedAdId: String?,
+    consume: @escaping @MainActor (String) async -> NativeAdPreloadCache.PreloadedNativeAd? = { id in
+        await NativeAdPreloadCache.shared.consume(id)
+    }
+) async -> NativeAdPreloadResolution {
+    guard let preloadedAdId else { return .unavailable }
+    let preloaded = await consume(preloadedAdId)
+    guard !Task.isCancelled else { return .cancelled }
+    return preloaded.map(NativeAdPreloadResolution.loaded) ?? .unavailable
+}
+
 /// An inline, contextually-targeted native ad — a sponsored character card rendered inside a
 /// publisher's feed (PRD).
 ///
@@ -312,9 +331,16 @@ public struct NativeAdSlot: View {
         }
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
-        if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
+        switch await resolveNativeAdPreload(preloadedAdId) {
+        case .cancelled:
+            // A cancelled SwiftUI task leaves the preload available for remount. Do not reinterpret
+            // it as a failed preload and start a duplicate cache/live path in this dead slot.
+            return
+        case .loaded(let preloaded):
             apply(preloaded.response, source: "preload", metadata: preloaded.metadata)
             return
+        case .unavailable:
+            break
         }
 
         // 2. Per-slot cache hit → render without a network call (no duplicate serve / impression).

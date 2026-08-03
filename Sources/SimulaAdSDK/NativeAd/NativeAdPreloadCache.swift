@@ -97,6 +97,7 @@ final class NativeAdPreloadCache {
     /// destroyed, already consumed) or its load failed — the caller then falls back to a live
     /// request, surfacing no error (PRD).
     func consume(_ id: String) async -> PreloadedNativeAd? {
+        guard !Task.isCancelled else { return nil }
         guard let entry = entries[id] else { return nil }
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
         do {
