@@ -433,9 +433,12 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 
 /// Hard cap on the server-driven close delay. The close button (and, on Android, the system
 /// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
-/// trap the user with no exit. The `close_chrome` experiment arms are 20/30/45s (default 30),
-/// so the cap is 45 to honor the largest authored value while still bounding a malformed one.
-let maxCloseDelaySeconds = 45
+/// trap the user with no exit. Keep this independent from SKOverlay timing and bounded at 60s.
+let maxCloseDelaySeconds = 60
+
+/// Independent cap for delayed SKOverlay presentation. It intentionally does not reuse the close
+/// gate's safety constant: changing close-button experiment arms must not change install timing.
+let maxSKOverlayDelaySeconds = 300
 
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
@@ -587,7 +590,7 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
         position: ClosePosition = .topRight,
         progressBarColor: String = "#FFFFFF"
     ) {
-        self.delaySeconds = delaySeconds
+        self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
         self.treatment = treatment
         // Every treatment honors the configured corner. (`progress_bar` renders its bar at the top
         // edge regardless; only its resolved close ✕ follows `position`.)
@@ -704,7 +707,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     ) {
         self.enabled = enabled
         self.timing = timing
-        self.delaySeconds = max(0, delaySeconds)
+        self.delaySeconds = min(maxSKOverlayDelaySeconds, max(0, delaySeconds))
         self.position = position
         self.dismissible = dismissible
     }
@@ -719,7 +722,10 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
         self.timing = .from(try? c.decode(String.self, forKey: .timing))
-        self.delaySeconds = max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        self.delaySeconds = min(
+            maxSKOverlayDelaySeconds,
+            max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+        )
         self.position = .from(try? c.decode(String.self, forKey: .position))
         self.dismissible = (try? c.decode(Bool.self, forKey: .dismissible)) ?? true
     }
@@ -1091,6 +1097,7 @@ public struct NativeAdRequest: Encodable, Sendable {
     public let charId: String?
     public let charName: String?
     public let charDesc: String?
+    public let metadata: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case position
@@ -1102,6 +1109,7 @@ public struct NativeAdRequest: Encodable, Sendable {
         case charId = "char_id"
         case charName = "char_name"
         case charDesc = "char_desc"
+        case metadata
     }
 
     public init(
@@ -1124,6 +1132,31 @@ public struct NativeAdRequest: Encodable, Sendable {
         self.charId = charId
         self.charName = charName
         self.charDesc = charDesc
+        self.metadata = nil
+    }
+
+    public init(
+        position: Int,
+        sessionId: String,
+        adUnitId: String? = nil,
+        context: SimulaAdContext? = nil,
+        theme: String? = nil,
+        width: String? = nil,
+        charId: String? = nil,
+        charName: String? = nil,
+        charDesc: String? = nil,
+        metadata: [String: String]?
+    ) {
+        self.position = position
+        self.sessionId = sessionId
+        self.adUnitId = adUnitId
+        self.context = context
+        self.theme = theme
+        self.width = width
+        self.charId = charId
+        self.charName = charName
+        self.charDesc = charDesc
+        self.metadata = metadata.flatMap { normalizeExtraParameters($0) }
     }
 }
 
@@ -1272,8 +1305,10 @@ public struct AdValue: Sendable, Equatable {
     /// Tolerant: a non-finite or negative bid clamps to 0, so a missing/garbage field yields a $0
     /// estimate rather than trapping — surfacing the paid event must never crash the host app.
     static func fromBidCpm(_ bidCpm: Double, currencyCode: String = "USD") -> AdValue {
-        let safeBid = (bidCpm.isFinite && bidCpm > 0) ? bidCpm : 0
-        let valueMicros = Int64((safeBid * 1_000).rounded())
+        let roundedMicros = (bidCpm * 1_000).rounded()
+        let valueMicros = (bidCpm.isFinite && bidCpm >= 0)
+            ? (Int64(exactly: roundedMicros) ?? 0)
+            : 0
         return AdValue(
             valueMicros: valueMicros,
             currencyCode: currencyCode,

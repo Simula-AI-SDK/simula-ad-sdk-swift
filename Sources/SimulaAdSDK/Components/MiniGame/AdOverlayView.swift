@@ -258,9 +258,9 @@ public struct AdOverlayView: View {
             lastTick = now
             let progress = accumulatedMs / totalMs
             ringProgress = progress.isFinite ? min(1, max(0, CGFloat(progress))) : 1
-            // Int(nonFinite) traps; clamp before converting.
+            // Failable conversion covers non-finite and out-of-range values.
             let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
-            adCountdown = remainingSecs.isFinite ? Int(remainingSecs) : 0
+            adCountdown = Int(exactly: remainingSecs) ?? 0
         }
         adCountdown = 0
         ringProgress = 1
@@ -291,6 +291,5 @@ private struct AdCountdownLifecycle: ViewModifier {
         #endif
     }
 }
-
 
 

@@ -100,16 +100,14 @@ public enum SimulaAds {
         do {
             try validateSimulaProviderProps(apiKey: apiKey)
         } catch {
-            // Debug: trap loudly. Release: log + return false (was a silent no-op) so the host gets
-            // a signal at the call site rather than only via later `.notInitialized` ad failures.
+            // Debug: trap loudly. Release: return false so the host gets a signal at the call site
+            // rather than only via later `.notInitialized` ad failures.
             assertionFailure("[SimulaSDK] \(error.localizedDescription)")
-            print("[SimulaSDK] initialize() failed: \(error.localizedDescription). The SDK is NOT initialized — ad calls will report .notInitialized.")
             return false
         }
 
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else {
-            print("[SimulaSDK] initialize() ignored — the SDK is already initialized; the first valid configuration wins.")
             return false
         }
 
@@ -249,7 +247,7 @@ public enum SimulaAds {
     /// `POST /load/native` using the current provider context, caches the full response, and returns
     /// a `preloadedAdId` to pass into a `NativeAdSlot` (which then renders from cache with no live
     /// network call). The entry is evicted once consumed; release any unconsumed id with
-    /// `destroyPreloadedAd`. At most 5 ads are kept (excess is dropped with an internal warning).
+    /// `destroyPreloadedAd`. At most 5 ads are kept (excess is dropped with sampled telemetry).
     /// Returns `nil` before `initialize` or when the cap is reached.
     ///
     /// `theme` is `"dark"`, `"light"`, `"system"`, or `nil`. `"system"` resolves to dark/light from

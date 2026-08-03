@@ -178,6 +178,8 @@ public final class SimulaInterstitialAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
+    private let metadataStore = ExtraParametersStore()
+
     // Character context is passed per `load()` call (see below); there is no global
     // character state to keep in sync.
 
@@ -191,9 +193,10 @@ public final class SimulaInterstitialAd {
     private enum State {
         case idle
         case loading
+        /// `metadata` is the immutable load-time snapshot used by the billable `/seen` beacon;
         /// `loadedAt` is when the creative became ready (used for staleness).
-        case ready(AdLoadResponse, loadedAt: Date)
-        case showing(AdLoadResponse)
+        case ready(AdLoadResponse, metadata: [String: String]?, loadedAt: Date)
+        case showing(AdLoadResponse, metadata: [String: String]?)
     }
 
     private var state: State = .idle
@@ -241,6 +244,20 @@ public final class SimulaInterstitialAd {
 
     public init(adUnitId: String) {
         self.adUnitId = adUnitId
+    }
+
+    /// Upserts one publisher metadata entry for future loads. Invalid entries are ignored safely.
+    /// Calling this after `load()` does not change the ready ad: each load snapshots its metadata for
+    /// both the load request and that impression's billable `/seen` beacon.
+    public func setMetadata(_ key: String, _ value: String) {
+        metadataStore.set(key: key, value: value)
+    }
+
+    /// Replaces publisher metadata for future loads. Passing an empty dictionary clears it. At most
+    /// 10 non-empty keys are accepted (64 Unicode scalars per key and 256 per value); keys beginning
+    /// with `$` or containing `.` are ignored. A ready ad retains its load-time snapshot.
+    public func setMetadata(_ metadata: [String: String]) {
+        metadataStore.replace(with: metadata)
     }
 
     // MARK: - Load
@@ -299,8 +316,18 @@ public final class SimulaInterstitialAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
+        let metadata = metadataStore.snapshot()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        loadTask = Task { [weak self] in await self?.runLoad(provider: provider, charId: charId, charName: charName, charImage: charImage, charDesc: charDesc) }
+        loadTask = Task { [weak self] in
+            await self?.runLoad(
+                provider: provider,
+                charId: charId,
+                charName: charName,
+                charImage: charImage,
+                charDesc: charDesc,
+                metadata: metadata
+            )
+        }
     }
 
     /// Load task body (named method — see the task-shape note in TelemetryManager).
@@ -309,7 +336,8 @@ public final class SimulaInterstitialAd {
         charId: String?,
         charName: String?,
         charImage: String?,
-        charDesc: String?
+        charDesc: String?,
+        metadata: [String: String]?
     ) async {
         let sessionId = await provider.ensureSession()
         if Task.isCancelled { return }
@@ -333,7 +361,8 @@ public final class SimulaInterstitialAd {
                 charDesc: charDesc,
                 // AdContext (contextual targeting) now rides on the full-screen request too, read
                 // from the same provider-level store the native surface uses.
-                context: provider.adContext
+                context: provider.adContext,
+                metadata: metadata
             )
             if Task.isCancelled { return }
             // Fillable only when the payload carries a non-blank `rendered_html`
@@ -351,7 +380,7 @@ public final class SimulaInterstitialAd {
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
                 adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
             )
-            state = .ready(response, loadedAt: Date())
+            state = .ready(response, metadata: metadata, loadedAt: Date())
             delegate?.interstitialDidLoad(self)
         } catch let apiError as SimulaAPIError {
             // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
@@ -386,8 +415,9 @@ public final class SimulaInterstitialAd {
     /// On close, fires `CLOSED` and automatically preloads the next ad.
     public func show() {
         let response: AdLoadResponse
+        let metadata: [String: String]?
         switch state {
-        case .ready(let loaded, let loadedAt):
+        case .ready(let loaded, let loadMetadata, let loadedAt):
             // A loaded ad expires after 1 hour. Drop it (back to idle so the host can
             // load() again — the dedup window is long gone) and report stale.
             if Date().timeIntervalSince(loadedAt) > Self.staleAfter {
@@ -396,6 +426,7 @@ public final class SimulaInterstitialAd {
                 return
             }
             response = loaded
+            metadata = loadMetadata
         case .showing:
             failDisplay(.alreadyShowing)
             return
@@ -431,7 +462,13 @@ public final class SimulaInterstitialAd {
                 self.delegate?.interstitialDidRecordImpression(self)
                 self.delegate?.interstitialDidPay(self, value: response.adValue)
                 // Durable billable-impression beacon (was a fire-and-forget trackImpression).
-                AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "seen", adFormat: Self.adFormat, adUnitId: self.adUnitId)
+                AdBeaconManager.shared.enqueue(
+                    impressionId: response.impressionId,
+                    action: "seen",
+                    adFormat: Self.adFormat,
+                    adUnitId: self.adUnitId,
+                    metadata: metadata
+                )
             },
             onClose: { [weak self] in
                 guard let self else { return }
@@ -485,7 +522,7 @@ public final class SimulaInterstitialAd {
         }
 
         // Only now is the ad actually on screen.
-        state = .showing(response)
+        state = .showing(response, metadata: metadata)
         self.presenter = presenter
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
         // instant the user closes — fetching after close left a gap that flashed the screen behind.
@@ -615,7 +652,7 @@ public final class SimulaInterstitialAd {
             failDisplay(.noPresentationContext)
             return
         }
-        state = .showing(response)
+        state = .showing(response, metadata: nil)
         self.presenter = presenter
         delegate?.interstitialDidDisplay(self)
         // Preview is local-only: deliberately no `trackImpression`.

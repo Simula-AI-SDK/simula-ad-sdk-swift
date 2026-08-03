@@ -9,8 +9,8 @@ import Foundation
 /// that id it `consume`s the entry — rendering from cache with no live network call — and the entry
 /// is evicted. Unconsumed ids must be released with `destroy`.
 ///
-/// At most `maxEntries` ads are kept at once; further preloads are dropped (PRD: "cap silently at 5,
-/// log warning internally"). MainActor-isolated: everything runs on the main thread, matching the
+/// At most `maxEntries` ads are kept at once; further preloads are dropped (PRD: "cap silently at 5")
+/// with sampled telemetry. MainActor-isolated: everything runs on the main thread, matching the
 /// rest of the imperative ad path.
 @MainActor
 final class NativeAdPreloadCache {
@@ -25,7 +25,7 @@ final class NativeAdPreloadCache {
     /// here (imperative context → `UITraitCollection`) since there's no SwiftUI environment.
     func preload(provider: SimulaProvider, adUnitId: String?, position: Int, theme: String?) -> String? {
         guard tasks.count < maxEntries else {
-            print("[SimulaSDK] preloadNativeAd ignored — at most \(maxEntries) preloaded ads are kept at once.")
+            Telemetry.shared.recordOperation(name: "native_preload_capped", durationMs: 0, success: false)
             return nil
         }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)

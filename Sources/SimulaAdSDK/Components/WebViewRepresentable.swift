@@ -489,7 +489,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// token-less attribution, or a `.web` destination, keeps today's external behavior unchanged.
         private func openNativeCTA(fallback: URL) {
             let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trackingURL = (tracking?.isEmpty == false) ? URL(string: tracking!) : nil
+            let trackingURL = tracking.flatMap { $0.isEmpty ? nil : URL(string: $0) }
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution

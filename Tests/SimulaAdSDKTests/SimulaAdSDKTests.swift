@@ -60,7 +60,18 @@ final class SimulaAdSDKTests: XCTestCase {
     func testInterstitialStoresConfiguration() {
         let ad = SimulaInterstitialAd(adUnitId: "unit_42")
         XCTAssertEqual(ad.adUnitId, "unit_42")
+        ad.setMetadata("page_name", "Search")
+        ad.setMetadata(["page_name": "Search", "surface": "chat"])
     }
+
+    #if os(iOS)
+    func testNativeAdSlotAcceptsMetadata() {
+        _ = NativeAdSlot(
+            adUnitId: "unit_42",
+            metadata: ["page_name": "Search", "surface": "chat"]
+        )
+    }
+    #endif
 
     func testMaxGamesToShowValues() {
         XCTAssertEqual(MaxGamesToShow.three.rawValue, 3)
@@ -304,6 +315,17 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNil(obj?["char_name"])
         XCTAssertNil(obj?["char_image"])
         XCTAssertNil(obj?["char_desc"])
+    }
+
+    func testAdLoadRequestEncodesMetadataAtTopLevel() throws {
+        let body = AdLoadRequest(
+            adUnitId: "u",
+            metadata: ["page_name": "Search", "surface": "chat"]
+        )
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["metadata"] as? [String: String], ["page_name": "Search", "surface": "chat"])
+        XCTAssertNil(obj?["extra_parameters"])
+        XCTAssertNil((try JSONSerialization.jsonObject(with: JSONEncoder().encode(AdLoadRequest(adUnitId: "u"))) as? [String: Any])?["metadata"])
     }
 
     // MARK: - AdDestination raw values
@@ -726,6 +748,24 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertFalse(o.dismissible)
     }
 
+    func testSKOverlayDelayClampsInDirectInitializer() {
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: -1).delaySeconds, 0)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 12).delaySeconds, 12)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 60).delaySeconds, 60)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 300).delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 301).delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxSKOverlayDelaySeconds)
+    }
+
+    func testSKOverlayOversizedDecodedDelayClampsToMax() throws {
+        let json = """
+        {"impression_id":"a","ad_inserted":true,"ad_unit_id":"u","rewarded":false,
+         "ad_behavior":{"skoverlay":{"delay_seconds":\(Int.max)}}}
+        """
+        let overlay = try XCTUnwrap(try XCTUnwrap(try decodeAdLoad(json).adBehavior).skoverlay)
+        XCTAssertEqual(overlay.delaySeconds, maxSKOverlayDelaySeconds)
+    }
+
     func testAdUnitTypeFallsBackToLegacyFlags() throws {
         // No creative node: adUnitType derives from the legacy `rendered_format` (the imperative
         // HTML model dropped the flat `rewarded` flag, so a stray `rewarded` key is ignored).
@@ -770,6 +810,14 @@ final class SimulaAdSDKTests: XCTestCase {
             try XCTUnwrap(try decodeAdLoad(json).adBehavior).close.delaySeconds,
             maxCloseDelaySeconds
         )
+    }
+
+    func testCloseBehaviorDelayClampsInDirectInitializer() {
+        XCTAssertEqual(CloseBehavior(delaySeconds: -1).delaySeconds, 0)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 12).delaySeconds, 12)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 60).delaySeconds, 60)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 61).delaySeconds, 60)
+        XCTAssertEqual(CloseBehavior(delaySeconds: Int.max).delaySeconds, maxCloseDelaySeconds)
     }
 
     func testDeviceCapabilitiesEncodesHandshakeKeys() throws {
@@ -964,6 +1012,14 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
     }
 
+    func testRewardedInitRequestEncodesMetadataAtTopLevel() throws {
+        let body = RewardedInitRequest(adUnitId: "unit_1", metadata: ["surface": "chat"])
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        XCTAssertEqual(obj?["metadata"] as? [String: String], ["surface": "chat"])
+        XCTAssertNil(obj?["extra_parameters"])
+        XCTAssertNil((try JSONSerialization.jsonObject(with: JSONEncoder().encode(RewardedInitRequest(adUnitId: "u"))) as? [String: Any])?["metadata"])
+    }
+
     func testVerifyRewardRequestEncodesSnakeCaseKeys() throws {
         let body = VerifyRewardRequest(serveId: "srv_1", sessionId: "sess_9", elapsedPlayTime: 31.5)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
@@ -988,6 +1044,8 @@ final class SimulaAdSDKTests: XCTestCase {
     func testRewardedDefaultConfiguration() {
         let ad = SimulaRewardedAd(adUnitId: "u")
         XCTAssertEqual(ad.adUnitId, "u")
+        ad.setMetadata("page_name", "Search")
+        ad.setMetadata(["surface": "chat"])
     }
 
     @MainActor

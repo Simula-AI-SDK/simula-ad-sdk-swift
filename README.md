@@ -29,6 +29,30 @@ Full integration guides, API references, and examples are available at:
 - [Interstitial Ad](https://docs.simula.ad/swift-sdk/interstitial-ad) -- full-screen ad
 - [Rewarded Ad](https://docs.simula.ad/swift-sdk/rewarded-ad) -- rewarded ad with server-side verification
 
+## Publisher Metadata
+
+Publisher metadata is scoped to an individual ad load. The SDK snapshots the normalized values when
+the load begins and uses that same snapshot for the load request and the impression's billable
+`/seen` beacon. Updating metadata after `load()` does not alter an already loaded ad.
+
+```swift
+let interstitial = SimulaInterstitialAd(adUnitId: "home")
+interstitial.setMetadata(["placement": "home", "surface": "feed"])
+interstitial.load()
+
+NativeAdSlot(
+    adUnitId: "chat",
+    metadata: ["conversation_type": "group"]
+)
+```
+
+Metadata accepts at most 10 entries. Keys must be non-empty, at most 64 Unicode scalars, must not
+start with `$`, and must not contain `.`. Values are limited to 256 Unicode scalars. Invalid or excess
+entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the same
+`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. The current native
+preload API has no metadata argument, so mounting a `preloadedAdId` does not retroactively attach the
+slot's metadata to that already loaded impression.
+
 ## Privacy & App Store Compliance
 
 The SDK bundles a `PrivacyInfo.xcprivacy` manifest and supports IAB consent frameworks (TCF, CCPA, GPP), COPPA, and App Tracking Transparency. See the [Quick Start guide](https://docs.simula.ad/swift-sdk/quick-start#privacy-att) for details.
