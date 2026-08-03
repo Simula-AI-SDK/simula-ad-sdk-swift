@@ -433,9 +433,8 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 
 /// Hard cap on the server-driven close delay. The close button (and, on Android, the system
 /// Back button) is blocked until the delay elapses, so an out-of-range value would otherwise
-/// trap the user with no exit. The `close_chrome` experiment arms are 20/30/45s (default 30),
-/// so the cap is 45 to honor the largest authored value while still bounding a malformed one.
-let maxCloseDelaySeconds = 45
+/// trap the user with no exit. Keep this independent from SKOverlay timing and bounded at 60s.
+let maxCloseDelaySeconds = 60
 
 /// Independent cap for delayed SKOverlay presentation. It intentionally does not reuse the close
 /// gate's safety constant: changing close-button experiment arms must not change install timing.

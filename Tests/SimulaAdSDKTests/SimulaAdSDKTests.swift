@@ -60,15 +60,15 @@ final class SimulaAdSDKTests: XCTestCase {
     func testInterstitialStoresConfiguration() {
         let ad = SimulaInterstitialAd(adUnitId: "unit_42")
         XCTAssertEqual(ad.adUnitId, "unit_42")
-        ad.setExtraParameter("page_name", "Search")
-        ad.setExtraParameters(["page_name": "Search", "surface": "chat"])
+        ad.setMetadata("page_name", "Search")
+        ad.setMetadata(["page_name": "Search", "surface": "chat"])
     }
 
     #if os(iOS)
-    func testNativeAdSlotAcceptsExtraParameters() {
+    func testNativeAdSlotAcceptsMetadata() {
         _ = NativeAdSlot(
             adUnitId: "unit_42",
-            extraParameters: ["page_name": "Search", "surface": "chat"]
+            metadata: ["page_name": "Search", "surface": "chat"]
         )
     }
     #endif
@@ -752,6 +752,8 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(SKOverlayConfig(delaySeconds: -1).delaySeconds, 0)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: 12).delaySeconds, 12)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: 60).delaySeconds, 60)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 300).delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 301).delaySeconds, 300)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxSKOverlayDelaySeconds)
     }
 
@@ -813,6 +815,8 @@ final class SimulaAdSDKTests: XCTestCase {
     func testCloseBehaviorDelayClampsInDirectInitializer() {
         XCTAssertEqual(CloseBehavior(delaySeconds: -1).delaySeconds, 0)
         XCTAssertEqual(CloseBehavior(delaySeconds: 12).delaySeconds, 12)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 60).delaySeconds, 60)
+        XCTAssertEqual(CloseBehavior(delaySeconds: 61).delaySeconds, 60)
         XCTAssertEqual(CloseBehavior(delaySeconds: Int.max).delaySeconds, maxCloseDelaySeconds)
     }
 
@@ -1040,8 +1044,8 @@ final class SimulaAdSDKTests: XCTestCase {
     func testRewardedDefaultConfiguration() {
         let ad = SimulaRewardedAd(adUnitId: "u")
         XCTAssertEqual(ad.adUnitId, "u")
-        ad.setExtraParameter("page_name", "Search")
-        ad.setExtraParameters(["surface": "chat"])
+        ad.setMetadata("page_name", "Search")
+        ad.setMetadata(["surface": "chat"])
     }
 
     @MainActor

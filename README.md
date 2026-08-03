@@ -37,19 +37,19 @@ the load begins and uses that same snapshot for the load request and the impress
 
 ```swift
 let interstitial = SimulaInterstitialAd(adUnitId: "home")
-interstitial.setExtraParameters(["placement": "home", "surface": "feed"])
+interstitial.setMetadata(["placement": "home", "surface": "feed"])
 interstitial.load()
 
 NativeAdSlot(
     adUnitId: "chat",
-    extraParameters: ["conversation_type": "group"]
+    metadata: ["conversation_type": "group"]
 )
 ```
 
 Metadata accepts at most 10 entries. Keys must be non-empty, at most 64 Unicode scalars, must not
 start with `$`, and must not contain `.`. Values are limited to 256 Unicode scalars. Invalid or excess
 entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the same
-`setExtraParameter` and `setExtraParameters` methods as `SimulaInterstitialAd`. The current native
+`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. The current native
 preload API has no metadata argument, so mounting a `preloadedAdId` does not retroactively attach the
 slot's metadata to that already loaded impression.
 

@@ -178,7 +178,7 @@ public final class SimulaInterstitialAd {
     /// Receives lifecycle events.
     public weak var delegate: SimulaInterstitialAdDelegate?
 
-    private let extraParameters = ExtraParametersStore()
+    private let metadataStore = ExtraParametersStore()
 
     // Character context is passed per `load()` call (see below); there is no global
     // character state to keep in sync.
@@ -249,15 +249,15 @@ public final class SimulaInterstitialAd {
     /// Upserts one publisher metadata entry for future loads. Invalid entries are ignored safely.
     /// Calling this after `load()` does not change the ready ad: each load snapshots its metadata for
     /// both the load request and that impression's billable `/seen` beacon.
-    public func setExtraParameter(_ key: String, _ value: String) {
-        extraParameters.set(key: key, value: value)
+    public func setMetadata(_ key: String, _ value: String) {
+        metadataStore.set(key: key, value: value)
     }
 
     /// Replaces publisher metadata for future loads. Passing an empty dictionary clears it. At most
     /// 10 non-empty keys are accepted (64 Unicode scalars per key and 256 per value); keys beginning
     /// with `$` or containing `.` are ignored. A ready ad retains its load-time snapshot.
-    public func setExtraParameters(_ parameters: [String: String]) {
-        extraParameters.replace(with: parameters)
+    public func setMetadata(_ metadata: [String: String]) {
+        metadataStore.replace(with: metadata)
     }
 
     // MARK: - Load
@@ -316,7 +316,7 @@ public final class SimulaInterstitialAd {
         currentKeyAt = now
         state = .loading
         loadStartNanos = DispatchTime.now().uptimeNanoseconds
-        let metadata = extraParameters.snapshot()
+        let metadata = metadataStore.snapshot()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         loadTask = Task { [weak self] in
             await self?.runLoad(

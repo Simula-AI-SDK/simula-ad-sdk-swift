@@ -32,7 +32,7 @@ public struct NativeAdSlot: View {
     private let previewHTML: String?
     private let dimension: ParsedDimension
     private let theme: String?
-    private let extraParameters: [String: String]?
+    private let metadata: [String: String]?
     private let onImpression: (NativeAdData) -> Void
     private let onPaid: (AdValue) -> Void
     private let onError: (NativeAdError) -> Void
@@ -42,7 +42,7 @@ public struct NativeAdSlot: View {
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
     /// Immutable metadata from the load that produced the mounted impression. It must never be
-    /// replaced by a recycled row's current `extraParameters`.
+    /// replaced by a recycled row's current `metadata`.
     @State private var impressionMetadata: [String: String]? = nil
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
@@ -106,7 +106,7 @@ public struct NativeAdSlot: View {
             position: position,
             width: width,
             theme: theme,
-            extraParameters: [:],
+            metadata: [:],
             preloadedAdId: preloadedAdId,
             onImpression: onImpression,
             onPaid: onPaid,
@@ -128,7 +128,7 @@ public struct NativeAdSlot: View {
         position: Int = 0,
         width: Any? = nil,
         theme: String? = nil,
-        extraParameters: [String: String],
+        metadata: [String: String],
         preloadedAdId: String? = nil,
         onImpression: @escaping (NativeAdData) -> Void = { _ in },
         onPaid: @escaping (AdValue) -> Void = { _ in },
@@ -142,7 +142,7 @@ public struct NativeAdSlot: View {
         self.theme = theme
         // SwiftUI may recreate a View value frequently. Keep this publisher-facing warning local and
         // process-deduped; telemetry belongs to explicit API work, not View.init.
-        self.extraParameters = normalizeExtraParameters(extraParameters, warn: warnInvalidExtraParametersLocally)
+        self.metadata = normalizeExtraParameters(metadata, warn: warnInvalidExtraParametersLocally)
         self.preloadedAdId = preloadedAdId
         self.previewHTML = previewHTML
         self.onImpression = onImpression
@@ -347,10 +347,10 @@ public struct NativeAdSlot: View {
                 adUnitId: adUnitId,
                 position: position,
                 theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark),
-                metadata: extraParameters
+                metadata: metadata
             )
             let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
-            apply(response, source: "network", durationMs: ms, metadata: extraParameters)
+            apply(response, source: "network", durationMs: ms, metadata: metadata)
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {
