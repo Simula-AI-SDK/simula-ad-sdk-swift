@@ -2,6 +2,25 @@
 import SwiftUI
 import UIKit
 
+internal enum NativeAdPreloadResolution {
+    case unavailable
+    case cancelled
+    case loaded(NativeAdResponse)
+}
+
+@MainActor
+internal func resolveNativeAdPreload(
+    _ preloadedAdId: String?,
+    consume: @escaping @MainActor (String) async -> NativeAdResponse? = { id in
+        await NativeAdPreloadCache.shared.consume(id)
+    }
+) async -> NativeAdPreloadResolution {
+    guard let preloadedAdId else { return .unavailable }
+    let preloaded = await consume(preloadedAdId)
+    guard !Task.isCancelled else { return .cancelled }
+    return preloaded.map(NativeAdPreloadResolution.loaded) ?? .unavailable
+}
+
 /// An inline, contextually-targeted native ad — a sponsored character card rendered inside a
 /// publisher's feed (PRD).
 ///
@@ -41,8 +60,8 @@ public struct NativeAdSlot: View {
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
     @State private var impressionFired = false
-    /// Immutable metadata from the load that produced the mounted impression. It must never be
-    /// replaced by a recycled row's current `metadata`.
+    /// Immutable metadata pending for this impression's `/seen` beacon. Normal loads send metadata
+    /// on `/load`; consumed preloads bind mount metadata here because their load already happened.
     @State private var impressionMetadata: [String: String]? = nil
     /// Parent width, measured only when `width` is a percentage (see `sizedSlot`).
     @State private var measuredParentWidth: CGFloat = 0
@@ -117,10 +136,9 @@ public struct NativeAdSlot: View {
     }
 
     /// Creates a native slot with publisher metadata scoped to the impression served by this view.
-    /// The SDK normalizes and snapshots this dictionary when loading. That same snapshot is used for
-    /// the billable `/seen` beacon even if SwiftUI later recreates the slot with different metadata.
-    /// A `preloadedAdId` has no metadata snapshot because the current preload API accepts none;
-    /// mount-time values are not retroactively attached to that already loaded impression.
+    /// A normal or preload-fallback request sends the normalized snapshot on `/load`. A successfully
+    /// consumed `preloadedAdId` has already loaded without metadata, so this snapshot is sent on the
+    /// billable `/seen` beacon instead. Later SwiftUI recreations cannot rewrite either snapshot.
     /// Invalid entries are ignored; at most 10 non-empty keys are accepted (64 Unicode scalars per
     /// key, 256 per value; keys beginning with `$` or containing `.` are rejected).
     public init(
@@ -312,10 +330,16 @@ public struct NativeAdSlot: View {
         }
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
-        if let preloadedAdId, let preloaded = await NativeAdPreloadCache.shared.consume(preloadedAdId) {
-            // The current preload API has no metadata parameter, so its load-time snapshot is nil.
-            apply(preloaded, source: "preload", metadata: nil)
+        switch await resolveNativeAdPreload(preloadedAdId) {
+        case .cancelled:
+            // A cancelled SwiftUI task leaves the preload available for remount. Do not reinterpret
+            // it as a failed preload and start a duplicate cache/live path in this dead slot.
             return
+        case .loaded(let response):
+            apply(response, source: "preload", metadata: metadata)
+            return
+        case .unavailable:
+            break
         }
 
         // 2. Per-slot cache hit → render without a network call (no duplicate serve / impression).
@@ -350,7 +374,7 @@ public struct NativeAdSlot: View {
                 metadata: metadata
             )
             let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
-            apply(response, source: "network", durationMs: ms, metadata: metadata)
+            apply(response, source: "network", durationMs: ms, metadata: nil)
         } catch is CancellationError {
             // Slot recycled / view torn down mid-load — leave state as-is.
         } catch let error as SimulaAdError {

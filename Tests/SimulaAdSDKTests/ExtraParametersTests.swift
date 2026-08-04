@@ -43,6 +43,19 @@ final class ExtraParametersTests: XCTestCase {
         XCTAssertEqual(Set(normalized.keys), Set(parameters.keys.sorted().prefix(10)))
     }
 
+    func testCapUsesUTF16OrderForCrossPlatformParity() throws {
+        let supplementary = "\u{10000}"
+        let privateUse = "\u{E000}"
+        var parameters = Dictionary(uniqueKeysWithValues: (0..<9).map { ("a\($0)", "value") })
+        parameters[supplementary] = "kept"
+        parameters[privateUse] = "dropped"
+
+        let normalized = try XCTUnwrap(normalizeExtraParameters(parameters, warn: {}))
+
+        XCTAssertNotNil(normalized[supplementary])
+        XCTAssertNil(normalized[privateUse])
+    }
+
     func testLengthsUseBackendCompatibleUnicodeScalarCounts() {
         let allowed = String(repeating: "🚀", count: 64)
         let rejected = String(repeating: "🚀", count: 65)

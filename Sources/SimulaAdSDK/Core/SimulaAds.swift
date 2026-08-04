@@ -256,7 +256,9 @@ public enum SimulaAds {
     @discardableResult
     public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0, theme: String? = nil) async -> String? {
         guard let provider = shared else { return nil }
-        return NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position, theme: theme)
+        return NativeAdPreloadCache.shared.preload(
+            provider: provider, adUnitId: adUnitId, position: position, theme: theme
+        )
     }
 
     /// Completion-based variant of `preloadNativeAd` for callers that must not create Swift
@@ -274,7 +276,9 @@ public enum SimulaAds {
             completion(nil)
             return
         }
-        completion(NativeAdPreloadCache.shared.preload(provider: provider, adUnitId: adUnitId, position: position, theme: theme))
+        completion(NativeAdPreloadCache.shared.preload(
+            provider: provider, adUnitId: adUnitId, position: position, theme: theme
+        ))
     }
 
     /// Release a preloaded native ad that was never consumed, cancelling its request if in flight.

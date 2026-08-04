@@ -71,6 +71,12 @@ final class SimulaAdSDKTests: XCTestCase {
             metadata: ["page_name": "Search", "surface": "chat"]
         )
     }
+
+    @MainActor
+    func testNativePreloadApiRemainsMetadataFree() async {
+        _ = await SimulaAds.preloadNativeAd(adUnitId: "unit_42")
+        SimulaAds.preloadNativeAd(adUnitId: "unit_42") { _ in }
+    }
     #endif
 
     func testMaxGamesToShowValues() {
