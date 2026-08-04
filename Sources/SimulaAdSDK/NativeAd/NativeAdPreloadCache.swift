@@ -16,37 +16,110 @@ import Foundation
 final class NativeAdPreloadCache {
     static let shared = NativeAdPreloadCache()
 
-    private let maxEntries = 5
-    private var tasks: [String: Task<NativeAdResponse, Error>] = [:]
+    typealias Loader = @MainActor (
+        _ provider: SimulaProvider,
+        _ adUnitId: String?,
+        _ position: Int,
+        _ theme: String?
+    ) async throws -> NativeAdResponse
 
-    private init() {}
+    private struct Entry {
+        let token: UUID
+        let task: Task<NativeAdResponse, Error>
+    }
+
+    private let maxEntries = 5
+    private let loader: Loader
+    private var entries: [String: Entry] = [:]
+
+    init(loader: @escaping Loader = { provider, adUnitId, position, theme in
+        try await NativeAdController.load(
+            provider: provider,
+            adUnitId: adUnitId,
+            position: position,
+            theme: theme
+        )
+    }) {
+        self.loader = loader
+    }
 
     /// Fire one preload and return its id, or nil if the cap is already reached. `theme` is resolved
     /// here (imperative context → `UITraitCollection`) since there's no SwiftUI environment.
-    func preload(provider: SimulaProvider, adUnitId: String?, position: Int, theme: String?) -> String? {
-        guard tasks.count < maxEntries else {
+    func preload(
+        provider: SimulaProvider,
+        adUnitId: String?,
+        position: Int,
+        theme: String?
+    ) -> String? {
+        guard entries.count < maxEntries else {
             Telemetry.shared.recordOperation(name: "native_preload_capped", durationMs: 0, success: false)
             return nil
         }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)
         let id = UUID().uuidString
+        let token = UUID()
         // Single-call task closure — see the task-shape note in TelemetryManager.
-        tasks[id] = Task { @MainActor in try await NativeAdController.load(provider: provider, adUnitId: adUnitId, position: position, theme: resolvedTheme) }
+        let task = Task { @MainActor in
+            try await runLoad(
+                provider: provider,
+                adUnitId: adUnitId,
+                position: position,
+                theme: resolvedTheme,
+                id: id,
+                token: token
+            )
+        }
+        entries[id] = Entry(token: token, task: task)
         return id
+    }
+
+    /// Named task entry point required by the optimizer-safe task-shape contract.
+    private func runLoad(
+        provider: SimulaProvider,
+        adUnitId: String?,
+        position: Int,
+        theme: String?,
+        id: String,
+        token: UUID
+    ) async throws -> NativeAdResponse {
+        do {
+            return try await loader(provider, adUnitId, position, theme)
+        } catch {
+            // A terminal preload must release capacity even when no slot is consuming it or the
+            // consumer was cancelled. The token prevents an old task touching a replacement entry.
+            if entries[id]?.token == token {
+                entries.removeValue(forKey: id)
+            }
+            throw error
+        }
     }
 
     /// Await and remove the preloaded ad for `id`. Returns nil if the id is unknown (expired,
     /// destroyed, already consumed) or its load failed — the caller then falls back to a live
     /// request, surfacing no error (PRD).
     func consume(_ id: String) async -> NativeAdResponse? {
-        guard let task = tasks.removeValue(forKey: id) else { return nil }
+        guard !Task.isCancelled else { return nil }
+        guard let entry = entries[id] else { return nil }
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
-        do { return try await task.value } catch { return nil }
+        do {
+            let response = try await entry.task.value
+            // SwiftUI cancelled this slot while the process-owned preload continued. Leave the
+            // completed entry available for a remount instead of forcing a duplicate live request.
+            guard !Task.isCancelled else { return nil }
+            guard entries[id]?.token == entry.token else { return nil }
+            entries.removeValue(forKey: id)
+            return response
+        } catch {
+            if !Task.isCancelled, entries[id]?.token == entry.token {
+                entries.removeValue(forKey: id)
+            }
+            return nil
+        }
     }
 
     /// Release a preloaded ad that was never consumed, cancelling its request if still in flight.
     func destroy(_ id: String) {
-        tasks.removeValue(forKey: id)?.cancel()
+        entries.removeValue(forKey: id)?.task.cancel()
     }
 }
 #endif

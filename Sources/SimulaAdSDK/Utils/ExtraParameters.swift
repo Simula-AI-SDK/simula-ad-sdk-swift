@@ -55,7 +55,7 @@ func normalizeExtraParameters(
                 !key.hasPrefix("$") &&
                 !key.contains(".")
         }
-        .sorted { $0.key < $1.key }
+        .sorted { utf16LexicographicallyPrecedes($0.key, $1.key) }
 
     if valid.count != parameters.count || valid.count > maxExtraParameterEntries {
         warn()
@@ -77,7 +77,7 @@ func mergeExtraParameters(
     let prior = normalizeExtraParameters(existing ?? [:], warn: { shouldWarn = true }) ?? [:]
     var merged = incoming
 
-    for key in prior.keys.sorted() where merged[key] == nil {
+    for key in prior.keys.sorted(by: utf16LexicographicallyPrecedes) where merged[key] == nil {
         guard merged.count < maxExtraParameterEntries else {
             shouldWarn = true
             break
@@ -86,6 +86,11 @@ func mergeExtraParameters(
     }
     if shouldWarn { warn() }
     return merged.isEmpty ? nil : merged
+}
+
+/// Matches Kotlin `String.compareTo` and JavaScript `Array.sort` for deterministic wire capping.
+private func utf16LexicographicallyPrecedes(_ lhs: String, _ rhs: String) -> Bool {
+    lhs.utf16.lexicographicallyPrecedes(rhs.utf16)
 }
 
 /// Main-actor-owned configuration used by imperative full-screen ad instances.
