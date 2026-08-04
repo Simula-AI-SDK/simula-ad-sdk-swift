@@ -33,7 +33,7 @@ final class NativeAdCache: @unchecked Sendable {
     /// fields off the main actor.
     final class Entry: @unchecked Sendable {
         let response: NativeAdResponse?
-        /// Immutable publisher metadata captured for the load that produced `response`.
+        /// Immutable publisher metadata pending for this impression's `/seen` beacon.
         let metadata: [String: String]?
         var heightPt: CGFloat = 0 // main-actor only
         var impressionFired = false // main-actor only

@@ -13,8 +13,7 @@ final class NativeAdCacheMetadataTests: XCTestCase {
         super.tearDown()
     }
 
-    func testCachedFillRetainsItsLoadTimeMetadataSnapshot() throws {
-        let loadMetadata = ["placement": "original"]
+    func testNormalFillHasNoPendingSeenMetadata() throws {
         let response = NativeAdResponse(
             impressionId: "imp-1",
             adInserted: true,
@@ -22,15 +21,14 @@ final class NativeAdCacheMetadataTests: XCTestCase {
             renderedHtml: "<div>ad</div>"
         )
 
-        NativeAdCache.shared.putFill("unit", 2, response, metadata: loadMetadata)
+        NativeAdCache.shared.putFill("unit", 2, response, metadata: nil)
         let cached = try XCTUnwrap(NativeAdCache.shared.get("unit", 2))
 
-        XCTAssertEqual(cached.metadata, loadMetadata)
-        XCTAssertNotEqual(cached.metadata, ["placement": "remount"])
+        XCTAssertNil(cached.metadata)
     }
 
-    func testPreloadedFillRetainsPreloadMetadataInsteadOfMountMetadata() throws {
-        let preloadMetadata = ["screen": "search"]
+    func testPreloadedFillRetainsMountMetadataForSeen() throws {
+        let mountMetadata = ["screen": "search"]
         let response = NativeAdResponse(
             impressionId: "preload-imp",
             adInserted: true,
@@ -38,11 +36,10 @@ final class NativeAdCacheMetadataTests: XCTestCase {
             renderedHtml: "<div>ad</div>"
         )
 
-        NativeAdCache.shared.putFill("unit", 3, response, metadata: preloadMetadata)
+        NativeAdCache.shared.putFill("unit", 3, response, metadata: mountMetadata)
         let cached = try XCTUnwrap(NativeAdCache.shared.get("unit", 3))
 
-        XCTAssertEqual(cached.metadata, preloadMetadata)
-        XCTAssertNotEqual(cached.metadata, ["screen": "mount"])
+        XCTAssertEqual(cached.metadata, mountMetadata)
     }
 }
 #endif

@@ -4,10 +4,10 @@ import XCTest
 
 @MainActor
 final class NativeAdPreloadCacheTests: XCTestCase {
-    func testPreloadSnapshotsMetadataForLoadAndConsumption() async throws {
-        var loadedMetadata: [String: String]?
-        let cache = NativeAdPreloadCache { _, _, _, _, metadata in
-            loadedMetadata = metadata
+    func testPreloadInvokesMetadataFreeLoaderAndReturnsItsResponse() async throws {
+        var loadCount = 0
+        let cache = NativeAdPreloadCache { _, _, _, _ in
+            loadCount += 1
             return NativeAdResponse(
                 impressionId: "preloaded-impression",
                 adInserted: true,
@@ -16,47 +16,25 @@ final class NativeAdPreloadCacheTests: XCTestCase {
             )
         }
         let provider = SimulaProvider(apiKey: "test-api-key")
-        var source = ["screen": "search"]
 
         let id = cache.preload(
             provider: provider,
             adUnitId: "feed",
             position: 1,
-            theme: nil,
-            metadata: source
+            theme: nil
         )
-        source["screen"] = "mutated"
         guard let id else {
             return XCTFail("Expected preload id")
         }
         let consumed = await cache.consume(id)
 
-        XCTAssertEqual(loadedMetadata, ["screen": "search"])
-        XCTAssertEqual(consumed?.metadata, ["screen": "search"])
-    }
-
-    func testPreloadWithoutMetadataRetainsNilSnapshot() async {
-        let cache = NativeAdPreloadCache { _, _, _, _, _ in
-            NativeAdResponse(
-                impressionId: "preloaded-impression",
-                adInserted: true,
-                adFormat: "character_ad",
-                renderedHtml: "<div>ad</div>"
-            )
-        }
-        let provider = SimulaProvider(apiKey: "test-api-key")
-        let id = cache.preload(provider: provider, adUnitId: "feed", position: 2, theme: nil, metadata: nil)
-        guard let id else {
-            return XCTFail("Expected preload id")
-        }
-        let consumed = await cache.consume(id)
-
-        XCTAssertNil(consumed?.metadata)
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(consumed?.impressionId, "preloaded-impression")
     }
 
     func testCancelledConsumerLeavesPreloadAvailableForRemount() async throws {
         let releaseLoad = AsyncStream<Void>.makeStream()
-        let cache = NativeAdPreloadCache { _, _, _, _, _ in
+        let cache = NativeAdPreloadCache { _, _, _, _ in
             for await _ in releaseLoad.stream { break }
             return NativeAdResponse(
                 impressionId: "preloaded-impression",
@@ -70,8 +48,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
             provider: provider,
             adUnitId: "feed",
             position: 3,
-            theme: nil,
-            metadata: ["screen": "search"]
+            theme: nil
         ))
         let firstConsumer = Task { @MainActor in await cache.consume(id) }
 
@@ -81,7 +58,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
         _ = await firstConsumer.value
         let remounted = await cache.consume(id)
 
-        XCTAssertEqual(remounted?.metadata, ["screen": "search"])
+        XCTAssertEqual(remounted?.impressionId, "preloaded-impression")
     }
 
     func testCancelledPreloadResolutionCannotFallThroughAsUnavailable() async {
@@ -103,6 +80,24 @@ final class NativeAdPreloadCacheTests: XCTestCase {
         guard case .cancelled = await resolution.value else {
             return XCTFail("Cancelled preload resolution must stop the slot load")
         }
+    }
+
+    func testFailedUnconsumedPreloadsReleaseCapacity() async throws {
+        enum LoadError: Error { case failed }
+        var loadCount = 0
+        let cache = NativeAdPreloadCache { _, _, _, _ in
+            loadCount += 1
+            throw LoadError.failed
+        }
+        let provider = SimulaProvider(apiKey: "test-api-key")
+
+        for position in 0..<5 {
+            XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: position, theme: nil))
+        }
+        while loadCount < 5 { await Task.yield() }
+        await Task.yield()
+
+        XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: 6, theme: nil))
     }
 }
 #endif

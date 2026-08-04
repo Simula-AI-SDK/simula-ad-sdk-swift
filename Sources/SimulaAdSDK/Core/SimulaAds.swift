@@ -257,22 +257,7 @@ public enum SimulaAds {
     public static func preloadNativeAd(adUnitId: String? = nil, position: Int = 0, theme: String? = nil) async -> String? {
         guard let provider = shared else { return nil }
         return NativeAdPreloadCache.shared.preload(
-            provider: provider, adUnitId: adUnitId, position: position, theme: theme, metadata: nil
-        )
-    }
-
-    /// Preload a native ad with publisher metadata snapshotted for its load and `/seen` beacon.
-    /// Metadata supplied later to `NativeAdSlot` cannot override this preload-time snapshot.
-    @discardableResult
-    public static func preloadNativeAd(
-        adUnitId: String? = nil,
-        position: Int = 0,
-        theme: String? = nil,
-        metadata: [String: String]
-    ) async -> String? {
-        guard let provider = shared else { return nil }
-        return NativeAdPreloadCache.shared.preload(
-            provider: provider, adUnitId: adUnitId, position: position, theme: theme, metadata: metadata
+            provider: provider, adUnitId: adUnitId, position: position, theme: theme
         )
     }
 
@@ -292,24 +277,7 @@ public enum SimulaAds {
             return
         }
         completion(NativeAdPreloadCache.shared.preload(
-            provider: provider, adUnitId: adUnitId, position: position, theme: theme, metadata: nil
-        ))
-    }
-
-    /// Completion-based preload with an immutable publisher metadata snapshot.
-    public static func preloadNativeAd(
-        adUnitId: String? = nil,
-        position: Int = 0,
-        theme: String? = nil,
-        metadata: [String: String],
-        completion: @escaping @MainActor (String?) -> Void
-    ) {
-        guard let provider = shared else {
-            completion(nil)
-            return
-        }
-        completion(NativeAdPreloadCache.shared.preload(
-            provider: provider, adUnitId: adUnitId, position: position, theme: theme, metadata: metadata
+            provider: provider, adUnitId: adUnitId, position: position, theme: theme
         ))
     }
 

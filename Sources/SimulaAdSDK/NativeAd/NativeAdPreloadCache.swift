@@ -20,32 +20,24 @@ final class NativeAdPreloadCache {
         _ provider: SimulaProvider,
         _ adUnitId: String?,
         _ position: Int,
-        _ theme: String?,
-        _ metadata: [String: String]?
+        _ theme: String?
     ) async throws -> NativeAdResponse
-
-    struct PreloadedNativeAd {
-        let response: NativeAdResponse
-        let metadata: [String: String]?
-    }
 
     private struct Entry {
         let token: UUID
         let task: Task<NativeAdResponse, Error>
-        let metadata: [String: String]?
     }
 
     private let maxEntries = 5
     private let loader: Loader
     private var entries: [String: Entry] = [:]
 
-    init(loader: @escaping Loader = { provider, adUnitId, position, theme, metadata in
+    init(loader: @escaping Loader = { provider, adUnitId, position, theme in
         try await NativeAdController.load(
             provider: provider,
             adUnitId: adUnitId,
             position: position,
-            theme: theme,
-            metadata: metadata
+            theme: theme
         )
     }) {
         self.loader = loader
@@ -57,14 +49,12 @@ final class NativeAdPreloadCache {
         provider: SimulaProvider,
         adUnitId: String?,
         position: Int,
-        theme: String?,
-        metadata: [String: String]?
+        theme: String?
     ) -> String? {
         guard entries.count < maxEntries else {
             Telemetry.shared.recordOperation(name: "native_preload_capped", durationMs: 0, success: false)
             return nil
         }
-        let metadataSnapshot = metadata.flatMap { normalizeExtraParameters($0) }
         let resolvedTheme = NativeAdTheme.resolve(theme, isDark: NativeAdTheme.systemIsDark)
         let id = UUID().uuidString
         let token = UUID()
@@ -75,10 +65,11 @@ final class NativeAdPreloadCache {
                 adUnitId: adUnitId,
                 position: position,
                 theme: resolvedTheme,
-                metadata: metadataSnapshot
+                id: id,
+                token: token
             )
         }
-        entries[id] = Entry(token: token, task: task, metadata: metadataSnapshot)
+        entries[id] = Entry(token: token, task: task)
         return id
     }
 
@@ -88,15 +79,25 @@ final class NativeAdPreloadCache {
         adUnitId: String?,
         position: Int,
         theme: String?,
-        metadata: [String: String]?
+        id: String,
+        token: UUID
     ) async throws -> NativeAdResponse {
-        try await loader(provider, adUnitId, position, theme, metadata)
+        do {
+            return try await loader(provider, adUnitId, position, theme)
+        } catch {
+            // A terminal preload must release capacity even when no slot is consuming it or the
+            // consumer was cancelled. The token prevents an old task touching a replacement entry.
+            if entries[id]?.token == token {
+                entries.removeValue(forKey: id)
+            }
+            throw error
+        }
     }
 
     /// Await and remove the preloaded ad for `id`. Returns nil if the id is unknown (expired,
     /// destroyed, already consumed) or its load failed — the caller then falls back to a live
     /// request, surfacing no error (PRD).
-    func consume(_ id: String) async -> PreloadedNativeAd? {
+    func consume(_ id: String) async -> NativeAdResponse? {
         guard !Task.isCancelled else { return nil }
         guard let entry = entries[id] else { return nil }
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
@@ -107,7 +108,7 @@ final class NativeAdPreloadCache {
             guard !Task.isCancelled else { return nil }
             guard entries[id]?.token == entry.token else { return nil }
             entries.removeValue(forKey: id)
-            return PreloadedNativeAd(response: response, metadata: entry.metadata)
+            return response
         } catch {
             if !Task.isCancelled, entries[id]?.token == entry.token {
                 entries.removeValue(forKey: id)

@@ -73,15 +73,9 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     @MainActor
-    func testNativePreloadAcceptsMetadata() async {
-        _ = await SimulaAds.preloadNativeAd(
-            adUnitId: "unit_42",
-            metadata: ["page_name": "Search"]
-        )
-        SimulaAds.preloadNativeAd(
-            adUnitId: "unit_42",
-            metadata: ["page_name": "Search"]
-        ) { _ in }
+    func testNativePreloadApiRemainsMetadataFree() async {
+        _ = await SimulaAds.preloadNativeAd(adUnitId: "unit_42")
+        SimulaAds.preloadNativeAd(adUnitId: "unit_42") { _ in }
     }
     #endif
 

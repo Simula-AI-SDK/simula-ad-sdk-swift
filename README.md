@@ -31,9 +31,9 @@ Full integration guides, API references, and examples are available at:
 
 ## Publisher Metadata
 
-Publisher metadata is scoped to an individual ad load. The SDK snapshots the normalized values when
-the load begins and uses that same snapshot for the load request and the impression's billable
-`/seen` beacon. Updating metadata after `load()` does not alter an already loaded ad.
+Publisher metadata is scoped to an individual impression. Fullscreen ads snapshot it when `load()`
+starts. A normal native slot sends its component snapshot on `/load`; a preloaded native ad has
+already loaded without metadata, so its consuming `NativeAdSlot` sends the snapshot on `/seen`.
 
 ```swift
 let interstitial = SimulaInterstitialAd(adUnitId: "home")
@@ -46,17 +46,21 @@ NativeAdSlot(
 )
 
 let preloadedAdId = await SimulaAds.preloadNativeAd(
+    adUnitId: "chat"
+)
+
+NativeAdSlot(
     adUnitId: "chat",
-    metadata: ["conversation_type": "group"]
+    metadata: ["conversation_type": "group"],
+    preloadedAdId: preloadedAdId
 )
 ```
 
 Metadata accepts at most 10 entries. Keys must be non-empty, at most 64 Unicode scalars, must not
 start with `$`, and must not contain `.`. Values are limited to 256 Unicode scalars. Invalid or excess
 entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the same
-`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. Pass metadata to
-`preloadNativeAd` for preloaded ads; mounting a `preloadedAdId` never overrides its load-time
-snapshot with the slot's current metadata.
+`setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. Native preloads do not
+accept metadata; supply it to the `NativeAdSlot` that consumes the preload.
 
 ## Privacy & App Store Compliance
 
