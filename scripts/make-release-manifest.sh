@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# Rewrites Package.swift into the CONSUMER (binary) manifest for a release tag.
+# Rewrites Package.swift into the consumer binary manifest and adds the same
+# artifact checksum to the CocoaPods HTTP source for a release tag.
 #
 # Distribution model: `main` keeps the source manifest (so `swift build && swift test`,
 # CI, and @testable tests all work unchanged), while each release TAG carries a manifest
 # whose target is the prebuilt XCFramework. SPM consumers pin tags/versions, so they
 # resolve the binary; the repo itself always builds from source.
 #
-# MANUAL release step (the workflow only builds + uploads the artifact — see
-# .github/workflows/release.yml). After the workflow produced the draft release:
-#   scripts/make-release-manifest.sh <version> <checksum>
-# then commit, tag <version>, push the tag, and publish the draft against it.
-# <checksum> is `swift package compute-checksum` of the zip (printed in the draft notes).
+# The release workflow calls this after building the artifact. It commits the generated
+# files only on the release tag; main retains the source Package.swift and checksum-free
+# development podspec.
 
 set -euo pipefail
 
@@ -19,6 +18,11 @@ cd "$(dirname "$0")/.."
 
 VERSION="${1:?usage: make-release-manifest.sh <version> <checksum>}"
 CHECKSUM="${2:?usage: make-release-manifest.sh <version> <checksum>}"
+
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
+  || { echo "ERROR: version must be semantic versioning without a leading v"; exit 1; }
+[[ "$CHECKSUM" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: checksum must be 64 lowercase hexadecimal characters"; exit 1; }
 
 cat > Package.swift <<EOF
 // swift-tools-version: 5.9
@@ -50,4 +54,16 @@ let package = Package(
 )
 EOF
 
-echo "Wrote binary Package.swift for ${VERSION} (checksum ${CHECKSUM})"
+ruby - "$CHECKSUM" <<'RUBY'
+path = "SimulaAdSDK.podspec"
+checksum = ARGV.fetch(0)
+lines = File.readlines(path)
+lines.reject! { |line| line.match?(/^\s*:sha256\s*=>/) }
+http_index = lines.index { |line| line.match?(/^\s*:http\s*=>/) }
+abort "ERROR: CocoaPods HTTP source not found" unless http_index
+lines[http_index] = lines[http_index].rstrip.sub(/,?$/, ",") + "\n"
+lines.insert(http_index + 1, "    :sha256 => \"#{checksum}\"\n")
+File.write(path, lines.join)
+RUBY
+
+echo "Wrote release manifests for ${VERSION} (checksum ${CHECKSUM})"

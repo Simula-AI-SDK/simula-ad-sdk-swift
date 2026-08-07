@@ -374,6 +374,7 @@ private struct CreativeInterstitialView: View {
             onAdClick: { handleHtmlClick() },
             bridge: bridge,
             attribution: response.skanAttribution,
+            ctaTrackingUrl: response.trackingUrl,
             // The serve's routing context: an in-creative CTA opens the store deterministically
             // (in-app sheet from the raw ios_store_url + background tracker fire) when available.
             ctaDestination: response.destinationKind,

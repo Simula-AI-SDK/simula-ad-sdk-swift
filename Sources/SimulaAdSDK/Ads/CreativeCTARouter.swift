@@ -1,3 +1,16 @@
+import Foundation
+
+/// Prefer the attribution URL carried outside rendered HTML, whose script text may HTML-escape
+/// query separators. Older payloads without a usable field keep using the creative's tapped URL.
+func preferredCreativeClickURL(trackingUrl: String?, fallback: URL) -> URL {
+    guard let value = trackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty,
+          let url = URL(string: value) else {
+        return fallback
+    }
+    return url
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit

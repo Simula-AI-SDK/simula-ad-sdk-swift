@@ -836,6 +836,7 @@ public final class SimulaRewardedAd {
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
+            ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
