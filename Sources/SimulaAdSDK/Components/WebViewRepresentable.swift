@@ -496,7 +496,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         /// Imperative interstitial/rewarded/fallback CTA routing. The HTML navigation proves a user
         /// interaction; the separately decoded tracker remains the attribution source of truth.
-        private func openCreativeCTA(fallback: URL) {
+        private func openCreativeCTA(fallback: URL, fallbackStoreAppID: String? = nil) {
             let target = preferredCreativeClickURL(trackingUrl: ctaTrackingUrl, fallback: fallback)
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
@@ -506,6 +506,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                     url: target,
                     destination: destination,
                     storeUrl: storeUrl,
+                    fallbackStoreAppID: fallbackStoreAppID,
                     attribution: attribution
                 )
             }
@@ -724,7 +725,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // unconditional (the game iframe's post-game auto-redirect still opens).
                 if navigationAction.navigationType == .linkActivated {
                     fireAdClickOnce()
-                    openCreativeCTA(fallback: url)
+                    openCreativeCTA(fallback: url, fallbackStoreAppID: appID)
                     decisionHandler(.cancel)
                     return
                 }
