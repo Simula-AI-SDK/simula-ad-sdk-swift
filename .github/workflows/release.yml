@@ -110,7 +110,8 @@ jobs:
           xcodebuild test \
             -scheme SimulaAdSDK \
             -configuration Release \
-            -destination "id=$UDID"
+            -destination "id=$UDID" \
+            ENABLE_TESTABILITY=YES
 
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
@@ -156,16 +157,21 @@ jobs:
         run: |
           set -euo pipefail
           CHECKSUM=$(<build/SimulaAdSDK.xcframework.zip.checksum)
-          PRERELEASE=()
-          [[ "$VERSION" == *-* ]] && PRERELEASE+=(--prerelease)
-          gh release create "$VERSION" \
-            --verify-tag \
-            --generate-notes \
-            --title "$VERSION" \
-            --notes "Binary XCFramework built with Xcode $XCODE_VERSION. SwiftPM checksum: \`$CHECKSUM\`." \
-            "${PRERELEASE[@]}" \
-            build/SimulaAdSDK.xcframework.zip \
-            build/SimulaAdSDK.xcframework.zip.checksum
+          publish_release() {
+            gh release create "$VERSION" \
+              --verify-tag \
+              --generate-notes \
+              --title "$VERSION" \
+              --notes "Binary XCFramework built with Xcode $XCODE_VERSION. SwiftPM checksum: \`$CHECKSUM\`." \
+              "$@" \
+              build/SimulaAdSDK.xcframework.zip \
+              build/SimulaAdSDK.xcframework.zip.checksum
+          }
+          if [[ "$VERSION" == *-* ]]; then
+            publish_release --prerelease
+          else
+            publish_release
+          fi
 
       - name: Verify published asset
         env:
