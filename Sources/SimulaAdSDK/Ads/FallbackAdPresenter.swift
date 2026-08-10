@@ -41,6 +41,7 @@ final class FallbackAdPresenter {
     /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
     /// opens deterministically (in-app store sheet from the raw `ios_store_url` + background tracker
     /// fire) instead of resolving the tracker's redirect chain. Defaults keep today's behavior.
+    private var ctaTrackingUrl: String?
     private var ctaDestination: AdDestination = .appstore
     private var ctaStoreUrl: String?
     private var attribution: AdAttribution?
@@ -50,6 +51,7 @@ final class FallbackAdPresenter {
     @discardableResult
     func present(
         ads: [FallbackAd],
+        ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
         ctaStoreUrl: String? = nil,
         attribution: AdAttribution? = nil,
@@ -62,6 +64,7 @@ final class FallbackAdPresenter {
         self.ads = ads
         self.index = 0
         self.onClose = onClose
+        self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
         self.ctaStoreUrl = ctaStoreUrl
         self.attribution = attribution
@@ -105,6 +108,7 @@ final class FallbackAdPresenter {
             adId: ad.adId,
             html: ad.html,
             onAdClick: { [weak self] in self?.onAdClick?() },
+            ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution

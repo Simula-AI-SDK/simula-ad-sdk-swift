@@ -1,3 +1,16 @@
+import Foundation
+
+/// Prefer the attribution URL carried outside rendered HTML, whose script text may HTML-escape
+/// query separators. Older payloads without a usable field keep using the creative's tapped URL.
+func preferredCreativeClickURL(trackingUrl: String?, fallback: URL) -> URL {
+    guard let value = trackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty,
+          let url = URL(string: value) else {
+        return fallback
+    }
+    return url
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit
@@ -107,12 +120,14 @@ enum CreativeCTARouter {
     /// creative at render time — and is always the click that's registered with the MMP. When the
     /// serve supplied a raw `ios_store_url` (`storeUrl`) and the destination is `.appstore`, the
     /// route is deterministic: fire `url` in the background and present the in-app store sheet from
-    /// the store link's app id. Without that context (older payloads, previews, the declarative
-    /// menu) it falls back to today's redirect-chain resolution, byte-for-byte.
+    /// the store link's app id. `fallbackStoreAppID` preserves an app id already parsed from the
+    /// user's tapped URL when a separately decoded tracking URL replaced it. Without either context
+    /// (older payloads, previews, the declarative menu), routing falls back to redirect resolution.
     static func routeCreativeTap(
         url: URL,
         destination: AdDestination,
         storeUrl: String?,
+        fallbackStoreAppID: String? = nil,
         attribution: AdAttribution? = nil
     ) {
         // A tap straight onto a store URL needs no tracker fire — it IS the destination.
@@ -123,6 +138,11 @@ enum CreativeCTARouter {
         if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
             fireClickTracker(url)
             presentStoreProduct(appID: appID, attribution: attribution)
+            return
+        }
+        if let fallbackStoreAppID, !fallbackStoreAppID.isEmpty {
+            fireClickTracker(url)
+            presentStoreProduct(appID: fallbackStoreAppID, attribution: attribution)
             return
         }
         resolveAndRoute(url: url, attribution: attribution)

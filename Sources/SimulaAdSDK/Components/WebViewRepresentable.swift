@@ -55,11 +55,8 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// for the interstitial HTML creative / game iframe — their behavior is unchanged.
     var externalClickOnly: Bool
 
-    /// Native-ad mode: the server's MMP click-tracking URL a CTA tap should open (preferred over the
-    /// URL the creative itself navigates to, so the click is attributed exactly like the imperative
-    /// ads), and where it routes (`.appstore` resolves the redirect chain to the App Store; `.web`
-    /// opens the link directly). A `nil`/empty tracker falls back to the in-creative URL. Ignored
-    /// unless `externalClickOnly` is set.
+    /// The server's MMP click-tracking URL a CTA tap should open, preferred over the URL embedded in
+    /// rendered HTML. A `nil`, blank, or malformed tracker falls back to the in-creative URL.
     var ctaTrackingUrl: String?
     var ctaDestination: AdDestination
 
@@ -497,6 +494,24 @@ struct WebViewRepresentable: UIViewRepresentable {
             Task { @MainActor in Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback) }
         }
 
+        /// Imperative interstitial/rewarded/fallback CTA routing. The HTML navigation proves a user
+        /// interaction; the separately decoded tracker remains the attribution source of truth.
+        private func openCreativeCTA(fallback: URL, fallbackStoreAppID: String? = nil) {
+            let target = preferredCreativeClickURL(trackingUrl: ctaTrackingUrl, fallback: fallback)
+            let destination = ctaDestination
+            let storeUrl = ctaStoreUrl
+            let attribution = self.attribution
+            Task { @MainActor in
+                CreativeCTARouter.routeCreativeTap(
+                    url: target,
+                    destination: destination,
+                    storeUrl: storeUrl,
+                    fallbackStoreAppID: fallbackStoreAppID,
+                    attribution: attribution
+                )
+            }
+        }
+
         /// Task body for the native-CTA routing (named method — see the task-shape note in
         /// TelemetryManager).
         @MainActor
@@ -708,7 +723,12 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // cross-domain branch below and Android's `hasGesture()` guard — so a
                 // programmatic redirect to the store can't fake a click. Routing is
                 // unconditional (the game iframe's post-game auto-redirect still opens).
-                if navigationAction.navigationType == .linkActivated { onAdClick?() }
+                if navigationAction.navigationType == .linkActivated {
+                    fireAdClickOnce()
+                    openCreativeCTA(fallback: url, fallbackStoreAppID: appID)
+                    decisionHandler(.cancel)
+                    return
+                }
                 let attribution = self.attribution
                 Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
                 decisionHandler(.cancel)
@@ -717,7 +737,12 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
-                if navigationAction.navigationType == .linkActivated { onAdClick?() } // CLICKED, user-activated only
+                if navigationAction.navigationType == .linkActivated {
+                    fireAdClickOnce()
+                    openCreativeCTA(fallback: url)
+                    decisionHandler(.cancel)
+                    return
+                }
                 if let appID = appStoreID(from: url) {
                     let attribution = self.attribution
                     Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
@@ -739,11 +764,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
                     fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
-                    let attribution = self.attribution
-                    let destination = ctaDestination
-                    let storeUrl = ctaStoreUrl
-                    // Single-call task closure — see the task-shape note in TelemetryManager.
-                    Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                    openCreativeCTA(fallback: url)
                     decisionHandler(.cancel)
                     return
                 }
@@ -784,11 +805,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // user-initiated new-window requests (target="_blank" / window.open), so
                         // this is a real click.
                         fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
-                        let attribution = self.attribution
-                        let destination = ctaDestination
-                        let storeUrl = ctaStoreUrl
-                        // Single-call task closure — see the task-shape note in TelemetryManager.
-                        Task { @MainActor in CreativeCTARouter.routeCreativeTap(url: url, destination: destination, storeUrl: storeUrl, attribution: attribution) }
+                        openCreativeCTA(fallback: url)
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))
@@ -1009,6 +1026,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     /// creative is iOS-only, so these are unused on macOS).
     var onAdClick: (() -> Void)?
     var attribution: AdAttribution?
+    var ctaTrackingUrl: String?
     var ctaDestination: AdDestination
     var ctaStoreUrl: String?
 
@@ -1021,6 +1039,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
         attribution: AdAttribution? = nil,
+        ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
         ctaStoreUrl: String? = nil
     ) {
@@ -1032,6 +1051,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
         self.attribution = attribution
+        self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
         self.ctaStoreUrl = ctaStoreUrl
     }

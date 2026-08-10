@@ -239,14 +239,14 @@ private struct RewardedGameView: View {
             // an in-playable CTA opens the store deterministically (in-app sheet + background
             // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /

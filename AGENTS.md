@@ -117,7 +117,7 @@ Tests in `Tests/SimulaAdSDKTests/`, XCTest with `@testable import`. Tier 0: pure
 Consumers get a **prebuilt XCFramework** — host Xcodes never compile SDK source (the mitigation for the Swift 6.1–6.3 optimizer task-teardown miscompile; see `.cursor/skills/swift-concurrency-task-shape/SKILL.md`). Consequences for code changes:
 
 - `main` keeps the source manifest; each release **tag** carries a generated binary manifest (`scripts/make-release-manifest.sh`). Never hand-edit a tag's `Package.swift`.
-- The release workflow (`.github/workflows/release.yml`) is artifact-only: pinned Xcode, `scripts/build-xcframework.sh`, then a **draft** GitHub Release with the zip + checksum. Publishing is manual: run `make-release-manifest.sh`, commit + tag, publish the draft against the tag, `pod trunk push`, then validate on the demo app (the release gate for the artifact). Release only from a green `main` (CI runs the Debug, Release/`-O`, and simulator test lanes).
+- The release workflow (`.github/workflows/release.yml`) runs only from `main`: pinned Xcode, optimized macOS and iOS tests, `scripts/build-xcframework.sh`, local CocoaPods lint, generated binary/checksummed release manifests, binary tag + GitHub Release, asset checksum verification, then `pod trunk push`. The `cocoa-pods` GitHub environment protects the irreversible publication step.
 - The public API must stay **library-evolution clean** (`BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — CI checks this). No `@inlinable`/`@_alwaysEmitIntoClient` on public API: inlined bodies would be compiled by host toolchains, re-opening the miscompile.
 - Resources (including `PrivacyInfo.xcprivacy`) ship inside the framework's `SimulaAdSDK_SimulaAdSDK.bundle`; the build script hard-fails if they're missing.
 

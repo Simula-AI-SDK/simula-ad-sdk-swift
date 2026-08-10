@@ -1,98 +1,200 @@
-name: Release (binary XCFramework)
-
-# Builds the binary SimulaAdSDK.xcframework with the PINNED toolchain and attaches it to a
-# DRAFT GitHub Release. Nothing else — no tagging, no pod push. Publishing is manual:
-#
-#   1. Run scripts/make-release-manifest.sh <version> <checksum> (checksum is in the draft
-#      release notes), commit, tag <version>, push the tag.
-#   2. Publish the draft release against that tag.
-#   3. pod trunk push SimulaAdSDK.podspec (the :http source resolves to the published asset).
-#   4. Smoke-test the demo app.
-#
-# Test gates (Debug + Release/-O + iOS Simulator) run in CI on every PR/push
-# (.github/workflows/ci.yml) — release from a green main.
-#
-# WHY BINARY: affected host Xcodes (Swift 6.1–6.3 optimizers) miscompile Swift Concurrency
-# shapes in source SDKs into task-teardown aborts inside host apps.
-# History: .cursor/skills/swift-concurrency-task-shape/SKILL.md
+name: Release XCFramework and CocoaPods
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (must match SimulaAdSDK.podspec s.version and SIMULA_SDK_VERSION)"
+        description: "Release version (must match the podspec and telemetry version)"
         required: true
+        type: string
 
 env:
-  # PINNED, VALIDATED builder toolchain. Bump only after the Release-lane (-O) suite
-  # passes on the new version. Do NOT use latest-stable here: the binary bakes in this
-  # toolchain's codegen, so it must be a deliberate choice.
+  # The binary bakes in this toolchain's codegen. Bump only after validating the
+  # optimized suite against the replacement compiler.
   XCODE_VERSION: "26.4.1"
+  COCOAPODS_DISABLE_STATS: "true"
 
 concurrency:
-  group: release
+  group: swift-release
   cancel-in-progress: false
 
 jobs:
-  build-and-upload:
-    # macOS 26 runner required: Xcode 26.4.x does not install on macOS 15 (Sequoia) images.
-    # Keep this in lockstep with XCODE_VERSION above when either changes.
+  publish:
+    name: Validate and publish
     runs-on: macos-26
+    timeout-minutes: 90
+    environment: cocoa-pods
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Select pinned Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: ${{ env.XCODE_VERSION }}
 
-      # Artifact-labeling guard: the binary embeds SIMULA_SDK_VERSION (telemetry), so a
-      # mismatched input would ship a mislabeled framework.
-      - name: Verify version sync
+      - name: Validate source and version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          V="${{ github.event.inputs.version }}"
-          grep -q "s.version          = \"$V\"" SimulaAdSDK.podspec \
-            || { echo "::error::podspec s.version != $V"; exit 1; }
-          grep -q "let SIMULA_SDK_VERSION = \"$V\"" Sources/SimulaAdSDK/Telemetry/Telemetry.swift \
-            || { echo "::error::SIMULA_SDK_VERSION != $V"; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "::error::Releases must be dispatched from main"
+            exit 1
+          }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || {
+            echo "::error::Version must be semantic versioning without a leading v"
+            exit 1
+          }
+          git fetch origin main
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
+            echo "::error::Release checkout is not the current origin/main commit"
+            exit 1
+          }
+          SUCCESSFUL_RUNS=$(gh run list \
+            --workflow CI \
+            --commit "$GITHUB_SHA" \
+            --json conclusion \
+            --jq 'map(select(.conclusion == "success")) | length')
+          [[ "$SUCCESSFUL_RUNS" -gt 0 ]] || {
+            echo "::error::Release commit must have a successful CI run"
+            exit 1
+          }
+          grep -Fq '.target(' Package.swift && ! grep -Fq '.binaryTarget(' Package.swift || {
+            echo "::error::main must contain the source Package.swift manifest"
+            exit 1
+          }
+          grep -Fq "s.version          = \"$VERSION\"" SimulaAdSDK.podspec || {
+            echo "::error::podspec version does not match $VERSION"
+            exit 1
+          }
+          grep -Fq "let SIMULA_SDK_VERSION = \"$VERSION\"" \
+            Sources/SimulaAdSDK/Telemetry/Telemetry.swift || {
+              echo "::error::telemetry version does not match $VERSION"
+              exit 1
+            }
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::Git tag $VERSION already exists"
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::error::GitHub release $VERSION already exists"
+            exit 1
+          fi
+          if pod trunk info SimulaAdSDK | grep -Fq -- "- $VERSION ("; then
+            echo "::error::CocoaPods version $VERSION already exists"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # The one test gate that cannot live in CI: CI validates latest-stable, but the binary
-      # bakes in THIS pinned toolchain's codegen. Run the optimized (-O) suite on the exact
-      # compiler that produces the shipped artifact to catch task-teardown miscompiles.
-      - name: Validate pinned toolchain (optimized test suite)
+      - name: Verify pinned toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Run optimized tests with release compiler
         run: swift test -c release -Xswiftc -enable-testing
+
+      - name: Run optimized iOS tests with release compiler
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -er '[.devices[][] | select(.name | test("iPhone"))][0].udid')
+          xcodebuild test \
+            -scheme SimulaAdSDK \
+            -configuration Release \
+            -destination "id=$UDID" \
+            ENABLE_TESTABILITY=YES
 
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
 
-      - name: Create draft release with artifact
+      - name: Generate release manifests
         env:
-          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          V="${{ github.event.inputs.version }}"
-          CHECKSUM=$(cat build/SimulaAdSDK.xcframework.zip.checksum)
-          # NOTE: a DRAFT release does not create the git tag. But if this draft is
-          # published while tag $V does not exist yet, GitHub creates the tag at this
-          # workflow's (source-manifest) commit and SPM consumers silently build from
-          # source — hence the warning below. Push the binary-manifest tag FIRST.
-          {
-            printf '%s\n' "**Do NOT publish this draft until tag \`$V\` exists.** Publishing without the tag makes GitHub create \`$V\` on a source-manifest commit, and SPM consumers would silently build from source instead of this binary."
-            printf '%s\n' ""
-            printf '%s\n' "Publish sequence:"
-            printf '%s\n' "1. \`scripts/make-release-manifest.sh $V $CHECKSUM\`"
-            printf '%s\n' "2. Commit, tag \`$V\`, push the tag"
-            printf '%s\n' "3. Publish this draft (it will attach to the pushed tag)"
-            printf '%s\n' "4. \`pod trunk push SimulaAdSDK.podspec\`"
-            printf '%s\n' "5. Validate on the demo app"
-            printf '%s\n' ""
-            printf '%s\n' "Binary XCFramework built with Xcode ${{ env.XCODE_VERSION }} (dSYMs embedded). SPM checksum: \`$CHECKSUM\`"
-          } > release-notes.md
-          gh release create "$V" \
-            --draft \
-            --title "$V" \
-            --notes-file release-notes.md \
-            "build/SimulaAdSDK.xcframework.zip"
+          CHECKSUM=$(<build/SimulaAdSDK.xcframework.zip.checksum)
+          ./scripts/make-release-manifest.sh "$VERSION" "$CHECKSUM"
+          [[ "$(git diff --name-only)" == $'Package.swift\nSimulaAdSDK.podspec' ]] || {
+            echo "::error::Release generation changed unexpected files"
+            git diff --name-only
+            exit 1
+          }
+
+      - name: Validate CocoaPods package locally
+        run: |
+          set -euo pipefail
+          STAGING="$RUNNER_TEMP/pod-staging"
+          mkdir -p "$STAGING"
+          cp SimulaAdSDK.podspec "$STAGING/"
+          ditto build/SimulaAdSDK.xcframework "$STAGING/SimulaAdSDK.xcframework"
+          pod lib lint "$STAGING/SimulaAdSDK.podspec" --allow-warnings --verbose
+
+      - name: Create and push binary release tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift SimulaAdSDK.podspec
+          git commit -m "Point release manifests at the $VERSION binary XCFramework."
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          CHECKSUM=$(<build/SimulaAdSDK.xcframework.zip.checksum)
+          publish_release() {
+            gh release create "$VERSION" \
+              --verify-tag \
+              --generate-notes \
+              --title "$VERSION" \
+              --notes "Binary XCFramework built with Xcode $XCODE_VERSION. SwiftPM checksum: \`$CHECKSUM\`." \
+              "$@" \
+              build/SimulaAdSDK.xcframework.zip \
+              build/SimulaAdSDK.xcframework.zip.checksum
+          }
+          if [[ "$VERSION" == *-* ]]; then
+            publish_release --prerelease
+          else
+            publish_release
+          fi
+
+      - name: Verify published asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          VERIFY_DIR="$RUNNER_TEMP/release-verify"
+          mkdir -p "$VERIFY_DIR"
+          gh release download "$VERSION" \
+            --pattern SimulaAdSDK.xcframework.zip \
+            --dir "$VERIFY_DIR"
+          EXPECTED=$(<build/SimulaAdSDK.xcframework.zip.checksum)
+          ACTUAL=$(swift package compute-checksum "$VERIFY_DIR/SimulaAdSDK.xcframework.zip")
+          [[ "$ACTUAL" == "$EXPECTED" ]] || {
+            echo "::error::Published XCFramework checksum does not match the validated artifact"
+            exit 1
+          }
+
+      - name: Publish to CocoaPods trunk
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+        run: |
+          pod trunk push "$RUNNER_TEMP/pod-staging/SimulaAdSDK.podspec" \
+            --allow-warnings \
+            --verbose
