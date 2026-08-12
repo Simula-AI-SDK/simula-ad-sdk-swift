@@ -23,7 +23,7 @@ jobs:
     name: Validate and publish
     runs-on: macos-26
     timeout-minutes: 90
-    environment: cocoa-pods
+    environment: Cocoa Pod
     permissions:
       actions: read
       contents: write
