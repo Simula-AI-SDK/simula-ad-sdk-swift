@@ -133,8 +133,22 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
-    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
-        current?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb, stack: stack)
+    func recordError(
+        signature: String,
+        errorCode: String? = nil,
+        message: String? = nil,
+        breadcrumb: String? = nil,
+        stack: [String]? = nil,
+        dedupeDiscriminator: String? = nil
+    ) {
+        current?.recordError(
+            signature: signature,
+            errorCode: errorCode,
+            message: message,
+            breadcrumb: breadcrumb,
+            stack: stack,
+            dedupeDiscriminator: dedupeDiscriminator
+        )
     }
 
     /// Persist + attempt delivery now (e.g. app background).

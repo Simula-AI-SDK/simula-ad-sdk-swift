@@ -29,7 +29,8 @@ Host app
                                      `start()`/`runStartup` (off-main prewarm: IDFV/UA,
                                      shared URLSession, telemetry, crash-guard install,
                                      beacon/verification drains, version check →
-                                     session warm-up + WebView prewarm). `ensureSession`
+                                     session warm-up). WebViews prewarm only from
+                                     active ad demand. `ensureSession`
                                      awaits that startup — no request can race ahead of it.
       → SimulaAPI (transport, models, makeHeaders chokepoint)
         → URLSession (SDK-configured session — never URLSession.shared on ad paths)
@@ -101,8 +102,8 @@ await MainActor.run { SimulaAds.initialize(apiKey: key) }
 - **Single init path**: everything funnels through `SimulaProvider.init` — but `init` must stay cheap enough to run inline at app launch. One-time disk/syscall costs (IDFV, UA, shared `URLSession` build, telemetry install, version check) belong in the deferred startup (`start()` → `runStartup`/`runStartupPrewarm`), not inline in `init`. `ensureSession` gates on that startup (and lazily kicks it), so "telemetry + privacy before the first request" holds for every entry path.
 - **Session**: `ensureSession()` coalesces concurrent callers into one Task; a failed task is cleared so the next call retries. Never re-create sessions per ad load.
 - **Feed performance**: reads that only need config use `@Environment(\.simulaProvider)` (non-observing), not `@EnvironmentObject` — prevents whole-feed re-renders on `@Published` changes.
-- **WebView pool**: `@MainActor`; consent-aware data store; release = stop loading, nil delegates, `about:blank`; script handlers use the stable-forwarder pattern (never re-register per acquire, never leak on discard).
-- **Crash guard**: reports only stacks containing SDK frames; chains to the host's existing handler; sync persist on crash, replay next launch.
+- **WebView pool**: `@MainActor`; one idle view (zero on constrained devices), five-minute pressure/background cooldown, active-demand prewarm only, consent-aware data store; release = stop loading, nil delegates, `about:blank`; script handlers use the stable-forwarder pattern (never re-register per acquire, never leak on discard).
+- **Crash guard**: reports MetricKit diagnostics only when the Apple-attributed thread contains SDK frames; chains to the host's existing handler; sync persist on crash, replay next launch. Fingerprint/dedupe semantics and bounded frame counts match Android while stack formats remain OS-native.
 - **CTA/MMP redirects**: use `SimulaUserAgent.sessionConfiguration()` (Safari-style UA, no `X-Device-Id`) — first-party API and telemetry keep `standardHeaders()`.
 - **Connection type**: `X-Connection-Type` read live per request in `makeHeaders`, never cached at init.
 - **Consent**: always via `SimulaPrivacy.shared.currentSnapshot`; PII re-read at telemetry flush.

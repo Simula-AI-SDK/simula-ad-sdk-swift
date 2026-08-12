@@ -191,14 +191,17 @@ public struct MiniGameInterstitial: View {
     /// Loads the bundled interstitial background image, falling back to solid color.
     @ViewBuilder
     private var bundledBackgroundImage: some View {
-        if let platformImg = BundledImageCache.image(named: "minigame_interstitial_background") {
-            Image(platformImage: platformImg)
-                .resizable()
-                .scaledToFill()
-                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-                .clipped()
-        } else {
-            Color(hex: "#1a1a2e")
+        BundledImage(asset: .minigameInterstitialBackground) { phase in
+            switch phase {
+            case .success(let image):
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                    .clipped()
+            case .empty, .failure:
+                Color(hex: "#1a1a2e")
+            }
         }
     }
 
