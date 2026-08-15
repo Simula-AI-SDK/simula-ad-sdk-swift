@@ -28,7 +28,44 @@ enum SimulaWebViewPolicy {
         now: TimeInterval,
         blockedUntil: TimeInterval
     ) -> Bool {
-        maxIdle > 0 && idleCount < maxIdle && applicationActive && now >= blockedUntil
+        prewarmDecision(
+            maxIdle: maxIdle,
+            idleCount: idleCount,
+            applicationActive: applicationActive,
+            now: now,
+            blockedUntil: blockedUntil
+        ) == .warm
+    }
+
+    static func prewarmDecision(
+        maxIdle: Int,
+        idleCount: Int,
+        applicationActive: Bool,
+        now: TimeInterval,
+        blockedUntil: TimeInterval
+    ) -> SimulaWebViewPrewarmDecision {
+        if maxIdle <= 0 { return .constrained }
+        if idleCount >= maxIdle { return .full }
+        if !applicationActive { return .inactive }
+        if now < blockedUntil { return .cooldown }
+        return .warm
+    }
+}
+
+enum SimulaWebViewPrewarmDecision: String, Hashable {
+    case warm = "warmed"
+    case constrained
+    case full
+    case cooldown
+    case inactive
+}
+
+struct SimulaWebViewPrewarmSkipGate {
+    private var reported: Set<SimulaWebViewPrewarmDecision> = []
+
+    mutating func shouldRecord(_ decision: SimulaWebViewPrewarmDecision) -> Bool {
+        guard decision != .warm else { return false }
+        return reported.insert(decision).inserted
     }
 }
 
@@ -103,6 +140,7 @@ final class WebViewPool {
     private let maxIdle = SimulaWebViewPolicy.idleCap(totalRamBytes: ProcessInfo.processInfo.physicalMemory)
     private var applicationActive = UIApplication.shared.applicationState == .active
     private var poolingBlockedUntil: TimeInterval = 0
+    private var prewarmSkipGate = SimulaWebViewPrewarmSkipGate()
     private let signposter = OSSignposter(subsystem: "ad.simula.sdk", category: "WebView")
 
     var allowsRetention: Bool {
@@ -235,10 +273,23 @@ final class WebViewPool {
     /// Create a warm web view ahead of time, if the pool has room. Loads
     /// `about:blank` to bring up the Web Content process so the later real load
     /// starts warm. The coordinator ignores `about:blank` navigations, so this
-    /// never reaches the consumer's load callbacks.
+    /// never reaches the consumer's load callbacks. Skips use the sampled operation pipeline and
+    /// are bounded to one event per canonical reason for the process.
     func prewarm(trigger: String = "demand") {
-        guard allowsRetention else { return }
         let startNanos = DispatchTime.now().uptimeNanoseconds
+        let decision = SimulaWebViewPolicy.prewarmDecision(
+            maxIdle: maxIdle,
+            idleCount: idle.count,
+            applicationActive: applicationActive && UIApplication.shared.applicationState == .active,
+            now: ProcessInfo.processInfo.systemUptime,
+            blockedUntil: poolingBlockedUntil
+        )
+        guard decision == .warm else {
+            if prewarmSkipGate.shouldRecord(decision) {
+                recordPrewarm(startNanos: startNanos, trigger: trigger, result: decision.rawValue)
+            }
+            return
+        }
         let interval = signposter.beginInterval("WebViewPrewarm")
         defer { signposter.endInterval("WebViewPrewarm", interval) }
         let pooled = makePooled()
@@ -246,11 +297,15 @@ final class WebViewPool {
             pooled.webView.load(URLRequest(url: blank))
         }
         idle.append(pooled)
+        recordPrewarm(startNanos: startNanos, trigger: trigger, result: decision.rawValue)
+    }
+
+    private func recordPrewarm(startNanos: UInt64, trigger: String, result: String) {
         Telemetry.shared.recordOperation(
             name: "webview_prewarm",
             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
             success: true,
-            breadcrumb: "trigger=\(Self.prewarmTrigger(trigger));result=warmed"
+            breadcrumb: "trigger=\(Self.prewarmTrigger(trigger));result=\(result)"
         )
     }
 

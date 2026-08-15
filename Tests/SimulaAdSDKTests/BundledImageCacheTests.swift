@@ -47,7 +47,13 @@ final class BundledImageCacheTests: XCTestCase {
             }
         )
 
+        if case .miss = cache.peek(.gameIcon) {} else {
+            XCTFail("Cold cache should miss")
+        }
         let first = await cache.load(.gameIcon)
+        if case .image = cache.peek(.gameIcon) {} else {
+            XCTFail("Decoded image should be synchronously visible in process memory")
+        }
         let second = await cache.load(.gameIcon)
         XCTAssertNotNil(first)
         XCTAssertNotNil(second)
@@ -104,8 +110,50 @@ final class BundledImageCacheTests: XCTestCase {
         let second = await cache.load(.minigameInterstitialBackground)
         XCTAssertNil(first)
         XCTAssertNil(second)
+        if case .failed = cache.peek(.minigameInterstitialBackground) {} else {
+            XCTFail("Failure should be synchronously visible until the cache is cleared")
+        }
         XCTAssertEqual(probe.snapshot.reads, 1)
         XCTAssertEqual(probe.snapshot.decodes, 0)
+    }
+
+    func testClearPreventsOlderInFlightDecodeFromRepopulatingCache() async {
+        let probe = Probe()
+        let decodeStarted = DispatchSemaphore(value: 0)
+        let finishDecode = DispatchSemaphore(value: 0)
+        let cache = BundledImageCache(
+            queueLabel: "test.bundled.image.clear-generation",
+            reader: { _ in
+                probe.recordRead()
+                return Data([1])
+            },
+            decoder: { _, _ in
+                probe.recordDecode()
+                if probe.snapshot.decodes == 1 {
+                    decodeStarted.signal()
+                    _ = finishDecode.wait(timeout: .now() + 2)
+                }
+                return Self.makeTestImage()
+            }
+        )
+
+        let oldLoad = Task { await cache.load(.gameIcon) }
+        XCTAssertEqual(decodeStarted.wait(timeout: .now() + 2), .success)
+        cache.clear()
+        finishDecode.signal()
+        let oldImage = await oldLoad.value
+        XCTAssertNotNil(oldImage)
+        if case .miss = cache.peek(.gameIcon) {} else {
+            XCTFail("A pre-clear decode must not repopulate the cache")
+        }
+
+        let newImage = await cache.load(.gameIcon)
+        XCTAssertNotNil(newImage)
+        XCTAssertEqual(probe.snapshot.reads, 2)
+        XCTAssertEqual(probe.snapshot.decodes, 2)
+        if case .image = cache.peek(.gameIcon) {} else {
+            XCTFail("A post-clear decode should populate the cache")
+        }
     }
 
     func testPackagedAssetsDecodeAtExpectedDimensions() async {
