@@ -29,21 +29,13 @@ final class AdBeaconManagerTests: XCTestCase {
         return (try? JSONDecoder().decode([PendingBeacon].self, from: data)) ?? []
     }
 
-    private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-    }
-
     func test2xxDeliversAndRemoves() async {
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
@@ -53,7 +45,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "click")
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(sender.callCount("imp", "click"), 1)
     }
 
@@ -63,7 +55,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
         let q = persistedQueue()
         XCTAssertEqual(q.count, 1)
         XCTAssertEqual(q.first?.lastAttemptTimestamp, 1000)
@@ -76,7 +68,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil(timeout: 2) { self.persistedQueue().count == 1 }
+        await waitUntil { self.persistedQueue().count == 1 }
         XCTAssertEqual(persistedQueue().count, 1)
     }
 
@@ -87,7 +79,7 @@ final class AdBeaconManagerTests: XCTestCase {
 
         mgr.enqueue(impressionId: "imp", action: "seen")
         mgr.enqueue(impressionId: "imp", action: "seen") // duplicate
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount ?? 0 >= 1 }
+        await waitUntil { self.persistedQueue().first?.retryCount ?? 0 >= 1 }
         XCTAssertEqual(persistedQueue().count, 1)
     }
 
@@ -102,7 +94,7 @@ final class AdBeaconManagerTests: XCTestCase {
             metadata: ["page_name": "Search", "surface": "chat"]
         )
 
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
         XCTAssertEqual(persistedQueue().first?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(sender.lastMetadata("imp", "seen"), ["page_name": "Search", "surface": "chat"])
     }
@@ -113,10 +105,10 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
 
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.metadata?["surface"] == "chat" }
+        await waitUntil { self.persistedQueue().first?.metadata?["surface"] == "chat" }
         let queued = persistedQueue().first
         XCTAssertEqual(queued?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(queued?.retryCount, 1)
@@ -130,10 +122,10 @@ final class AdBeaconManagerTests: XCTestCase {
         let second = Dictionary(uniqueKeysWithValues: (0..<6).map { ("b\($0)", "v") })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: first)
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: second)
 
-        await waitUntil(timeout: 2) { self.persistedQueue().first?.metadata?["b0"] == "v" }
+        await waitUntil { self.persistedQueue().first?.metadata?["b0"] == "v" }
         let metadata = persistedQueue().first?.metadata
         XCTAssertEqual(metadata?.count, 10)
         XCTAssertTrue(second.keys.allSatisfy { metadata?[$0] == "v" }, "newest keys must survive the cap")
@@ -146,12 +138,12 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
         await sender.waitForFirstCall()
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
-        await waitUntil(timeout: 2) {
+        await waitUntil {
             self.persistedQueue().first?.metadata == ["page_name": "Search", "surface": "chat"]
         }
 
         await sender.releaseFirstCall()
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
 
         let metadata = await sender.metadataSnapshots()
         XCTAssertEqual(metadata.count, 2)
@@ -167,7 +159,7 @@ final class AdBeaconManagerTests: XCTestCase {
         await sender.waitForFirstCall()
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
         await sender.releaseFirstCall()
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
 
         let metadata = await sender.metadataSnapshots()
         XCTAssertEqual(metadata.count, 2)
@@ -182,7 +174,7 @@ final class AdBeaconManagerTests: XCTestCase {
 
         mgr.enqueue(impressionId: "imp", action: "seen")
         mgr.enqueue(impressionId: "imp", action: "click")
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
         XCTAssertEqual(sender.callCount("imp", "click"), 1)
     }
@@ -196,7 +188,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
 
         mgr.triggerProcessQueue()
-        await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
@@ -211,7 +203,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
 
         mgr.triggerProcessQueue()
-        await waitUntil(timeout: 2) { sender.callCount("imp", "click") == 2 }
+        await waitUntil { sender.callCount("imp", "click") == 2 }
 
         XCTAssertTrue(persistedQueue().isEmpty)
     }

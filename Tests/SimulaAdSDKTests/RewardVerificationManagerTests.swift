@@ -67,7 +67,7 @@ final class RewardVerificationManagerTests: XCTestCase {
             XCTAssertEqual(try? result.get(), "tokA")
             exp.fulfill()
         }
-        await fulfillment(of: [exp], timeout: 2)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertTrue(persistedQueue().isEmpty)
@@ -82,7 +82,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { exp.fulfill() }
         }
-        await fulfillment(of: [exp], timeout: 2)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         XCTAssertTrue(persistedQueue().isEmpty, "a permanent error must drop the task")
     }
@@ -96,7 +96,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { exp.fulfill() }
         }
-        await fulfillment(of: [exp], timeout: 2)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         let queue = persistedQueue()
         XCTAssertEqual(queue.count, 1)
@@ -126,7 +126,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         }
 
         verifier.release("A")
-        await fulfillment(of: [expA, expB], timeout: 2)
+        await fulfillment(of: [expA, expB], timeout: TestWait.timeout)
 
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(verifier.callCount("B"), 1)
@@ -146,7 +146,7 @@ final class RewardVerificationManagerTests: XCTestCase {
 
         verifier.release("A")
         // Drain finishes asynchronously; poll the persisted queue until empty.
-        try? await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
@@ -160,37 +160,47 @@ final class RewardVerificationManagerTests: XCTestCase {
         let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
 
         mgr.triggerProcessQueue() // the app-launch recovery path (Fix C)
-        try? await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
+    /// Re-enqueue after the backoff window must retry — distinct from the automatic
+    /// wake path below. Injected sleeper so a 5xx does not park on wall-clock 5s
+    /// (and so XCTest does not wait on that leftover Task under simulator load).
     func testBackedOffTaskIsRetriedAfterItsDelay() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
         let clock = TestClock(0)
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { clock.time })
+        let sleeper = ControllableSleep()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            defaults: defaults,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
 
-        let failExp = expectation(description: "first attempt fails")
-        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
-            if case .failure = result { failExp.fulfill() }
-        }
-        await fulfillment(of: [failExp], timeout: 2)
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
+
+        // Drain finished + wake scheduled (invokeCallback happens before sleep).
+        await waitUntil { sleeper.isSleeping }
+        guard sleeper.isSleeping else { return }
+        let requested = await sleeper.waitForSleepRequest()
+        XCTAssertEqual(requested, 5, accuracy: 0.01, "backoff(1) = 5s must drive the wake delay")
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(persistedQueue().first?.retryCount, 1) // recorded at t=0; backoff(1)=5s
 
-        // After the backoff window, a retry succeeds. Re-enqueue (dedup → just registers
-        // a fresh callback + triggers) to get an awaitable result.
+        // Become eligible, then re-enqueue (dedup → fresh callback + trigger). Leave
+        // the wake parked so this drain is the re-enqueue path, not the scheduled wake.
         verifier.clearError(for: "A")
         verifier.setToken("tokA", for: "A")
         clock.time = 5
-        let okExp = expectation(description: "retry succeeds")
-        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
-            if case .success = result { okExp.fulfill() }
-        }
-        await fulfillment(of: [okExp], timeout: 2)
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
 
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2) // attempted again only after the delay
         XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(sleeper.isSleeping, "re-enqueue must drain without consuming the scheduled wake")
     }
 
     /// The retry-wake path: a 5xx bail must schedule a drain that re-fires on its own after
@@ -212,7 +222,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { failExp.fulfill() }
         }
-        await fulfillment(of: [failExp], timeout: 2)
+        await fulfillment(of: [failExp], timeout: TestWait.timeout)
         XCTAssertEqual(verifier.callCount("A"), 1)
 
         let requested = await sleeper.waitForSleepRequest()
@@ -224,7 +234,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         clock.time = 5
         sleeper.release()
 
-        try? await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2, "wake must re-drain once the backoff elapses")
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
@@ -247,12 +257,12 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { failExp.fulfill() }
         }
-        await fulfillment(of: [failExp], timeout: 2)
+        await fulfillment(of: [failExp], timeout: TestWait.timeout)
         _ = await sleeper.waitForSleepRequest()
 
         // Release the wake without advancing the clock → task still ineligible.
         sleeper.release()
-        try? await waitUntil(timeout: 2) { !sleeper.isSleeping }
+        await waitUntil { !sleeper.isSleeping }
         // Settle so a wrongly chained wake would have parked on sleep again.
         try? await Task.sleep(nanoseconds: 50_000_000)
 
@@ -263,16 +273,6 @@ final class RewardVerificationManagerTests: XCTestCase {
 
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
     // applicable here, as Swift completion closures are non-throwing by type.
-
-    // MARK: - Helpers
-
-    private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
-            try await Task.sleep(nanoseconds: 5_000_000) // 5ms
-        }
-    }
 }
 
 // MARK: - Test doubles
