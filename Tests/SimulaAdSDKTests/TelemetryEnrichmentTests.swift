@@ -252,4 +252,33 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let e = allEvents(sender.batches).first { $0.type == TelemetryType.error }
         XCTAssertEqual(e?.stack, ["Foo.bar(Foo.swift:1)", "Baz.qux(Baz.swift:2)"])
     }
+
+    func testErrorDedupeSeparatesCrashContextsWithoutChangingWireName() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.recordError(
+            signature: "crash:exc_10_sig_9",
+            breadcrumb: "fatal=watchdog;fp=site_a",
+            stack: ["SimulaAdSDK uuid=A offset=1"],
+            dedupeDiscriminator: "site_a"
+        )
+        m.recordError(
+            signature: "crash:exc_10_sig_9",
+            breadcrumb: "fatal=watchdog;fp=site_b",
+            stack: ["SimulaAdSDK uuid=B offset=2"],
+            dedupeDiscriminator: "site_b"
+        )
+
+        await waitUntil {
+            self.allEvents(sender.batches).filter { $0.name == "crash:exc_10_sig_9" }.count == 2
+        }
+        let events = allEvents(sender.batches).filter { $0.name == "crash:exc_10_sig_9" }
+        XCTAssertEqual(events.map(\.name), ["crash:exc_10_sig_9", "crash:exc_10_sig_9"])
+        XCTAssertEqual(Set(events.compactMap { $0.stack?.first }), Set([
+            "SimulaAdSDK uuid=A offset=1",
+            "SimulaAdSDK uuid=B offset=2",
+        ]))
+    }
 }

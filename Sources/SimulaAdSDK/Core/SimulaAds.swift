@@ -28,8 +28,8 @@ import Foundation
 ///
 /// `initialize` is deliberately cheap: it only builds the provider and kicks the deferred
 /// startup (`SimulaProvider.start()`), which moves IDFV/UA syscalls, the shared URLSession
-/// build, telemetry install, the version check, session warm-up, and the WebView prewarm off
-/// the caller's critical path. Safe to call inline at app launch.
+/// build, telemetry install, the version check, and session warm-up off the caller's critical
+/// path. WebViews prewarm only from active ad demand, never unconditionally at process launch.
 ///
 /// IMPORTANT: every member here — including `initialize` — is `@MainActor`-isolated, so it MUST be
 /// called on the main thread. App launch (`application(_:didFinishLaunching…)`, SwiftUI `App.init`)
@@ -113,7 +113,7 @@ public enum SimulaAds {
 
         // Keep this call cheap: it runs on the main thread, typically during app launch. The
         // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up, WebView prewarm) is deferred to `provider.start()`.
+        // version check, session warm-up) is deferred to `provider.start()`.
         let provider = SimulaProvider(
             apiKey: apiKey,
             devMode: devMode,
@@ -129,8 +129,8 @@ public enum SimulaAds {
         // native ad) can react once instead of polling `shared` on a timer.
         NotificationCenter.default.post(name: .simulaAdsDidInitialize, object: nil)
 
-        // Deferred startup: telemetry install + UA/IDFV/session warm-up + WebView prewarm,
-        // off this call's critical path. `ensureSession` awaits it, so no request can race
+        // Deferred startup: telemetry install + UA/IDFV/session warm-up, off this call's
+        // critical path. `ensureSession` awaits it, so no request can race
         // ahead of privacy/telemetry setup. Reward-verification recovery and the beacon-queue
         // drain also run there: the first touch of those singletons constructs a `SimulaAPI`,
         // which would otherwise build the shared `URLSession` (UA/IDFV headers) on the main

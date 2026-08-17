@@ -168,7 +168,7 @@ final class TelemetryManager: @unchecked Sendable {
     private func recover() {
         lock.lock()
         for e in store.load() {
-            if e.type == TelemetryType.error, !e.name.isEmpty { errorAgg[e.name] = e }
+            if e.type == TelemetryType.error, !e.name.isEmpty { errorAgg[aggregationKey(for: e)] = e }
             else { buffer.append(e) }
         }
         lock.unlock()
@@ -291,15 +291,29 @@ final class TelemetryManager: @unchecked Sendable {
     /// Record a handled error. `signature` is the dedup key (e.g. `domain:code`); identical
     /// signatures aggregate with a count instead of flooding the buffer. `message` is truncated;
     /// never pass raw URLs/tokens/PII.
-    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
+    func recordError(
+        signature: String,
+        errorCode: String? = nil,
+        message: String? = nil,
+        breadcrumb: String? = nil,
+        stack: [String]? = nil,
+        dedupeDiscriminator: String? = nil
+    ) {
         // Sanitize at the source so secrets are stripped from BOTH the dev log and the payload
         // sent to the backend (exception text can embed URLs/tokens).
         let redacted = redact(message)
+        let stackFingerprint = stack.flatMap {
+            $0.isEmpty ? nil : SimulaMetricKitParser.fingerprint(for: Array($0.prefix(8)))
+        }
+        let aggregateKey = aggregationKey(
+            signature: signature,
+            discriminator: dedupeDiscriminator ?? stackFingerprint
+        )
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
-        if var existing = errorAgg[signature] {
+        if var existing = errorAgg[aggregateKey] {
             existing.count = (existing.count ?? 1) + 1
-            errorAgg[signature] = existing
+            errorAgg[aggregateKey] = existing
         } else if errorAgg.count < maxErrorSignatures {
             var e = newEvent(type: TelemetryType.error, name: signature)
             e.errorCode = errorCode
@@ -309,11 +323,11 @@ final class TelemetryManager: @unchecked Sendable {
             // `message` they carry no URLs/tokens/PII and need no redaction.
             e.stack = stack
             e.count = 1
-            errorAgg[signature] = e
+            errorAgg[aggregateKey] = e
         } else {
             droppedCount += 1
         }
-        let logEvent = errorAgg[signature]
+        let logEvent = errorAgg[aggregateKey]
         let snapshot = snapshotLocked()
         persistAsync(snapshot)
         lock.unlock()
@@ -424,6 +438,42 @@ final class TelemetryManager: @unchecked Sendable {
         return String(r.prefix(maxMessageLen))
     }
 
+    /// Internal-only error key. Crash/hang records keep their stable wire `name` for dashboards,
+    /// while a bounded discriminator prevents different attributed sites/build windows collapsing.
+    private func aggregationKey(signature: String, discriminator: String?) -> String {
+        guard let discriminator = boundedDedupeToken(discriminator) else { return signature }
+        return "\(signature)\u{1f}\(discriminator)"
+    }
+
+    /// Rebuild the key after durable recovery from the token persisted in the existing breadcrumb.
+    private func aggregationKey(for event: TelemetryEvent) -> String {
+        guard let breadcrumb = event.breadcrumb else { return event.name }
+        let fields = breadcrumb.split(separator: ";")
+        let dedupe = fields.first { $0.hasPrefix("dedupe=") }
+        let fingerprint = fields.first { $0.hasPrefix("fp=") }
+        let value: String?
+        if let dedupe {
+            value = String(dedupe.dropFirst("dedupe=".count))
+        } else if let fingerprint {
+            value = String(fingerprint.dropFirst("fp=".count))
+        } else {
+            value = nil
+        }
+        let stackFingerprint = event.stack.flatMap {
+            $0.isEmpty ? nil : SimulaMetricKitParser.fingerprint(for: Array($0.prefix(8)))
+        }
+        return aggregationKey(signature: event.name, discriminator: value ?? stackFingerprint)
+    }
+
+    private func boundedDedupeToken(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        let filtered = value.unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-"
+        }
+        let token = String(String.UnicodeScalarView(filtered)).prefix(64)
+        return token.isEmpty ? nil : String(token)
+    }
+
     private func enqueuePerf(_ event: TelemetryEvent) {
         enqueuePerf(event, triggersFlush: true)
     }
@@ -483,6 +533,8 @@ final class TelemetryManager: @unchecked Sendable {
     private struct FlushBatch {
         let body: Data
         let pendingBuffer: [TelemetryEvent]
+        /// Internal aggregation key → count. The wire `name` may intentionally be shared by
+        /// different crash fingerprints/builds, so it cannot reconcile the dictionary safely.
         let pendingErrors: [String: Int]
         let droppedSnap: Int
     }
@@ -494,9 +546,10 @@ final class TelemetryManager: @unchecked Sendable {
         if isFlushing || (buffer.isEmpty && errorAgg.isEmpty) { return nil }
         isFlushing = true
         let pendingBuffer = buffer
-        let pendingErrorEvents = Array(errorAgg.values)
+        let pendingErrorEntries = Array(errorAgg)
+        let pendingErrorEvents = pendingErrorEntries.map { $0.value }
         var pendingErrors: [String: Int] = [:]
-        for e in pendingErrorEvents { pendingErrors[e.name] = e.count ?? 1 }
+        for (key, event) in pendingErrorEntries { pendingErrors[key] = event.count ?? 1 }
         let droppedSnap = droppedCount
         var events = pendingBuffer + pendingErrorEvents
         if droppedSnap > 0 {
@@ -528,10 +581,10 @@ final class TelemetryManager: @unchecked Sendable {
         case .accepted, .drop:
             let ids = Set(batch.pendingBuffer.map { $0.eventId })
             buffer.removeAll { ids.contains($0.eventId) }
-            for (sig, cnt) in batch.pendingErrors {
-                if var e = errorAgg[sig] {
+            for (key, cnt) in batch.pendingErrors {
+                if var e = errorAgg[key] {
                     let remaining = (e.count ?? 0) - cnt
-                    if remaining <= 0 { errorAgg[sig] = nil } else { e.count = remaining; errorAgg[sig] = e }
+                    if remaining <= 0 { errorAgg[key] = nil } else { e.count = remaining; errorAgg[key] = e }
                 }
             }
             droppedCount = max(0, droppedCount - batch.droppedSnap)

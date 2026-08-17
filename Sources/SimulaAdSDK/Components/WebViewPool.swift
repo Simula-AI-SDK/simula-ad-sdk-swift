@@ -1,6 +1,78 @@
+import Foundation
+
+/// Cross-platform-testable iOS retention policy. Android uses the same business limits with
+/// Android-native low-RAM/heap signals; iOS uses physical RAM plus lifecycle/memory callbacks.
+enum SimulaWebViewPolicy {
+    static let normalIdleCap = 1
+    static let normalRetainedCap = 3
+    static let constrainedRetainedCap = 1
+    static let cooldown: TimeInterval = 5 * 60
+    private static let constrainedRamBytes: UInt64 = 2 * 1024 * 1024 * 1024
+
+    static func isMemoryConstrained(totalRamBytes: UInt64) -> Bool {
+        totalRamBytes <= constrainedRamBytes
+    }
+
+    static func idleCap(totalRamBytes: UInt64) -> Int {
+        isMemoryConstrained(totalRamBytes: totalRamBytes) ? 0 : normalIdleCap
+    }
+
+    static func retainedCap(totalRamBytes: UInt64) -> Int {
+        isMemoryConstrained(totalRamBytes: totalRamBytes) ? constrainedRetainedCap : normalRetainedCap
+    }
+
+    static func canRetain(
+        maxIdle: Int,
+        idleCount: Int,
+        applicationActive: Bool,
+        now: TimeInterval,
+        blockedUntil: TimeInterval
+    ) -> Bool {
+        prewarmDecision(
+            maxIdle: maxIdle,
+            idleCount: idleCount,
+            applicationActive: applicationActive,
+            now: now,
+            blockedUntil: blockedUntil
+        ) == .warm
+    }
+
+    static func prewarmDecision(
+        maxIdle: Int,
+        idleCount: Int,
+        applicationActive: Bool,
+        now: TimeInterval,
+        blockedUntil: TimeInterval
+    ) -> SimulaWebViewPrewarmDecision {
+        if maxIdle <= 0 { return .constrained }
+        if idleCount >= maxIdle { return .full }
+        if !applicationActive { return .inactive }
+        if now < blockedUntil { return .cooldown }
+        return .warm
+    }
+}
+
+enum SimulaWebViewPrewarmDecision: String, Hashable {
+    case warm = "warmed"
+    case constrained
+    case full
+    case cooldown
+    case inactive
+}
+
+struct SimulaWebViewPrewarmSkipGate {
+    private var reported: Set<SimulaWebViewPrewarmDecision> = []
+
+    mutating func shouldRecord(_ decision: SimulaWebViewPrewarmDecision) -> Bool {
+        guard decision != .warm else { return false }
+        return reported.insert(decision).inserted
+    }
+}
+
 #if os(iOS)
 import WebKit
 import UIKit
+import os
 
 // MARK: - MessageForwarder
 
@@ -63,9 +135,30 @@ final class WebViewPool {
     /// them deallocate and tear down their Web Content process.
     private var active: [ObjectIdentifier: Pooled] = [:]
 
-    /// How many warm web views to keep on hand. The game and post-game ad are
-    /// shown sequentially, so a small buffer is enough; `acquire` refills.
-    private let maxIdle = 2
+    /// One spare matches Android and is enough for sequential game/post-game use. Constrained
+    /// devices keep no speculative idle view; a required acquire still builds cold.
+    private let maxIdle = SimulaWebViewPolicy.idleCap(totalRamBytes: ProcessInfo.processInfo.physicalMemory)
+    private var applicationActive = UIApplication.shared.applicationState == .active
+    private var poolingBlockedUntil: TimeInterval = 0
+    private var prewarmSkipGate = SimulaWebViewPrewarmSkipGate()
+    private let signposter = OSSignposter(subsystem: "ad.simula.sdk", category: "WebView")
+
+    var allowsRetention: Bool {
+        SimulaWebViewPolicy.canRetain(
+            maxIdle: maxIdle,
+            idleCount: idle.count,
+            applicationActive: applicationActive && UIApplication.shared.applicationState == .active,
+            now: ProcessInfo.processInfo.systemUptime,
+            blockedUntil: poolingBlockedUntil
+        )
+    }
+
+    /// Native retained views have their own cap; they share only lifecycle/cooldown eligibility.
+    var allowsNativeRetention: Bool {
+        applicationActive
+            && UIApplication.shared.applicationState == .active
+            && ProcessInfo.processInfo.systemUptime >= poolingBlockedUntil
+    }
 
     private init() {
         // Each idle web view keeps a Web Content process resident. Under memory pressure, drop the
@@ -76,7 +169,21 @@ final class WebViewPool {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.clear() }
+            MainActor.assumeIsolated { self?.handleMemoryPressure() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleBackground() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleActive() }
         }
     }
 
@@ -118,6 +225,8 @@ final class WebViewPool {
     )
 
     private func makePooled() -> Pooled {
+        let interval = signposter.beginInterval("WebViewCreate")
+        defer { signposter.endInterval("WebViewCreate", interval) }
         let forwarder = WebViewMessageForwarder()
 
         let controller = WKUserContentController()
@@ -154,6 +263,9 @@ final class WebViewPool {
     /// `WKWebView` — a leak in long sessions. Re-pooled views deliberately keep their handler.
     private func teardown(_ pooled: Pooled) {
         pooled.forwarder.onMessage = nil
+        pooled.webView.stopLoading()
+        pooled.webView.navigationDelegate = nil
+        pooled.webView.uiDelegate = nil
         pooled.webView.configuration.userContentController
             .removeScriptMessageHandler(forName: WebViewPool.messageHandlerName)
     }
@@ -161,14 +273,40 @@ final class WebViewPool {
     /// Create a warm web view ahead of time, if the pool has room. Loads
     /// `about:blank` to bring up the Web Content process so the later real load
     /// starts warm. The coordinator ignores `about:blank` navigations, so this
-    /// never reaches the consumer's load callbacks.
-    func prewarm() {
-        guard idle.count < maxIdle else { return }
+    /// never reaches the consumer's load callbacks. Skips use the sampled operation pipeline and
+    /// are bounded to one event per canonical reason for the process.
+    func prewarm(trigger: String = "demand") {
+        let startNanos = DispatchTime.now().uptimeNanoseconds
+        let decision = SimulaWebViewPolicy.prewarmDecision(
+            maxIdle: maxIdle,
+            idleCount: idle.count,
+            applicationActive: applicationActive && UIApplication.shared.applicationState == .active,
+            now: ProcessInfo.processInfo.systemUptime,
+            blockedUntil: poolingBlockedUntil
+        )
+        guard decision == .warm else {
+            if prewarmSkipGate.shouldRecord(decision) {
+                recordPrewarm(startNanos: startNanos, trigger: trigger, result: decision.rawValue)
+            }
+            return
+        }
+        let interval = signposter.beginInterval("WebViewPrewarm")
+        defer { signposter.endInterval("WebViewPrewarm", interval) }
         let pooled = makePooled()
         if let blank = URL(string: "about:blank") {
             pooled.webView.load(URLRequest(url: blank))
         }
         idle.append(pooled)
+        recordPrewarm(startNanos: startNanos, trigger: trigger, result: decision.rawValue)
+    }
+
+    private func recordPrewarm(startNanos: UInt64, trigger: String, result: String) {
+        Telemetry.shared.recordOperation(
+            name: "webview_prewarm",
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
+            success: true,
+            breadcrumb: "trigger=\(Self.prewarmTrigger(trigger));result=\(result)"
+        )
     }
 
     /// Returns a web view wired to `delegate` and `onMessage`, reusing a
@@ -197,7 +335,7 @@ final class WebViewPool {
 
         // Refill on the next runloop turn so this acquire returns immediately and
         // the following one (e.g. the post-game ad) is also warm.
-        Task { @MainActor [weak self] in self?.prewarm() }
+        Task { @MainActor [weak self] in self?.prewarm(trigger: "acquire_refill") }
 
         // Warm (pool hit) vs cold (had to create) — surfaces prewarm effectiveness + cold cost.
         Telemetry.shared.recordOperation(
@@ -229,15 +367,15 @@ final class WebViewPool {
         pooled.webView.uiDelegate = nil
         pooled.forwarder.onMessage = nil
 
-        // Tear down the DOM so a recycled view never flashes the prior creative.
-        if let blank = URL(string: "about:blank") {
-            pooled.webView.load(URLRequest(url: blank))
-        }
-
         // Only re-pool when the storage policy still matches current consent; a
         // mismatched view is dropped so the next acquire builds a fresh one.
         let wantPersistent = SimulaPrivacy.shared.currentSnapshot.allowsLocalStorage
-        if pooled.persistent == wantPersistent && idle.count < maxIdle {
+        if pooled.persistent == wantPersistent && allowsRetention {
+            // Tear down the DOM only when recycling. Starting an about:blank load immediately
+            // before discarding can race callbacks into a deallocated WebView.
+            if let blank = URL(string: "about:blank") {
+                pooled.webView.load(URLRequest(url: blank))
+            }
             idle.append(pooled)
         } else {
             // Not re-pooled → discard it fully so the content controller doesn't retain the forwarder.
@@ -249,8 +387,42 @@ final class WebViewPool {
     /// view is built with a data store matching the new storage policy (a
     /// prewarmed view bakes its policy in at creation time).
     func clear() {
+        let interval = signposter.beginInterval("WebViewPoolClear")
+        defer { signposter.endInterval("WebViewPoolClear", interval) }
         idle.forEach { teardown($0) }
         idle.removeAll()
+    }
+
+    private func handleMemoryPressure() {
+        poolingBlockedUntil = max(
+            poolingBlockedUntil,
+            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        )
+        clear()
+    }
+
+    private func handleBackground() {
+        applicationActive = false
+        poolingBlockedUntil = max(
+            poolingBlockedUntil,
+            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        )
+        clear()
+    }
+
+    private func handleActive() {
+        applicationActive = true
+        // Demand callers may prewarm after the cooldown; never allocate automatically here.
+    }
+
+    private static func prewarmTrigger(_ value: String) -> String {
+        switch value {
+        case "native_load", "interstitial_ready", "rewarded_ready", "minigame_menu",
+             "minigame_game", "acquire_refill":
+            return value
+        default:
+            return "demand"
+        }
     }
 }
 #endif

@@ -42,8 +42,13 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
         run: |
           set -euo pipefail
+          [[ -n "${COCOAPODS_TRUNK_TOKEN:-}" ]] || {
+            echo "::error::Cocoa Pod environment is missing COCOAPODS_TRUNK_TOKEN"
+            exit 1
+          }
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
             echo "::error::Releases must be dispatched from main"
             exit 1

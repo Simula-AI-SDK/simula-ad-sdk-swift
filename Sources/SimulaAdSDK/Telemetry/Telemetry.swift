@@ -8,7 +8,7 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.1.9-dev.1"
+let SIMULA_SDK_VERSION = "1.1.9-dev.2"
 
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
@@ -133,8 +133,22 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
-    func recordError(signature: String, errorCode: String? = nil, message: String? = nil, breadcrumb: String? = nil, stack: [String]? = nil) {
-        current?.recordError(signature: signature, errorCode: errorCode, message: message, breadcrumb: breadcrumb, stack: stack)
+    func recordError(
+        signature: String,
+        errorCode: String? = nil,
+        message: String? = nil,
+        breadcrumb: String? = nil,
+        stack: [String]? = nil,
+        dedupeDiscriminator: String? = nil
+    ) {
+        current?.recordError(
+            signature: signature,
+            errorCode: errorCode,
+            message: message,
+            breadcrumb: breadcrumb,
+            stack: stack,
+            dedupeDiscriminator: dedupeDiscriminator
+        )
     }
 
     /// Persist + attempt delivery now (e.g. app background).
