@@ -8,14 +8,6 @@ final class Ipv4BeaconTests: XCTestCase {
 
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
 
-    private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
-            do { try await Task.sleep(nanoseconds: 5_000_000) } catch { return }
-        }
-    }
-
     private func makeBeacon(
         urlString: String = "https://ip4.example/px",
         deviceId: String? = "device-123",
@@ -80,7 +72,7 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "key-1", sessionId: "sess-1", ppid: "user-1", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 }
+        await waitUntil { recorder.count == 1 }
 
         let query = recorder.urls.first?.query ?? ""
         XCTAssertTrue(query.contains("k=key-1"))
@@ -95,7 +87,7 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonPpidUpdate)
         try? await Task.sleep(nanoseconds: 50_000_000)
 
@@ -107,9 +99,9 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess-1", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
         beacon.fire(apiKey: "k", sessionId: "sess-2", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 2 }
+        await waitUntil { recorder.count == 2 }
     }
 
     func testANewPpidIsANewIdentityAndRefires() async {
@@ -117,9 +109,9 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: nil, reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "user-1", reason: Ipv4Beacon.reasonPpidUpdate)
-        await waitUntil(timeout: 2) { recorder.count == 2 }
+        await waitUntil { recorder.count == 2 }
     }
 
     func testOverlappingFiresForTheSameIdentityCoalesce() async {
@@ -128,10 +120,10 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 } // first is in flight (gated)
+        await waitUntil { recorder.count == 1 } // first is in flight (gated)
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
         recorder.open()
-        await waitUntil(timeout: 2) { beacon.isIdleForTests }
+        await waitUntil { beacon.isIdleForTests }
 
         XCTAssertEqual(recorder.count, 1)
     }
@@ -144,11 +136,11 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
 
         recorder.result = true
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 2 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 2 && beacon.isIdleForTests }
 
         // Now captured — a third fire is deduped.
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
@@ -163,11 +155,11 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "user-1", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 && beacon.isIdleForTests }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
 
         beacon.onLogout()
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "user-1", reason: Ipv4Beacon.reasonPpidUpdate)
-        await waitUntil(timeout: 2) { recorder.count == 2 }
+        await waitUntil { recorder.count == 2 }
     }
 
     func testACompletionThatLandsAfterALogoutDoesNotResurrectStaleState() async {
@@ -176,14 +168,14 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        await waitUntil(timeout: 2) { recorder.count == 1 } // in flight, gated
+        await waitUntil { recorder.count == 1 } // in flight, gated
 
         beacon.onLogout() // clears bookkeeping while the fire is mid-flight
         recorder.open() // stale fire now completes successfully
 
         // The stale success must NOT mark the identity captured — post-logout it fires again.
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonPpidUpdate)
-        await waitUntil(timeout: 2) { recorder.count == 2 }
+        await waitUntil { recorder.count == 2 }
     }
 
     // MARK: - disabled / invalid input

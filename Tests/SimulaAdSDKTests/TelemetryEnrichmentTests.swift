@@ -68,14 +68,6 @@ final class TelemetryEnrichmentTests: XCTestCase {
 
     private func allEvents(_ s: [TelemetryEnvelope]) -> [TelemetryEvent] { s.flatMap { $0.events } }
 
-    private func waitUntil(timeout: TimeInterval = 2, _ condition: @escaping () -> Bool) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-    }
-
     func testEventAgeStampedAtFlush() async {
         let clock = Clock(1_000)
         let sender = FakeSender()

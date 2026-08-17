@@ -10,11 +10,6 @@ final class RewardVerificationManagerTests: XCTestCase {
     // Must mirror RewardVerificationManager.userDefaultsKey (private there).
     private let queueKey = "simula_pending_reward_verifications"
 
-    /// Drain runs on an unstructured `Task`. iOS Simulator CI can leave that task
-    /// unscheduled for many seconds while WebKit's GPU process launches (we've
-    /// seen 8–11s). Happy-path polls still return on the first check.
-    private let drainTimeout: TimeInterval = 20
-
     private var suiteName = ""
     private var defaults: UserDefaults!
 
@@ -72,7 +67,7 @@ final class RewardVerificationManagerTests: XCTestCase {
             XCTAssertEqual(try? result.get(), "tokA")
             exp.fulfill()
         }
-        await fulfillment(of: [exp], timeout: drainTimeout)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertTrue(persistedQueue().isEmpty)
@@ -87,7 +82,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { exp.fulfill() }
         }
-        await fulfillment(of: [exp], timeout: drainTimeout)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         XCTAssertTrue(persistedQueue().isEmpty, "a permanent error must drop the task")
     }
@@ -101,7 +96,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { exp.fulfill() }
         }
-        await fulfillment(of: [exp], timeout: drainTimeout)
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         let queue = persistedQueue()
         XCTAssertEqual(queue.count, 1)
@@ -131,7 +126,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         }
 
         verifier.release("A")
-        await fulfillment(of: [expA, expB], timeout: drainTimeout)
+        await fulfillment(of: [expA, expB], timeout: TestWait.timeout)
 
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(verifier.callCount("B"), 1)
@@ -151,7 +146,7 @@ final class RewardVerificationManagerTests: XCTestCase {
 
         verifier.release("A")
         // Drain finishes asynchronously; poll the persisted queue until empty.
-        try? await waitUntil(timeout: drainTimeout) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
@@ -165,7 +160,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
 
         mgr.triggerProcessQueue() // the app-launch recovery path (Fix C)
-        try? await waitUntil(timeout: drainTimeout) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
@@ -188,7 +183,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
 
         // Drain finished + wake scheduled (invokeCallback happens before sleep).
-        try? await waitUntil(timeout: drainTimeout) { sleeper.isSleeping }
+        await waitUntil { sleeper.isSleeping }
         guard sleeper.isSleeping else { return }
         let requested = await sleeper.waitForSleepRequest()
         XCTAssertEqual(requested, 5, accuracy: 0.01, "backoff(1) = 5s must drive the wake delay")
@@ -202,7 +197,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         clock.time = 5
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
 
-        try? await waitUntil(timeout: drainTimeout) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2) // attempted again only after the delay
         XCTAssertTrue(persistedQueue().isEmpty)
         XCTAssertTrue(sleeper.isSleeping, "re-enqueue must drain without consuming the scheduled wake")
@@ -227,7 +222,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { failExp.fulfill() }
         }
-        await fulfillment(of: [failExp], timeout: drainTimeout)
+        await fulfillment(of: [failExp], timeout: TestWait.timeout)
         XCTAssertEqual(verifier.callCount("A"), 1)
 
         let requested = await sleeper.waitForSleepRequest()
@@ -239,7 +234,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         clock.time = 5
         sleeper.release()
 
-        try? await waitUntil(timeout: drainTimeout) { self.persistedQueue().isEmpty }
+        await waitUntil { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2, "wake must re-drain once the backoff elapses")
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
@@ -262,12 +257,12 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
             if case .failure = result { failExp.fulfill() }
         }
-        await fulfillment(of: [failExp], timeout: drainTimeout)
+        await fulfillment(of: [failExp], timeout: TestWait.timeout)
         _ = await sleeper.waitForSleepRequest()
 
         // Release the wake without advancing the clock → task still ineligible.
         sleeper.release()
-        try? await waitUntil(timeout: drainTimeout) { !sleeper.isSleeping }
+        await waitUntil { !sleeper.isSleeping }
         // Settle so a wrongly chained wake would have parked on sleep again.
         try? await Task.sleep(nanoseconds: 50_000_000)
 
@@ -278,24 +273,6 @@ final class RewardVerificationManagerTests: XCTestCase {
 
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
     // applicable here, as Swift completion closures are non-throwing by type.
-
-    // MARK: - Helpers
-
-    private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while true {
-            if condition() { return }
-            if Date() > deadline {
-                // Yield so a drain Task that was starved alongside this loop can land
-                // before we declare failure (common after a WebKit GPU stall).
-                await Task.yield()
-                if condition() { return }
-                XCTFail("condition not met within \(timeout)s")
-                return
-            }
-            try await Task.sleep(nanoseconds: 5_000_000) // 5ms
-        }
-    }
 }
 
 // MARK: - Test doubles
