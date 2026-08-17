@@ -28,6 +28,254 @@ private let simulaFrameSep = "\u{3}"
 private let simulaMaxFrames = 8
 private let simulaMaxCrashFileBytes: UInt64 = 64 * 1024
 
+// MARK: - MetricKit call-stack parsing (Foundation-only so macOS tests can exercise it)
+
+private let simulaMaxMetricKitJSONBytes = 1024 * 1024
+private let simulaMaxMetricKitNodes = 512
+private let simulaMaxMetricKitDepth = 64
+private let simulaMaxMetricKitFrameLength = 96
+
+struct SimulaMetricKitAttribution: Equatable {
+    let frames: [String]
+    let fingerprint: String
+}
+
+private struct SimulaMetricKitEnvelope: Decodable {
+    let callStackTree: SimulaMetricKitTree
+
+    private enum CodingKeys: String, CodingKey {
+        case callStackTree
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let wrapped = try container.decodeIfPresent(SimulaMetricKitTree.self, forKey: .callStackTree) {
+            callStackTree = wrapped
+        } else {
+            callStackTree = try SimulaMetricKitTree(from: decoder)
+        }
+    }
+}
+
+private struct SimulaMetricKitTree: Decodable {
+    let callStacks: [SimulaMetricKitStack]
+
+    private enum CodingKeys: String, CodingKey {
+        case callStacks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callStacks = (try? container.decode([SimulaMetricKitStack].self, forKey: .callStacks)) ?? []
+    }
+}
+
+private struct SimulaMetricKitStack: Decodable {
+    let threadAttributed: Bool
+    let callStackRootFrames: [SimulaMetricKitFrame]
+
+    private enum CodingKeys: String, CodingKey {
+        case threadAttributed, callStackRootFrames
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        threadAttributed = (try? container.decode(Bool.self, forKey: .threadAttributed)) ?? false
+        callStackRootFrames = (try? container.decode([SimulaMetricKitFrame].self, forKey: .callStackRootFrames)) ?? []
+    }
+}
+
+private struct SimulaMetricKitFrame: Decodable {
+    let binaryName: String?
+    let binaryUUID: String?
+    let offsetIntoBinaryTextSegment: UInt64?
+    let subFrames: [SimulaMetricKitFrame]
+
+    private enum CodingKeys: String, CodingKey {
+        case binaryName, binaryUUID, offsetIntoBinaryTextSegment, subFrames
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        binaryName = try? container.decode(String.self, forKey: .binaryName)
+        binaryUUID = try? container.decode(String.self, forKey: .binaryUUID)
+        offsetIntoBinaryTextSegment = Self.decodeUInt64(container, key: .offsetIntoBinaryTextSegment)
+        subFrames = (try? container.decode([SimulaMetricKitFrame].self, forKey: .subFrames)) ?? []
+    }
+
+    private static func decodeUInt64(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) -> UInt64? {
+        if let value = try? container.decode(UInt64.self, forKey: key) { return value }
+        if let value = try? container.decode(Int64.self, forKey: key), value >= 0 { return UInt64(value) }
+        if let value = try? container.decode(String.self, forKey: key) { return UInt64(value) }
+        return nil
+    }
+}
+
+enum SimulaMetricKitParser {
+    static func attribution(from data: Data) -> SimulaMetricKitAttribution? {
+        guard !data.isEmpty, data.count <= simulaMaxMetricKitJSONBytes,
+              let envelope = try? JSONDecoder().decode(SimulaMetricKitEnvelope.self, from: data) else {
+            return nil
+        }
+
+        var visited = 0
+        var canonicalFrames: [String] = []
+        for stack in envelope.callStackTree.callStacks where stack.threadAttributed {
+            for root in stack.callStackRootFrames {
+                guard collect(
+                    root,
+                    depth: 0,
+                    visited: &visited,
+                    canonicalFrames: &canonicalFrames
+                ) else {
+                    return nil
+                }
+            }
+        }
+        guard !canonicalFrames.isEmpty else { return nil }
+        let bounded = Array(canonicalFrames.prefix(simulaMaxFrames))
+        return SimulaMetricKitAttribution(
+            frames: bounded,
+            fingerprint: fingerprint(for: bounded)
+        )
+    }
+
+    private static func collect(
+        _ frame: SimulaMetricKitFrame,
+        depth: Int,
+        visited: inout Int,
+        canonicalFrames: inout [String]
+    ) -> Bool {
+        guard depth <= simulaMaxMetricKitDepth else { return false }
+        visited += 1
+        guard visited <= simulaMaxMetricKitNodes else { return false }
+
+        if frame.binaryName == simulaSDKMarker, canonicalFrames.count < simulaMaxFrames {
+            let uuid = safeToken(frame.binaryUUID, fallback: "unknown", maxLength: 36)
+            let offset = frame.offsetIntoBinaryTextSegment.map(String.init) ?? "unknown"
+            canonicalFrames.append(
+                String("\(simulaSDKMarker) uuid=\(uuid) offset=\(offset)".prefix(simulaMaxMetricKitFrameLength))
+            )
+        }
+        for child in frame.subFrames {
+            guard collect(
+                child,
+                depth: depth + 1,
+                visited: &visited,
+                canonicalFrames: &canonicalFrames
+            ) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    static func fingerprint(for frames: [String]) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for frame in frames {
+            for byte in frame.utf8 {
+                hash ^= UInt64(byte)
+                hash = hash &* 1_099_511_628_211
+            }
+            hash ^= 0
+            hash = hash &* 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    static func watchdogContext(from reason: String?) -> (event: String, visibility: String)? {
+        guard let reason, !reason.isEmpty else { return nil }
+        let lower = reason.lowercased()
+        let isWatchdog = lower.contains("0x8badf00d")
+            || lower.contains("2343432205")
+            || lower.contains("watchdogevent:")
+            || lower.contains("watchdog transgression")
+        guard isWatchdog else { return nil }
+
+        let rawEvent = token(after: "watchdogevent:", in: lower)
+            ?? knownWatchdogEvent(in: lower)
+            ?? "unknown"
+        let visibility = token(after: "watchdogvisibility:", in: lower)
+            ?? token(after: "processvisibility:", in: lower)
+            ?? "unknown"
+        return (normalizeWatchdogEvent(rawEvent), normalizeVisibility(visibility))
+    }
+
+    static func incidentBreadcrumb(
+        fatal: String,
+        watchdog: (event: String, visibility: String)?,
+        attribution: SimulaMetricKitAttribution,
+        applicationVersion: String?,
+        applicationBuild: String?,
+        windowStart: Date,
+        windowEnd: Date,
+        detail: String? = nil
+    ) -> (breadcrumb: String, dedupe: String) {
+        let startMs = epochMilliseconds(windowStart)
+        let endMs = epochMilliseconds(windowEnd)
+        let version = safeToken(applicationVersion, fallback: "unknown", maxLength: 32)
+        let build = safeToken(applicationBuild, fallback: "unknown", maxLength: 32)
+        let event = watchdog?.event ?? fatal
+        let visibility = watchdog?.visibility ?? "unknown"
+        let dedupe = attribution.fingerprint
+        let boundedDetail = detail.map { String($0.prefix(80)) + ";" } ?? ""
+        let value = "fatal=\(fatal);event=\(event);visibility=\(visibility);\(boundedDetail)fp=\(attribution.fingerprint);" +
+            "appVersion=\(version);appBuild=\(build);windowStartMs=\(startMs);windowEndMs=\(endMs)"
+        return (String(value.prefix(300)), dedupe)
+    }
+
+    private static func safeToken(_ value: String?, fallback: String, maxLength: Int) -> String {
+        guard let value else { return fallback }
+        let filtered = value.unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0) || $0 == "." || $0 == "_" || $0 == "-"
+        }
+        let token = String(String.UnicodeScalarView(filtered)).prefix(maxLength)
+        return token.isEmpty ? fallback : String(token)
+    }
+
+    private static func token(after marker: String, in value: String) -> String? {
+        guard let range = value.range(of: marker) else { return nil }
+        let suffix = value[range.upperBound...].drop(while: { $0 == " " || $0 == "\t" })
+        let token = suffix.prefix(while: { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        return token.isEmpty ? nil : String(token)
+    }
+
+    private static func knownWatchdogEvent(in value: String) -> String? {
+        for event in ["scene-create", "scene-update", "process-exit", "background-task", "app-launch"] {
+            if value.contains(event) { return event }
+        }
+        return nil
+    }
+
+    private static func normalizeWatchdogEvent(_ value: String) -> String {
+        switch value.replacingOccurrences(of: "-", with: "_") {
+        case "scene_create": return "scene_create"
+        case "scene_update": return "scene_update"
+        case "process_exit": return "process_exit"
+        case "background_task": return "background_task"
+        case "app_launch": return "app_launch"
+        default: return "unknown"
+        }
+    }
+
+    private static func normalizeVisibility(_ value: String) -> String {
+        switch value {
+        case "foreground": return "foreground"
+        case "background": return "background"
+        default: return "unknown"
+        }
+    }
+
+    private static func epochMilliseconds(_ date: Date) -> Int64 {
+        let value = date.timeIntervalSince1970 * 1_000
+        guard value.isFinite, value >= 0, value <= Double(Int64.max) else { return 0 }
+        return Int64(value)
+    }
+}
+
 /**
  Process-wide crash capture for the SDK, routed into `Telemetry`. No third-party framework, no
  signal handlers:
@@ -47,11 +295,10 @@ private let simulaMaxCrashFileBytes: UInt64 = 64 * 1024
 
  SDK-citizen rules (mirror the Android guard):
  - **Only the SDK's own crashes are reported** — an exception only when its `callStackSymbols`
-   mention `simulaSDKMarker`; a MetricKit diagnostic only when its call-stack tree does. The host's
-   unrelated crashes / hangs are never exfiltrated. (Caveat: a *statically*-linked SDK's MetricKit
-   call stacks are unsymbolicated and carry the host's binary name, so the MetricKit path
-   under-reports there — the live-symbolicated exception path is unaffected, and server-side dSYM
-   symbolication can recover the rest.)
+   mention `simulaSDKMarker`; a MetricKit diagnostic only when Apple's `threadAttributed` stack
+   contains SDK frames. The host's unrelated crashes / hangs are never exfiltrated. (Caveat: a
+   *statically*-linked SDK's MetricKit call stacks carry the host binary name, so the MetricKit path
+   under-reports there — the live-symbolicated exception path is unaffected.)
  - **The host's crash handling is preserved** — we always chain to the previously-installed
    uncaught-exception handler.
  - **The crash path does no async work** — `Telemetry.recordError` persists on a serial queue, which
@@ -135,12 +382,16 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
             // 6th field (frames) is present on records written by this SDK version; older 5-field
             // records simply carry no structured stack.
             let stack = (fields.count >= 6 && !fields[5].isEmpty) ? fields[5].components(separatedBy: simulaFrameSep) : nil
+            let fingerprint = stack.flatMap { $0.isEmpty ? nil : SimulaMetricKitParser.fingerprint(for: $0) }
+            let breadcrumb = "fatal=uncaught;thread=\(fields[1])" +
+                (fingerprint.map { ";fp=\($0)" } ?? "")
             Telemetry.shared.recordError(
                 signature: fields[2],
                 errorCode: fields[3],
                 message: fields[4].replacingOccurrences(of: simulaNewlineEsc, with: "\n"),
-                breadcrumb: "fatal=uncaught;thread=\(fields[1])",
-                stack: stack
+                breadcrumb: breadcrumb,
+                stack: stack,
+                dedupeDiscriminator: fingerprint
             )
         }
     }
@@ -217,41 +468,75 @@ extension SimulaCrashGuard: MXMetricManagerSubscriber {
     /// Crash + hang diagnostics from the previous period, delivered at most once each.
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         for payload in payloads {
-            payload.crashDiagnostics?.forEach { handleCrashDiagnostic($0) }
-            payload.hangDiagnostics?.forEach { handleHangDiagnostic($0) } // the iOS analog of an ANR
+            let start = payload.timeStampBegin
+            let end = payload.timeStampEnd
+            payload.crashDiagnostics?.forEach {
+                handleCrashDiagnostic($0, windowStart: start, windowEnd: end)
+            }
+            payload.hangDiagnostics?.forEach {
+                handleHangDiagnostic($0, windowStart: start, windowEnd: end)
+            } // the iOS analog of an ANR
         }
     }
 
-    private func handleCrashDiagnostic(_ crash: MXCrashDiagnostic) {
-        guard callStackInvolvesSDK(crash.callStackTree) else { return }
+    private func handleCrashDiagnostic(
+        _ crash: MXCrashDiagnostic,
+        windowStart: Date,
+        windowEnd: Date
+    ) {
+        guard let attribution = attribution(from: crash.callStackTree) else { return }
         let excType = crash.exceptionType?.intValue ?? -1
         let signal = crash.signal?.intValue ?? -1
+        let watchdog = SimulaMetricKitParser.watchdogContext(from: crash.terminationReason)
+        let context = SimulaMetricKitParser.incidentBreadcrumb(
+            fatal: watchdog == nil ? "crash" : "watchdog",
+            watchdog: watchdog,
+            attribution: attribution,
+            applicationVersion: crash.applicationVersion,
+            applicationBuild: crash.metaData.applicationBuildVersion,
+            windowStart: windowStart,
+            windowEnd: windowEnd,
+            detail: "excType=\(excType);excCode=\(crash.exceptionCode?.intValue ?? -1);signal=\(signal)"
+        )
         Telemetry.shared.recordError(
             signature: "crash:exc_\(excType)_sig_\(signal)",
             errorCode: "metrickit",
             message: crash.terminationReason,
-            breadcrumb: "fatal=crash;excType=\(excType);excCode=\(crash.exceptionCode?.intValue ?? -1);signal=\(signal)"
+            breadcrumb: context.breadcrumb,
+            stack: attribution.frames,
+            dedupeDiscriminator: context.dedupe
         )
     }
 
-    private func handleHangDiagnostic(_ hang: MXHangDiagnostic) {
-        guard callStackInvolvesSDK(hang.callStackTree) else { return }
+    private func handleHangDiagnostic(
+        _ hang: MXHangDiagnostic,
+        windowStart: Date,
+        windowEnd: Date
+    ) {
+        guard let attribution = attribution(from: hang.callStackTree) else { return }
+        let context = SimulaMetricKitParser.incidentBreadcrumb(
+            fatal: "hang",
+            watchdog: nil,
+            attribution: attribution,
+            applicationVersion: hang.applicationVersion,
+            applicationBuild: hang.metaData.applicationBuildVersion,
+            windowStart: windowStart,
+            windowEnd: windowEnd
+        )
         Telemetry.shared.recordError(
             signature: "exit:hang",
             errorCode: "metrickit",
             message: "hangDuration=\(hang.hangDuration)",
-            breadcrumb: "fatal=hang"
+            breadcrumb: context.breadcrumb,
+            stack: attribution.frames,
+            dedupeDiscriminator: context.dedupe
         )
     }
 
-    /// True when the diagnostic's call-stack tree mentions SDK code. Works when the SDK is a dynamic
-    /// framework (its binary name appears in the tree); a statically-linked SDK's tree carries the
-    /// host binary name + raw addresses, so this under-matches there (see the type doc).
-    private func callStackInvolvesSDK(_ tree: MXCallStackTree) -> Bool {
-        guard let json = try? tree.jsonRepresentation(), let text = String(data: json, encoding: .utf8) else {
-            return false
-        }
-        return text.contains(simulaSDKMarker)
+    /// Conservative attribution: only an Apple-attributed thread containing SDK frames qualifies.
+    /// A malformed/merged tree is skipped — under-reporting is safer than exfiltrating a host crash.
+    private func attribution(from tree: MXCallStackTree) -> SimulaMetricKitAttribution? {
+        SimulaMetricKitParser.attribution(from: tree.jsonRepresentation())
     }
 }
 #endif

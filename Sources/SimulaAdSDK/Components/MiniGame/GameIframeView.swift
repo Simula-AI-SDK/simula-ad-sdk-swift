@@ -216,7 +216,7 @@ public struct GameIframeView: View {
             // Backstop prewarm: warms a web view in parallel with the getMinigame
             // network round-trip in case the pool was drained.
             #if os(iOS)
-            WebViewPool.shared.prewarm()
+            WebViewPool.shared.prewarm(trigger: "minigame_game")
             #endif
         }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.

@@ -296,7 +296,7 @@ public final class SimulaRewardedAd {
             #if os(iOS)
             // Warm a web view so `show()` doesn't pay WebView cold-start on the
             // critical path.
-            WebViewPool.shared.prewarm()
+            WebViewPool.shared.prewarm(trigger: "rewarded_ready")
             #endif
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,

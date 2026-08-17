@@ -196,7 +196,7 @@ public struct MiniGameMenu: View {
                         // (and post-game ad) load from a warm process instead of
                         // paying cold-start right after the user taps.
                         #if os(iOS)
-                        WebViewPool.shared.prewarm()
+                        WebViewPool.shared.prewarm(trigger: "minigame_menu")
                         #endif
                     }
 
@@ -367,11 +367,16 @@ public struct MiniGameMenu: View {
                         )
                         .frame(width: 80, height: 80)
 
-                    if let uiImage = BundledImageCache.image(named: "game_icon") {
-                        Image(platformImage: uiImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 56, height: 56)
+                    BundledImage(asset: .gameIcon) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 56, height: 56)
+                        } else {
+                            Color.clear
+                                .frame(width: 56, height: 56)
+                        }
                     }
                 }
                 .frame(width: 80, height: 80)
@@ -435,20 +440,26 @@ public struct MiniGameMenu: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if catalogError {
             VStack(spacing: 16) {
-                if let uiImage = BundledImageCache.image(named: "games_unavailable") {
-                    Image(platformImage: uiImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 150, height: 150)
-                        .clipShape(Circle())
-                } else {
-                    Circle()
-                        .fill(Color(hex: theme.resolvedBackgroundColor).opacity(0.5))
-                        .frame(width: 150, height: 150)
-                        .overlay(
-                            Text("🎮")
-                                .font(.system(size: 60))
-                        )
+                BundledImage(asset: .gamesUnavailable) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: 150, height: 150)
+                            .clipShape(Circle())
+                    case .empty:
+                        Color.clear
+                            .frame(width: 150, height: 150)
+                    case .failure:
+                        Circle()
+                            .fill(Color(hex: theme.resolvedBackgroundColor).opacity(0.5))
+                            .frame(width: 150, height: 150)
+                            .overlay(
+                                Text("🎮")
+                                    .font(.system(size: 60))
+                            )
+                    }
                 }
 
                 Text("No games are available to play right now. Please check back later!")

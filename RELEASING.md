@@ -6,13 +6,13 @@ CocoaPods. `.github/workflows/release.yml` performs the complete release from a 
 
 ## One-time GitHub setup
 
-Create a `cocoa-pods` environment, require a reviewer, and add this environment secret:
+Create a `Cocoa Pod` environment and add this environment secret:
 
 - `COCOAPODS_TRUNK_TOKEN`: token from `~/.netrc` after `pod trunk register`
 
 Allow GitHub Actions to write repository contents so the workflow can push the binary release tag
 and create the GitHub release. Protect `main` and release tags, while allowing the release workflow
-to create tags after environment approval.
+to create tags after any configured environment approval.
 
 ## Release steps
 

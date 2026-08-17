@@ -27,7 +27,9 @@ final class NativeAdWebViewStore {
     /// Retained-view cap. Each retained view pins a live Web Content process (~20-30 MB); three is
     /// enough for the handful of ads near the viewport, and idle sessions drop on memory warnings.
     /// Matches the Kotlin store's cap.
-    static let maxRetained = 3
+    static let maxRetained = SimulaWebViewPolicy.retainedCap(
+        totalRamBytes: ProcessInfo.processInfo.physicalMemory
+    )
 
     /// One retained creative: its loaded web view + the stable message forwarder wired at creation.
     final class Session {
@@ -61,6 +63,8 @@ final class NativeAdWebViewStore {
     private var sessions: [String: Session] = [:]
     /// LRU recency: front = least-recently attached, back = most-recent. Kept in sync with `sessions`.
     private var accessOrder: [String] = []
+    private var applicationActive = UIApplication.shared.applicationState == .active
+    private var retentionBlockedUntil: TimeInterval = 0
     /// Store-owned navigation delegate installed on detached views (their coordinator delegate is
     /// unwired on release) so an off-screen render-process death is still observed. One shared
     /// instance — it identifies the session by the terminating view. `navigationDelegate` is weak,
@@ -76,7 +80,21 @@ final class NativeAdWebViewStore {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.evictAllIdle() }
+            MainActor.assumeIsolated { self?.handleMemoryPressure() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleBackground() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleActive() }
         }
     }
 
@@ -141,11 +159,20 @@ final class NativeAdWebViewStore {
             remove(impressionId)
             return true
         }
+        guard allowsRetention else {
+            // Background/pressure policy: do not pin an off-screen Web Content process. Attached
+            // views are never yanked; this runs only after their representable released ownership.
+            remove(impressionId)
+            return true
+        }
         // Retain: freeze callbacks, keep the DOM. The monitor keeps watching for a render death.
         session.forwarder.onMessage = nil
         webView.uiDelegate = nil
         webView.navigationDelegate = detachedMonitor
         webView.removeFromSuperview()
+        // More than the cap may have been attached simultaneously and therefore unevictable.
+        // Re-run now that this session is idle so the documented bound becomes enforceable.
+        evictIfNeeded()
         return true
     }
 
@@ -257,6 +284,33 @@ final class NativeAdWebViewStore {
         for key in Array(accessOrder) where sessions[key]?.attached == false {
             remove(key)
         }
+    }
+
+    private var allowsRetention: Bool {
+        applicationActive
+            && ProcessInfo.processInfo.systemUptime >= retentionBlockedUntil
+            && WebViewPool.shared.allowsNativeRetention
+    }
+
+    private func handleMemoryPressure() {
+        retentionBlockedUntil = max(
+            retentionBlockedUntil,
+            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        )
+        evictAllIdle()
+    }
+
+    private func handleBackground() {
+        applicationActive = false
+        retentionBlockedUntil = max(
+            retentionBlockedUntil,
+            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        )
+        evictAllIdle()
+    }
+
+    private func handleActive() {
+        applicationActive = true
     }
 
     /// Nothing currently retained may ever be REATTACHED again — a consent change rebuilt the

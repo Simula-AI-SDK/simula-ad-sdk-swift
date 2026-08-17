@@ -218,5 +218,26 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         XCTAssertFalse(second.alreadyLoaded, "evicted session must not be reattached")
         cleanup(second.webView, id: id)
     }
+
+    /// The store can temporarily exceed its cap when every session is attached. The first detach
+    /// creates an evictable idle session and must immediately restore the documented bound.
+    func testDetachEnforcesCapAfterAttachedOverflow() {
+        let ids = (0...NativeAdWebViewStore.maxRetained).map { _ in UUID().uuidString }
+        let attached = ids.map { id -> WKWebView in
+            let result = attach(id)
+            NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(result.webView))
+            return result.webView
+        }
+
+        XCTAssertTrue(NativeAdWebViewStore.shared.detach(attached[0], impressionId: ids[0]))
+        let rebuilt = attach(ids[0])
+        XCTAssertFalse(rebuilt.alreadyLoaded, "the newly-idle eldest session should be evicted")
+        XCTAssertFalse(rebuilt.webView === attached[0])
+
+        cleanup(rebuilt.webView, id: ids[0])
+        for index in 1..<ids.count {
+            cleanup(attached[index], id: ids[index])
+        }
+    }
 }
 #endif
