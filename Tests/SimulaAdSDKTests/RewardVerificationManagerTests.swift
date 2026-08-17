@@ -164,33 +164,43 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
+    /// Re-enqueue after the backoff window must retry — distinct from the automatic
+    /// wake path below. Injected sleeper so a 5xx does not park on wall-clock 5s
+    /// (and so XCTest does not wait on that leftover Task under simulator load).
     func testBackedOffTaskIsRetriedAfterItsDelay() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
         let clock = TestClock(0)
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { clock.time })
+        let sleeper = ControllableSleep()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            defaults: defaults,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
 
-        let failExp = expectation(description: "first attempt fails")
-        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
-            if case .failure = result { failExp.fulfill() }
-        }
-        await fulfillment(of: [failExp], timeout: 2)
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
+
+        // Drain finished + wake scheduled (invokeCallback happens before sleep).
+        try? await waitUntil(timeout: 2) { sleeper.isSleeping }
+        guard sleeper.isSleeping else { return }
+        let requested = await sleeper.waitForSleepRequest()
+        XCTAssertEqual(requested, 5, accuracy: 0.01, "backoff(1) = 5s must drive the wake delay")
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(persistedQueue().first?.retryCount, 1) // recorded at t=0; backoff(1)=5s
 
-        // After the backoff window, a retry succeeds. Re-enqueue (dedup → just registers
-        // a fresh callback + triggers) to get an awaitable result.
+        // Become eligible, then re-enqueue (dedup → fresh callback + trigger). Leave
+        // the wake parked so this drain is the re-enqueue path, not the scheduled wake.
         verifier.clearError(for: "A")
         verifier.setToken("tokA", for: "A")
         clock.time = 5
-        let okExp = expectation(description: "retry succeeds")
-        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
-            if case .success = result { okExp.fulfill() }
-        }
-        await fulfillment(of: [okExp], timeout: 2)
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
 
+        try? await waitUntil(timeout: 2) { self.persistedQueue().isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2) // attempted again only after the delay
         XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(sleeper.isSleeping, "re-enqueue must drain without consuming the scheduled wake")
     }
 
     /// The retry-wake path: a 5xx bail must schedule a drain that re-fires on its own after
@@ -268,8 +278,14 @@ final class RewardVerificationManagerTests: XCTestCase {
 
     private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { XCTFail("condition not met within \(timeout)s"); return }
+        while true {
+            if condition() { return }
+            if Date() > deadline {
+                // Re-check: work may have landed during the last sleep / a scheduler stall.
+                if condition() { return }
+                XCTFail("condition not met within \(timeout)s")
+                return
+            }
             try await Task.sleep(nanoseconds: 5_000_000) // 5ms
         }
     }
