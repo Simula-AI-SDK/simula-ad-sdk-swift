@@ -308,6 +308,25 @@ final class PrivacyTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleIdReadDoesNotCancelNewerForegroundRefresh() async {
+        let reader = ReentrantAdvertisingReader()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        reader.store = store
+
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil(timeout: 1) { reader.statusCount == 2 }
+
+        XCTAssertEqual(reader.idCount, 2)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "fresh-idfa")
+    }
+
+    @MainActor
     func testForegroundRevocationClearsIdfaInsideFourHours() async {
         let reader = AdvertisingReaderRecorder()
         let clock = PrivacyClock(100)
@@ -387,6 +406,28 @@ private final class AdvertisingReaderRecorder {
     private(set) var idCount = 0
     func readStatus() -> Int? { statusCount += 1; return statusRaw }
     func readId() -> String? { idCount += 1; return "test-idfa" }
+}
+
+@MainActor
+private final class ReentrantAdvertisingReader {
+    weak var store: SimulaPrivacy?
+    private(set) var statusCount = 0
+    private(set) var idCount = 0
+
+    func readStatus() -> Int? {
+        statusCount += 1
+        return 3
+    }
+
+    func readId() -> String? {
+        idCount += 1
+        guard idCount == 1 else { return "fresh-idfa" }
+
+        // Model a prompt refresh and a newer foreground check completing while the old read is in flight.
+        store?.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        store?.refreshAdvertisingTrackingOnForeground()
+        return "stale-idfa"
+    }
 }
 
 private final class PrivacyClock: @unchecked Sendable {

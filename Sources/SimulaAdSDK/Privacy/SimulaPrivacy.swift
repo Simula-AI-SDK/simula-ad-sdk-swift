@@ -366,8 +366,11 @@ public final class SimulaPrivacy: ObservableObject {
 
     private func applyAutomaticAdvertisingId(_ id: String?, generation: Int) {
         lock.lock()
-        guard generation == advertisingRefreshGeneration,
-              explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies,
+        if generation != advertisingRefreshGeneration {
+            lock.unlock()
+            return
+        }
+        guard explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies,
               attStatusRaw == 3 else {
             advertisingRefreshScheduled = false
             lock.unlock()
