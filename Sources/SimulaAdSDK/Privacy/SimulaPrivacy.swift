@@ -8,6 +8,9 @@ import AdSupport
 
 // MARK: - SimulaPrivacy
 
+typealias AdvertisingTrackingStatusReader = @MainActor @Sendable () -> Int?
+typealias AdvertisingIdReader = @MainActor @Sendable () -> String?
+
 /// Process-wide consent store and source of truth for the SDK's privacy signals.
 ///
 /// Responsibilities:
@@ -34,6 +37,10 @@ public final class SimulaPrivacy: ObservableObject {
     // MARK: - State
 
     private let defaults: UserDefaults
+    private let launchGate: LaunchSettling
+    private let advertisingTrackingStatusReader: AdvertisingTrackingStatusReader
+    private let advertisingIdReader: AdvertisingIdReader
+    private let now: @Sendable () -> TimeInterval
     private let lock = NSLock()
     private var explicitConfig = SimulaPrivacyConfig()
     private var collectedAdvertisingId: String?
@@ -41,6 +48,13 @@ public final class SimulaPrivacy: ObservableObject {
     private var lockedSnapshot = ConsentSnapshot()
     private var observer: NSObjectProtocol?
     private var foregroundObserver: NSObjectProtocol?
+    private var advertisingRefreshScheduled = false
+    private var advertisingRefreshGeneration = 0
+    private var lastAdvertisingStatusRefresh: TimeInterval?
+    private var lastAdvertisingIdRefresh: TimeInterval?
+    #if os(iOS)
+    private var trackingAuthorizationTask: Task<ATTrackingManager.AuthorizationStatus, Never>?
+    #endif
 
     /// IAB-standard `UserDefaults` keys, written by an in-app CMP.
     private enum IABKey {
@@ -53,11 +67,32 @@ public final class SimulaPrivacy: ObservableObject {
     }
 
     private static let zeroUUID = "00000000-0000-0000-0000-000000000000"
+    static let advertisingRefreshInterval: TimeInterval = 4 * 60 * 60
 
     // MARK: - Init
 
-    public init(defaults: UserDefaults = .standard) {
+    public convenience init(defaults: UserDefaults = .standard) {
+        self.init(
+            defaults: defaults,
+            launchGate: LaunchSettledGate.shared,
+            now: { ProcessInfo.processInfo.systemUptime },
+            advertisingTrackingStatusReader: { SimulaPrivacy.defaultAdvertisingTrackingStatus() },
+            advertisingIdReader: { SimulaPrivacy.defaultAdvertisingId() }
+        )
+    }
+
+    init(
+        defaults: UserDefaults,
+        launchGate: LaunchSettling,
+        now: @escaping @Sendable () -> TimeInterval,
+        advertisingTrackingStatusReader: @escaping AdvertisingTrackingStatusReader,
+        advertisingIdReader: @escaping AdvertisingIdReader
+    ) {
         self.defaults = defaults
+        self.launchGate = launchGate
+        self.now = now
+        self.advertisingTrackingStatusReader = advertisingTrackingStatusReader
+        self.advertisingIdReader = advertisingIdReader
         recompute()
         // CMPs write the IAB keys asynchronously and may refresh them later; pick
         // changes up automatically. `object: nil` because the notification is not
@@ -77,7 +112,7 @@ public final class SimulaPrivacy: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.refreshAdvertisingIdIfNeeded()
+            self?.refreshAdvertisingTrackingOnForeground()
             self?.recompute()
         }
         #endif
@@ -100,10 +135,21 @@ public final class SimulaPrivacy: ObservableObject {
     /// Replace the explicit configuration wholesale (provider init / CMP handoff).
     public func apply(_ config: SimulaPrivacyConfig) {
         lock.lock()
+        let wasEnabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
         explicitConfig = config
-        if !config.enableAdvertisingId || config.coppaApplies { collectedAdvertisingId = nil }
+        let isEnabled = config.enableAdvertisingId && !config.coppaApplies
+        if isEnabled && !wasEnabled {
+            lastAdvertisingStatusRefresh = nil
+            lastAdvertisingIdRefresh = nil
+        }
+        if !config.enableAdvertisingId || config.coppaApplies {
+            collectedAdvertisingId = nil
+            attStatusRaw = nil
+            advertisingRefreshGeneration += 1
+            advertisingRefreshScheduled = false
+        }
         lock.unlock()
-        refreshAdvertisingIdIfNeeded()
+        scheduleAdvertisingRefresh(alwaysCheckStatus: false)
         recompute()
     }
 
@@ -122,6 +168,7 @@ public final class SimulaPrivacy: ObservableObject {
     ) {
         lock.lock()
         var c = explicitConfig
+        let wasEnabled = c.enableAdvertisingId && !c.coppaApplies
         if let hasPrivacyConsent { c.hasPrivacyConsent = hasPrivacyConsent }
         if let tcString { c.tcString = tcString }
         if let uspString { c.uspString = uspString }
@@ -132,9 +179,19 @@ public final class SimulaPrivacy: ObservableObject {
         if let coppaApplies { c.coppaApplies = coppaApplies }
         if let enableAdvertisingId { c.enableAdvertisingId = enableAdvertisingId }
         explicitConfig = c
-        if !c.enableAdvertisingId || c.coppaApplies { collectedAdvertisingId = nil }
+        let isEnabled = c.enableAdvertisingId && !c.coppaApplies
+        if isEnabled && !wasEnabled {
+            lastAdvertisingStatusRefresh = nil
+            lastAdvertisingIdRefresh = nil
+        }
+        if !c.enableAdvertisingId || c.coppaApplies {
+            collectedAdvertisingId = nil
+            attStatusRaw = nil
+            advertisingRefreshGeneration += 1
+            advertisingRefreshScheduled = false
+        }
         lock.unlock()
-        refreshAdvertisingIdIfNeeded()
+        scheduleAdvertisingRefresh(alwaysCheckStatus: false)
         recompute()
     }
 
@@ -178,16 +235,26 @@ public final class SimulaPrivacy: ObservableObject {
     @MainActor
     @discardableResult
     public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {
+        if let trackingAuthorizationTask { return await trackingAuthorizationTask.value }
+        let task = Task { await self.performTrackingAuthorizationRequest() }
+        trackingAuthorizationTask = task
+        let status = await task.value
+        trackingAuthorizationTask = nil
+        return status
+    }
+
+    @MainActor
+    private func performTrackingAuthorizationRequest() async -> ATTrackingManager.AuthorizationStatus {
         // Calling the ATT API without NSUserTrackingUsageDescription terminates the
         // app. Fail safe: skip the prompt and return the current status instead.
         guard Bundle.main.object(forInfoDictionaryKey: "NSUserTrackingUsageDescription") != nil else {
             assertionFailure("[SimulaSDK] NSUserTrackingUsageDescription is missing from Info.plist; ATT prompt skipped.")
             let status = ATTrackingManager.trackingAuthorizationStatus
-            applyTrackingStatus(status)
+            refreshAdvertisingTrackingAfterPrompt(statusRaw: Int(status.rawValue))
             return status
         }
         let status = await ATTrackingManager.requestTrackingAuthorization()
-        applyTrackingStatus(status)
+        refreshAdvertisingTrackingAfterPrompt(statusRaw: Int(status.rawValue))
         return status
     }
 
@@ -208,48 +275,154 @@ public final class SimulaPrivacy: ObservableObject {
         completion(await requestTrackingAuthorization())
     }
 
-    private func applyTrackingStatus(_ status: ATTrackingManager.AuthorizationStatus) {
-        lock.lock()
-        attStatusRaw = Int(status.rawValue)
-        let enabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
-        collectedAdvertisingId = (status == .authorized && enabled) ? SimulaPrivacy.readIDFA() : nil
-        lock.unlock()
-        recompute()
-    }
     #endif
 
-    /// Reads the IDFA when collection is enabled, COPPA does not apply, and ATT is
-    /// authorized — used when the host enables collection *after* authorization.
-    private func refreshAdvertisingIdIfNeeded() {
-        #if os(iOS)
+    @MainActor
+    func refreshAdvertisingTrackingAfterPrompt(statusRaw: Int) {
         lock.lock()
+        advertisingRefreshGeneration += 1
+        advertisingRefreshScheduled = false
         let enabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
         lock.unlock()
         guard enabled else { return }
-        let status = ATTrackingManager.trackingAuthorizationStatus
+        let id = statusRaw == 3 ? advertisingIdReader() : nil
+        applyPromptAdvertisingReading(statusRaw: statusRaw, advertisingId: id)
+    }
+
+    /// Schedules the automatic ATT/IDFA snapshot. The first opt-in waits for the shared launch
+    /// quiet window. Foreground always re-checks cheap ATT status; only the IDFA read is throttled
+    /// to Android's four-hour interval. Reapplied unchanged config is coalesced by the same window.
+    private func scheduleAdvertisingRefresh(alwaysCheckStatus: Bool) {
         lock.lock()
-        attStatusRaw = Int(status.rawValue)
-        collectedAdvertisingId = (status == .authorized) ? SimulaPrivacy.readIDFA() : nil
+        let enabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
+        let recentStatus = lastAdvertisingStatusRefresh.map {
+            now() - $0 < Self.advertisingRefreshInterval
+        } ?? false
+        if !enabled || advertisingRefreshScheduled || (!alwaysCheckStatus && recentStatus) {
+            lock.unlock()
+            return
+        }
+        advertisingRefreshScheduled = true
+        advertisingRefreshGeneration += 1
+        let generation = advertisingRefreshGeneration
         lock.unlock()
+        Task { await self.runScheduledAdvertisingRefresh(generation: generation) }
+    }
+
+    func refreshAdvertisingTrackingOnForeground() {
+        scheduleAdvertisingRefresh(alwaysCheckStatus: true)
+    }
+
+    private func runScheduledAdvertisingRefresh(generation: Int) async {
+        await launchGate.waitUntilSettled()
+        guard shouldReadAdvertisingTracking(generation: generation) else { return }
+        let statusRaw = await MainActor.run { advertisingTrackingStatusReader() }
+        let shouldReadId = applyAutomaticAdvertisingStatus(statusRaw, generation: generation)
+        if shouldReadId {
+            let id = await MainActor.run { advertisingIdReader() }
+            applyAutomaticAdvertisingId(id, generation: generation)
+        } else {
+            recompute()
+        }
+    }
+
+    private func shouldReadAdvertisingTracking(generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return advertisingRefreshScheduled
+            && advertisingRefreshGeneration == generation
+            && explicitConfig.enableAdvertisingId
+            && !explicitConfig.coppaApplies
+    }
+
+    private func applyAutomaticAdvertisingStatus(_ statusRaw: Int?, generation: Int) -> Bool {
+        lock.lock()
+        if generation != advertisingRefreshGeneration {
+            lock.unlock()
+            return false
+        }
+        guard explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies else {
+            advertisingRefreshScheduled = false
+            lock.unlock()
+            return false
+        }
+        let previousStatusRaw = attStatusRaw
+        attStatusRaw = statusRaw
+        lastAdvertisingStatusRefresh = now()
+        if statusRaw != 3 {
+            collectedAdvertisingId = nil
+            advertisingRefreshScheduled = false
+            lock.unlock()
+            return false
+        }
+        let idRefreshExpired = lastAdvertisingIdRefresh.map {
+            now() - $0 >= Self.advertisingRefreshInterval
+        } ?? true
+        let shouldReadId = previousStatusRaw != 3 || idRefreshExpired
+        if !shouldReadId { advertisingRefreshScheduled = false }
+        lock.unlock()
+        return shouldReadId
+    }
+
+    private func applyAutomaticAdvertisingId(_ id: String?, generation: Int) {
+        lock.lock()
+        guard generation == advertisingRefreshGeneration,
+              explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies,
+              attStatusRaw == 3 else {
+            advertisingRefreshScheduled = false
+            lock.unlock()
+            return
+        }
+        collectedAdvertisingId = id
+        lastAdvertisingIdRefresh = now()
+        advertisingRefreshScheduled = false
+        lock.unlock()
+        recompute()
+    }
+
+    private func applyPromptAdvertisingReading(statusRaw: Int, advertisingId: String?) {
+        lock.lock()
+        guard explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies else {
+            lock.unlock()
+            return
+        }
+        attStatusRaw = statusRaw
+        collectedAdvertisingId = statusRaw == 3 ? advertisingId : nil
+        lastAdvertisingStatusRefresh = now()
+        if statusRaw == 3 { lastAdvertisingIdRefresh = now() }
+        lock.unlock()
+        recompute()
+    }
+
+    /// Platform reads are centralized here and always invoked on MainActor by the scheduler.
+    @MainActor
+    private static func defaultAdvertisingTrackingStatus() -> Int? {
+        #if os(iOS)
+        return Int(ATTrackingManager.trackingAuthorizationStatus.rawValue)
+        #else
+        return nil
         #endif
     }
 
-    #if os(iOS)
-    /// Reads the IDFA, mapping the all-zero "unavailable" id to `nil`.
-    private static func readIDFA() -> String? {
+    @MainActor
+    private static func defaultAdvertisingId() -> String? {
+        #if os(iOS)
         let id = ASIdentifierManager.shared().advertisingIdentifier.uuidString
+        let advertisingId: String?
         if id == zeroUUID {
             #if targetEnvironment(simulator)
-            // Simulators have no real IDFA; surface a stable dummy so the
-            // end-to-end gating/wire path is observable without a device.
-            return "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD"
+            advertisingId = "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD"
             #else
-            return nil
+            advertisingId = nil
             #endif
+        } else {
+            advertisingId = id
         }
-        return id
+        return advertisingId
+        #else
+        return nil
+        #endif
     }
-    #endif
 
     // MARK: - Snapshot building
 

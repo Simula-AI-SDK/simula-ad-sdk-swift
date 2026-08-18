@@ -94,6 +94,46 @@ final class Ipv4BeaconTests: XCTestCase {
         XCTAssertEqual(recorder.count, 1)
     }
 
+    func testSendWaitsForLaunchSettledGate() async {
+        let recorder = SendRecorder()
+        let gate = ControllableLaunchSettledGate()
+        let beacon = Ipv4Beacon(
+            urlString: "https://ip4.example/px",
+            send: { url in await recorder.record(url) },
+            deviceId: { "device" },
+            now: { [date = referenceDate] in date },
+            launchGate: gate
+        )
+
+        beacon.fire(apiKey: "k", sessionId: "s", ppid: nil, reason: Ipv4Beacon.reasonInit)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(recorder.count, 0)
+
+        await gate.open()
+        await waitUntil { recorder.count == 1 }
+    }
+
+    func testLogoutWhileWaitingForLaunchGatePreventsStaleTransmission() async {
+        let recorder = SendRecorder()
+        let gate = ControllableLaunchSettledGate()
+        let beacon = Ipv4Beacon(
+            urlString: "https://ip4.example/px",
+            send: { url in await recorder.record(url) },
+            deviceId: { "device" },
+            now: { [date = referenceDate] in date },
+            launchGate: gate
+        )
+
+        beacon.fire(apiKey: "k", sessionId: "stale-session", ppid: "user", reason: Ipv4Beacon.reasonInit)
+        await waitUntil { !beacon.isIdleForTests }
+        beacon.onLogout()
+        await gate.open()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(recorder.count, 0)
+        XCTAssertTrue(beacon.isIdleForTests)
+    }
+
     func testANewSessionIdIsANewIdentityAndRefires() async {
         let recorder = SendRecorder()
         let beacon = makeBeacon(recorder: recorder)

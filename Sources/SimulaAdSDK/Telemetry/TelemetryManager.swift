@@ -73,6 +73,7 @@ final class TelemetryManager: @unchecked Sendable {
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
+    private let launchGate: LaunchSettling
     // Dev-only sink: when set (devMode), each recorded event is logged here (already redacted).
     private let debugLog: (@Sendable (String) -> Void)?
     private let flushThreshold: Int
@@ -124,6 +125,7 @@ final class TelemetryManager: @unchecked Sendable {
         now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 * 1000 },
         random: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) },
         backoff: @escaping @Sendable (Int) -> TimeInterval = { telemetryBackoff(retryCount: $0) },
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         debugLog: (@Sendable (String) -> Void)? = nil,
         flushThreshold: Int = 20,
         maxBuffer: Int = 200,
@@ -144,6 +146,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.createdAtMs = now()
         self.random = random
         self.backoff = backoff
+        self.launchGate = launchGate
         self.debugLog = debugLog
         self.flushThreshold = flushThreshold
         self.maxBuffer = maxBuffer
@@ -524,6 +527,8 @@ final class TelemetryManager: @unchecked Sendable {
     /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
     /// reconcile (sync, under lock). All `NSLock` use stays in the synchronous helpers.
     private func flush() async {
+        await launchGate.waitUntilSettled()
+        guard !Task.isCancelled else { return }
         guard let batch = beginFlush() else { return }
         let ack: TelemetryAck = batch.body.isEmpty ? .retry : await sender.send(batch.body)
         let outcome = completeFlush(ack: ack, batch: batch)
