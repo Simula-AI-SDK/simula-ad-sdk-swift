@@ -55,6 +55,32 @@ final class WebViewPoolPolicyTests: XCTestCase {
         XCTAssertEqual(SimulaWebViewPolicy.cooldown, 300)
     }
 
+    func testBackgroundDoesNotStartOrExtendCooldown() {
+        XCTAssertEqual(
+            SimulaWebViewPolicy.blockedUntil(current: 0, now: 100, event: .background),
+            0
+        )
+        XCTAssertEqual(
+            SimulaWebViewPolicy.blockedUntil(current: 250, now: 100, event: .background),
+            250
+        )
+    }
+
+    func testPressureAndRendererDeathStartCooldown() {
+        XCTAssertEqual(
+            SimulaWebViewPolicy.blockedUntil(current: 0, now: 100, event: .memoryPressure),
+            400
+        )
+        XCTAssertEqual(
+            SimulaWebViewPolicy.blockedUntil(current: 450, now: 100, event: .rendererDeath),
+            450
+        )
+        XCTAssertEqual(
+            SimulaWebViewPolicy.blockedUntil(current: 0, now: 100, event: .rendererDeath),
+            400
+        )
+    }
+
     func testPrewarmDecisionsStayCanonical() {
         XCTAssertEqual(
             SimulaWebViewPolicy.prewarmDecision(

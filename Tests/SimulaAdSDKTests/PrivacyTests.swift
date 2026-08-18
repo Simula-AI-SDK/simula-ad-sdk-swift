@@ -186,6 +186,173 @@ final class PrivacyTests: XCTestCase {
         XCTAssertNil(store.currentSnapshot.advertisingId)
     }
 
+    // MARK: - Deferred ATT / IDFA scheduling
+
+    @MainActor
+    func testAdvertisingReadsStayDisabledByDefault() async {
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+
+        store.apply(SimulaPrivacyConfig())
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 0)
+        XCTAssertNil(store.currentSnapshot.attStatus)
+    }
+
+    @MainActor
+    func testOptInReadsOnceOnlyAfterLaunchGateOpens() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        let config = SimulaPrivacyConfig(enableAdvertisingId: true)
+
+        store.apply(config)
+        store.apply(config)
+        store.update(enableAdvertisingId: true)
+        await waitForGateWaiter(gate)
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 0)
+
+        await gate.open()
+        await waitUntil { reader.statusCount == 1 && reader.idCount == 1 }
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+    }
+
+    @MainActor
+    func testUnchangedRefreshesAreThrottledForFourHours() async {
+        let reader = AdvertisingReaderRecorder()
+        let clock = PrivacyClock(100)
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { clock.value },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        let config = SimulaPrivacyConfig(enableAdvertisingId: true)
+
+        store.apply(config)
+        await waitUntil { reader.statusCount == 1 && reader.idCount == 1 }
+        clock.value += SimulaPrivacy.advertisingRefreshInterval - 1
+        store.apply(config)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(reader.statusCount, 1)
+        XCTAssertEqual(reader.idCount, 1)
+
+        clock.value += 1
+        store.apply(config)
+        await waitUntil { reader.statusCount == 2 && reader.idCount == 2 }
+    }
+
+    @MainActor
+    func testReenablingAdvertisingIdRefreshesWithoutWaitingFourHours() async {
+        let reader = AdvertisingReaderRecorder()
+        let clock = PrivacyClock(100)
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { clock.value },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil { reader.statusCount == 1 && reader.idCount == 1 }
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+
+        clock.value += 1
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil { reader.statusCount == 2 && reader.idCount == 2 }
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+    }
+
+    @MainActor
+    func testPromptCompletionRefreshesImmediatelyAndCancelsDeferredRead() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+
+        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 1)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+
+        await gate.open()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 1)
+    }
+
+    @MainActor
+    func testForegroundRevocationClearsIdfaInsideFourHours() async {
+        let reader = AdvertisingReaderRecorder()
+        let clock = PrivacyClock(100)
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { clock.value },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil { reader.idCount == 1 }
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+
+        clock.value += 60
+        reader.statusRaw = 2
+        store.refreshAdvertisingTrackingOnForeground()
+        await waitUntil { reader.statusCount == 2 && store.currentSnapshot.attStatus == 2 }
+
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+        XCTAssertEqual(reader.idCount, 1, "revocation must not touch the IDFA reader")
+    }
+
+    @MainActor
+    func testAuthorizedForegroundRefreshChecksStatusButThrottlesIdfa() async {
+        let reader = AdvertisingReaderRecorder()
+        let clock = PrivacyClock(100)
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { clock.value },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil { reader.idCount == 1 }
+
+        clock.value += 60
+        store.refreshAdvertisingTrackingOnForeground()
+        await waitUntil { reader.statusCount == 2 }
+
+        XCTAssertEqual(reader.idCount, 1)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+    }
+
     // MARK: - Privacy resolution (shared by SimulaAds.initialize via SimulaProvider)
 
     @MainActor
@@ -210,5 +377,31 @@ final class PrivacyTests: XCTestCase {
         let cfg = SimulaPrivacyConfig(hasPrivacyConsent: true)
         let provider = SimulaProvider(apiKey: "test-key", hasPrivacyConsent: false, privacy: cfg)
         XCTAssertTrue(provider.privacyConfig.hasPrivacyConsent)
+    }
+}
+
+@MainActor
+private final class AdvertisingReaderRecorder {
+    var statusRaw = 3
+    private(set) var statusCount = 0
+    private(set) var idCount = 0
+    func readStatus() -> Int? { statusCount += 1; return statusRaw }
+    func readId() -> String? { idCount += 1; return "test-idfa" }
+}
+
+private final class PrivacyClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var time: TimeInterval
+    init(_ value: TimeInterval) { time = value }
+    var value: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return time }
+        set { lock.lock(); time = newValue; lock.unlock() }
+    }
+}
+
+private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
+    let deadline = Date().addingTimeInterval(TestWait.timeout)
+    while await gate.waitCount == 0, Date() < deadline {
+        try? await Task.sleep(nanoseconds: 5_000_000)
     }
 }

@@ -314,9 +314,18 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
     static let shared = SimulaCrashGuard()
 
     private let lock = NSLock()
+    private let launchGate: LaunchSettling
     private var installed = false
 
-    private override init() { super.init() }
+    private override init() {
+        launchGate = LaunchSettledGate.shared
+        super.init()
+    }
+
+    init(launchGate: LaunchSettling) {
+        self.launchGate = launchGate
+        super.init()
+    }
 
     func install(enabled: Bool) {
         guard enabled else { return }
@@ -337,7 +346,13 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
 
         // File I/O off the caller's thread. recordError persists durably on its own, so no explicit
         // flush is needed — the eager flush recordError schedules delivers it.
-        DispatchQueue.global(qos: .utility).async { [weak self] in self?.replayPending() }
+        Task { [weak self] in await self?.replayAfterLaunchSettles() }
+    }
+
+    private func replayAfterLaunchSettles() async {
+        await launchGate.waitUntilSettled()
+        guard !Task.isCancelled else { return }
+        replayPending()
     }
 
     // MARK: - Uncaught Objective-C exceptions

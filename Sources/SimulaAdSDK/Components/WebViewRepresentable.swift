@@ -606,6 +606,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
+            // A renderer death is a real pressure signal: drain idle views and suppress retention /
+            // explicit minigame prewarm for the cooldown. Ordinary backgrounding does not do this.
+            WebViewPool.shared.handleRendererDeath()
+            NativeAdWebViewStore.shared.handleRendererDeath()
             // Retained native-ad view: flag the store session so a dead view is never reattached.
             // The in-place recovery below may still succeed — didFinish clears the flag then.
             noteRetainedUnusable(webView)

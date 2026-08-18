@@ -59,6 +59,7 @@ public struct NativeAdSlot: View {
 
     @State private var phase: Phase = .loading
     @State private var heightPt: CGFloat = 0
+    @State private var mountAdmitted = false
     @State private var impressionFired = false
     /// Immutable metadata pending for this impression's `/seen` beacon. Normal loads send metadata
     /// on `/load`; consumed preloads bind mount metadata here because their load already happened.
@@ -185,8 +186,10 @@ public struct NativeAdSlot: View {
     public var body: some View {
         sizedSlot
             .task(id: taskKey) { await load() }
+            .task(id: mountRequestKey) { await requestMount() }
             // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
             .task(id: awaitingHeight) { await watchForMissingHeight() }
+            .onDisappear { mountAdmitted = false }
             // The creative can freeze mid-video/mid-typing across a background/foreground cycle (its
             // WKWebView's content process suspends, and in-page visibilitychange/pageshow/focus
             // listeners aren't guaranteed to fire on the way back). Deterministically wake it via the
@@ -204,68 +207,71 @@ public struct NativeAdSlot: View {
         case .filled(let response):
             let impressionId = response.impressionId ?? ""
             ZStack {
-                WebViewRepresentable(
-                    // Prefer the server-rendered html (the inline <iframe srcdoc> creative); fall back to
-                    // the iframe url when no html is present.
-                    url: response.renderedHTML == nil ? response.iframeURL.flatMap { URL(string: $0) } : nil,
-                    htmlString: response.renderedHTML,
-                    onNavigationFailed: { _ in handleLoadFailure() },
-                    onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
-                    onAdClick: {
-                        // Surface the click to the publisher (parity with the interstitial's
-                        // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
-                        onClick()
-                        // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
-                        Telemetry.shared.recordLifecycle(
-                            stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
-                            adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
-                        )
-                    },
-                    // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an
-                    // App Store CTA routes through the in-app store sheet so the tokens ride it; absent
-                    // tokens keep today's external open (see `openNativeCTA`).
-                    attribution: response.skanAttribution,
-                    externalClickOnly: true,
-                    // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).
-                    // The raw store link makes the App Store route deterministic (see `openNativeCTA`).
-                    ctaTrackingUrl: response.trackingUrl,
-                    ctaDestination: response.destinationKind,
-                    ctaStoreUrl: response.iosStoreUrl,
-                    reportsContentHeight: true,
-                    // Key this serve's rendered WKWebView in NativeAdWebViewStore so a recycled row
-                    // reattaches the same, already-rendered view (no reload, no flash). Previews
-                    // (empty id) stay on the ephemeral pool path.
-                    retainedImpressionId: impressionId.isEmpty ? nil : impressionId,
-                    telemetryAdFormat: response.adFormat,
-                    visibilityRelay: visibilityRelay
-                )
-                // Hold a provisional height while the creative measures (never collapse), then grow.
-                .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
-                // Snap height changes (grow on first paint, collapse on error) — never animate the
-                // feed reflow, which reads as a weird "bump".
-                .animation(nil, value: heightPt)
-                .trackNativeAdViewability(
-                    enabled: heightPt > 0,
-                    // Forward the live visible fraction to the creative (window.onVisibility) every
-                    // frame so a video/animation can react; per-frame, never sent to telemetry.
-                    onVisibilityRatio: { visibilityRelay.report($0) }
-                ) { stats in
-                    fireImpression(impressionId: impressionId, adFormat: response.adFormat, adValue: response.adValue, stats: stats)
+                if mountAdmitted {
+                    WebViewRepresentable(
+                        // Prefer the server-rendered html (the inline <iframe srcdoc> creative); fall back to
+                        // the iframe url when no html is present.
+                        url: response.renderedHTML == nil ? response.iframeURL.flatMap { URL(string: $0) } : nil,
+                        htmlString: response.renderedHTML,
+                        onNavigationFailed: { _ in handleLoadFailure() },
+                        onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
+                        onAdClick: {
+                            // Surface the click to the publisher (parity with the interstitial's
+                            // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
+                            onClick()
+                            // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
+                            Telemetry.shared.recordLifecycle(
+                                stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
+                                adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+                            )
+                        },
+                        // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an
+                        // App Store CTA routes through the in-app store sheet so the tokens ride it; absent
+                        // tokens keep today's external open (see `openNativeCTA`).
+                        attribution: response.skanAttribution,
+                        externalClickOnly: true,
+                        // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).
+                        // The raw store link makes the App Store route deterministic (see `openNativeCTA`).
+                        ctaTrackingUrl: response.trackingUrl,
+                        ctaDestination: response.destinationKind,
+                        ctaStoreUrl: response.iosStoreUrl,
+                        reportsContentHeight: true,
+                        // Key this serve's rendered WKWebView in NativeAdWebViewStore so a recycled row
+                        // reattaches the same, already-rendered view (no reload, no flash). Previews
+                        // (empty id) stay on the ephemeral pool path.
+                        retainedImpressionId: impressionId.isEmpty ? nil : impressionId,
+                        telemetryAdFormat: response.adFormat,
+                        visibilityRelay: visibilityRelay
+                    )
+                    // Snap height changes (grow on first paint, collapse on error) — never animate the
+                    // feed reflow, which reads as a weird "bump".
+                    .animation(nil, value: heightPt)
+                    .trackNativeAdViewability(
+                        enabled: heightPt > 0,
+                        // Forward the live visible fraction to the creative (window.onVisibility) every
+                        // frame so a video/animation can react; per-frame, never sent to telemetry.
+                        onVisibilityRatio: { visibilityRelay.report($0) }
+                    ) { stats in
+                        fireImpression(impressionId: impressionId, adFormat: response.adFormat, adValue: response.adValue, stats: stats)
+                    }
                 }
 
-                // Keep the shimmer over the slot until the creative reports its height. Without
-                // this the slot would collapse between "filled" and "measured" and jolt the feed
-                // below up then back down (it "looks broken").
-                if heightPt <= 0 {
-                    NativeAdShimmer(isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) != "light")
+                // Keep a stable placeholder while queued and until the creative reports its height.
+                if !mountAdmitted || heightPt <= 0 {
+                    NativeAdShimmer(
+                        isDark: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark) != "light",
+                        height: heightPt > 0 ? heightPt : Self.provisionalHeight
+                    )
                 }
 
                 // Tap-to-open AdChoices over the creative's top-left "AD" badge (Interested /
                 // Not interested / Report / About) — the SDK's standard dialog, once the ad shows.
-                if heightPt > 0 {
+                if mountAdmitted && heightPt > 0 {
                     NativeAdInfoOverlay(adId: impressionId, apiKey: resolvedProvider?.apiKey ?? "")
                 }
             }
+            // Hold a provisional height while queued/measuring (never collapse), then grow.
+            .frame(height: heightPt > 0 ? heightPt : Self.provisionalHeight)
             .clipped()
         case .loading:
             // While the request is in flight, show a shimmer placeholder.
@@ -315,11 +321,25 @@ public struct NativeAdSlot: View {
 
     private var taskKey: String { "\(adUnitId ?? "")|\(position)|\(preloadedAdId ?? "")|\(previewHTML != nil)" }
 
+    private var mountRequestKey: String? {
+        guard case .filled(let response) = phase else { return nil }
+        return "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)"
+    }
+
+    @MainActor
+    private func requestMount() async {
+        guard !mountAdmitted, let requestedKey = mountRequestKey else { return }
+        let admitted = await NativeAdMountScheduler.shared.waitForAdmission()
+        guard admitted, !Task.isCancelled, mountRequestKey == requestedKey else { return }
+        mountAdmitted = true
+    }
+
     @MainActor
     private func load() async {
         // Preview/QA: render the supplied HTML with no network (mirrors imperative showPreview).
         if let previewHTML {
             impressionMetadata = nil
+            mountAdmitted = false
             phase = .filled(NativeAdResponse(
                 impressionId: nil,
                 adInserted: true,
@@ -348,6 +368,7 @@ public struct NativeAdSlot: View {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
                 impressionMetadata = entry.metadata
+                mountAdmitted = false
                 phase = .filled(response)
                 reportLoadSuccess(response, source: "cache")
             } else {
@@ -357,6 +378,7 @@ public struct NativeAdSlot: View {
         }
 
         // 3. Live request.
+        mountAdmitted = false
         phase = .loading
         guard let provider = resolvedProvider else {
             // No SimulaProvider in the environment and no imperative SimulaAds.initialize() — render
@@ -405,6 +427,7 @@ public struct NativeAdSlot: View {
                 renderStartUptime = ProcessInfo.processInfo.systemUptime
                 renderTimeRecorded = false
             }
+            mountAdmitted = false
             phase = .filled(response)
             reportLoadSuccess(response, source: source, durationMs: durationMs)
         } else {
@@ -495,11 +518,10 @@ public struct NativeAdSlot: View {
         reportError(.network)
     }
 
-    /// True while a filled creative has not yet reported a usable height — i.e. it is still holding
-    /// the provisional block. Drives the missing-height watchdog and flips false the moment a real
-    /// height arrives (`handleMessage`), the slot collapses, or it disappears.
+    /// True while an admitted creative has not yet reported a usable height — i.e. it is still
+    /// holding the provisional block. Queue time is deliberately excluded from the render watchdog.
     private var awaitingHeight: Bool {
-        if case .filled = phase { return heightPt <= 0 }
+        if case .filled = phase { return mountAdmitted && heightPt <= 0 }
         return false
     }
 
@@ -594,6 +616,7 @@ public struct NativeAdSlot: View {
 /// dark block rather than a light one that then flips.
 private struct NativeAdShimmer: View {
     var isDark: Bool = true
+    var height: CGFloat = NativeAdSlot.provisionalHeight
     @State private var animate = false
 
     private var base: Color {
@@ -608,7 +631,7 @@ private struct NativeAdShimmer: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 16)
             .fill(base)
-            .frame(height: NativeAdSlot.provisionalHeight)
+            .frame(height: height)
             .overlay(
                 GeometryReader { geo in
                     LinearGradient(

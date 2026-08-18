@@ -77,6 +77,7 @@ final class Telemetry: @unchecked Sendable {
             diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             batteryProvider: { Telemetry.resolveBattery() },
             carrierProvider: { Telemetry.resolveCarrier() },
+            launchGate: LaunchSettledGate.shared,
             debugLog: consoleLog
         )
         lock.lock(); manager = mgr; lock.unlock()

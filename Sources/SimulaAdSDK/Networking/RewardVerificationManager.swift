@@ -52,41 +52,63 @@ func isPermanentVerificationError(_ error: Error) -> Bool {
 /// - Idempotent: deduped by `serve_id`; the API layer maps HTTP 409 (already
 ///   claimed) to a successful verification, so retries converge without
 ///   double-firing the publisher's postback.
-/// - Durable: the queue is persisted to `UserDefaults` and survives relaunch.
+/// - Durable: atomically persisted under Application Support and migrated once from the exact
+///   legacy `simula_pending_reward_verifications` UserDefaults entry.
 /// - Backed off: failed attempts retry with exponential backoff (5s → max 60s).
 ///
-/// `@unchecked Sendable` is safe: all mutable state is guarded by `lock`, and the
-/// `URLSession` inside `SimulaAPI` is itself thread-safe.
+/// `@unchecked Sendable` is safe: mutable state and persistence are confined to `executor`, and
+/// the `URLSession` inside `SimulaAPI` is itself thread-safe.
 public final class RewardVerificationManager: @unchecked Sendable {
     public static let shared = RewardVerificationManager()
 
-    private let userDefaultsKey = "simula_pending_reward_verifications"
     private let verifier: RewardVerifying
-    private let defaults: UserDefaults
+    private let store: RewardVerificationStoring
     private let now: @Sendable () -> TimeInterval
+    private let launchGate: LaunchSettling
+    private let persistenceSleep: @Sendable (TimeInterval) async -> Void
+    private let loadSleep: @Sendable (TimeInterval) async -> Void
     /// Suspends for the retry-wake delay. Production uses `Task.sleep`; tests inject a
     /// controllable sleeper so the wake can be released after advancing the fake clock —
     /// without waiting on wall-clock backoff (5s → 60s).
     private let sleep: @Sendable (TimeInterval) async -> Void
-    private let lock = NSLock()
+    private let executor = DispatchQueue(label: "ad.simula.reward-verification.queue", qos: .utility)
+    private let callbackQueue = DispatchQueue(label: "ad.simula.reward-verification.callbacks", qos: .utility)
+    private var queue: [PendingVerification] = []
+    private var pendingQueue: [PendingVerification] = []
+    private var isLoaded = false
+    private var isDirty = false
     private var isProcessing = false
+    private var persistenceRetryCount = 0
+    private var persistenceRetryTask: Task<Void, Never>?
+    private var loadRetryCount = 0
+    private var loadRetryTask: Task<Void, Never>?
+    private var pendingCallbacks: [(@Sendable (Result<String?, Error>) -> Void, Result<String?, Error>)] = []
+    private var pendingNetworkRetryDelay: TimeInterval?
+    private let maxPendingEnqueues = 100
 
     /// A scheduled wake-up for the earliest backed-off task after a retryable failure (e.g. a
     /// server 5xx). Without it the backoff computed eligibility but nothing ever re-triggered
     /// the drain — a failed verify sat in the queue until the NEXT earned reward or app
-    /// relaunch, so REWARD_VERIFIED could stall for a whole session. Guarded by `lock`.
+    /// relaunch, so REWARD_VERIFIED could stall for a whole session. Executor-confined.
     private var retryTask: Task<Void, Never>?
 
     /// Per-`serveId` result callbacks, so a verification's outcome reaches the caller
     /// that enqueued it — not whoever happens to be draining the queue. One-shot:
     /// removed the first time the task is attempted, so it can't be misrouted to
-    /// another play. Guarded by `lock`.
+    /// another play. Executor-confined.
     private var activeCallbacks: [String: @Sendable (Result<String?, Error>) -> Void] = [:]
 
     private init() {
         self.verifier = SimulaAPI()
-        self.defaults = .standard
+        let fallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Application Support/SimulaAdSDK", isDirectory: true)
+            .appendingPathComponent("pending_reward_verifications.json")
+        let url = DurableJSONQueueStore<PendingVerification>.applicationSupportURL(fileName: "pending_reward_verifications.json") ?? fallback
+        self.store = FileRewardVerificationStore(fileURL: url)
         self.now = { Date().timeIntervalSince1970 }
+        self.launchGate = LaunchSettledGate.shared
+        self.persistenceSleep = Self.defaultPersistenceSleep
+        self.loadSleep = Self.defaultPersistenceSleep
         self.sleep = { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
@@ -102,8 +124,31 @@ public final class RewardVerificationManager: @unchecked Sendable {
         sleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) {
         self.verifier = verifier
-        self.defaults = defaults
+        self.store = UserDefaultsRewardVerificationStore(defaults)
         self.now = now
+        self.launchGate = ImmediateLaunchSettledGate.shared
+        self.persistenceSleep = Self.defaultPersistenceSleep
+        self.loadSleep = Self.defaultPersistenceSleep
+        self.sleep = sleep ?? { delay in
+            do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
+        }
+    }
+
+    init(
+        verifier: RewardVerifying,
+        store: RewardVerificationStoring,
+        now: @escaping @Sendable () -> TimeInterval,
+        sleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
+        persistenceSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        loadSleep: (@Sendable (TimeInterval) async -> Void)? = nil
+    ) {
+        self.verifier = verifier
+        self.store = store
+        self.now = now
+        self.launchGate = launchGate
+        self.persistenceSleep = persistenceSleep ?? Self.defaultPersistenceSleep
+        self.loadSleep = loadSleep ?? Self.defaultPersistenceSleep
         self.sleep = sleep ?? { delay in
             do { try await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000)) } catch { return }
         }
@@ -120,15 +165,54 @@ public final class RewardVerificationManager: @unchecked Sendable {
         adUnitId: String = "",
         completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
     ) {
-        lock.lock()
-        // Register before enqueueing so a drain already in flight (which reloads the
-        // queue each iteration and can pick this task up) still routes the result here.
-        if let completion = completion {
-            activeCallbacks[serveId] = completion
+        executor.async { [weak self] in
+            self?.enqueueOnExecutor(
+                serveId: serveId,
+                sessionId: sessionId,
+                elapsedPlayTime: elapsedPlayTime,
+                adUnitId: adUnitId,
+                completion: completion
+            )
         }
-        var list = loadQueue()
-        if !list.contains(where: { $0.serveId == serveId }) {
-            list.append(
+    }
+
+    private func enqueueOnExecutor(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String,
+        completion: (@Sendable (Result<String?, Error>) -> Void)?
+    ) {
+        let loaded = loadIfNeeded()
+        if let completion { activeCallbacks[serveId] = completion }
+        guard loaded else {
+            if !pendingQueue.contains(where: { $0.serveId == serveId }) {
+                guard pendingQueue.count < maxPendingEnqueues else {
+                    Telemetry.shared.recordError(
+                        signature: "durable_queue:pending_full",
+                        breadcrumb: "queue=reward_verification"
+                    )
+                    let callback = activeCallbacks.removeValue(forKey: serveId)
+                    callbackQueue.async {
+                        callback?(.failure(SimulaAPIError.invalidResponse))
+                    }
+                    return
+                }
+                pendingQueue.append(
+                    PendingVerification(
+                        serveId: serveId,
+                        sessionId: sessionId,
+                        elapsedPlayTime: elapsedPlayTime,
+                        retryCount: 0,
+                        lastAttemptTimestamp: 0,
+                        adUnitId: adUnitId
+                    )
+                )
+            }
+            return
+        }
+        if !queue.contains(where: { $0.serveId == serveId }) {
+            queue.append(
                 PendingVerification(
                     serveId: serveId,
                     sessionId: sessionId,
@@ -138,161 +222,204 @@ public final class RewardVerificationManager: @unchecked Sendable {
                     adUnitId: adUnitId
                 )
             )
-            saveQueue(list)
+            isDirty = true
+            persistIfNeeded()
+        } else if !isDirty {
+            processNextIfPossible()
         }
-        lock.unlock()
-
-        triggerProcessQueue()
     }
 
     /// Drains any persisted verifications that are eligible under their backoff.
     /// Call at app launch to recover work left over from a previous session.
     public func triggerProcessQueue() {
-        lock.lock()
-        if isProcessing {
-            lock.unlock()
-            return
+        executor.async { [weak self] in
+            guard let self else { return }
+            guard self.loadIfNeeded() else { return }
+            if self.isDirty { self.persistIfNeeded() }
+            else { self.processNextIfPossible() }
         }
-        isProcessing = true
-        lock.unlock()
-
-        Task { await self.processQueue() }
     }
 
     // MARK: - Processing
 
-    private func processQueue() async {
-        // True when we stop because a task hit a retryable error: its peers (if any)
-        // are intentionally left for a later trigger, so we must NOT immediately re-drain.
-        var bailedForBackoff = false
+    private func processNextIfPossible() {
+        guard isLoaded, !isDirty, !isProcessing else { return }
+        let nowTs = now()
+        guard let task = queue.first(where: {
+            nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
+        }) else { return }
+        isProcessing = true
+        Task { await self.verify(task) }
+    }
 
-        while let task = nextEligibleTask() {
-            do {
-                let res = try await verifier.verifyReward(
-                    serveId: task.serveId,
-                    sessionId: task.sessionId,
-                    elapsedPlayTime: task.elapsedPlayTime,
-                    adUnitId: task.adUnitId ?? ""
-                )
-                removeTask(serveId: task.serveId)
-                invokeCallback(serveId: task.serveId, .success(res.token))
-            } catch {
-                // A 4xx (except 408/429) is permanent: retrying won't help, so drop it.
-                if !isPermanentVerificationError(error) {
-                    // Keep the task for a later trigger; deliver this attempt's failure
-                    // to its caller once (the server-side SSV postback still lands on a
-                    // successful retry — the client signal is one-shot).
-                    recordAttempt(serveId: task.serveId)
-                    invokeCallback(serveId: task.serveId, .failure(error))
-                    bailedForBackoff = true
-                    break
-                } else {
-                    removeTask(serveId: task.serveId)
-                    invokeCallback(serveId: task.serveId, .failure(error))
-                }
-            }
+    private func verify(_ task: PendingVerification) async {
+        await launchGate.waitUntilSettled()
+        let result: Result<String?, Error>
+        do {
+            let response = try await verifier.verifyReward(
+                serveId: task.serveId,
+                sessionId: task.sessionId,
+                elapsedPlayTime: task.elapsedPlayTime,
+                adUnitId: task.adUnitId ?? ""
+            )
+            result = .success(response.token)
+        } catch {
+            result = .failure(error)
         }
-
-        finishProcessing(reDrainIfEligible: !bailedForBackoff)
+        executor.async { [weak self] in self?.complete(task: task, result: result) }
     }
 
-    /// Delivers a task's outcome to its registered caller exactly once, off the lock.
-    private func invokeCallback(serveId: String, _ result: Result<String?, Error>) {
-        lock.lock()
-        let callback = activeCallbacks.removeValue(forKey: serveId)
-        lock.unlock()
-        callback?(result)
-    }
-
-    /// Releases the processing claim and, under the SAME lock that observes the queue,
-    /// decides whether to re-drain. This closes the race where a verification enqueued
+    /// Releases the processing claim on the same serial executor that observes the queue,
+    /// then decides whether to re-drain. This closes the race where a verification enqueued
     /// just as the drain finished would otherwise sit idle until some later trigger: a
     /// task persisted concurrently is either seen here (→ re-trigger) or seen by the
-    /// enqueuer's own `triggerProcessQueue` once `isProcessing` is false.
-    private func finishProcessing(reDrainIfEligible: Bool) {
-        lock.lock()
+    /// enqueuer's own executor turn once `isProcessing` is false.
+    private func complete(task: PendingVerification, result: Result<String?, Error>) {
         isProcessing = false
-        var reDrain = false
+        let callback = activeCallbacks.removeValue(forKey: task.serveId)
         var retryDelay: TimeInterval?
-        let nowTs = now()
-        if reDrainIfEligible {
-            reDrain = loadQueue().contains { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
-        } else {
-            // Bailed on a retryable failure: schedule a wake at the earliest remaining backoff so
-            // the retry actually happens in-session, instead of waiting for the next enqueue or
-            // launch. Scheduled ONLY from the bail path (not from every pass with pending tasks),
-            // so a wake that finds nothing eligible — e.g. under a frozen test clock — terminates
-            // instead of rescheduling itself forever.
-            let queue = loadQueue()
-            if !queue.isEmpty {
-                let soonest = queue
-                    .map { rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp) }
-                    .min() ?? 0
-                // ≥1s floor: never hot-loop against a backend that just failed.
+        switch result {
+        case .success:
+            queue.removeAll { $0.serveId == task.serveId }
+        case .failure(let error):
+            if isPermanentVerificationError(error) {
+                queue.removeAll { $0.serveId == task.serveId }
+            } else if let index = queue.firstIndex(where: { $0.serveId == task.serveId }) {
+                queue[index].retryCount += 1
+                queue[index].lastAttemptTimestamp = now()
+                let nowTs = now()
+                let soonest = queue.map {
+                    rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
+                }.min() ?? 0
                 retryDelay = max(soonest, 1)
             }
         }
-        lock.unlock()
-        if reDrain { triggerProcessQueue() }
-        if let retryDelay { scheduleRetry(after: retryDelay) }
+        if let callback { pendingCallbacks.append((callback, result)) }
+        pendingNetworkRetryDelay = retryDelay
+        isDirty = true
+        persistIfNeeded()
     }
 
     /// Schedules (replacing any prior schedule) a queue drain after `delay`. A single pending
     /// wake is enough: every bail recomputes the earliest eligibility across the WHOLE queue,
     /// and a completed wake either drains or chains the next bail's schedule.
     private func scheduleRetry(after delay: TimeInterval) {
-        lock.lock()
         retryTask?.cancel()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         retryTask = Task { await self.runRetryWake(delay: delay) }
-        lock.unlock()
     }
 
     /// Retry-wake task body (named method — see the task-shape note in TelemetryManager).
     private func runRetryWake(delay: TimeInterval) async {
         await sleep(delay)
         guard !Task.isCancelled else { return }
-        triggerProcessQueue()
-    }
-
-    // MARK: - Queue state (lock-guarded)
-
-    private func nextEligibleTask() -> PendingVerification? {
-        lock.lock()
-        defer { lock.unlock() }
-        let nowTs = now()
-        return loadQueue().first { nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount) }
-    }
-
-    private func removeTask(serveId: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        var queue = loadQueue()
-        queue.removeAll { $0.serveId == serveId }
-        saveQueue(queue)
-    }
-
-    private func recordAttempt(serveId: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        var queue = loadQueue()
-        if let idx = queue.firstIndex(where: { $0.serveId == serveId }) {
-            queue[idx].retryCount += 1
-            queue[idx].lastAttemptTimestamp = now()
-        }
-        saveQueue(queue)
+        executor.async { [weak self] in self?.processNextIfPossible() }
     }
 
     // MARK: - Persistence
 
-    private func loadQueue() -> [PendingVerification] {
-        guard let data = defaults.data(forKey: userDefaultsKey) else { return [] }
-        return (try? JSONDecoder().decode([PendingVerification].self, from: data)) ?? []
+    @discardableResult
+    private func loadIfNeeded() -> Bool {
+        if isLoaded { return true }
+        if loadRetryTask != nil { return false }
+        return attemptLoad()
     }
 
-    private func saveQueue(_ queue: [PendingVerification]) {
-        if let data = try? JSONEncoder().encode(queue) {
-            defaults.set(data, forKey: userDefaultsKey)
+    @discardableResult
+    private func attemptLoad() -> Bool {
+        switch store.load() {
+        case .missing:
+            queue = []
+        case .loaded(let records):
+            queue = records
+        case .failed:
+            loadRetryCount += 1
+            Telemetry.shared.recordError(signature: "reward_verification:load_failed")
+            scheduleLoadRetry()
+            return false
         }
+        isLoaded = true
+        loadRetryCount = 0
+        loadRetryTask?.cancel()
+        loadRetryTask = nil
+        let hadPending = !pendingQueue.isEmpty
+        for pending in pendingQueue where !queue.contains(where: { $0.serveId == pending.serveId }) {
+            queue.append(pending)
+        }
+        pendingQueue.removeAll()
+        if hadPending {
+            // Persist the complete loaded + pending candidate even when every pending serve id
+            // deduped against recovered state. Only then may callbacks/sends use that recovery.
+            isDirty = true
+            persistIfNeeded()
+        } else {
+            processNextIfPossible()
+        }
+        return true
+    }
+
+    private func persistIfNeeded() {
+        guard isDirty, isLoaded else { return }
+        if store.save(queue) {
+            isDirty = false
+            persistenceRetryCount = 0
+            persistenceRetryTask?.cancel()
+            persistenceRetryTask = nil
+            durabilityCommitted()
+        } else {
+            persistenceRetryCount += 1
+            Telemetry.shared.recordError(signature: "reward_verification:persist_failed")
+            schedulePersistenceRetry()
+        }
+    }
+
+    private func durabilityCommitted() {
+        let callbacks = pendingCallbacks
+        pendingCallbacks.removeAll()
+        for (callback, result) in callbacks {
+            callbackQueue.async { callback(result) }
+        }
+        if let delay = pendingNetworkRetryDelay {
+            pendingNetworkRetryDelay = nil
+            scheduleRetry(after: delay)
+        } else {
+            processNextIfPossible()
+        }
+    }
+
+    private func schedulePersistenceRetry() {
+        guard persistenceRetryTask == nil else { return }
+        let delay = queuePersistenceBackoff(retryCount: persistenceRetryCount)
+        persistenceRetryTask = Task { await self.runPersistenceRetry(after: delay) }
+    }
+
+    private func runPersistenceRetry(after delay: TimeInterval) async {
+        await persistenceSleep(delay)
+        guard !Task.isCancelled else { return }
+        executor.async { [weak self] in
+            guard let self else { return }
+            self.persistenceRetryTask = nil
+            self.persistIfNeeded()
+        }
+    }
+
+    private func scheduleLoadRetry() {
+        guard loadRetryTask == nil else { return }
+        let delay = queuePersistenceBackoff(retryCount: loadRetryCount)
+        loadRetryTask = Task { await self.runLoadRetry(after: delay) }
+    }
+
+    private func runLoadRetry(after delay: TimeInterval) async {
+        await loadSleep(delay)
+        guard !Task.isCancelled else { return }
+        executor.async { [weak self] in
+            guard let self else { return }
+            self.loadRetryTask = nil
+            _ = self.attemptLoad()
+        }
+    }
+
+    private static let defaultPersistenceSleep: @Sendable (TimeInterval) async -> Void = { delay in
+        do { try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000)) } catch { return }
     }
 }

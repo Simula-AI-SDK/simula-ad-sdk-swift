@@ -35,7 +35,7 @@ import Foundation
 /// collaborators are `@Sendable` closures.
 final class Ipv4Beacon: @unchecked Sendable {
 
-    static let shared = Ipv4Beacon()
+    static let shared = Ipv4Beacon(launchGate: LaunchSettledGate.shared)
 
     /// The A-record-only host to beacon. MUST be a domain configured with ONLY A records (no
     /// AAAA) so the request is forced to resolve over IPv4. Empty = DISABLED.
@@ -48,6 +48,7 @@ final class Ipv4Beacon: @unchecked Sendable {
     private let send: @Sendable (URL) async -> Bool
     private let deviceId: @Sendable () -> String?
     private let now: @Sendable () -> Date
+    private let launchGate: LaunchSettling
 
     private let lock = NSLock()
     /// Identities whose beacon has SUCCESSFULLY fired this process (failures stay retryable).
@@ -64,12 +65,14 @@ final class Ipv4Beacon: @unchecked Sendable {
         urlString: String = Ipv4Beacon.defaultURLString,
         send: @escaping @Sendable (URL) async -> Bool = Ipv4Beacon.defaultSend,
         deviceId: @escaping @Sendable () -> String? = { SimulaDeviceId.value },
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared
     ) {
         self.urlString = urlString
         self.send = send
         self.deviceId = deviceId
         self.now = now
+        self.launchGate = launchGate
     }
 
     /// Fire (fire-and-forget) for the given identity. Deduped per (apiKey, sessionId, ppid) —
@@ -117,8 +120,16 @@ final class Ipv4Beacon: @unchecked Sendable {
 
     /// Fire task body (named method — see the task-shape note in TelemetryManager).
     private func runFire(key: String, generation gen: Int, url: URL) async {
+        await launchGate.waitUntilSettled()
+        guard isStillInFlight(key: key, generation: gen) else { return }
         let ok = await send(url)
         complete(key: key, generation: gen, ok: ok)
+    }
+
+    private func isStillInFlight(key: String, generation gen: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return gen == generation && inFlight.contains(key)
     }
 
     /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6) — same

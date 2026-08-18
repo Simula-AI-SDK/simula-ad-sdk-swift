@@ -109,7 +109,8 @@ final class TelemetryManagerTests: XCTestCase {
         ppid: String? = nil,
         gaid: String? = nil,
         debugLog: (@Sendable (String) -> Void)? = nil,
-        persistenceWaitTimeout: TimeInterval = 0.1
+        persistenceWaitTimeout: TimeInterval = 0.1,
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared
     ) -> TelemetryManager {
         TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -122,6 +123,7 @@ final class TelemetryManagerTests: XCTestCase {
             now: { 1_000 },
             random: random,
             backoff: { _ in 0 }, // instant retries — keep tests fast
+            launchGate: launchGate,
             debugLog: debugLog,
             flushThreshold: 20,
             flushInterval: 0.05, // sub-threshold perf flushes promptly via the timer
@@ -263,6 +265,22 @@ final class TelemetryManagerTests: XCTestCase {
 
         XCTAssertTrue(allEvents(sender.batches).contains { $0.eventId == "id-prev" })
         await waitUntil { store.load().isEmpty }
+    }
+
+    func testRecoveredTelemetryDoesNotSendUntilLaunchSettles() async {
+        let seeded = TelemetryEvent(type: TelemetryType.error, name: "recovered", eventId: "old", timestamp: 1)
+        let store = FakeStore([seeded])
+        let sender = FakeSender()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: store, sender: sender, launchGate: gate)
+
+        mgr.start()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sender.attemptCount, 0)
+        XCTAssertEqual(store.load().map(\.eventId), ["old"], "recovery may load promptly but cannot send early")
+
+        await gate.open()
+        await waitUntil { sender.attemptCount == 1 && store.load().isEmpty }
     }
 
     // MARK: - Retry + drop
