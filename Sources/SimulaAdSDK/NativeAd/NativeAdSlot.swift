@@ -323,7 +323,8 @@ public struct NativeAdSlot: View {
 
     private var mountRequestKey: String? {
         guard case .filled(let response) = phase else { return nil }
-        return "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)"
+        // Admission is part of the task identity so resetting it remounts an unchanged creative.
+        return "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)|\(mountAdmitted)"
     }
 
     @MainActor

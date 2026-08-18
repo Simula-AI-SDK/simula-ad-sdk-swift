@@ -341,16 +341,17 @@ final class RewardVerificationManagerTests: XCTestCase {
     }
 
     /// Re-enqueue after the backoff window must retry — distinct from the automatic
-    /// wake path below. Injected sleeper so a 5xx does not park on wall-clock 5s
-    /// (and so XCTest does not wait on that leftover Task under simulator load).
+    /// wake path below. Injected store/sleeper avoid simulator persistence and wall-clock
+    /// stalls while keeping the persist-before-retry behavior under test.
     func testBackedOffTaskIsRetriedAfterItsDelay() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
         let clock = TestClock(0)
         let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(saveResults: [])
         let mgr = RewardVerificationManager(
             verifier: verifier,
-            defaults: defaults,
+            store: store,
             now: { clock.time },
             sleep: { await sleeper.sleep($0) }
         )
@@ -364,7 +365,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         let requested = await sleeper.waitForSleepRequest()
         XCTAssertEqual(requested, 5, accuracy: 0.01, "backoff(1) = 5s must drive the wake delay")
         XCTAssertEqual(verifier.callCount("A"), 1)
-        XCTAssertEqual(persistedQueue().first?.retryCount, 1) // recorded at t=0; backoff(1)=5s
+        XCTAssertEqual(store.persisted.first?.retryCount, 1) // recorded at t=0; backoff(1)=5s
 
         // Become eligible, then re-enqueue (dedup → fresh callback + trigger). Leave
         // the wake parked so this drain is the re-enqueue path, not the scheduled wake.
@@ -373,9 +374,9 @@ final class RewardVerificationManagerTests: XCTestCase {
         clock.time = 5
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
 
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { store.persisted.isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2) // attempted again only after the delay
-        XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(store.persisted.isEmpty)
         XCTAssertTrue(sleeper.isSleeping, "re-enqueue must drain without consuming the scheduled wake")
     }
 
