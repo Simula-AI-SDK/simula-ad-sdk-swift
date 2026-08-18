@@ -15,8 +15,8 @@ import UIKit
 /// hand a permanently-blank view back to the next attach).
 ///
 /// The LRU is bounded by `maxRetained`; the eldest **idle** session is destroyed when the cap is
-/// exceeded, and everything idle is dropped on a memory warning. An attached (on-screen) session is
-/// never destroyed by eviction — its representable still owns the view.
+/// exceeded, and everything idle is dropped on a memory warning or background transition. An
+/// attached (on-screen) session is never destroyed by eviction — its representable still owns it.
 ///
 /// Blank impression ids (previews) never reach this store — `WebViewRepresentable` keeps them on
 /// the ephemeral `WebViewPool` path, preserving the one-shot behavior for QA creatives.
@@ -293,18 +293,29 @@ final class NativeAdWebViewStore {
     }
 
     private func handleMemoryPressure() {
-        retentionBlockedUntil = max(
-            retentionBlockedUntil,
-            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        retentionBlockedUntil = SimulaWebViewPolicy.blockedUntil(
+            current: retentionBlockedUntil,
+            now: ProcessInfo.processInfo.systemUptime,
+            event: .memoryPressure
+        )
+        evictAllIdle()
+    }
+
+    func handleRendererDeath() {
+        retentionBlockedUntil = SimulaWebViewPolicy.blockedUntil(
+            current: retentionBlockedUntil,
+            now: ProcessInfo.processInfo.systemUptime,
+            event: .rendererDeath
         )
         evictAllIdle()
     }
 
     private func handleBackground() {
         applicationActive = false
-        retentionBlockedUntil = max(
-            retentionBlockedUntil,
-            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        retentionBlockedUntil = SimulaWebViewPolicy.blockedUntil(
+            current: retentionBlockedUntil,
+            now: ProcessInfo.processInfo.systemUptime,
+            event: .background
         )
         evictAllIdle()
     }
@@ -384,6 +395,8 @@ private final class DetachedRenderMonitor: NSObject, WKNavigationDelegate {
             errorCode: "render_terminated",
             breadcrumb: "native_ad_detached"
         )
+        WebViewPool.shared.handleRendererDeath()
+        NativeAdWebViewStore.shared.handleRendererDeath()
         NativeAdWebViewStore.markUnusable(viewID: ObjectIdentifier(webView))
     }
 

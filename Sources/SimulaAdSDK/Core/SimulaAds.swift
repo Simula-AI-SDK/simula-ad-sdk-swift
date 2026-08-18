@@ -29,7 +29,7 @@ import Foundation
 /// `initialize` is deliberately cheap: it only builds the provider and kicks the deferred
 /// startup (`SimulaProvider.start()`), which moves IDFV/UA syscalls, the shared URLSession
 /// build, telemetry install, the version check, and session warm-up off the caller's critical
-/// path. WebViews prewarm only from active ad demand, never unconditionally at process launch.
+/// path. Ad load/preload APIs perform network work only; WebViews are created by visible UI surfaces.
 ///
 /// IMPORTANT: every member here — including `initialize` — is `@MainActor`-isolated, so it MUST be
 /// called on the main thread. App launch (`application(_:didFinishLaunching…)`, SwiftUI `App.init`)

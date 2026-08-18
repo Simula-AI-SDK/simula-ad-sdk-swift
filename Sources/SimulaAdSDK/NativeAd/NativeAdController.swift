@@ -23,10 +23,6 @@ enum NativeAdController {
         let sessionId = await provider.ensureSession()
         guard let sessionId, !sessionId.isEmpty else { throw SimulaAdError.noSession }
 
-        // Demand-only prewarm: overlap WebKit startup with the native load request, but never
-        // allocate during process launch/background. The pool safely no-ops under pressure.
-        WebViewPool.shared.prewarm(trigger: "native_load")
-
         do {
             return try await SimulaAPI().loadNative(
                 position: position,

@@ -21,6 +21,19 @@ enum SimulaWebViewPolicy {
         isMemoryConstrained(totalRamBytes: totalRamBytes) ? constrainedRetainedCap : normalRetainedCap
     }
 
+    static func blockedUntil(
+        current: TimeInterval,
+        now: TimeInterval,
+        event: SimulaWebViewLifecycleEvent
+    ) -> TimeInterval {
+        switch event {
+        case .background:
+            return current
+        case .memoryPressure, .rendererDeath:
+            return max(current, now + cooldown)
+        }
+    }
+
     static func canRetain(
         maxIdle: Int,
         idleCount: Int,
@@ -52,6 +65,12 @@ enum SimulaWebViewPolicy {
     }
 }
 
+enum SimulaWebViewLifecycleEvent {
+    case background
+    case memoryPressure
+    case rendererDeath
+}
+
 enum SimulaWebViewPrewarmDecision: String, Hashable {
     case warm = "warmed"
     case constrained
@@ -69,10 +88,105 @@ struct SimulaWebViewPrewarmSkipGate {
     }
 }
 
+/// Paces required native-ad mounts without moving WebKit work off the main actor. The frame wait is
+/// injected so queue order, pacing, and cancellation stay deterministic in tests.
+@MainActor
+final class NativeAdMountScheduler {
+    typealias FrameWait = @MainActor () async -> Void
+
+    #if os(iOS)
+    static let shared = NativeAdMountScheduler(waitForNextFrame: waitForNativeAdDisplayFrame)
+    #endif
+
+    private let waitForNextFrame: FrameWait
+    private var order: [UUID] = []
+    private var continuations: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var frameTask: Task<Void, Never>?
+
+    init(waitForNextFrame: @escaping FrameWait) {
+        self.waitForNextFrame = waitForNextFrame
+    }
+
+    var pendingCount: Int { continuations.count }
+
+    func waitForAdmission() async -> Bool {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { return false }
+            return await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                order.append(id)
+                continuations[id] = continuation
+                scheduleFrameIfNeeded()
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor in self?.cancel(id) }
+        }
+    }
+
+    private func scheduleFrameIfNeeded() {
+        guard frameTask == nil, !continuations.isEmpty else { return }
+        frameTask = Task { @MainActor [weak self] in await self?.runFrame() }
+    }
+
+    private func runFrame() async {
+        await waitForNextFrame()
+        frameTask = nil
+        guard !Task.isCancelled else { return }
+
+        while !order.isEmpty {
+            let id = order.removeFirst()
+            if let continuation = continuations.removeValue(forKey: id) {
+                continuation.resume(returning: true)
+                break
+            }
+        }
+        scheduleFrameIfNeeded()
+    }
+
+    private func cancel(_ id: UUID) {
+        if let index = order.firstIndex(of: id) { order.remove(at: index) }
+        continuations.removeValue(forKey: id)?.resume(returning: false)
+    }
+}
+
 #if os(iOS)
 import WebKit
 import UIKit
 import os
+
+@MainActor
+private final class NativeAdDisplayLinkWaiter: NSObject {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var displayLink: CADisplayLink?
+
+    init(continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func start() {
+        let displayLink = CADisplayLink(target: self, selector: #selector(frameDidArrive))
+        self.displayLink = displayLink
+        displayLink.add(to: .main, forMode: .common)
+    }
+
+    @objc private func frameDidArrive() {
+        displayLink?.invalidate()
+        displayLink = nil
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+@MainActor
+private func waitForNativeAdDisplayFrame() async {
+    await withCheckedContinuation { continuation in
+        NativeAdDisplayLinkWaiter(continuation: continuation).start()
+    }
+}
 
 // MARK: - MessageForwarder
 
@@ -103,8 +217,7 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
 
 // MARK: - WebViewPool
 
-/// Prewarms and reuses `WKWebView` instances to keep the cold-start cost off the
-/// ad path.
+/// Reuses `WKWebView` instances and supports explicit prewarming for an already-open minigame UI.
 ///
 /// The first `WKWebView` an app creates is expensive: it allocates the view,
 /// initializes WebKit, and brings up a Web Content process. By creating a web
@@ -309,9 +422,8 @@ final class WebViewPool {
         )
     }
 
-    /// Returns a web view wired to `delegate` and `onMessage`, reusing a
-    /// prewarmed one when available. Schedules a refill so the next acquire
-    /// (e.g. the post-game ad) is also warm.
+    /// Returns a web view wired to `delegate` and `onMessage`, reusing a prewarmed one when available.
+    /// Acquiring never refills speculatively; only an explicit, open minigame surface may prewarm.
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (String) -> Void
@@ -332,10 +444,6 @@ final class WebViewPool {
         pooled.webView.uiDelegate = delegate
 
         active[ObjectIdentifier(pooled.webView)] = pooled
-
-        // Refill on the next runloop turn so this acquire returns immediately and
-        // the following one (e.g. the post-game ad) is also warm.
-        Task { @MainActor [weak self] in self?.prewarm(trigger: "acquire_refill") }
 
         // Warm (pool hit) vs cold (had to create) — surfaces prewarm effectiveness + cold cost.
         Telemetry.shared.recordOperation(
@@ -394,19 +502,25 @@ final class WebViewPool {
     }
 
     private func handleMemoryPressure() {
-        poolingBlockedUntil = max(
-            poolingBlockedUntil,
-            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
+        poolingBlockedUntil = SimulaWebViewPolicy.blockedUntil(
+            current: poolingBlockedUntil,
+            now: ProcessInfo.processInfo.systemUptime,
+            event: .memoryPressure
+        )
+        clear()
+    }
+
+    func handleRendererDeath() {
+        poolingBlockedUntil = SimulaWebViewPolicy.blockedUntil(
+            current: poolingBlockedUntil,
+            now: ProcessInfo.processInfo.systemUptime,
+            event: .rendererDeath
         )
         clear()
     }
 
     private func handleBackground() {
         applicationActive = false
-        poolingBlockedUntil = max(
-            poolingBlockedUntil,
-            ProcessInfo.processInfo.systemUptime + SimulaWebViewPolicy.cooldown
-        )
         clear()
     }
 
@@ -417,8 +531,7 @@ final class WebViewPool {
 
     private static func prewarmTrigger(_ value: String) -> String {
         switch value {
-        case "native_load", "interstitial_ready", "rewarded_ready", "minigame_menu",
-             "minigame_game", "acquire_refill":
+        case "minigame_menu", "minigame_game":
             return value
         default:
             return "demand"
