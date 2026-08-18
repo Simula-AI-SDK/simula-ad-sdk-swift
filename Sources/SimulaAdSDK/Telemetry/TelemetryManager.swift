@@ -96,9 +96,13 @@ final class TelemetryManager: @unchecked Sendable {
     private var droppedCount = 0
     private var isFlushing = false
     private var flushScheduled = false
+    private var immediateFlushScheduled = false
+    private var retryScheduled = false
     private var retryCount = 0
     private var isEnabled: Bool
     private var perfSampledIn: Bool
+    private var recoveryStarted = false
+    private var recoveryCompleted = false
     private var sessionId: String?
 
     // Aux session state for the funnel / time-to-first-ad / experiment, guarded by `lock`.
@@ -159,22 +163,45 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Recover any buffer left by a prior process, then attempt a flush.
     func start() {
-        Task { [weak self] in await self?.recoverAndFlush() }
-    }
-
-    private func recoverAndFlush() async {
-        recover()
-        await flush()
-    }
-
-    /// Synchronous (no `await`) so `NSLock` use stays out of async contexts (Swift 6).
-    private func recover() {
         lock.lock()
-        for e in store.load() {
-            if e.type == TelemetryType.error, !e.name.isEmpty { errorAgg[aggregationKey(for: e)] = e }
-            else { buffer.append(e) }
+        if recoveryStarted {
+            lock.unlock()
+            return
         }
+        recoveryStarted = true
         lock.unlock()
+        persistQueue.async { [weak self] in self?.recoverOnPersistenceQueue() }
+    }
+
+    private func recoverOnPersistenceQueue() {
+        let recovered = store.load()
+        lock.lock()
+        if isEnabled {
+            var recoveredBuffer: [TelemetryEvent] = []
+            for event in recovered {
+                if event.type == TelemetryType.error, !event.name.isEmpty {
+                    let key = aggregationKey(for: event)
+                    if var existing = errorAgg[key] {
+                        let existingCount = max(1, existing.count ?? 1)
+                        let recoveredCount = max(1, event.count ?? 1)
+                        existing.count = existingCount >= Int.max - recoveredCount
+                            ? Int.max
+                            : existingCount + recoveredCount
+                        errorAgg[key] = existing
+                    } else {
+                        errorAgg[key] = event
+                    }
+                } else {
+                    recoveredBuffer.append(event)
+                }
+            }
+            buffer.insert(contentsOf: recoveredBuffer, at: 0)
+        }
+        recoveryCompleted = true
+        let snapshot = snapshotLocked()
+        lock.unlock()
+        requestImmediateFlush()
+        store.save(snapshot)
     }
 
     /// Push the live session id (from `SimulaProvider`) so the envelope can carry it without
@@ -188,6 +215,14 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         isEnabled = enabled
         perfSampledIn = enabled && random() < min(max(sampleRate, 0), 1)
+        if !enabled {
+            buffer.removeAll()
+            errorAgg.removeAll()
+            droppedCount = 0
+            funnel.removeAll()
+            retryCount = 0
+            if recoveryCompleted { persistAsync([]) }
+        }
         lock.unlock()
     }
 
@@ -315,7 +350,8 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
         if var existing = errorAgg[aggregateKey] {
-            existing.count = (existing.count ?? 1) + 1
+            let count = existing.count ?? 1
+            existing.count = count < Int.max ? count + 1 : Int.max
             errorAgg[aggregateKey] = existing
         } else if errorAgg.count < maxErrorSignatures {
             var e = newEvent(type: TelemetryType.error, name: signature)
@@ -331,15 +367,14 @@ final class TelemetryManager: @unchecked Sendable {
             droppedCount += 1
         }
         let logEvent = errorAgg[aggregateKey]
-        let snapshot = snapshotLocked()
-        persistAsync(snapshot)
+        if recoveryCompleted { persistAsync(snapshotLocked()) }
         lock.unlock()
         // Persist off the caller's thread (often the main thread during ad-failure
         // callbacks). The serial queue keeps the write ordered and prompt, so the error
         // still lands quickly before a possible crash without blocking the caller on a
         // JSON encode + UserDefaults write.
         if let logEvent { debugLog?(formatForLog(logEvent)) }
-        Task { [weak self] in await self?.flush() } // eager — an error may precede a crash/kill
+        requestImmediateFlush() // eager — an error may precede a crash/kill
     }
 
     /// Persist + attempt a flush now (e.g. app background).
@@ -347,7 +382,7 @@ final class TelemetryManager: @unchecked Sendable {
         // Emit the session funnel deltas + a diagnostics sample as part of this (background) flush.
         emitSummaries()
         persistNow()
-        Task { [weak self] in await self?.flush() }
+        requestImmediateFlush()
     }
 
     private func emitSummaries() {
@@ -388,6 +423,10 @@ final class TelemetryManager: @unchecked Sendable {
         // App-background path: enqueue the snapshot in state-mutation order, then release the
         // lock before waiting for it to land so nothing is lost on suspension.
         lock.lock()
+        guard recoveryCompleted else {
+            lock.unlock()
+            return
+        }
         let persistence = persistAsync(snapshotLocked())
         lock.unlock()
         _ = persistence.wait(timeout: .now() + persistenceWaitTimeout)
@@ -450,8 +489,7 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Rebuild the key after durable recovery from the token persisted in the existing breadcrumb.
     private func aggregationKey(for event: TelemetryEvent) -> String {
-        guard let breadcrumb = event.breadcrumb else { return event.name }
-        let fields = breadcrumb.split(separator: ";")
+        let fields = event.breadcrumb?.split(separator: ";") ?? []
         let dedupe = fields.first { $0.hasPrefix("dedupe=") }
         let fingerprint = fields.first { $0.hasPrefix("fp=") }
         let value: String?
@@ -505,7 +543,7 @@ final class TelemetryManager: @unchecked Sendable {
         debugLog?(formatForLog(event))
         if triggersFlush {
             if shouldFlush {
-                Task { [weak self] in await self?.flush() }
+                requestImmediateFlush()
             } else {
                 scheduleTimedFlush()
             }
@@ -548,7 +586,8 @@ final class TelemetryManager: @unchecked Sendable {
     /// Returns `nil` when another flush is in flight or there's nothing to send.
     private func beginFlush() -> FlushBatch? {
         lock.lock(); defer { lock.unlock() }
-        if isFlushing || (buffer.isEmpty && errorAgg.isEmpty) { return nil }
+        if !recoveryCompleted || !isEnabled || retryScheduled || isFlushing
+            || (buffer.isEmpty && errorAgg.isEmpty) { return nil }
         isFlushing = true
         let pendingBuffer = buffer
         let pendingErrorEntries = Array(errorAgg)
@@ -567,7 +606,14 @@ final class TelemetryManager: @unchecked Sendable {
         events = events.map { e in
             guard e.eventAgeMs == nil else { return e }
             var c = e
-            c.eventAgeMs = Int(stampClock - e.timestamp)
+            let age = stampClock - e.timestamp
+            if !age.isFinite || age >= Double(Int.max / 2) {
+                c.eventAgeMs = Int.max
+            } else if age <= 0 {
+                c.eventAgeMs = 0
+            } else {
+                c.eventAgeMs = Int(age)
+            }
             return c
         }
         let body = (try? JSONEncoder().encode(envelopeLocked(events: events))) ?? Data()
@@ -604,7 +650,7 @@ final class TelemetryManager: @unchecked Sendable {
             result = (buffer.count >= flushThreshold || !errorAgg.isEmpty || hasPendingSummary, false)
         case .retry:
             snapshot = snapshotLocked()
-            retryCount += 1
+            if retryCount < Int.max { retryCount += 1 }
             isFlushing = false
             result = (false, true)
         }
@@ -668,14 +714,48 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     private func scheduleRetry() {
-        let rc = currentRetryCount()
+        lock.lock()
+        if retryScheduled || !isEnabled {
+            lock.unlock()
+            return
+        }
+        retryScheduled = true
+        let rc = retryCount
+        lock.unlock()
         Task { [weak self] in await self?.retryFlush(after: rc) }
     }
 
     /// Retry-flush task body (named method — see the task-shape note above).
     private func retryFlush(after retryCount: Int) async {
         do { try await Task.sleep(nanoseconds: UInt64(backoff(retryCount) * 1_000_000_000)) } catch {}
+        releaseRetrySchedule()
         await flush()
+    }
+
+    private func requestImmediateFlush() {
+        guard claimImmediateFlushSchedule() else { return }
+        Task { [weak self] in await self?.runImmediateFlush() }
+    }
+
+    private func runImmediateFlush() async {
+        await flush()
+        finishImmediateFlush()
+    }
+
+    private func claimImmediateFlushSchedule() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if immediateFlushScheduled || retryScheduled || !recoveryCompleted || !isEnabled { return false }
+        immediateFlushScheduled = true
+        return true
+    }
+
+    private func finishImmediateFlush() {
+        lock.lock()
+        immediateFlushScheduled = false
+        let needsAnotherFlush = isEnabled && !retryScheduled && !isFlushing
+            && (!errorAgg.isEmpty || buffer.count >= flushThreshold)
+        lock.unlock()
+        if needsAnotherFlush { requestImmediateFlush() }
     }
 
     // Synchronous lock-guarded accessors so the schedulers' async closures never touch NSLock.
@@ -688,7 +768,7 @@ final class TelemetryManager: @unchecked Sendable {
 
     private func releaseFlushSchedule() { lock.lock(); flushScheduled = false; lock.unlock() }
 
-    private func currentRetryCount() -> Int { lock.lock(); defer { lock.unlock() }; return retryCount }
+    private func releaseRetrySchedule() { lock.lock(); retryScheduled = false; lock.unlock() }
 }
 
 /// Exponential backoff for failed telemetry batches: 2s, 4s, 8s … capped at 60s.

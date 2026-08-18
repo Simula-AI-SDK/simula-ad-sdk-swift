@@ -274,7 +274,7 @@ final class AdBeaconManagerTests: XCTestCase {
 
     func testInitialSaveFailuresBlockSendAndRetainSubsequentEnqueues() async {
         let sender = FakeBeaconSender()
-        let store = ScriptedBeaconStore(saveResults: [false, false, true])
+        let store = ScriptedBeaconStore(saveResults: [false, true])
         let persistenceSleep = ControllablePersistenceSleep()
         let mgr = AdBeaconManager(
             sender: sender,
@@ -289,9 +289,9 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.totalCalls, 0)
 
         mgr.enqueue(impressionId: "B", action: "seen")
-        await waitUntil { store.saveCount == 2 }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(store.saveCount, 1, "new enqueues must merge behind the one persistence retry")
         XCTAssertEqual(sender.totalCalls, 0)
-        XCTAssertEqual(store.lastCandidate.map(\.impressionId), ["A", "B"])
 
         persistenceSleep.release()
         await waitUntil { sender.totalCalls == 2 && store.persisted.isEmpty }
@@ -316,8 +316,10 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.callCount("A", "seen"), 1)
         XCTAssertEqual(store.persisted.map(\.impressionId), ["A"], "failed removal must leave durable state intact")
 
+        mgr.enqueue(impressionId: "A", action: "seen")
         try? await Task.sleep(nanoseconds: 30_000_000)
         XCTAssertEqual(sender.callCount("A", "seen"), 1)
+        XCTAssertEqual(store.saveCount, 2, "duplicate enqueue must wait for the pending removal commit")
         persistenceSleep.release()
         await waitUntil { store.persisted.isEmpty }
         XCTAssertEqual(sender.callCount("A", "seen"), 1)

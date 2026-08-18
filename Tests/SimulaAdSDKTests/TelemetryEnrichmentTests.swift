@@ -46,7 +46,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
         ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
         flushThreshold: Int = 20
     ) -> TelemetryManager {
-        TelemetryManager(
+        let manager = TelemetryManager(
             ctx: ctx,
             store: store,
             sender: sender,
@@ -64,6 +64,8 @@ final class TelemetryEnrichmentTests: XCTestCase {
             flushThreshold: flushThreshold,
             flushInterval: 0.05
         )
+        manager.start()
+        return manager
     }
 
     private func allEvents(_ s: [TelemetryEnvelope]) -> [TelemetryEvent] { s.flatMap { $0.events } }

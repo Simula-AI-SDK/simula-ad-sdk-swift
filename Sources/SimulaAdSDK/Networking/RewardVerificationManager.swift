@@ -82,6 +82,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private var persistenceRetryTask: Task<Void, Never>?
     private var loadRetryCount = 0
     private var loadRetryTask: Task<Void, Never>?
+    private var pendingRemovalServeIds: Set<String> = []
     private var pendingCallbacks: [(@Sendable (Result<String?, Error>) -> Void, Result<String?, Error>)] = []
     private var pendingNetworkRetryDelay: TimeInterval?
     private let maxPendingEnqueues = 100
@@ -183,6 +184,15 @@ public final class RewardVerificationManager: @unchecked Sendable {
         adUnitId: String,
         completion: (@Sendable (Result<String?, Error>) -> Void)?
     ) {
+        guard elapsedPlayTime.isFinite else {
+            Telemetry.shared.recordError(
+                signature: "reward_verification:invalid_elapsed_time",
+                breadcrumb: "value=non_finite"
+            )
+            callbackQueue.async { completion?(.failure(SimulaAPIError.invalidResponse)) }
+            return
+        }
+        guard !pendingRemovalServeIds.contains(serveId) else { return }
         let loaded = loadIfNeeded()
         if let completion { activeCallbacks[serveId] = completion }
         guard loaded else {
@@ -280,12 +290,14 @@ public final class RewardVerificationManager: @unchecked Sendable {
         var retryDelay: TimeInterval?
         switch result {
         case .success:
+            pendingRemovalServeIds.insert(task.serveId)
             queue.removeAll { $0.serveId == task.serveId }
         case .failure(let error):
             if isPermanentVerificationError(error) {
+                pendingRemovalServeIds.insert(task.serveId)
                 queue.removeAll { $0.serveId == task.serveId }
             } else if let index = queue.firstIndex(where: { $0.serveId == task.serveId }) {
-                queue[index].retryCount += 1
+                if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
                 queue[index].lastAttemptTimestamp = now()
                 let nowTs = now()
                 let soonest = queue.map {
@@ -359,7 +371,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
     }
 
     private func persistIfNeeded() {
-        guard isDirty, isLoaded else { return }
+        guard isDirty, isLoaded, persistenceRetryTask == nil else { return }
         if store.save(queue) {
             isDirty = false
             persistenceRetryCount = 0
@@ -374,6 +386,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
     }
 
     private func durabilityCommitted() {
+        pendingRemovalServeIds.removeAll()
         let callbacks = pendingCallbacks
         pendingCallbacks.removeAll()
         for (callback, result) in callbacks {

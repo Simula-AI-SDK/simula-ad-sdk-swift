@@ -51,11 +51,12 @@ final class DurableJSONQueueStore<Record: Codable>: @unchecked Sendable {
             refusesWrites = true
             return .failed
         }
-        if writeLocked(legacy) {
-            legacyDefaults.removeObject(forKey: legacyKey)
+        guard writeLocked(legacy) else {
+            refusesWrites = true
+            return .failed
         }
+        legacyDefaults.removeObject(forKey: legacyKey)
         refusesWrites = false
-        // The complete legacy queue remains durable in UserDefaults if the migration write failed.
         return .loaded(legacy)
     }
 
@@ -68,15 +69,6 @@ final class DurableJSONQueueStore<Record: Codable>: @unchecked Sendable {
     }
 
     private func writeLocked(_ records: [Record]) -> Bool {
-        if records.isEmpty {
-            if !FileManager.default.fileExists(atPath: fileURL.path) { return true }
-            do {
-                try FileManager.default.removeItem(at: fileURL)
-                return true
-            } catch {
-                return false
-            }
-        }
         guard let data = try? JSONEncoder().encode(records) else { return false }
         do {
             try FileManager.default.createDirectory(

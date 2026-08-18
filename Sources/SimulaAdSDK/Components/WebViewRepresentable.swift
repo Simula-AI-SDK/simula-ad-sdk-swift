@@ -175,17 +175,36 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.onNavigationFinished = onNavigationFinished
+        coordinator.onNavigationFailed = onNavigationFailed
+        coordinator.onMessageReceived = onMessageReceived
+        coordinator.onAdClick = onAdClick
+        coordinator.bridge = bridge
+        coordinator.attribution = attribution
+        coordinator.externalClickOnly = externalClickOnly
+        coordinator.ctaTrackingUrl = ctaTrackingUrl
+        coordinator.ctaDestination = ctaDestination
+        coordinator.ctaStoreUrl = ctaStoreUrl
+        coordinator.reportsContentHeight = reportsContentHeight
+        coordinator.telemetryAdFormat = telemetryAdFormat
+        if coordinator.visibilityRelay !== visibilityRelay {
+            coordinator.visibilityRelay?.bind(nil)
+            coordinator.visibilityRelay = visibilityRelay
+            visibilityRelay?.bind(webView)
+        }
+
         // Re-apply every update: pool reuse + content-size churn can re-enable bounce even when
         // `isScrollEnabled` stays false (visible as a tiny rubber-band while the feed scrolls).
-        configureScrollBehavior(webView, coordinator: context.coordinator)
+        configureScrollBehavior(webView, coordinator: coordinator)
 
         // The slot can be recycled to a DIFFERENT serve in place (host list recycling updates
         // props without remaking this representable). The coordinator's id — set once in
         // makeCoordinator — must follow, or dismantle detaches under the wrong key; and the store
         // session retained under the old id must be re-keyed before the new creative loads into
         // its view, or a revisit of the old serve would reattach the wrong DOM.
-        if context.coordinator.retainedImpressionId != retainedImpressionId {
-            if let oldId = context.coordinator.retainedImpressionId, !oldId.isEmpty {
+        if coordinator.retainedImpressionId != retainedImpressionId {
+            if let oldId = coordinator.retainedImpressionId, !oldId.isEmpty {
                 NativeAdWebViewStore.shared.rebind(
                     webView,
                     from: oldId,
@@ -193,31 +212,33 @@ struct WebViewRepresentable: UIViewRepresentable {
                     creativeKey: storeCreativeKey
                 )
             }
-            context.coordinator.retainedImpressionId = retainedImpressionId
+            coordinator.retainedImpressionId = retainedImpressionId
             // A DIFFERENT serve must always issue a fresh navigation, even when its markup is
             // byte-identical to the previous serve's (templated creatives): the old page is live
             // DOM with the old serve's state (timers, macros, viewed animations) while clicks and
             // beacons already carry the new id. Clearing the load-tracking state makes the block
             // below re-issue the load; its didFinish then marks the rebound store session
             // loadCompleted, so the new serve is retained (not destroyed) on scroll-out.
-            context.coordinator.currentHTML = nil
-            context.coordinator.currentURL = nil
+            coordinator.currentHTML = nil
+            coordinator.currentURL = nil
+            coordinator.currentBaseURL = nil
         }
 
         // Only load if URL/HTML changed
-        let currentURL = context.coordinator.currentURL
-        let currentHTML = context.coordinator.currentHTML
+        let currentURL = coordinator.currentURL
+        let currentHTML = coordinator.currentHTML
 
-        if let html = htmlString, html != currentHTML {
-            context.coordinator.currentHTML = html
-            context.coordinator.currentURL = nil
-            context.coordinator.currentBaseURL = baseURL
-            context.coordinator.realLoadStarted = true
+        if let html = htmlString, html != currentHTML || baseURL != coordinator.currentBaseURL {
+            coordinator.currentHTML = html
+            coordinator.currentURL = nil
+            coordinator.currentBaseURL = baseURL
+            coordinator.realLoadStarted = true
             webView.loadHTMLString(html, baseURL: baseURL)
         } else if let url = url, url != currentURL {
-            context.coordinator.currentURL = url
-            context.coordinator.currentHTML = nil
-            context.coordinator.realLoadStarted = true
+            coordinator.currentURL = url
+            coordinator.currentHTML = nil
+            coordinator.currentBaseURL = nil
+            coordinator.realLoadStarted = true
             let request = URLRequest(url: url)
             webView.load(request)
         }

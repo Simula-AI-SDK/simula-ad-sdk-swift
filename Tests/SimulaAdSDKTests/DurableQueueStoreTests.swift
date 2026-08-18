@@ -115,10 +115,52 @@ final class DurableQueueStoreTests: XCTestCase {
             legacyDefaults: defaults
         )
 
-        XCTAssertEqual(beacons(from: store.load()), expected)
+        guard case .failed = store.load() else {
+            return XCTFail("a failed migration must block queue delivery")
+        }
         XCTAssertNotNil(defaults.data(forKey: "simula_pending_beacons"))
         XCTAssertFalse(store.save(expected))
         XCTAssertNotNil(defaults.data(forKey: "simula_pending_beacons"))
+    }
+
+    func testFailedMigrationRetriesTheWholeMigrationBeforeLoading() throws {
+        let defaults = isolatedDefaults()
+        let expected = [PendingBeacon(impressionId: "A", action: "seen")]
+        defaults.set(try JSONEncoder().encode(expected), forKey: "simula_pending_beacons")
+        let blockedParent = temporaryFile("blocked-parent")
+        try FileManager.default.createDirectory(
+            at: blockedParent.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not-a-directory".utf8).write(to: blockedParent)
+        let fileURL = blockedParent.appendingPathComponent("pending_beacons.json")
+        let store = FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults)
+
+        guard case .failed = store.load() else { return XCTFail("blocked migration must fail closed") }
+        try FileManager.default.removeItem(at: blockedParent)
+
+        XCTAssertEqual(beacons(from: store.load()), expected)
+        XCTAssertNil(defaults.data(forKey: "simula_pending_beacons"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
+    func testEmptyQueueFilePreventsStaleLegacyQueueResurrection() throws {
+        let defaults = isolatedDefaults()
+        let current = [PendingBeacon(impressionId: "current", action: "seen")]
+        let stale = [PendingBeacon(impressionId: "stale", action: "click")]
+        let fileURL = temporaryFile("empty-tombstone.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(current).write(to: fileURL)
+        defaults.set(try JSONEncoder().encode(stale), forKey: "simula_pending_beacons")
+        let store = FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults)
+
+        XCTAssertTrue(store.save([]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        // Model termination before stale migration cleanup: the current empty file must still win.
+        defaults.set(try JSONEncoder().encode(stale), forKey: "simula_pending_beacons")
+
+        let relaunched = FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults)
+        XCTAssertEqual(beacons(from: relaunched.load()), [])
     }
 
     func testPersistenceBackoffIsBounded() {

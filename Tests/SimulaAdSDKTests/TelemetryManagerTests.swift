@@ -110,9 +110,11 @@ final class TelemetryManagerTests: XCTestCase {
         gaid: String? = nil,
         debugLog: (@Sendable (String) -> Void)? = nil,
         persistenceWaitTimeout: TimeInterval = 0.1,
-        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
+        now: @escaping @Sendable () -> TimeInterval = { 1_000 },
+        backoff: @escaping @Sendable (Int) -> TimeInterval = { _ in 0 }
     ) -> TelemetryManager {
-        TelemetryManager(
+        let manager = TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
             store: store,
             sender: sender,
@@ -120,15 +122,17 @@ final class TelemetryManagerTests: XCTestCase {
             advertisingIdProvider: { gaid },
             enabled: enabled,
             sampleRate: sampleRate,
-            now: { 1_000 },
+            now: now,
             random: random,
-            backoff: { _ in 0 }, // instant retries — keep tests fast
+            backoff: backoff,
             launchGate: launchGate,
             debugLog: debugLog,
             flushThreshold: 20,
             flushInterval: 0.05, // sub-threshold perf flushes promptly via the timer
             persistenceWaitTimeout: persistenceWaitTimeout
         )
+        manager.start()
+        return manager
     }
 
     /// Thread-safe line collector for the debug-log tests.
@@ -150,7 +154,9 @@ final class TelemetryManagerTests: XCTestCase {
         for _ in 0..<3 {
             mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)
         }
-        await waitUntil { !sender.batches.isEmpty }
+        await waitUntil {
+            self.allEvents(sender.batches).filter { $0.type == TelemetryType.network }.count == 3
+        }
 
         let net = allEvents(sender.batches).filter { $0.type == TelemetryType.network }
         XCTAssertEqual(net.count, 3)
@@ -179,11 +185,10 @@ final class TelemetryManagerTests: XCTestCase {
         store.release()
         await waitUntil { store.saveCount >= 4 && store.load().isEmpty }
         let savedNames = store.savedNames
-        XCTAssertEqual(savedNames.count, 4)
-        XCTAssertEqual(Set(savedNames[0]), ["api:first"])
-        XCTAssertEqual(Set(savedNames[1]), ["api:first", "api:inflight"])
-        XCTAssertEqual(Set(savedNames[2]), ["api:inflight"])
-        XCTAssertTrue(savedNames[3].isEmpty)
+        XCTAssertTrue(savedNames.contains { Set($0) == ["api:first"] })
+        XCTAssertTrue(savedNames.contains { Set($0) == ["api:first", "api:inflight"] })
+        XCTAssertTrue(savedNames.contains { Set($0) == ["api:inflight"] })
+        XCTAssertTrue(savedNames.last?.isEmpty == true)
     }
 
     func testFlushNowDoesNotWaitIndefinitelyForBlockedPersistence() async {
@@ -283,6 +288,25 @@ final class TelemetryManagerTests: XCTestCase {
         await waitUntil { sender.attemptCount == 1 && store.load().isEmpty }
     }
 
+    func testErrorBurstCreatesOneLaunchGateWaiter() async {
+        let sender = FakeSender()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: FakeStore(), sender: sender, launchGate: gate)
+
+        for _ in 0..<100 { mgr.recordError(signature: "launch:error") }
+        await waitForGateWaiters(gate, count: 1)
+        let waiterCount = await gate.waitCount
+        XCTAssertEqual(waiterCount, 1)
+        XCTAssertEqual(sender.attemptCount, 0)
+
+        await gate.open()
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "launch:error" && $0.count == 100 }
+        }
+        let error = allEvents(sender.batches).first { $0.name == "launch:error" }
+        XCTAssertEqual(error?.count, 100)
+    }
+
     // MARK: - Retry + drop
 
     func testFailedBatchRetriesUntilAccepted() async {
@@ -297,6 +321,19 @@ final class TelemetryManagerTests: XCTestCase {
 
         XCTAssertEqual(sender.batches.count, 3, "1 initial attempt + 2 retries")
         XCTAssertTrue(sender.batches.allSatisfy { env in env.events.contains { $0.name == "api:net" } })
+    }
+
+    func testRetryBackoffCannotBeBypassedByImmediateFlush() async {
+        let sender = FakeSender()
+        sender.enqueueAcks([.retry, .accepted])
+        let mgr = build(store: FakeStore(), sender: sender, backoff: { _ in 0.1 })
+
+        mgr.recordError(signature: "api:backoff")
+        await waitUntil { sender.attemptCount == 1 }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sender.attemptCount, 1)
+
+        await waitUntil { sender.attemptCount == 2 }
     }
 
     func testPermanent4xxDropsWithoutRetry() async {
@@ -375,6 +412,45 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertTrue(store.load().isEmpty)
     }
 
+    func testServerKillSwitchDropsEventsWaitingForLaunchGate() async {
+        let store = FakeStore()
+        let sender = FakeSender()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: store, sender: sender, launchGate: gate)
+
+        mgr.recordError(signature: "queued-before-disable")
+        await waitForGateWaiters(gate, count: 1)
+        mgr.applyServerConfig(enabled: false, sampleRate: 1)
+        await gate.open()
+        await waitUntil { store.load().isEmpty }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(sender.attemptCount, 0)
+    }
+
+    func testRecoveredExtremeValuesCannotOverflowFlush() async {
+        var countExtreme = TelemetryEvent(type: TelemetryType.error, name: "count-extreme", eventId: "count-old", timestamp: 1_000)
+        countExtreme.count = Int.max
+        let ageExtreme = TelemetryEvent(type: TelemetryType.error, name: "age-extreme", eventId: "age-old", timestamp: -1e100)
+        let store = FakeStore([countExtreme, ageExtreme])
+        let sender = FakeSender()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: store, sender: sender, launchGate: gate)
+
+        mgr.start()
+        mgr.recordError(signature: "count-extreme")
+        await waitForGateWaiters(gate, count: 1)
+        await gate.open()
+        await waitUntil {
+            let names = self.allEvents(sender.batches).map(\.name)
+            return names.contains("count-extreme") && names.contains("age-extreme")
+        }
+
+        let events = allEvents(sender.batches)
+        XCTAssertEqual(events.first { $0.name == "count-extreme" }?.count, Int.max)
+        XCTAssertEqual(events.first { $0.name == "age-extreme" }?.eventAgeMs, Int.max)
+    }
+
     // MARK: - Consent-gated PII
 
     func testPiiIncludedWhenProvidedAndOmittedWhenNot() async {
@@ -393,5 +469,15 @@ final class TelemetryManagerTests: XCTestCase {
         await waitUntil { !noPii.batches.isEmpty }
         XCTAssertNil(noPii.batches.first?.primaryUserId)
         XCTAssertNil(noPii.batches.first?.advertisingId)
+    }
+
+    private func waitForGateWaiters(_ gate: ControllableLaunchSettledGate, count: Int) async {
+        let deadline = Date().addingTimeInterval(TestWait.timeout)
+        while Date() <= deadline {
+            if await gate.waitCount >= count { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let waiterCount = await gate.waitCount
+        XCTAssertGreaterThanOrEqual(waiterCount, count)
     }
 }

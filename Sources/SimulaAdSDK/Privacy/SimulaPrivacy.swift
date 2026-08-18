@@ -442,8 +442,15 @@ public final class SimulaPrivacy: ObservableObject {
         if Thread.isMainThread {
             snapshot = new
         } else {
-            DispatchQueue.main.async { [weak self] in self?.snapshot = new }
+            DispatchQueue.main.async { [weak self] in self?.publishCurrentSnapshot() }
         }
+    }
+
+    private func publishCurrentSnapshot() {
+        lock.lock()
+        let current = lockedSnapshot
+        lock.unlock()
+        snapshot = current
     }
 
     /// Builds the resolved snapshot. The caller MUST hold `lock`.

@@ -68,6 +68,11 @@ extension SimulaAPI: BeaconSending {}
 public final class AdBeaconManager: @unchecked Sendable {
     public static let shared = AdBeaconManager()
 
+    private struct BeaconKey: Hashable {
+        let impressionId: String
+        let action: String
+    }
+
     private let sender: BeaconSending
     private let store: AdBeaconStoring
     private let now: @Sendable () -> TimeInterval
@@ -85,6 +90,7 @@ public final class AdBeaconManager: @unchecked Sendable {
     private var persistenceRetryTask: Task<Void, Never>?
     private var loadRetryCount = 0
     private var loadRetryTask: Task<Void, Never>?
+    private var pendingRemovalKeys: Set<BeaconKey> = []
     private var pauseAfterPersistence = false
     private let maxPendingEnqueues = 100
 
@@ -178,6 +184,8 @@ public final class AdBeaconManager: @unchecked Sendable {
             enqueuePending(impressionId: impressionId, action: action, metadata: normalizedMetadata)
             return
         }
+        let key = BeaconKey(impressionId: impressionId, action: action)
+        guard !pendingRemovalKeys.contains(key) else { return }
         // An explicit enqueue is a fresh drain trigger once the latest full candidate is durable.
         pauseAfterPersistence = false
         var changed = false
@@ -261,10 +269,11 @@ public final class AdBeaconManager: @unchecked Sendable {
         }
         if let index {
             if delivered {
+                pendingRemovalKeys.insert(BeaconKey(impressionId: task.impressionId, action: task.action))
                 queue.remove(at: index)
                 pauseAfterPersistence = false
             } else {
-                queue[index].retryCount += 1
+                if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
                 queue[index].lastAttemptTimestamp = now()
                 // Preserve the existing bail-on-transient-failure behavior. A later enqueue,
                 // startup trigger, or explicit trigger can re-enter the drain after backoff.
@@ -318,9 +327,10 @@ public final class AdBeaconManager: @unchecked Sendable {
     }
 
     private func persistIfNeeded() {
-        guard isDirty, isLoaded else { return }
+        guard isDirty, isLoaded, persistenceRetryTask == nil else { return }
         if store.save(queue) {
             isDirty = false
+            pendingRemovalKeys.removeAll()
             persistenceRetryCount = 0
             persistenceRetryTask?.cancel()
             persistenceRetryTask = nil

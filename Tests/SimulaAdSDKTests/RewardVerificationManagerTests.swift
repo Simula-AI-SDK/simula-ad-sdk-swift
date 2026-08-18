@@ -244,6 +244,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         let store = ScriptedRewardStore(saveResults: [true, false, true])
         let persistenceSleep = ControllablePersistenceSleep()
         let callback = RewardCallbackRecorder()
+        let duplicateCallback = RewardCallbackRecorder()
         let mgr = RewardVerificationManager(
             verifier: verifier,
             store: store,
@@ -260,9 +261,38 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(callback.count, 0)
         XCTAssertEqual(store.persisted.map(\.serveId), ["A"])
 
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 1) {
+            duplicateCallback.record($0)
+        }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(verifier.callCount("A"), 1)
+        XCTAssertEqual(duplicateCallback.count, 0)
+
         persistenceSleep.release()
         await waitUntil { callback.count == 1 && store.persisted.isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
+        XCTAssertEqual(duplicateCallback.count, 0)
+    }
+
+    func testNonFiniteElapsedTimeDoesNotPoisonQueue() async {
+        let verifier = FakeVerifier()
+        verifier.setToken("token", for: "valid")
+        let store = ScriptedRewardStore(saveResults: [])
+        let invalidCallback = RewardCallbackRecorder()
+        let validCallback = RewardCallbackRecorder()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
+
+        mgr.queueVerification(serveId: "invalid", sessionId: "s", elapsedPlayTime: .nan) {
+            invalidCallback.record($0)
+        }
+        mgr.queueVerification(serveId: "valid", sessionId: "s", elapsedPlayTime: 1) {
+            validCallback.record($0)
+        }
+
+        await waitUntil { invalidCallback.count == 1 && validCallback.count == 1 }
+        XCTAssertEqual(verifier.callCount("invalid"), 0)
+        XCTAssertEqual(verifier.callCount("valid"), 1)
+        XCTAssertTrue(store.persisted.isEmpty)
     }
 
     func testRetryStateSaveFailureWithholdsFailureCallbackAndRetryWake() async {

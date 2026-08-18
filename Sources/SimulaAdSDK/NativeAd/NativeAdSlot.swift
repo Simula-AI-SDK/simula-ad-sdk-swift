@@ -396,6 +396,7 @@ public struct NativeAdSlot: View {
                 theme: NativeAdTheme.resolve(theme, isDark: colorScheme == .dark),
                 metadata: metadata
             )
+            guard !Task.isCancelled else { return }
             let ms = Int((DispatchTime.now().uptimeNanoseconds &- loadStartNanos) / 1_000_000)
             apply(response, source: "network", durationMs: ms, metadata: nil)
         } catch is CancellationError {
