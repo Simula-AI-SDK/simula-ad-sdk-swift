@@ -55,6 +55,9 @@ final class Ipv4Beacon: @unchecked Sendable {
     private var captured = Set<String>()
     /// Identities with a beacon in flight — claimed under `lock` so parallel fires coalesce.
     private var inFlight = Set<String>()
+    /// Fire tasks that have been launched but may still be waiting on the launch gate. Kept
+    /// separately from `inFlight`, which logout intentionally clears before those tasks resume.
+    private var runningTasks = 0
     /// Bumped on every `onLogout()`. A fire captures the generation it started with and
     /// re-checks it before recording; a mismatch means the session moved on mid-flight, so the
     /// completion is discarded instead of resurrecting stale dedup state after a logout reset.
@@ -100,6 +103,7 @@ final class Ipv4Beacon: @unchecked Sendable {
             return
         }
         inFlight.insert(key)
+        runningTasks += 1
         let gen = generation
         lock.unlock()
 
@@ -121,7 +125,10 @@ final class Ipv4Beacon: @unchecked Sendable {
     /// Fire task body (named method — see the task-shape note in TelemetryManager).
     private func runFire(key: String, generation gen: Int, url: URL) async {
         await launchGate.waitUntilSettled()
-        guard isStillInFlight(key: key, generation: gen) else { return }
+        guard isStillInFlight(key: key, generation: gen) else {
+            finishTask()
+            return
+        }
         let ok = await send(url)
         complete(key: key, generation: gen, ok: ok)
     }
@@ -137,6 +144,7 @@ final class Ipv4Beacon: @unchecked Sendable {
     private func complete(key: String, generation gen: Int, ok: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        runningTasks = max(0, runningTasks - 1)
         // A logout while in flight already cleared this key; bail instead of resurrecting a
         // stale captured/in-flight entry into the new session.
         if gen != generation { return }
@@ -144,11 +152,17 @@ final class Ipv4Beacon: @unchecked Sendable {
         if ok { captured.insert(key) }
     }
 
+    private func finishTask() {
+        lock.lock()
+        runningTasks = max(0, runningTasks - 1)
+        lock.unlock()
+    }
+
     /// True when no beacon is in flight. Test-only synchronization hook.
     var isIdleForTests: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return inFlight.isEmpty
+        return inFlight.isEmpty && runningTasks == 0
     }
 
     /// Pure URL construction — exposed for tests. Blank sid/ppid/did are omitted.

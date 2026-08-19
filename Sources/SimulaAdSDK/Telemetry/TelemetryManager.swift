@@ -73,6 +73,8 @@ final class TelemetryManager: @unchecked Sendable {
     private let now: @Sendable () -> TimeInterval
     private let random: @Sendable () -> Double
     private let backoff: @Sendable (Int) -> TimeInterval
+    private let timedFlushSleep: @Sendable (TimeInterval) async -> Void
+    private let retrySleep: @Sendable (TimeInterval) async -> Void
     private let launchGate: LaunchSettling
     // Dev-only sink: when set (devMode), each recorded event is logged here (already redacted).
     private let debugLog: (@Sendable (String) -> Void)?
@@ -97,12 +99,14 @@ final class TelemetryManager: @unchecked Sendable {
     private var isFlushing = false
     private var flushScheduled = false
     private var immediateFlushScheduled = false
+    private var immediateFlushIdleWaiters: [CheckedContinuation<Void, Never>] = []
     private var retryScheduled = false
     private var retryCount = 0
     private var isEnabled: Bool
     private var perfSampledIn: Bool
     private var recoveryStarted = false
     private var recoveryCompleted = false
+    private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
     private var sessionId: String?
 
     // Aux session state for the funnel / time-to-first-ad / experiment, guarded by `lock`.
@@ -129,6 +133,8 @@ final class TelemetryManager: @unchecked Sendable {
         now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 * 1000 },
         random: @escaping @Sendable () -> Double = { Double.random(in: 0..<1) },
         backoff: @escaping @Sendable (Int) -> TimeInterval = { telemetryBackoff(retryCount: $0) },
+        timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         debugLog: (@Sendable (String) -> Void)? = nil,
         flushThreshold: Int = 20,
@@ -150,6 +156,8 @@ final class TelemetryManager: @unchecked Sendable {
         self.createdAtMs = now()
         self.random = random
         self.backoff = backoff
+        self.timedFlushSleep = timedFlushSleep ?? Self.defaultSleep
+        self.retrySleep = retrySleep ?? Self.defaultSleep
         self.launchGate = launchGate
         self.debugLog = debugLog
         self.flushThreshold = flushThreshold
@@ -198,8 +206,11 @@ final class TelemetryManager: @unchecked Sendable {
             buffer.insert(contentsOf: recoveredBuffer, at: 0)
         }
         recoveryCompleted = true
+        let waiters = recoveryWaiters
+        recoveryWaiters.removeAll()
         let snapshot = snapshotLocked()
         lock.unlock()
+        waiters.forEach { $0.resume() }
         requestImmediateFlush()
         store.save(snapshot)
     }
@@ -704,10 +715,7 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Timed-flush task body (named method — see the task-shape note above).
     private func timedFlush() async {
-        // These tasks are never cancelled, so a sleep error is impossible in practice;
-        // swallow-and-continue preserves the prior `try?` semantics without putting a
-        // `try?`-wrapped await inside a Task closure.
-        do { try await Task.sleep(nanoseconds: UInt64(flushInterval * 1_000_000_000)) } catch {}
+        await timedFlushSleep(flushInterval)
         releaseFlushSchedule()
         emitSummaries()
         await flush()
@@ -727,7 +735,7 @@ final class TelemetryManager: @unchecked Sendable {
 
     /// Retry-flush task body (named method — see the task-shape note above).
     private func retryFlush(after retryCount: Int) async {
-        do { try await Task.sleep(nanoseconds: UInt64(backoff(retryCount) * 1_000_000_000)) } catch {}
+        await retrySleep(backoff(retryCount))
         releaseRetrySchedule()
         await flush()
     }
@@ -754,8 +762,37 @@ final class TelemetryManager: @unchecked Sendable {
         immediateFlushScheduled = false
         let needsAnotherFlush = isEnabled && !retryScheduled && !isFlushing
             && (!errorAgg.isEmpty || buffer.count >= flushThreshold)
+        let waiters = needsAnotherFlush ? [] : immediateFlushIdleWaiters
+        if !needsAnotherFlush { immediateFlushIdleWaiters.removeAll() }
         lock.unlock()
+        waiters.forEach { $0.resume() }
         if needsAnotherFlush { requestImmediateFlush() }
+    }
+
+    func waitForImmediateFlushIdleForTests() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if !immediateFlushScheduled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                immediateFlushIdleWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    func waitForRecoveryForTests() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if recoveryCompleted {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                recoveryWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 
     // Synchronous lock-guarded accessors so the schedulers' async closures never touch NSLock.
@@ -769,6 +806,10 @@ final class TelemetryManager: @unchecked Sendable {
     private func releaseFlushSchedule() { lock.lock(); flushScheduled = false; lock.unlock() }
 
     private func releaseRetrySchedule() { lock.lock(); retryScheduled = false; lock.unlock() }
+
+    private static let defaultSleep: @Sendable (TimeInterval) async -> Void = { delay in
+        do { try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000)) } catch { return }
+    }
 }
 
 /// Exponential backoff for failed telemetry batches: 2s, 4s, 8s … capped at 60s.

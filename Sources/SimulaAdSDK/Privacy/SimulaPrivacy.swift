@@ -50,6 +50,8 @@ public final class SimulaPrivacy: ObservableObject {
     private var foregroundObserver: NSObjectProtocol?
     private var advertisingRefreshScheduled = false
     private var advertisingRefreshGeneration = 0
+    private var automaticRefreshTasksInFlight = 0
+    private var automaticRefreshIdleWaiters: [CheckedContinuation<Void, Never>] = []
     private var lastAdvertisingStatusRefresh: TimeInterval?
     private var lastAdvertisingIdRefresh: TimeInterval?
     #if os(iOS)
@@ -304,6 +306,7 @@ public final class SimulaPrivacy: ObservableObject {
         }
         advertisingRefreshScheduled = true
         advertisingRefreshGeneration += 1
+        automaticRefreshTasksInFlight += 1
         let generation = advertisingRefreshGeneration
         lock.unlock()
         Task { await self.runScheduledAdvertisingRefresh(generation: generation) }
@@ -314,6 +317,7 @@ public final class SimulaPrivacy: ObservableObject {
     }
 
     private func runScheduledAdvertisingRefresh(generation: Int) async {
+        defer { finishAutomaticRefreshTask() }
         await launchGate.waitUntilSettled()
         guard shouldReadAdvertisingTracking(generation: generation) else { return }
         let statusRaw = await MainActor.run { advertisingTrackingStatusReader() }
@@ -323,6 +327,28 @@ public final class SimulaPrivacy: ObservableObject {
             applyAutomaticAdvertisingId(id, generation: generation)
         } else {
             recompute()
+        }
+    }
+
+    private func finishAutomaticRefreshTask() {
+        lock.lock()
+        automaticRefreshTasksInFlight = max(0, automaticRefreshTasksInFlight - 1)
+        let waiters = automaticRefreshTasksInFlight == 0 ? automaticRefreshIdleWaiters : []
+        if automaticRefreshTasksInFlight == 0 { automaticRefreshIdleWaiters.removeAll() }
+        lock.unlock()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitForAdvertisingRefreshIdleForTests() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if automaticRefreshTasksInFlight == 0 {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                automaticRefreshIdleWaiters.append(continuation)
+                lock.unlock()
+            }
         }
     }
 

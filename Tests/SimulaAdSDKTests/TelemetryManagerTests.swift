@@ -112,7 +112,9 @@ final class TelemetryManagerTests: XCTestCase {
         persistenceWaitTimeout: TimeInterval = 0.1,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         now: @escaping @Sendable () -> TimeInterval = { 1_000 },
-        backoff: @escaping @Sendable (Int) -> TimeInterval = { _ in 0 }
+        backoff: @escaping @Sendable (Int) -> TimeInterval = { _ in 0 },
+        timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) -> TelemetryManager {
         let manager = TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -125,6 +127,8 @@ final class TelemetryManagerTests: XCTestCase {
             now: now,
             random: random,
             backoff: backoff,
+            timedFlushSleep: timedFlushSleep,
+            retrySleep: retrySleep,
             launchGate: launchGate,
             debugLog: debugLog,
             flushThreshold: 20,
@@ -149,11 +153,16 @@ final class TelemetryManagerTests: XCTestCase {
 
     func testSubThresholdPerfFlushesOnTimerAndClears() async {
         let store = FakeStore(); let sender = FakeSender()
-        let mgr = build(store: store, sender: sender)
+        let sleep = ControllablePersistenceSleep()
+        let mgr = build(store: store, sender: sender, timedFlushSleep: { await sleep.sleep($0) })
 
         for _ in 0..<3 {
             mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)
         }
+        let delay = await sleep.waitForRequest()
+        XCTAssertEqual(delay, 0.05)
+        XCTAssertTrue(sender.batches.isEmpty)
+        sleep.release()
         await waitUntil {
             self.allEvents(sender.batches).filter { $0.type == TelemetryType.network }.count == 3
         }
@@ -231,8 +240,7 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: store, sender: sender)
 
         for _ in 0..<3 { mgr.recordError(signature: "api:decode", errorCode: "decode", message: "bad json") }
-        // Give the eager flushes time to enqueue + park on the gate.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await waitUntil { sender.attemptCount == 1 }
         sender.release()
         // Wait on the observable OUTCOME (all 3 occurrences delivered + buffer reconciled empty).
         // "store empty" alone is satisfied by the initial state: the persist/flush pipeline is
@@ -280,7 +288,7 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: store, sender: sender, launchGate: gate)
 
         mgr.start()
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await waitForGateWaiters(gate, count: 1)
         XCTAssertEqual(sender.attemptCount, 0)
         XCTAssertEqual(store.load().map(\.eventId), ["old"], "recovery may load promptly but cannot send early")
 
@@ -326,13 +334,19 @@ final class TelemetryManagerTests: XCTestCase {
     func testRetryBackoffCannotBeBypassedByImmediateFlush() async {
         let sender = FakeSender()
         sender.enqueueAcks([.retry, .accepted])
-        let mgr = build(store: FakeStore(), sender: sender, backoff: { _ in 0.1 })
+        let sleep = ControllablePersistenceSleep()
+        let mgr = build(
+            store: FakeStore(), sender: sender, backoff: { _ in 0.1 },
+            retrySleep: { await sleep.sleep($0) }
+        )
 
         mgr.recordError(signature: "api:backoff")
         await waitUntil { sender.attemptCount == 1 }
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        let delay = await sleep.waitForRequest()
+        XCTAssertEqual(delay, 0.1)
         XCTAssertEqual(sender.attemptCount, 1)
 
+        sleep.release()
         await waitUntil { sender.attemptCount == 2 }
     }
 
@@ -342,10 +356,8 @@ final class TelemetryManagerTests: XCTestCase {
         let mgr = build(store: store, sender: sender)
 
         mgr.recordError(signature: "api:bad", errorCode: "bad", message: "x")
-        // Async error persistence → wait on the send + reconcile, not the initial write.
-        await waitUntil { sender.batches.count == 1 && store.load().isEmpty }
-        // Settle a beat to ensure no spurious retry was scheduled.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await waitUntil { sender.attemptCount == 1 }
+        await mgr.waitForImmediateFlushIdleForTests()
         XCTAssertEqual(sender.batches.count, 1, "no retry on a permanent error")
     }
 
@@ -406,7 +418,8 @@ final class TelemetryManagerTests: XCTestCase {
 
         mgr.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 10, failureClass: nil)
         mgr.recordError(signature: "api:err", errorCode: "err", message: "x")
-        try? await Task.sleep(nanoseconds: 100_000_000) // can't poll for absence; settle then assert
+        await mgr.waitForRecoveryForTests()
+        await mgr.waitForImmediateFlushIdleForTests()
 
         XCTAssertTrue(sender.batches.isEmpty)
         XCTAssertTrue(store.load().isEmpty)
@@ -422,8 +435,7 @@ final class TelemetryManagerTests: XCTestCase {
         await waitForGateWaiters(gate, count: 1)
         mgr.applyServerConfig(enabled: false, sampleRate: 1)
         await gate.open()
-        await waitUntil { store.load().isEmpty }
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await mgr.waitForImmediateFlushIdleForTests()
 
         XCTAssertEqual(sender.attemptCount, 0)
     }

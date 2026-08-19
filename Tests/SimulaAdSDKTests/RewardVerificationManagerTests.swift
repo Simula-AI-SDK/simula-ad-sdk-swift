@@ -60,7 +60,8 @@ final class RewardVerificationManagerTests: XCTestCase {
     func testSuccessDeliversTokenAndRemovesTask() async {
         let verifier = FakeVerifier()
         verifier.setToken("tokA", for: "A")
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         let exp = expectation(description: "A verified")
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
@@ -70,7 +71,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         await fulfillment(of: [exp], timeout: TestWait.timeout)
 
         XCTAssertEqual(verifier.callCount("A"), 1)
-        XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(store.persisted.isEmpty)
     }
 
     func testPermanentErrorDeliversFailureAndDropsTask() async {
@@ -93,7 +94,8 @@ final class RewardVerificationManagerTests: XCTestCase {
     func testRetryableErrorKeepsTaskAndRecordsAttempt() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 1000 })
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 1000 })
 
         let exp = expectation(description: "A failed")
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
@@ -101,7 +103,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         }
         await fulfillment(of: [exp], timeout: TestWait.timeout)
 
-        let queue = persistedQueue()
+        let queue = store.persisted
         XCTAssertEqual(queue.count, 1)
         XCTAssertEqual(queue.first?.retryCount, 1)
         XCTAssertEqual(queue.first?.lastAttemptTimestamp, 1000)
@@ -113,7 +115,8 @@ final class RewardVerificationManagerTests: XCTestCase {
         verifier.setToken("tokA", for: "A")
         verifier.setToken("tokB", for: "B")
         verifier.gate("A") // hold A in flight while B is enqueued
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         let expA = expectation(description: "A")
         let expB = expectation(description: "B")
@@ -133,37 +136,38 @@ final class RewardVerificationManagerTests: XCTestCase {
 
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(verifier.callCount("B"), 1)
-        XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(store.persisted.isEmpty)
     }
 
     func testDuplicateServeIdIsEnqueuedAndVerifiedOnce() async {
         let verifier = FakeVerifier()
         verifier.setToken("tokA", for: "A")
         verifier.gate("A")
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5)
         await verifier.waitUntilEntered("A")
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) // duplicate, in flight
-        XCTAssertEqual(persistedQueue().count, 1)
+        XCTAssertEqual(store.persisted.count, 1)
 
         verifier.release("A")
         // Drain finishes asynchronously; poll the persisted queue until empty.
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { store.persisted.isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
     func testTriggerDrainsTaskLeftByPriorSession() async {
         // Seed a persisted task as if a prior process had left it pending.
         let seeded = [PendingVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5, retryCount: 0, lastAttemptTimestamp: 0)]
-        defaults.set(try! JSONEncoder().encode(seeded), forKey: queueKey)
 
         let verifier = FakeVerifier()
         verifier.setToken("tokA", for: "A")
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         mgr.triggerProcessQueue() // the app-launch recovery path (Fix C)
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { verifier.callCount("A") == 1 && store.persisted.isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 1)
     }
 
@@ -173,12 +177,12 @@ final class RewardVerificationManagerTests: XCTestCase {
             PendingVerification(serveId: "B", sessionId: "s", elapsedPlayTime: 2, retryCount: 0, lastAttemptTimestamp: 0),
             PendingVerification(serveId: "C", sessionId: "s", elapsedPlayTime: 3, retryCount: 0, lastAttemptTimestamp: 0),
         ]
-        defaults.set(try? JSONEncoder().encode(seeded), forKey: queueKey)
         let verifier = FakeVerifier()
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         mgr.triggerProcessQueue()
-        await waitUntil { verifier.callOrder.count == 3 && self.persistedQueue().isEmpty }
+        await waitUntil { verifier.callOrder.count == 3 && store.persisted.isEmpty }
 
         XCTAssertEqual(verifier.callOrder, ["A", "B", "C"])
     }
@@ -204,15 +208,15 @@ final class RewardVerificationManagerTests: XCTestCase {
     func testQueuePersistsDuringQuietWindowThenVerifiesAfterGate() async {
         let verifier = FakeVerifier()
         let gate = ControllableLaunchSettledGate()
-        let store = UserDefaultsRewardVerificationStore(defaults)
+        let store = ScriptedRewardStore()
         let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 }, launchGate: gate)
 
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 1)
-        await waitUntil { self.persistedQueue().count == 1 }
+        await waitUntil { store.persisted.count == 1 }
         XCTAssertEqual(verifier.callCount("A"), 0)
 
         await gate.open()
-        await waitUntil { verifier.callCount("A") == 1 && self.persistedQueue().isEmpty }
+        await waitUntil { verifier.callCount("A") == 1 && store.persisted.isEmpty }
     }
 
     func testInitialSaveFailureBlocksVerifierAndCallbackUntilRetryPersists() async {
@@ -267,7 +271,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 1) {
             duplicateCallback.record($0)
         }
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await mgr.waitForExecutorForTests()
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(duplicateCallback.count, 0)
 
@@ -421,9 +425,10 @@ final class RewardVerificationManagerTests: XCTestCase {
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
         let clock = TestClock(0)
         let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore()
         let mgr = RewardVerificationManager(
             verifier: verifier,
-            defaults: defaults,
+            store: store,
             now: { clock.time },
             sleep: { await sleeper.sleep($0) }
         )
@@ -444,7 +449,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         clock.time = 5
         sleeper.release()
 
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { store.persisted.isEmpty }
         XCTAssertEqual(verifier.callCount("A"), 2, "wake must re-drain once the backoff elapses")
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
@@ -456,9 +461,10 @@ final class RewardVerificationManagerTests: XCTestCase {
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
         let clock = TestClock(0)
         let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore()
         let mgr = RewardVerificationManager(
             verifier: verifier,
-            defaults: defaults,
+            store: store,
             now: { clock.time },
             sleep: { await sleeper.sleep($0) }
         )
@@ -473,11 +479,10 @@ final class RewardVerificationManagerTests: XCTestCase {
         // Release the wake without advancing the clock → task still ineligible.
         sleeper.release()
         await waitUntil { !sleeper.isSleeping }
-        // Settle so a wrongly chained wake would have parked on sleep again.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await mgr.waitForExecutorForTests()
 
         XCTAssertEqual(verifier.callCount("A"), 1)
-        XCTAssertEqual(persistedQueue().count, 1)
+        XCTAssertEqual(store.persisted.count, 1)
         XCTAssertEqual(sleeper.count, 1, "ineligible wake must not chain another sleep")
     }
 
@@ -661,8 +666,14 @@ private final class ScriptedRewardStore: RewardVerificationStoring, @unchecked S
     private var results: [Bool]
     private var durable: [PendingVerification] = []
 
-    init(saveResults: [Bool]) { results = saveResults }
-    func load() -> DurableQueueLoad<PendingVerification> { .missing }
+    init(saveResults: [Bool] = [], initial: [PendingVerification] = []) {
+        results = saveResults
+        durable = initial
+    }
+    func load() -> DurableQueueLoad<PendingVerification> {
+        lock.lock(); defer { lock.unlock() }
+        return .loaded(durable)
+    }
     func save(_ records: [PendingVerification]) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let succeeds = results.isEmpty ? true : results.removeFirst()

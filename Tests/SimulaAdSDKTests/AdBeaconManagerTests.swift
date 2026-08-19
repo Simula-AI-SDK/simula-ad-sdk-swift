@@ -2,8 +2,8 @@ import XCTest
 @testable import SimulaAdSDK
 
 /// Tier-1 tests for the durable impression/click beacon queue: delivery / permanent-drop / retain /
-/// dedup / recovery, exercised with a fake sender, an isolated `UserDefaults`, and a controllable
-/// clock — no network, no wall-clock timing.
+/// dedup / recovery, exercised with in-memory fake stores/senders and a controllable clock — no
+/// network, simulator preferences daemon, or wall-clock timing.
 final class AdBeaconManagerTests: XCTestCase {
 
     // Must mirror AdBeaconManager.userDefaultsKey (private there).
@@ -32,31 +32,34 @@ final class AdBeaconManagerTests: XCTestCase {
     func test2xxDeliversAndRemoves() async {
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil { sender.callCount("imp", "seen") == 1 && self.persistedQueue().isEmpty }
+        await waitUntil { sender.callCount("imp", "seen") == 1 && store.persisted.isEmpty }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
     func testPermanent4xxDropsWithoutRetry() async {
         let sender = FakeBeaconSender()
         sender.setCode(400, for: "imp", "click")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "click")
-        await waitUntil { sender.callCount("imp", "click") == 1 && self.persistedQueue().isEmpty }
+        await waitUntil { sender.callCount("imp", "click") == 1 && store.persisted.isEmpty }
         XCTAssertEqual(sender.callCount("imp", "click"), 1)
     }
 
     func test5xxKeepsAndRecordsAttempt() async {
         let sender = FakeBeaconSender()
         sender.setCode(503, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 1000 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
-        let q = persistedQueue()
+        await waitUntil { store.persisted.first?.retryCount == 1 }
+        let q = store.persisted
         XCTAssertEqual(q.count, 1)
         XCTAssertEqual(q.first?.lastAttemptTimestamp, 1000)
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
@@ -65,28 +68,31 @@ final class AdBeaconManagerTests: XCTestCase {
     func testConnectivityFailureKeepsBeacon() async {
         let sender = FakeBeaconSender()
         sender.setError(URLError(.notConnectedToInternet), for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil { self.persistedQueue().count == 1 }
-        XCTAssertEqual(persistedQueue().count, 1)
+        await waitUntil { store.persisted.first?.retryCount == 1 }
+        XCTAssertEqual(store.persisted.count, 1)
     }
 
     func testDuplicateBeaconEnqueuedOnce() async {
         let sender = FakeBeaconSender()
         sender.setCode(503, for: "imp", "seen") // keep it queued
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
         mgr.enqueue(impressionId: "imp", action: "seen") // duplicate
-        await waitUntil { self.persistedQueue().first?.retryCount ?? 0 >= 1 }
-        XCTAssertEqual(persistedQueue().count, 1)
+        await waitUntil { store.persisted.first?.retryCount ?? 0 >= 1 }
+        XCTAssertEqual(store.persisted.count, 1)
     }
 
     func testSeenMetadataIsPersistedAndForwarded() async {
         let sender = FakeBeaconSender()
         sender.setCode(503, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 1000 })
 
         mgr.enqueue(
             impressionId: "imp",
@@ -94,22 +100,23 @@ final class AdBeaconManagerTests: XCTestCase {
             metadata: ["page_name": "Search", "surface": "chat"]
         )
 
-        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
-        XCTAssertEqual(persistedQueue().first?.metadata, ["page_name": "Search", "surface": "chat"])
+        await waitUntil { store.persisted.first?.retryCount == 1 }
+        XCTAssertEqual(store.persisted.first?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(sender.lastMetadata("imp", "seen"), ["page_name": "Search", "surface": "chat"])
     }
 
     func testDuplicateSeenMergesMetadataWithoutResettingRetry() async {
         let sender = FakeBeaconSender()
         sender.setCode(503, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 1000 })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
-        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { store.persisted.first?.retryCount == 1 }
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
 
-        await waitUntil { self.persistedQueue().first?.metadata?["surface"] == "chat" }
-        let queued = persistedQueue().first
+        await waitUntil { store.persisted.first?.metadata?["surface"] == "chat" }
+        let queued = store.persisted.first
         XCTAssertEqual(queued?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(queued?.retryCount, 1)
     }
@@ -117,33 +124,35 @@ final class AdBeaconManagerTests: XCTestCase {
     func testDuplicateSeenMergeRemainsBounded() async {
         let sender = FakeBeaconSender()
         sender.setCode(503, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 1000 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 1000 })
         let first = Dictionary(uniqueKeysWithValues: (0..<6).map { ("a\($0)", "v") })
         let second = Dictionary(uniqueKeysWithValues: (0..<6).map { ("b\($0)", "v") })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: first)
-        await waitUntil { self.persistedQueue().first?.retryCount == 1 }
+        await waitUntil { store.persisted.first?.retryCount == 1 }
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: second)
 
-        await waitUntil { self.persistedQueue().first?.metadata?["b0"] == "v" }
-        let metadata = persistedQueue().first?.metadata
+        await waitUntil { store.persisted.first?.metadata?["b0"] == "v" }
+        let metadata = store.persisted.first?.metadata
         XCTAssertEqual(metadata?.count, 10)
         XCTAssertTrue(second.keys.allSatisfy { metadata?[$0] == "v" }, "newest keys must survive the cap")
     }
 
     func testMetadataMergedDuringSuccessfulSendIsDeliveredThenQueueDrains() async {
         let sender = BlockingBeaconSender()
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
         await sender.waitForFirstCall()
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
         await waitUntil {
-            self.persistedQueue().first?.metadata == ["page_name": "Search", "surface": "chat"]
+            store.persisted.first?.metadata == ["page_name": "Search", "surface": "chat"]
         }
 
         await sender.releaseFirstCall()
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { store.persisted.isEmpty }
 
         let metadata = await sender.metadataSnapshots()
         XCTAssertEqual(metadata.count, 2)
@@ -153,13 +162,14 @@ final class AdBeaconManagerTests: XCTestCase {
 
     func testMetadataReplacementDuringFailedSendContinuesWithNewestSnapshot() async {
         let sender = BlockingBeaconSender(firstCode: 503)
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["page_name": "Search"])
         await sender.waitForFirstCall()
         mgr.enqueue(impressionId: "imp", action: "seen", metadata: ["surface": "chat"])
         await sender.releaseFirstCall()
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { store.persisted.isEmpty }
 
         let metadata = await sender.metadataSnapshots()
         XCTAssertEqual(metadata.count, 2)
@@ -170,14 +180,15 @@ final class AdBeaconManagerTests: XCTestCase {
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
         sender.setCode(200, for: "imp", "click")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "imp", action: "seen")
         mgr.enqueue(impressionId: "imp", action: "click")
         await waitUntil {
-            sender.callCount("imp", "seen") == 1
+                sender.callCount("imp", "seen") == 1
                 && sender.callCount("imp", "click") == 1
-                && self.persistedQueue().isEmpty
+                && store.persisted.isEmpty
         }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
         XCTAssertEqual(sender.callCount("imp", "click"), 1)
@@ -185,14 +196,13 @@ final class AdBeaconManagerTests: XCTestCase {
 
     func testTriggerDrainsBeaconLeftByPriorSession() async {
         let seeded = [PendingBeacon(impressionId: "imp", action: "seen", retryCount: 0, lastAttemptTimestamp: 0)]
-        defaults.set(try! JSONEncoder().encode(seeded), forKey: queueKey)
-
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "seen")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore(initial: seeded)
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.triggerProcessQueue()
-        await waitUntil { self.persistedQueue().isEmpty }
+        await waitUntil { sender.callCount("imp", "seen") == 1 && store.persisted.isEmpty }
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
     }
 
@@ -201,15 +211,15 @@ final class AdBeaconManagerTests: XCTestCase {
             PendingBeacon(id: "click-1", impressionId: "imp", action: "click"),
             PendingBeacon(id: "click-2", impressionId: "imp", action: "click"),
         ]
-        defaults.set(try JSONEncoder().encode(seeded), forKey: queueKey)
         let sender = FakeBeaconSender()
         sender.setCode(200, for: "imp", "click")
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore(initial: seeded)
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.triggerProcessQueue()
         await waitUntil { sender.callCount("imp", "click") == 2 }
 
-        XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(store.persisted.isEmpty)
     }
 
     func testPendingBeaconIdentitySurvivesPersistence() throws {
@@ -232,11 +242,11 @@ final class AdBeaconManagerTests: XCTestCase {
 
     func testBlankImpressionIdIgnored() async {
         let sender = FakeBeaconSender()
-        let mgr = AdBeaconManager(sender: sender, defaults: defaults, now: { 0 })
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
 
         mgr.enqueue(impressionId: "", action: "seen")
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertTrue(persistedQueue().isEmpty)
+        XCTAssertTrue(store.persisted.isEmpty)
         XCTAssertEqual(sender.totalCalls, 0)
     }
 
@@ -261,15 +271,15 @@ final class AdBeaconManagerTests: XCTestCase {
     func testQueuePersistsDuringQuietWindowThenSendsAfterGate() async {
         let sender = FakeBeaconSender()
         let gate = ControllableLaunchSettledGate()
-        let store = UserDefaultsAdBeaconStore(defaults)
+        let store = ScriptedBeaconStore()
         let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 }, launchGate: gate)
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil { self.persistedQueue().count == 1 }
+        await waitUntil { store.persisted.count == 1 }
         XCTAssertEqual(sender.totalCalls, 0)
 
         await gate.open()
-        await waitUntil { sender.callCount("imp", "seen") == 1 && self.persistedQueue().isEmpty }
+        await waitUntil { sender.callCount("imp", "seen") == 1 && store.persisted.isEmpty }
     }
 
     func testInitialSaveFailuresBlockSendAndRetainSubsequentEnqueues() async {
@@ -289,7 +299,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.totalCalls, 0)
 
         mgr.enqueue(impressionId: "B", action: "seen")
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await mgr.waitForExecutorForTests()
         XCTAssertEqual(store.saveCount, 1, "new enqueues must merge behind the one persistence retry")
         XCTAssertEqual(sender.totalCalls, 0)
 
@@ -317,7 +327,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(store.persisted.map(\.impressionId), ["A"], "failed removal must leave durable state intact")
 
         mgr.enqueue(impressionId: "A", action: "seen")
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await mgr.waitForExecutorForTests()
         XCTAssertEqual(sender.callCount("A", "seen"), 1)
         XCTAssertEqual(store.saveCount, 2, "duplicate enqueue must wait for the pending removal commit")
         persistenceSleep.release()
@@ -334,17 +344,21 @@ final class AdBeaconManagerTests: XCTestCase {
         try malformed.write(to: fileURL)
         defer { try? FileManager.default.removeItem(at: directory) }
         let sender = FakeBeaconSender()
+        let loadSleep = ControllablePersistenceSleep()
         let mgr = AdBeaconManager(
             sender: sender,
             store: FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults),
-            now: { 0 }
+            now: { 0 },
+            loadSleep: { await loadSleep.sleep($0) }
         )
 
         mgr.enqueue(impressionId: "new", action: "seen")
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        _ = await loadSleep.waitForRequest()
 
         XCTAssertEqual(sender.totalCalls, 0)
         XCTAssertEqual(try Data(contentsOf: fileURL), malformed)
+        await mgr.cancelPendingWorkForTests()
+        loadSleep.release()
     }
 
     func testTransientLoadRecoveryCoalescesPendingAndPersistsBeforeSending() async {
@@ -394,7 +408,7 @@ final class AdBeaconManagerTests: XCTestCase {
         _ = await loadSleep.waitForRequest()
         await waitUntil { store.loadCount == 2 }
         for _ in 0..<20 { mgr.enqueue(impressionId: "same", action: "seen") }
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await mgr.waitForExecutorForTests()
         XCTAssertEqual(store.loadCount, 2, "events must share the one scheduled load retry")
 
         store.allowRecovery()
@@ -509,8 +523,14 @@ private final class ScriptedBeaconStore: AdBeaconStoring, @unchecked Sendable {
     private var candidates: [[PendingBeacon]] = []
     private var durable: [PendingBeacon] = []
 
-    init(saveResults: [Bool]) { results = saveResults }
-    func load() -> DurableQueueLoad<PendingBeacon> { .missing }
+    init(saveResults: [Bool] = [], initial: [PendingBeacon] = []) {
+        results = saveResults
+        durable = initial
+    }
+    func load() -> DurableQueueLoad<PendingBeacon> {
+        lock.lock(); defer { lock.unlock() }
+        return .loaded(durable)
+    }
     func save(_ records: [PendingBeacon]) -> Bool {
         lock.lock(); defer { lock.unlock() }
         candidates.append(records)

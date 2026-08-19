@@ -428,6 +428,24 @@ public final class AdBeaconManager: @unchecked Sendable {
         }
     }
 
+    func waitForExecutorForTests() async {
+        await withCheckedContinuation { continuation in
+            executor.async { continuation.resume() }
+        }
+    }
+
+    func cancelPendingWorkForTests() async {
+        await withCheckedContinuation { continuation in
+            executor.async { [self] in
+                persistenceRetryTask?.cancel()
+                persistenceRetryTask = nil
+                loadRetryTask?.cancel()
+                loadRetryTask = nil
+                continuation.resume()
+            }
+        }
+    }
+
     private static let defaultPersistenceSleep: @Sendable (TimeInterval) async -> Void = { delay in
         do { try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000)) } catch { return }
     }

@@ -6,10 +6,14 @@ final class ControllablePersistenceSleep: @unchecked Sendable {
     private var delayWaiter: CheckedContinuation<TimeInterval, Never>?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
     private var releaseRequested = false
+    private var requests = 0
+
+    var requestCount: Int { lock.lock(); defer { lock.unlock() }; return requests }
 
     func sleep(_ delay: TimeInterval) async {
         let waiter: CheckedContinuation<TimeInterval, Never>?
         lock.lock()
+        requests += 1
         requestedDelay = delay
         waiter = delayWaiter
         delayWaiter = nil

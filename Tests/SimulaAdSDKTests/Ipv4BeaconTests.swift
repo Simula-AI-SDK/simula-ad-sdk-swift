@@ -89,7 +89,6 @@ final class Ipv4BeaconTests: XCTestCase {
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
         await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonPpidUpdate)
-        try? await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(recorder.count, 1)
     }
@@ -106,11 +105,11 @@ final class Ipv4BeaconTests: XCTestCase {
         )
 
         beacon.fire(apiKey: "k", sessionId: "s", ppid: nil, reason: Ipv4Beacon.reasonInit)
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await waitForGateWaiter(gate)
         XCTAssertEqual(recorder.count, 0)
 
         await gate.open()
-        await waitUntil { recorder.count == 1 }
+        await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
     }
 
     func testLogoutWhileWaitingForLaunchGatePreventsStaleTransmission() async {
@@ -125,10 +124,10 @@ final class Ipv4BeaconTests: XCTestCase {
         )
 
         beacon.fire(apiKey: "k", sessionId: "stale-session", ppid: "user", reason: Ipv4Beacon.reasonInit)
-        await waitUntil { !beacon.isIdleForTests }
+        await waitForGateWaiter(gate)
         beacon.onLogout()
         await gate.open()
-        try? await Task.sleep(nanoseconds: 30_000_000)
+        await waitUntil { beacon.isIdleForTests }
 
         XCTAssertEqual(recorder.count, 0)
         XCTAssertTrue(beacon.isIdleForTests)
@@ -184,7 +183,6 @@ final class Ipv4BeaconTests: XCTestCase {
 
         // Now captured — a third fire is deduped.
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(recorder.count, 2)
     }
 
@@ -225,7 +223,6 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(urlString: "   ", recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(recorder.count, 0)
     }
 
@@ -234,8 +231,17 @@ final class Ipv4BeaconTests: XCTestCase {
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
-        try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(recorder.count, 0)
+    }
+
+    private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
+        let deadline = Date().addingTimeInterval(TestWait.timeout)
+        while Date() <= deadline {
+            if await gate.waitCount > 0 { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let count = await gate.waitCount
+        XCTAssertGreaterThan(count, 0)
     }
 }
 
