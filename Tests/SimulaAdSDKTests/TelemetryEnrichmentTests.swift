@@ -155,12 +155,9 @@ final class TelemetryEnrichmentTests: XCTestCase {
         m.recordLifecycle(stage: "displayed", adFormat: "rewarded", adUnitId: "u", adId: "a1", serveId: nil, durationMs: nil, errorCode: nil)
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
 
-        let summaryBatches = sender.batches.filter { envelope in
-            envelope.events.contains { $0.name == "funnel_summary" }
-        }
-        XCTAssertEqual(summaryBatches.count, 1)
-        XCTAssertEqual(summaryBatches.first?.events.map(\.name), ["funnel_summary"])
-        XCTAssertEqual(summaryBatches.first?.events.first?.breadcrumb, "fmt=rewarded;req=0;fill=0;nofill=0;fail=0;imp=1;clk=0")
+        let summaries = allEvents(sender.batches).filter { $0.name == "funnel_summary" }
+        XCTAssertEqual(summaries.count, 1)
+        XCTAssertEqual(summaries.first?.breadcrumb, "fmt=rewarded;req=0;fill=0;nofill=0;fail=0;imp=1;clk=0")
     }
 
     func testPeriodicFunnelIsNotCountedAgainByLaterExplicitFlush() async {

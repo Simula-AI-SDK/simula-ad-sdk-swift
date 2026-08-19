@@ -76,15 +76,18 @@ final class RewardVerificationManagerTests: XCTestCase {
     func testPermanentErrorDeliversFailureAndDropsTask() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 400), for: "A")
-        let mgr = RewardVerificationManager(verifier: verifier, defaults: defaults, now: { 0 })
+        let store = ScriptedRewardStore(saveResults: [])
+        let callback = RewardCallbackRecorder()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
-        let exp = expectation(description: "A failed")
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
-            if case .failure = result { exp.fulfill() }
+            callback.record(result)
         }
-        await fulfillment(of: [exp], timeout: TestWait.timeout)
+        await waitUntil { callback.count == 1 && store.persisted.isEmpty }
 
-        XCTAssertTrue(persistedQueue().isEmpty, "a permanent error must drop the task")
+        XCTAssertEqual(callback.failureCount, 1)
+        XCTAssertEqual(verifier.callCount("A"), 1)
+        XCTAssertTrue(store.persisted.isEmpty, "a permanent error must drop the task")
     }
 
     func testRetryableErrorKeepsTaskAndRecordsAttempt() async {
@@ -674,6 +677,10 @@ private final class RewardCallbackRecorder: @unchecked Sendable {
     private var results: [Result<String?, Error>] = []
     func record(_ result: Result<String?, Error>) { lock.lock(); results.append(result); lock.unlock() }
     var count: Int { lock.lock(); defer { lock.unlock() }; return results.count }
+    var failureCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return results.filter { if case .failure = $0 { return true }; return false }.count
+    }
     var successToken: String? {
         lock.lock(); defer { lock.unlock() }
         guard let first = results.first else { return nil }
