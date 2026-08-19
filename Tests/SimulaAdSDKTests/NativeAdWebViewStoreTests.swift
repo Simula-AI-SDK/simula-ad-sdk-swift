@@ -110,9 +110,12 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         let first = attach(id)
         NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
         XCTAssertTrue(NativeAdWebViewStore.shared.detach(first.webView, impressionId: id))
+        XCTAssertTrue(NativeAdWebViewStore.shared.canReattach(impressionId: id, creativeKey: "creative"))
 
         let second = attach(id)
         XCTAssertTrue(second.alreadyLoaded)
+        XCTAssertFalse(NativeAdWebViewStore.shared.canReattach(impressionId: id, creativeKey: "creative"),
+                       "an already-attached session cannot be claimed as a retained remount")
         XCTAssertTrue(second.webView === first.webView, "reattach must hand back the retained view")
         cleanup(second.webView, id: id)
     }

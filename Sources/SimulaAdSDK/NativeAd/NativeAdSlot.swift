@@ -189,6 +189,7 @@ public struct NativeAdSlot: View {
             .task(id: mountRequestKey) { await requestMount() }
             // Collapse a creative that loaded but never reported a height (see watchForMissingHeight).
             .task(id: awaitingHeight) { await watchForMissingHeight() }
+            .onAppear { restoreRetainedMountIfAvailable() }
             .onDisappear { mountAdmitted = false }
             // The creative can freeze mid-video/mid-typing across a background/foreground cycle (its
             // WKWebView's content process suspends, and in-page visibilitychange/pageshow/focus
@@ -325,6 +326,27 @@ public struct NativeAdSlot: View {
         guard case .filled(let response) = phase else { return nil }
         // Admission is part of the task identity so resetting it remounts an unchanged creative.
         return "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)|\(mountAdmitted)"
+    }
+
+    @MainActor
+    private func restoreRetainedMountIfAvailable() {
+        guard !mountAdmitted,
+              case .filled(let response) = phase,
+              let impressionId = response.impressionId, !impressionId.isEmpty,
+              NativeAdWebViewStore.shared.canReattach(
+                  impressionId: impressionId,
+                  creativeKey: retainedCreativeKey(response)
+              ) else { return }
+        mountAdmitted = true
+    }
+
+    private func retainedCreativeKey(_ response: NativeAdResponse) -> String {
+        if response.renderedHTML == nil,
+           let rawURL = response.iframeURL,
+           let url = URL(string: rawURL) {
+            return url.absoluteString
+        }
+        return "html:\(response.renderedHTML?.hashValue ?? 0)"
     }
 
     @MainActor

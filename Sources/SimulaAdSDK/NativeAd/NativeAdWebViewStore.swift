@@ -142,6 +142,17 @@ final class NativeAdWebViewStore {
         return (webView, false)
     }
 
+    /// Whether this serve can remount its completed DOM immediately. NativeAdSlot uses this on
+    /// appearance to skip frame admission only for a genuine retained reattach; a missing,
+    /// attached, stale, or unusable session still goes through NativeAdMountScheduler.
+    func canReattach(impressionId: String, creativeKey: String) -> Bool {
+        guard let session = sessions[impressionId] else { return false }
+        return !session.attached
+            && !session.unusable
+            && session.loadCompleted
+            && session.loadedKey == creativeKey
+    }
+
     /// Scroll-out / teardown for a view previously handed out by `attach`. Returns `true` when the
     /// store owned the view and has handled it (retained it — or destroyed it if its render process
     /// died); the caller must NOT release it to `WebViewPool`. `false` for ephemeral/unknown views —
