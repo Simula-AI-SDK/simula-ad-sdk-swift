@@ -119,8 +119,9 @@ final class BundledImageCacheTests: XCTestCase {
 
     func testClearPreventsOlderInFlightDecodeFromRepopulatingCache() async {
         let probe = Probe()
-        let decodeStarted = DispatchSemaphore(value: 0)
+        let decodeStarted = expectation(description: "decode started")
         let finishDecode = DispatchSemaphore(value: 0)
+        defer { finishDecode.signal() }
         let cache = BundledImageCache(
             queueLabel: "test.bundled.image.clear-generation",
             reader: { _ in
@@ -130,15 +131,15 @@ final class BundledImageCacheTests: XCTestCase {
             decoder: { _, _ in
                 probe.recordDecode()
                 if probe.snapshot.decodes == 1 {
-                    decodeStarted.signal()
-                    _ = finishDecode.wait(timeout: .now() + 2)
+                    decodeStarted.fulfill()
+                    finishDecode.wait()
                 }
                 return Self.makeTestImage()
             }
         )
 
         let oldLoad = Task { await cache.load(.gameIcon) }
-        XCTAssertEqual(decodeStarted.wait(timeout: .now() + 2), .success)
+        await fulfillment(of: [decodeStarted], timeout: TestWait.timeout)
         cache.clear()
         finishDecode.signal()
         let oldImage = await oldLoad.value

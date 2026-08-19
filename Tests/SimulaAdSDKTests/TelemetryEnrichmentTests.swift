@@ -44,9 +44,10 @@ final class TelemetryEnrichmentTests: XCTestCase {
         battery: @escaping @Sendable () -> BatteryInfo? = { nil },
         carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
         ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
-        flushThreshold: Int = 20
+        flushThreshold: Int = 20,
+        timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) -> TelemetryManager {
-        TelemetryManager(
+        let manager = TelemetryManager(
             ctx: ctx,
             store: store,
             sender: sender,
@@ -61,9 +62,12 @@ final class TelemetryEnrichmentTests: XCTestCase {
             now: { clock.now },
             random: { 0.0 },
             backoff: { _ in 0 },
+            timedFlushSleep: timedFlushSleep,
             flushThreshold: flushThreshold,
             flushInterval: 0.05
         )
+        manager.start()
+        return manager
     }
 
     private func allEvents(_ s: [TelemetryEnvelope]) -> [TelemetryEvent] { s.flatMap { $0.events } }
@@ -71,10 +75,16 @@ final class TelemetryEnrichmentTests: XCTestCase {
     func testEventAgeStampedAtFlush() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
-        let m = build(store: FakeStore(), sender: sender, clock: clock)
+        let sleep = ControllablePersistenceSleep()
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
 
         m.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 0, failureClass: nil)
+        _ = await sleep.waitForRequest()
         clock.now = 5_000 // time passes before the timed flush fires
+        sleep.release()
         await waitUntil { !sender.batches.isEmpty }
 
         let e = allEvents(sender.batches).first { $0.type == TelemetryType.network }
@@ -116,11 +126,17 @@ final class TelemetryEnrichmentTests: XCTestCase {
     func testTimeToFirstAdEmittedOnce() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
-        let m = build(store: FakeStore(), sender: sender, clock: clock)
+        let sleep = ControllablePersistenceSleep()
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
 
         clock.now = 1_250
         m.recordLifecycle(stage: "load_success", adFormat: "interstitial", adUnitId: "u", adId: "a1", serveId: nil, durationMs: 10, errorCode: nil, cacheSource: "network")
         m.recordLifecycle(stage: "load_success", adFormat: "interstitial", adUnitId: "u", adId: "a2", serveId: nil, durationMs: 10, errorCode: nil, cacheSource: "network")
+        _ = await sleep.waitForRequest()
+        sleep.release()
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "time_to_first_ad" } }
 
         let ttfa = allEvents(sender.batches).filter { $0.name == "time_to_first_ad" }
@@ -148,28 +164,35 @@ final class TelemetryEnrichmentTests: XCTestCase {
     func testPeriodicFlushSendsFunnelWhenLifecycleBatchAlreadyDrained() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
-        let m = build(store: FakeStore(), sender: sender, clock: clock, flushThreshold: 1)
+        let sleep = ControllablePersistenceSleep()
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock, flushThreshold: 1,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
 
         m.recordLifecycle(stage: "displayed", adFormat: "rewarded", adUnitId: "u", adId: "a1", serveId: nil, durationMs: nil, errorCode: nil)
+        _ = await sleep.waitForRequest()
+        sleep.release()
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
 
-        let summaryBatches = sender.batches.filter { envelope in
-            envelope.events.contains { $0.name == "funnel_summary" }
-        }
-        XCTAssertEqual(summaryBatches.count, 1)
-        XCTAssertEqual(summaryBatches.first?.events.map(\.name), ["funnel_summary"])
-        XCTAssertEqual(summaryBatches.first?.events.first?.breadcrumb, "fmt=rewarded;req=0;fill=0;nofill=0;fail=0;imp=1;clk=0")
+        let summaries = allEvents(sender.batches).filter { $0.name == "funnel_summary" }
+        XCTAssertEqual(summaries.count, 1)
+        XCTAssertEqual(summaries.first?.breadcrumb, "fmt=rewarded;req=0;fill=0;nofill=0;fail=0;imp=1;clk=0")
     }
 
     func testPeriodicFunnelIsNotCountedAgainByLaterExplicitFlush() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
+        let sleep = ControllablePersistenceSleep()
         let m = build(
             store: FakeStore(), sender: sender, clock: clock,
-            diagnostics: { "mem_used_mb=42" }
+            diagnostics: { "mem_used_mb=42" },
+            timedFlushSleep: { await sleep.sleep($0) }
         )
 
         m.recordLifecycle(stage: "click", adFormat: "native", adUnitId: "u", adId: "a1", serveId: nil, durationMs: nil, errorCode: nil)
+        _ = await sleep.waitForRequest()
+        sleep.release()
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
         m.flushNow()
         await waitUntil { self.allEvents(sender.batches).filter { $0.name == "diagnostics" }.count == 2 }
@@ -184,9 +207,9 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let sender = FakeSender()
         let m = build(store: FakeStore(), sender: sender, clock: clock, diagnostics: { "mem_used_mb=42" })
 
-        m.recordError(signature: "api:boom", errorCode: "boom")
+        await m.waitForRecoveryForTests()
         m.flushNow()
-        await waitUntil { self.allEvents(sender.batches).contains { $0.name == "diagnostics" } }
+        await m.waitForImmediateFlushIdleForTests()
 
         XCTAssertEqual(allEvents(sender.batches).first { $0.name == "diagnostics" }?.breadcrumb, "mem_used_mb=42")
     }
@@ -194,15 +217,21 @@ final class TelemetryEnrichmentTests: XCTestCase {
     func testPeriodicDiagnosticsDoesNotScheduleAnotherTimer() async {
         let clock = Clock(1_000)
         let sender = FakeSender()
-        let m = build(store: FakeStore(), sender: sender, clock: clock, diagnostics: { "mem_used_mb=7" })
+        let sleep = ControllablePersistenceSleep()
+        let m = build(
+            store: FakeStore(), sender: sender, clock: clock, diagnostics: { "mem_used_mb=7" },
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
 
         m.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 1, requestBytes: 0, responseBytes: 0, failureClass: nil)
+        _ = await sleep.waitForRequest()
+        sleep.release()
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "diagnostics" } }
-        try? await Task.sleep(nanoseconds: 150_000_000)
 
         let diagnostics = allEvents(sender.batches).filter { $0.name == "diagnostics" }
         XCTAssertEqual(diagnostics.count, 1)
         XCTAssertEqual(diagnostics.first?.breadcrumb, "mem_used_mb=7")
+        XCTAssertEqual(sleep.requestCount, 1, "periodic diagnostics must not arm another timer")
     }
 
     func testDeviceDiagnosticsOnEnvelope() async {

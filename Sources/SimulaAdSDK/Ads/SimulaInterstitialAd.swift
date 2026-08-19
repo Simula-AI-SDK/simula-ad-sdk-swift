@@ -371,10 +371,6 @@ public final class SimulaInterstitialAd {
                 failLoad(.noFill)
                 return
             }
-            #if os(iOS)
-            // Warm a WKWebView so the first spin-up is off the present() critical path.
-            WebViewPool.shared.prewarm(trigger: "interstitial_ready")
-            #endif
             Telemetry.shared.setExperiment(experimentId: response.experiment?.experimentId, variantId: response.experiment?.variantId)
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,

@@ -151,6 +151,10 @@ public final class SimulaProvider: ObservableObject {
         self.privacyConfig = resolved
         self.telemetryEnabled = telemetryEnabled
 
+        // Establish the one shared quiet-window deadline during the cheap init path. This performs
+        // no I/O and never waits; recovery sends, telemetry, ATT/IDFA, and IPv4 work await it later.
+        _ = LaunchSettledGate.shared
+
         // Start the connection-type monitor before the first request so `X-Connection-Type` is
         // live from `session/create` onward. Idempotent — safe if a host recreates the provider.
         // Independent of `telemetryEnabled`: the header is a first-party-request signal, not a

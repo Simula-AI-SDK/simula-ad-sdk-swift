@@ -70,17 +70,21 @@ final class Telemetry: @unchecked Sendable {
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            // Read the PPID live so a mid-session updatePrimaryUserID is honored.
-            primaryUserIdProvider: { primaryUserIDProvider() },
+            // Read consent and PPID live so revocation and mid-session identity changes apply at flush.
+            primaryUserIdProvider: {
+                let privacy = SimulaPrivacy.shared.currentSnapshot
+                return privacy.allowsPrimaryUserID ? primaryUserIDProvider() : nil
+            },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             connectionTypeProvider: { SimulaConnectionType.shared.label },
             diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             batteryProvider: { Telemetry.resolveBattery() },
             carrierProvider: { Telemetry.resolveCarrier() },
+            launchGate: LaunchSettledGate.shared,
             debugLog: consoleLog
         )
-        lock.lock(); manager = mgr; lock.unlock()
         mgr.start()
+        lock.lock(); manager = mgr; lock.unlock()
     }
 
     private var current: TelemetryManager? {
