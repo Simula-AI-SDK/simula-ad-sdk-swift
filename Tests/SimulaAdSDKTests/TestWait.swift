@@ -16,12 +16,31 @@ func waitUntil(
     line: UInt = #line,
     _ condition: @escaping () -> Bool
 ) async {
-    let deadline = Date().addingTimeInterval(timeout)
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
     while true {
         if condition() { return }
-        if Date() > deadline {
+        if ProcessInfo.processInfo.systemUptime > deadline {
             await Task.yield()
             if condition() { return }
+            XCTFail("condition not met within \(timeout)s", file: file, line: line)
+            return
+        }
+        do { try await Task.sleep(nanoseconds: 5_000_000) } catch { return }
+    }
+}
+
+func waitUntil(
+    timeout: TimeInterval = TestWait.timeout,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ condition: @escaping () async -> Bool
+) async {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while true {
+        if await condition() { return }
+        if ProcessInfo.processInfo.systemUptime > deadline {
+            await Task.yield()
+            if await condition() { return }
             XCTFail("condition not met within \(timeout)s", file: file, line: line)
             return
         }

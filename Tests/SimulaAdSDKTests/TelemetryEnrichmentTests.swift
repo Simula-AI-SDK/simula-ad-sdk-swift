@@ -80,6 +80,8 @@ final class TelemetryEnrichmentTests: XCTestCase {
             store: FakeStore(), sender: sender, clock: clock,
             timedFlushSleep: { await sleep.sleep($0) }
         )
+        await m.waitForRecoveryForTests()
+        await m.waitForImmediateFlushIdleForTests()
 
         m.recordNetwork(path: "/load", method: "POST", statusCode: 200, durationMs: 5, requestBytes: 0, responseBytes: 0, failureClass: nil)
         _ = await sleep.waitForRequest()

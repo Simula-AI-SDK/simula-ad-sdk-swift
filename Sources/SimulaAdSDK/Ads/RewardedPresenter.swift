@@ -15,7 +15,8 @@ final class RewardedPresenter {
     private var window: UIWindow?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
-    private var onClose: ((Bool, Double) -> Void)?
+    private var onClose: ((Bool, Double, FullscreenPresentationLease) -> Void)?
+    private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so the
     /// host regains touch/keyboard focus (a new key window doesn't auto-revert).
     private weak var originalKeyWindow: UIWindow?
@@ -49,11 +50,15 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onClick: @escaping () -> Void,
         onImpression: @escaping () -> Void,
-        onClose: @escaping (Bool, Double) -> Void
+        onClose: @escaping (Bool, Double, FullscreenPresentationLease) -> Void
     ) -> Bool {
+        guard presentationLease == nil else { return false }
+        let presentationLease = FullscreenPresentationRegistry.shared.claim()
         guard let scene = Self.activeWindowScene() else {
+            presentationLease.releaseAfterPresentationFailure()
             return false
         }
+        self.presentationLease = presentationLease
         self.onClose = onClose
 
         // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
@@ -120,10 +125,18 @@ final class RewardedPresenter {
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
+        let presentationLease = presentationLease
+        self.presentationLease = nil
         // Release the presentation-scoped self-retention. The caller's reference keeps `self`
         // alive through this method even when this was the last strong reference.
         retainedWhilePresenting = nil
-        callback?(earned, elapsedPlayTime)
+        if let presentationLease {
+            if let callback {
+                callback(earned, elapsedPlayTime, presentationLease)
+            } else {
+                presentationLease.finishPostCloseTeardown()
+            }
+        }
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).
         SimulaAppStatusBar.restore()
@@ -132,6 +145,7 @@ final class RewardedPresenter {
         // Restore the host's key window so it regains focus. A fallback window presented in the
         // callback stays visible on top and still receives touches via hit-testing.
         hostKeyWindow?.makeKey()
+        presentationLease?.finishPrimaryTeardown()
     }
 
     /// Finds a foreground window scene to attach the overlay window to.

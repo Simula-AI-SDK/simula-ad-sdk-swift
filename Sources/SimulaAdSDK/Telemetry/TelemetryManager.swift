@@ -210,8 +210,8 @@ final class TelemetryManager: @unchecked Sendable {
         recoveryWaiters.removeAll()
         let snapshot = snapshotLocked()
         lock.unlock()
-        waiters.forEach { $0.resume() }
         requestImmediateFlush()
+        waiters.forEach { $0.resume() }
         store.save(snapshot)
     }
 

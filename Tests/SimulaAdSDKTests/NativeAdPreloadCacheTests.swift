@@ -71,7 +71,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
                 return nil
             }
         }
-        await fulfillment(of: [consumeStarted], timeout: 1)
+        await fulfillment(of: [consumeStarted], timeout: TestWait.timeout)
 
         resolution.cancel()
         releaseConsume.continuation.yield()
@@ -94,8 +94,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
         for position in 0..<5 {
             XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: position, theme: nil))
         }
-        while loadCount < 5 { await Task.yield() }
-        await Task.yield()
+        await waitUntil { loadCount == 5 }
 
         XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: 6, theme: nil))
     }

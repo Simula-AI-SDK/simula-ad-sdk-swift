@@ -63,6 +63,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(q.count, 1)
         XCTAssertEqual(q.first?.lastAttemptTimestamp, 1000)
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testConnectivityFailureKeepsBeacon() async {
@@ -74,6 +75,7 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen")
         await waitUntil { store.persisted.first?.retryCount == 1 }
         XCTAssertEqual(store.persisted.count, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateBeaconEnqueuedOnce() async {
@@ -86,6 +88,7 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen") // duplicate
         await waitUntil { store.persisted.first?.retryCount ?? 0 >= 1 }
         XCTAssertEqual(store.persisted.count, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testSeenMetadataIsPersistedAndForwarded() async {
@@ -103,6 +106,7 @@ final class AdBeaconManagerTests: XCTestCase {
         await waitUntil { store.persisted.first?.retryCount == 1 }
         XCTAssertEqual(store.persisted.first?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(sender.lastMetadata("imp", "seen"), ["page_name": "Search", "surface": "chat"])
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateSeenMergesMetadataWithoutResettingRetry() async {
@@ -119,6 +123,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let queued = store.persisted.first
         XCTAssertEqual(queued?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(queued?.retryCount, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateSeenMergeRemainsBounded() async {
@@ -137,6 +142,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let metadata = store.persisted.first?.metadata
         XCTAssertEqual(metadata?.count, 10)
         XCTAssertTrue(second.keys.allSatisfy { metadata?[$0] == "v" }, "newest keys must survive the cap")
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testMetadataMergedDuringSuccessfulSendIsDeliveredThenQueueDrains() async {
@@ -268,18 +274,34 @@ final class AdBeaconManagerTests: XCTestCase {
         await waitUntil { sender.callCount("imp", "seen") == 1 }
     }
 
-    func testQueuePersistsDuringQuietWindowThenSendsAfterGate() async {
+    func testLiveEnqueuePersistsAndSendsWithoutWaitingForLaunchGate() async {
         let sender = FakeBeaconSender()
         let gate = ControllableLaunchSettledGate()
         let store = ScriptedBeaconStore()
         let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 }, launchGate: gate)
 
         mgr.enqueue(impressionId: "imp", action: "seen")
-        await waitUntil { store.persisted.count == 1 }
+        await waitUntil { sender.callCount("imp", "seen") == 1 && store.persisted.isEmpty }
+
+        let waitCount = await gate.waitCount
+        XCTAssertEqual(waitCount, 0)
+    }
+
+    func testStartupTriggerWaitsWithoutClaimingProcessing() async {
+        let seeded = [PendingBeacon(impressionId: "startup", action: "seen")]
+        let sender = FakeBeaconSender()
+        let gate = ControllableLaunchSettledGate()
+        let store = ScriptedBeaconStore(initial: seeded)
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 }, launchGate: gate)
+
+        mgr.triggerProcessQueue()
+        await waitForGateWaiter(gate)
         XCTAssertEqual(sender.totalCalls, 0)
 
+        mgr.enqueue(impressionId: "live", action: "click")
+        await waitUntil { sender.totalCalls == 2 && store.persisted.isEmpty }
+        XCTAssertEqual(sender.callCount("live", "click"), 1, "startup waiting must not claim processing")
         await gate.open()
-        await waitUntil { sender.callCount("imp", "seen") == 1 && store.persisted.isEmpty }
     }
 
     func testInitialSaveFailuresBlockSendAndRetainSubsequentEnqueues() async {
@@ -416,6 +438,160 @@ final class AdBeaconManagerTests: XCTestCase {
         await waitUntil { sender.callCount("same", "seen") == 1 && store.persisted.isEmpty }
         XCTAssertEqual(store.firstSaved.map(\.impressionId), ["same"])
     }
+
+    func testRetryWakeReDrainsAfterBackoffWithoutNewEnqueue() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let clock = BeaconTestClock(0)
+        let sleeper = BeaconControllableSleep()
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        mgr.enqueue(impressionId: "imp", action: "seen")
+        let delay = await sleeper.waitForSleepRequest()
+        XCTAssertEqual(delay, 5, accuracy: 0.01)
+        XCTAssertEqual(store.persisted.first?.retryCount, 1)
+
+        sender.setCode(200, for: "imp", "seen")
+        clock.time = 5
+        sleeper.release()
+
+        await waitUntil { sender.callCount("imp", "seen") == 2 && store.persisted.isEmpty }
+        XCTAssertEqual(sleeper.count, 1)
+    }
+
+    func testRetryWakeWaitsForRetryStatePersistence() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let store = ScriptedBeaconStore(saveResults: [true, false, true])
+        let persistenceSleep = ControllablePersistenceSleep()
+        let retrySleep = BeaconControllableSleep()
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { 100 },
+            sleep: { await retrySleep.sleep($0) },
+            persistenceSleep: { await persistenceSleep.sleep($0) }
+        )
+        defer { retrySleep.release() }
+
+        mgr.enqueue(impressionId: "imp", action: "seen")
+        _ = await persistenceSleep.waitForRequest()
+        XCTAssertFalse(retrySleep.isSleeping)
+        XCTAssertEqual(store.persisted.first?.retryCount, 0)
+
+        persistenceSleep.release()
+        let delay = await retrySleep.waitForSleepRequest()
+        XCTAssertEqual(delay, 5, accuracy: 0.01)
+        XCTAssertEqual(store.persisted.first?.retryCount, 1)
+    }
+
+    func testRecoveredBackedOffRowsScheduleOneEarliestWake() async {
+        let seeded = [
+            PendingBeacon(impressionId: "later", action: "seen", retryCount: 2, lastAttemptTimestamp: 95),
+            PendingBeacon(impressionId: "earlier", action: "click", retryCount: 1, lastAttemptTimestamp: 98),
+        ]
+        let sender = FakeBeaconSender()
+        let clock = BeaconTestClock(100)
+        let sleeper = BeaconControllableSleep()
+        let store = ScriptedBeaconStore(initial: seeded)
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
+
+        mgr.triggerProcessQueue()
+        let delay = await sleeper.waitForSleepRequest()
+
+        XCTAssertEqual(delay, 3, accuracy: 0.01)
+        XCTAssertEqual(sleeper.count, 1)
+        XCTAssertEqual(sender.totalCalls, 0)
+    }
+
+    func testRetryWakeDoesNotRescheduleWhenStillBackedOff() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "seen")
+        let clock = BeaconTestClock(0)
+        let sleeper = BeaconControllableSleep()
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        mgr.enqueue(impressionId: "imp", action: "seen")
+        _ = await sleeper.waitForSleepRequest()
+
+        sleeper.release()
+        await waitUntil { !sleeper.isSleeping }
+        await mgr.waitForExecutorForTests()
+
+        XCTAssertEqual(sender.callCount("imp", "seen"), 1)
+        XCTAssertEqual(store.persisted.count, 1)
+        XCTAssertEqual(sleeper.count, 1, "an early wake must not start a retry loop")
+    }
+
+    func testCompletedStaleWakeDoesNotClearNewerRetryTask() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "A", "seen")
+        sender.setCode(503, for: "B", "seen")
+        let clock = BeaconTestClock(0)
+        let sleeper = BeaconControllableSleep()
+        let store = BlockingNthSaveBeaconStore(blockingSave: 4)
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer {
+            store.release()
+            sleeper.release()
+        }
+
+        mgr.enqueue(impressionId: "A", action: "seen")
+        _ = await sleeper.waitForSleepRequest()
+        guard let staleWake = await mgr.retryTaskForTests() else {
+            XCTFail("expected first retry wake")
+            return
+        }
+
+        mgr.enqueue(impressionId: "B", action: "seen")
+        await waitUntil { store.isBlocked }
+        guard store.isBlocked else {
+            XCTFail("expected B retry persistence to block")
+            sleeper.release()
+            return
+        }
+
+        // Finish A's wake while B's failure owns the executor. Its drain is now queued behind
+        // the executor turn that replaces A with B's newer retry task.
+        sleeper.release()
+        await staleWake.value
+        store.release()
+        _ = await sleeper.waitForSleepRequest()
+        await mgr.waitForExecutorForTests()
+
+        let ownedRetryTask = await mgr.retryTaskForTests()
+        XCTAssertNotNil(ownedRetryTask, "the stale wake must not discard B's task handle")
+
+        await mgr.cancelPendingWorkForTests()
+        sleeper.release()
+    }
+
+    private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
+        await waitUntil { await gate.waitCount > 0 }
+    }
 }
 
 // MARK: - Test double
@@ -459,6 +635,7 @@ private actor BlockingBeaconSender: BeaconSending {
     private var metadata: [[String: String]?] = []
     private var firstCallWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstCallContinuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
     private let firstCode: Int
 
     init(firstCode: Int = 200) {
@@ -475,7 +652,14 @@ private actor BlockingBeaconSender: BeaconSending {
         guard self.metadata.count == 1 else { return 200 }
         firstCallWaiters.forEach { $0.resume() }
         firstCallWaiters.removeAll()
-        await withCheckedContinuation { firstCallContinuation = $0 }
+        await withCheckedContinuation { continuation in
+            if releaseRequested {
+                releaseRequested = false
+                continuation.resume()
+            } else {
+                firstCallContinuation = continuation
+            }
+        }
         return firstCode
     }
 
@@ -485,8 +669,12 @@ private actor BlockingBeaconSender: BeaconSending {
     }
 
     func releaseFirstCall() {
-        firstCallContinuation?.resume()
+        guard let continuation = firstCallContinuation else {
+            releaseRequested = true
+            return
+        }
         firstCallContinuation = nil
+        continuation.resume()
     }
 
     func metadataSnapshots() -> [[String: String]?] { metadata }
@@ -508,6 +696,51 @@ private final class BlockingBeaconStore: AdBeaconStoring, @unchecked Sendable {
         if shouldWait { gate.wait() }
         return true
     }
+    func release() {
+        lock.lock()
+        let shouldSignal = !didRelease
+        didRelease = true
+        lock.unlock()
+        if shouldSignal { gate.signal() }
+    }
+}
+
+private final class BlockingNthSaveBeaconStore: AdBeaconStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let blockingSave: Int
+    private var saves = 0
+    private var blocked = false
+    private var didRelease = false
+    private var durable: [PendingBeacon] = []
+
+    init(blockingSave: Int) { self.blockingSave = blockingSave }
+
+    func load() -> DurableQueueLoad<PendingBeacon> {
+        lock.lock(); defer { lock.unlock() }
+        return .loaded(durable)
+    }
+
+    func save(_ records: [PendingBeacon]) -> Bool {
+        lock.lock()
+        saves += 1
+        let shouldBlock = saves == blockingSave && !didRelease
+        if shouldBlock { blocked = true }
+        lock.unlock()
+
+        if shouldBlock { gate.wait() }
+
+        lock.lock()
+        durable = records
+        lock.unlock()
+        return true
+    }
+
+    var isBlocked: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return blocked && !didRelease
+    }
+
     func release() {
         lock.lock()
         let shouldSignal = !didRelease
@@ -568,4 +801,77 @@ private final class RecoveringBeaconStore: AdBeaconStoring, @unchecked Sendable 
     var saveCount: Int { lock.lock(); defer { lock.unlock() }; return saves.count }
     var firstSaved: [PendingBeacon] { lock.lock(); defer { lock.unlock() }; return saves.first ?? [] }
     var persisted: [PendingBeacon] { lock.lock(); defer { lock.unlock() }; return durable }
+}
+
+private final class BeaconTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval
+    init(_ value: TimeInterval) { self.value = value }
+    var time: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
+}
+
+private final class BeaconControllableSleep: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingDelay: TimeInterval?
+    private var delayWaiter: CheckedContinuation<TimeInterval, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+    private var sleeping = false
+    private var sleepCount = 0
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return sleepCount }
+    var isSleeping: Bool { lock.lock(); defer { lock.unlock() }; return sleeping }
+
+    func sleep(_ delay: TimeInterval) async {
+        lock.lock()
+        sleepCount += 1
+        sleeping = true
+        pendingDelay = delay
+        let waiter = delayWaiter
+        delayWaiter = nil
+        lock.unlock()
+        waiter?.resume(returning: delay)
+
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if releaseRequested {
+                releaseRequested = false
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            releaseContinuation = continuation
+            lock.unlock()
+        }
+
+        lock.lock()
+        sleeping = false
+        pendingDelay = nil
+        lock.unlock()
+    }
+
+    func waitForSleepRequest() async -> TimeInterval {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let pendingDelay {
+                lock.unlock()
+                continuation.resume(returning: pendingDelay)
+                return
+            }
+            delayWaiter = continuation
+            lock.unlock()
+        }
+    }
+
+    func release() {
+        lock.lock()
+        let continuation = releaseContinuation
+        releaseContinuation = nil
+        if continuation == nil { releaseRequested = true }
+        lock.unlock()
+        continuation?.resume()
+    }
 }

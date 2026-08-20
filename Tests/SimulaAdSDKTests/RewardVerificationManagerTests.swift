@@ -108,6 +108,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(queue.first?.retryCount, 1)
         XCTAssertEqual(queue.first?.lastAttemptTimestamp, 1000)
         XCTAssertEqual(verifier.callCount("A"), 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testVerificationEnqueuedDuringInFlightDrainIsRoutedToItsOwnCaller() async {
@@ -205,18 +206,39 @@ final class RewardVerificationManagerTests: XCTestCase {
         await waitUntil { verifier.callCount("A") == 1 }
     }
 
-    func testQueuePersistsDuringQuietWindowThenVerifiesAfterGate() async {
+    func testLiveEnqueuePersistsAndVerifiesWithoutWaitingForLaunchGate() async {
         let verifier = FakeVerifier()
         let gate = ControllableLaunchSettledGate()
         let store = ScriptedRewardStore()
         let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 }, launchGate: gate)
 
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 1)
-        await waitUntil { store.persisted.count == 1 }
-        XCTAssertEqual(verifier.callCount("A"), 0)
-
-        await gate.open()
         await waitUntil { verifier.callCount("A") == 1 && store.persisted.isEmpty }
+
+        let waitCount = await gate.waitCount
+        XCTAssertEqual(waitCount, 0)
+    }
+
+    func testStartupTriggerWaitsWithoutClaimingProcessing() async {
+        let seeded = [
+            PendingVerification(
+                serveId: "startup", sessionId: "s", elapsedPlayTime: 1,
+                retryCount: 0, lastAttemptTimestamp: 0
+            ),
+        ]
+        let verifier = FakeVerifier()
+        let gate = ControllableLaunchSettledGate()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 }, launchGate: gate)
+
+        mgr.triggerProcessQueue()
+        await waitForGateWaiter(gate)
+        XCTAssertEqual(verifier.callOrder, [])
+
+        mgr.queueVerification(serveId: "live", sessionId: "s", elapsedPlayTime: 1)
+        await waitUntil { verifier.callOrder.count == 2 && store.persisted.isEmpty }
+        XCTAssertEqual(verifier.callCount("live"), 1, "startup waiting must not claim processing")
+        await gate.open()
     }
 
     func testInitialSaveFailureBlocksVerifierAndCallbackUntilRetryPersists() async {
@@ -454,6 +476,33 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
 
+    func testRecoveredBackedOffTaskSchedulesWakeWithoutNewEnqueue() async {
+        let seeded = [
+            PendingVerification(
+                serveId: "A", sessionId: "s", elapsedPlayTime: 5,
+                retryCount: 1, lastAttemptTimestamp: 98
+            ),
+        ]
+        let verifier = FakeVerifier()
+        let clock = TestClock(100)
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
+
+        mgr.triggerProcessQueue()
+        let requested = await sleeper.waitForSleepRequest()
+
+        XCTAssertEqual(requested, 3, accuracy: 0.01)
+        XCTAssertEqual(verifier.callCount("A"), 0)
+        XCTAssertEqual(sleeper.count, 1)
+    }
+
     /// A wake that finds nothing eligible (frozen clock) must terminate — not reschedule
     /// itself forever against a backend that just failed.
     func testRetryWakeDoesNotRescheduleWhenStillBackedOff() async {
@@ -486,6 +535,10 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(sleeper.count, 1, "ineligible wake must not chain another sleep")
     }
 
+    private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
+        await waitUntil { await gate.waitCount > 0 }
+    }
+
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
     // applicable here, as Swift completion closures are non-throwing by type.
 }
@@ -509,6 +562,7 @@ private final class ControllableSleep: @unchecked Sendable {
     private var pendingDelay: TimeInterval?
     private var delayWaiter: CheckedContinuation<TimeInterval, Never>?
     private var releaseCont: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
     private var _count = 0
     private var sleeping = false
 
@@ -534,6 +588,12 @@ private final class ControllableSleep: @unchecked Sendable {
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             lock.lock()
+            if releaseRequested {
+                releaseRequested = false
+                lock.unlock()
+                cont.resume()
+                return
+            }
             releaseCont = cont
             lock.unlock()
         }
@@ -561,6 +621,7 @@ private final class ControllableSleep: @unchecked Sendable {
         lock.lock()
         let cont = releaseCont
         releaseCont = nil
+        if cont == nil { releaseRequested = true }
         lock.unlock()
         cont?.resume()
     }

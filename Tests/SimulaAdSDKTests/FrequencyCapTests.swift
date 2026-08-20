@@ -57,6 +57,11 @@ final class FrequencyCapTests: XCTestCase {
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)
     private var oneDay: TimeInterval { 86_400 }
 
+    override func setUp() {
+        super.setUp()
+        FrequencyCapCache.shared.clear()
+    }
+
     override func tearDown() {
         FrequencyCapCache.shared.clear()
         super.tearDown()

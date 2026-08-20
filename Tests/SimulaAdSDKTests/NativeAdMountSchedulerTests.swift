@@ -18,6 +18,21 @@ final class NativeAdMountSchedulerTests: XCTestCase {
         }
     }
 
+    func testMountTaskIdentityChangesWhenAdmissionChangesForSameResponse() {
+        let response = NativeAdResponse(
+            impressionId: "impression-1",
+            adInserted: true,
+            adFormat: "character_ad",
+            iframeUrl: "https://example.com/creative",
+            renderedHtml: "<html>creative</html>"
+        )
+
+        XCTAssertNotEqual(
+            nativeAdMountTaskIdentity(response: response, mountAdmitted: false),
+            nativeAdMountTaskIdentity(response: response, mountAdmitted: true)
+        )
+    }
+
     func testAdmitsAtMostOneRequestPerFrameInQueueOrder() async {
         let clock = ManualFrameClock()
         let scheduler = NativeAdMountScheduler(waitForNextFrame: { await clock.waitForFrame() })
@@ -71,12 +86,5 @@ final class NativeAdMountSchedulerTests: XCTestCase {
         clock.advance()
         await Task.yield()
         XCTAssertFalse(admitted)
-    }
-
-    private func waitUntil(_ condition: () -> Bool) async {
-        for _ in 0..<100 where !condition() {
-            await Task.yield()
-        }
-        XCTAssertTrue(condition())
     }
 }
