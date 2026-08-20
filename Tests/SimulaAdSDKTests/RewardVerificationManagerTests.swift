@@ -205,18 +205,39 @@ final class RewardVerificationManagerTests: XCTestCase {
         await waitUntil { verifier.callCount("A") == 1 }
     }
 
-    func testQueuePersistsDuringQuietWindowThenVerifiesAfterGate() async {
+    func testLiveEnqueuePersistsAndVerifiesWithoutWaitingForLaunchGate() async {
         let verifier = FakeVerifier()
         let gate = ControllableLaunchSettledGate()
         let store = ScriptedRewardStore()
         let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 }, launchGate: gate)
 
         mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 1)
-        await waitUntil { store.persisted.count == 1 }
-        XCTAssertEqual(verifier.callCount("A"), 0)
-
-        await gate.open()
         await waitUntil { verifier.callCount("A") == 1 && store.persisted.isEmpty }
+
+        let waitCount = await gate.waitCount
+        XCTAssertEqual(waitCount, 0)
+    }
+
+    func testStartupTriggerWaitsWithoutClaimingProcessing() async {
+        let seeded = [
+            PendingVerification(
+                serveId: "startup", sessionId: "s", elapsedPlayTime: 1,
+                retryCount: 0, lastAttemptTimestamp: 0
+            ),
+        ]
+        let verifier = FakeVerifier()
+        let gate = ControllableLaunchSettledGate()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 }, launchGate: gate)
+
+        mgr.triggerProcessQueue()
+        await waitForGateWaiter(gate)
+        XCTAssertEqual(verifier.callOrder, [])
+
+        mgr.queueVerification(serveId: "live", sessionId: "s", elapsedPlayTime: 1)
+        await waitUntil { verifier.callOrder.count == 2 && store.persisted.isEmpty }
+        XCTAssertEqual(verifier.callCount("live"), 1, "startup waiting must not claim processing")
+        await gate.open()
     }
 
     func testInitialSaveFailureBlocksVerifierAndCallbackUntilRetryPersists() async {
@@ -454,6 +475,33 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
 
+    func testRecoveredBackedOffTaskSchedulesWakeWithoutNewEnqueue() async {
+        let seeded = [
+            PendingVerification(
+                serveId: "A", sessionId: "s", elapsedPlayTime: 5,
+                retryCount: 1, lastAttemptTimestamp: 98
+            ),
+        ]
+        let verifier = FakeVerifier()
+        let clock = TestClock(100)
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
+
+        mgr.triggerProcessQueue()
+        let requested = await sleeper.waitForSleepRequest()
+
+        XCTAssertEqual(requested, 3, accuracy: 0.01)
+        XCTAssertEqual(verifier.callCount("A"), 0)
+        XCTAssertEqual(sleeper.count, 1)
+    }
+
     /// A wake that finds nothing eligible (frozen clock) must terminate — not reschedule
     /// itself forever against a backend that just failed.
     func testRetryWakeDoesNotRescheduleWhenStillBackedOff() async {
@@ -484,6 +532,16 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(verifier.callCount("A"), 1)
         XCTAssertEqual(store.persisted.count, 1)
         XCTAssertEqual(sleeper.count, 1, "ineligible wake must not chain another sleep")
+    }
+
+    private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
+        let deadline = Date().addingTimeInterval(TestWait.timeout)
+        while Date() <= deadline {
+            if await gate.waitCount > 0 { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let waitCount = await gate.waitCount
+        XCTAssertGreaterThan(waitCount, 0)
     }
 
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not

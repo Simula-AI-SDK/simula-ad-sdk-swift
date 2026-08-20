@@ -378,6 +378,11 @@ public final class SimulaInterstitialAd {
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
             delegate?.interstitialDidLoad(self)
+            #if os(iOS)
+            Task { [weak self, impressionId = response.impressionId] in
+                await self?.prewarmWhenReady(impressionId: impressionId)
+            }
+            #endif
         } catch let apiError as SimulaAPIError {
             // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
             // lifecycle event comes from failLoad()).
@@ -394,6 +399,18 @@ public final class SimulaInterstitialAd {
             failLoad(.network(.invalidResponse))
         }
     }
+
+    #if os(iOS)
+    private func prewarmWhenReady(impressionId: String) async {
+        await LaunchSettledGate.shared.waitUntilSettled()
+        guard !Task.isCancelled,
+              case .ready(let readyResponse, _, _) = state,
+              readyResponse.impressionId == impressionId else { return }
+        FullscreenPresentationRegistry.shared.prewarmIfEligible {
+            WebViewPool.shared.prewarm(trigger: "interstitial_ready")
+        }
+    }
+    #endif
 
     /// Dedup key: (ad unit id, character id, character name, current session id),
     /// joined with a NUL separator so values containing spaces can't collide.
@@ -466,8 +483,11 @@ public final class SimulaInterstitialAd {
                     metadata: metadata
                 )
             },
-            onClose: { [weak self] in
-                guard let self else { return }
+            onClose: { [weak self] presentationLease in
+                guard let self else {
+                    presentationLease.finishPostCloseTeardown()
+                    return
+                }
                 self.presenter = nil
                 self.state = .idle
                 Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
@@ -487,6 +507,7 @@ public final class SimulaInterstitialAd {
                             attribution: response.skanAttribution
                         )
                     },
+                    presentationLease: presentationLease,
                     onAllClosed: { [weak self] in
                         guard let self else { return }
                         self.delegate?.interstitialDidClose(self)
@@ -636,7 +657,8 @@ public final class SimulaInterstitialAd {
                 self.delegate?.interstitialDidRecordImpression(self)
                 self.delegate?.interstitialDidPay(self, value: response.adValue)
             },
-            onClose: { [weak self] in
+            onClose: { [weak self] presentationLease in
+                defer { presentationLease.finishPostCloseTeardown() }
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
@@ -742,6 +764,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
@@ -750,15 +773,17 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
             // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed) }
+            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed) }
         } else {
             onAllClosed()
+            presentationLease.finishPostCloseTeardown()
         }
         #else
         onAllClosed()
+        presentationLease.finishPostCloseTeardown()
         #endif
     }
 
@@ -773,11 +798,16 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) async {
         let ads = await prefetch.value
-        guard let ad else { onAllClosed(); return }
-        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+        guard let ad else {
+            onAllClosed()
+            presentationLease.finishPostCloseTeardown()
+            return
+        }
+        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
     }
     #endif
 
@@ -789,10 +819,15 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
-        guard !ads.isEmpty else { onAllClosed(); return }
+        guard !ads.isEmpty else {
+            onAllClosed()
+            presentationLease.finishPostCloseTeardown()
+            return
+        }
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
@@ -802,14 +837,21 @@ public final class SimulaInterstitialAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) }
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) },
+            presentationLease: presentationLease
         ) { [weak self] in
             self?.fallbackPresenter = nil
             onAllClosed()
         }
-        if didPresent { self.fallbackPresenter = presenter } else { onAllClosed() }
+        if didPresent {
+            self.fallbackPresenter = presenter
+        } else {
+            onAllClosed()
+            presentationLease.finishPostCloseTeardown()
+        }
         #else
         onAllClosed()
+        presentationLease.finishPostCloseTeardown()
         #endif
     }
 }

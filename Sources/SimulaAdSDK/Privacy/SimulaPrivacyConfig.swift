@@ -38,8 +38,9 @@ public struct SimulaPrivacyConfig: Sendable, Equatable {
     public var coppaApplies: Bool
 
     /// Opt-in switch for advertising-identifier (IDFA) collection. Default `false`
-    /// keeps the SDK contextual-only. Even when `true`, the IDFA is read only when
-    /// ATT is authorized, COPPA does not apply, and consent permits.
+    /// keeps the SDK contextual-only. The SDK may still report the non-prompting ATT
+    /// authorization status; IDFA itself is read only when this is `true`, ATT is
+    /// authorized, and COPPA does not apply.
     public var enableAdvertisingId: Bool
 
     public init(
@@ -86,7 +87,7 @@ public struct ConsentSnapshot: Sendable, Equatable {
     /// not allowed. Never the all-zero "unavailable" UUID.
     public let advertisingId: String?
     /// Raw ATT authorization status (`ATTrackingManager.AuthorizationStatus.rawValue`),
-    /// or `nil` on platforms without ATT / before it is resolved.
+    /// or `nil` on platforms without ATT, before it is resolved, or under COPPA.
     public let attStatus: Int?
 
     public init(

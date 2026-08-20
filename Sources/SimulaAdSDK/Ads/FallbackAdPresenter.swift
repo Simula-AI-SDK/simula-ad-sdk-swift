@@ -17,6 +17,7 @@ import UIKit
 final class FallbackAdPresenter {
     private var window: UIWindow?
     private var onClose: (() -> Void)?
+    private var presentationLease: FullscreenPresentationLease?
     private var ads: [FallbackAd] = []
     private var index = 0
     /// The host's key window, captured before we take key. Restored on dismiss so the host
@@ -58,6 +59,7 @@ final class FallbackAdPresenter {
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
+        presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
         guard let firstAd = ads.first, let scene = Self.activeWindowScene() else { return false }
@@ -71,6 +73,7 @@ final class FallbackAdPresenter {
         self.autoStoreRedirect = autoStoreRedirect
         self.onAutoStoreRedirect = onAutoStoreRedirect
         self.onAdClick = onAdClick
+        self.presentationLease = presentationLease
 
         originalKeyWindow = scene.keyWindow
 
@@ -141,6 +144,8 @@ final class FallbackAdPresenter {
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
+        let presentationLease = presentationLease
+        self.presentationLease = nil
         retainedWhilePresenting = nil
         win?.isHidden = true
         win?.rootViewController = nil
@@ -149,6 +154,7 @@ final class FallbackAdPresenter {
         // Balanced with the present-time hide(); ref count keeps the bar hidden if the close
         // callback opens another presenter, restoring the host only when the last one ends.
         SimulaAppStatusBar.restore()
+        presentationLease?.finishPostCloseTeardown()
     }
 
     private static func activeWindowScene() -> UIWindowScene? {

@@ -162,7 +162,11 @@ struct WebViewRepresentable: UIViewRepresentable {
                 webView.evaluateJavaScript(Coordinator.overflowLockScript, completionHandler: nil)
             }
         } else {
-            webView = WebViewPool.shared.acquire(delegate: coordinator, onMessage: onMessage)
+            webView = WebViewPool.shared.acquire(
+                delegate: coordinator,
+                onMessage: onMessage,
+                surface: telemetryAdFormat
+            )
         }
         // The coordinator needs the web view to post `GET_*` replies back into the page.
         coordinator.webView = webView

@@ -24,7 +24,8 @@ let impressionTickNanos: UInt64 = 200_000_000
 @MainActor
 final class InterstitialPresenter {
     private var window: UIWindow?
-    private var onClose: (() -> Void)?
+    private var onClose: ((FullscreenPresentationLease) -> Void)?
+    private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so
     /// the host regains touch/keyboard focus (a new key window doesn't auto-revert).
     private weak var originalKeyWindow: UIWindow?
@@ -48,12 +49,16 @@ final class InterstitialPresenter {
         response: AdLoadResponse,
         onClick: @escaping () -> Void,
         onImpression: @escaping () -> Void,
-        onClose: @escaping () -> Void
+        onClose: @escaping (FullscreenPresentationLease) -> Void
     ) -> Bool {
+        guard presentationLease == nil else { return false }
+        let presentationLease = FullscreenPresentationRegistry.shared.claim()
         guard let scene = Self.activeWindowScene() else {
             // No scene to present in — caller decides how to surface this.
+            presentationLease.releaseAfterPresentationFailure()
             return false
         }
+        self.presentationLease = presentationLease
         self.onClose = onClose
 
         // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
@@ -108,10 +113,18 @@ final class InterstitialPresenter {
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil
+        let presentationLease = presentationLease
+        self.presentationLease = nil
         // Release the presentation-scoped self-retention. The caller's reference keeps `self`
         // alive through this method even when this was the last strong reference.
         retainedWhilePresenting = nil
-        callback?()
+        if let presentationLease {
+            if let callback {
+                callback(presentationLease)
+            } else {
+                presentationLease.finishPostCloseTeardown()
+            }
+        }
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).
         SimulaAppStatusBar.restore()
@@ -120,6 +133,7 @@ final class InterstitialPresenter {
         // Restore the host's key window so it regains focus. A fallback window presented in the
         // callback stays visible on top and still receives touches via hit-testing.
         hostKeyWindow?.makeKey()
+        presentationLease?.finishPrimaryTeardown()
     }
 
     /// Finds a foreground window scene to attach the overlay window to.
