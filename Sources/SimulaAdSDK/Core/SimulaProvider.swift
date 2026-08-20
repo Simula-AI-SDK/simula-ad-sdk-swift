@@ -5,6 +5,21 @@ import Combine
 import AppTrackingTransparency
 #endif
 
+struct PrivacyChangeImpact: Equatable, Sendable {
+    let requiresSessionResync: Bool
+    let requiresWebViewReset: Bool
+}
+
+/// Privacy fields are wire-visible and require a fresh session, while WebView state only depends
+/// on the derived local-storage policy. In particular, deferred ATT/IDFA updates must not churn UI.
+func classifyPrivacyChange(from previous: ConsentSnapshot, to current: ConsentSnapshot) -> PrivacyChangeImpact {
+    let changed = previous != current
+    return PrivacyChangeImpact(
+        requiresSessionResync: changed,
+        requiresWebViewReset: changed && previous.allowsLocalStorage != current.allowsLocalStorage
+    )
+}
+
 // MARK: - SimulaProvider
 
 /// The central state manager for the Simula Ad SDK.
@@ -118,6 +133,10 @@ public final class SimulaProvider: ObservableObject {
     /// Subscriptions to the consent store (re-sync session on CMP refresh).
     private var cancellables: Set<AnyCancellable> = []
 
+    /// Last settled privacy value observed by the provider. Used to distinguish a wire-only
+    /// update (for example deferred ATT) from a local-storage policy transition.
+    private var observedPrivacySnapshot = ConsentSnapshot()
+
     // MARK: - Init
 
     public init(
@@ -178,15 +197,20 @@ public final class SimulaProvider: ObservableObject {
         // Feed the process-wide store, then re-sync the session whenever consent
         // changes (host CMP refresh or ATT result) so the backend sees current signals.
         SimulaPrivacy.shared.apply(resolved)
+        observedPrivacySnapshot = SimulaPrivacy.shared.currentSnapshot
         SimulaPrivacy.shared.$snapshot
             .dropFirst()
             .removeDuplicates()
             // CMPs write the IAB keys in a burst; coalesce so a settled consent
             // state triggers exactly one /session/create instead of a race.
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] current in
+                guard let self else { return }
+                let impact = classifyPrivacyChange(from: self.observedPrivacySnapshot, to: current)
+                self.observedPrivacySnapshot = current
+                guard impact.requiresSessionResync else { return }
                 // Single-call task closure — see the task-shape note in TelemetryManager.
-                Task { @MainActor in await self?.handleConsentChange() }
+                Task { @MainActor in await self.handlePrivacyChange(impact) }
             }
             .store(in: &cancellables)
     }
@@ -296,19 +320,17 @@ public final class SimulaProvider: ObservableObject {
         }
     }
 
-    /// Task body for the consent-change reaction (named method — see the task-shape note in
-    /// TelemetryManager): drop consent-scoped web views, then re-sync the session.
+    /// Task body for the privacy-change reaction (named method — see the task-shape note in
+    /// TelemetryManager): reset WebViews only for storage-policy changes, then re-sync the session.
     @MainActor
-    private func handleConsentChange() async {
+    private func handlePrivacyChange(_ impact: PrivacyChangeImpact) async {
         #if os(iOS)
-        // The storage policy may have flipped (TCF Purpose 1 / GDPR); drop prewarmed web
-        // views so the next game/ad is built with a data store matching the new consent.
-        // (`acquire` also guards this lazily; this just frees stale views proactively.)
-        WebViewPool.shared.clear()
-        // Retained native-ad views baked the previous data store in at creation too: destroy the
-        // idle ones now and flag on-screen ones so they're destroyed on scroll-out instead of
-        // being retained/reattached under stale consent.
-        NativeAdWebViewStore.shared.invalidateAllSessions()
+        if impact.requiresWebViewReset {
+            // The storage policy flipped (TCF Purpose 1 / GDPR); drop views whose data store no
+            // longer matches. Wire-only updates such as ATT/IDFA deliberately preserve them.
+            WebViewPool.shared.clear()
+            NativeAdWebViewStore.shared.invalidateAllSessions()
+        }
         #endif
         await resyncSession()
     }
@@ -674,10 +696,10 @@ public final class SimulaProvider: ObservableObject {
     }
 
     #if os(iOS)
-    /// Presents the App Tracking Transparency prompt and, when advertising-id
-    /// collection is enabled (and COPPA does not apply), begins forwarding the
-    /// IDFA on authorization. Call from the host's launch flow or a post-CMP
-    /// callback. Requires `NSUserTrackingUsageDescription` in the app's Info.plist.
+    /// Presents the App Tracking Transparency prompt and reports the resulting status. When
+    /// advertising-id collection is enabled (and COPPA does not apply), also begins forwarding
+    /// IDFA on authorization. Call from the host's launch flow or a post-CMP callback. Requires
+    /// `NSUserTrackingUsageDescription` in the app's Info.plist.
     @MainActor
     @discardableResult
     public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {

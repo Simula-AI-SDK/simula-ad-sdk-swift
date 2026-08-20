@@ -21,7 +21,8 @@ typealias AdvertisingIdReader = @MainActor @Sendable () -> String?
 ///   `UserDefaults.didChangeNotification`).
 /// - Merges **explicit overrides** from `SimulaPrivacyConfig` / `update(...)` on
 ///   top of the IAB-read values.
-/// - Owns ATT + IDFA collection, gated by `enableAdvertisingId` and `coppaApplies`.
+/// - Reports ATT status independently from optional IDFA collection. COPPA suppresses
+///   both; `enableAdvertisingId` gates only the IDFA read.
 /// - Publishes `snapshot` for SwiftUI; exposes `currentSnapshot` for thread-safe
 ///   reads from the API client.
 ///
@@ -107,8 +108,8 @@ public final class SimulaPrivacy: ObservableObject {
             self?.recompute()
         }
         #if os(iOS)
-        // ATT/IDFA can change while backgrounded (Settings, GAID reset). Re-read
-        // the advertising id when the app returns to the foreground.
+        // ATT/IDFA can change while backgrounded (Settings, IDFA reset). Re-read
+        // ATT status and, when enabled, the advertising id on foreground.
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
@@ -138,17 +139,25 @@ public final class SimulaPrivacy: ObservableObject {
     public func apply(_ config: SimulaPrivacyConfig) {
         lock.lock()
         let wasEnabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
+        let advertisingSettingChanged = explicitConfig.enableAdvertisingId != config.enableAdvertisingId
+        let coppaChanged = explicitConfig.coppaApplies != config.coppaApplies
         explicitConfig = config
         let isEnabled = config.enableAdvertisingId && !config.coppaApplies
+        if advertisingSettingChanged || coppaChanged {
+            advertisingRefreshGeneration += 1
+            advertisingRefreshScheduled = false
+        }
         if isEnabled && !wasEnabled {
             lastAdvertisingStatusRefresh = nil
             lastAdvertisingIdRefresh = nil
         }
-        if !config.enableAdvertisingId || config.coppaApplies {
+        if !isEnabled {
             collectedAdvertisingId = nil
+        }
+        if config.coppaApplies {
             attStatusRaw = nil
-            advertisingRefreshGeneration += 1
-            advertisingRefreshScheduled = false
+        } else if coppaChanged {
+            lastAdvertisingStatusRefresh = nil
         }
         lock.unlock()
         scheduleAdvertisingRefresh(alwaysCheckStatus: false)
@@ -171,6 +180,8 @@ public final class SimulaPrivacy: ObservableObject {
         lock.lock()
         var c = explicitConfig
         let wasEnabled = c.enableAdvertisingId && !c.coppaApplies
+        let previousAdvertisingSetting = c.enableAdvertisingId
+        let previousCoppa = c.coppaApplies
         if let hasPrivacyConsent { c.hasPrivacyConsent = hasPrivacyConsent }
         if let tcString { c.tcString = tcString }
         if let uspString { c.uspString = uspString }
@@ -182,15 +193,21 @@ public final class SimulaPrivacy: ObservableObject {
         if let enableAdvertisingId { c.enableAdvertisingId = enableAdvertisingId }
         explicitConfig = c
         let isEnabled = c.enableAdvertisingId && !c.coppaApplies
+        if previousAdvertisingSetting != c.enableAdvertisingId || previousCoppa != c.coppaApplies {
+            advertisingRefreshGeneration += 1
+            advertisingRefreshScheduled = false
+        }
         if isEnabled && !wasEnabled {
             lastAdvertisingStatusRefresh = nil
             lastAdvertisingIdRefresh = nil
         }
-        if !c.enableAdvertisingId || c.coppaApplies {
+        if !isEnabled {
             collectedAdvertisingId = nil
+        }
+        if c.coppaApplies {
             attStatusRaw = nil
-            advertisingRefreshGeneration += 1
-            advertisingRefreshScheduled = false
+        } else if previousCoppa != c.coppaApplies {
+            lastAdvertisingStatusRefresh = nil
         }
         lock.unlock()
         scheduleAdvertisingRefresh(alwaysCheckStatus: false)
@@ -229,9 +246,9 @@ public final class SimulaPrivacy: ObservableObject {
         ATTrackingManager.trackingAuthorizationStatus
     }
 
-    /// Presents the ATT prompt (if still undetermined) and — when advertising-id
-    /// collection is enabled and COPPA does not apply — reads the IDFA into the
-    /// snapshot on authorization. Returns the resulting status.
+    /// Presents the ATT prompt (if still undetermined) and stores the resulting
+    /// status unless COPPA applies. When advertising-id collection is enabled,
+    /// non-COPPA, and authorized, also reads the IDFA into the snapshot.
     ///
     /// The host app must declare `NSUserTrackingUsageDescription` in its Info.plist.
     @MainActor
@@ -284,23 +301,24 @@ public final class SimulaPrivacy: ObservableObject {
         lock.lock()
         advertisingRefreshGeneration += 1
         advertisingRefreshScheduled = false
-        let enabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
+        let reportStatus = !explicitConfig.coppaApplies
+        let readId = reportStatus && explicitConfig.enableAdvertisingId && statusRaw == 3
         lock.unlock()
-        guard enabled else { return }
-        let id = statusRaw == 3 ? advertisingIdReader() : nil
+        guard reportStatus else { return }
+        let id = readId ? advertisingIdReader() : nil
         applyPromptAdvertisingReading(statusRaw: statusRaw, advertisingId: id)
     }
 
-    /// Schedules the automatic ATT/IDFA snapshot. The first opt-in waits for the shared launch
-    /// quiet window. Foreground always re-checks cheap ATT status; only the IDFA read is throttled
-    /// to Android's four-hour interval. Reapplied unchanged config is coalesced by the same window.
+    /// Schedules the automatic ATT snapshot after the shared launch quiet window. Foreground always
+    /// re-checks cheap ATT status; only an enabled, authorized IDFA read is throttled to Android's
+    /// four-hour interval. Reapplied unchanged config is coalesced by the same window.
     private func scheduleAdvertisingRefresh(alwaysCheckStatus: Bool) {
         lock.lock()
-        let enabled = explicitConfig.enableAdvertisingId && !explicitConfig.coppaApplies
+        let statusAllowed = !explicitConfig.coppaApplies
         let recentStatus = lastAdvertisingStatusRefresh.map {
             now() - $0 < Self.advertisingRefreshInterval
         } ?? false
-        if !enabled || advertisingRefreshScheduled || (!alwaysCheckStatus && recentStatus) {
+        if !statusAllowed || advertisingRefreshScheduled || (!alwaysCheckStatus && recentStatus) {
             lock.unlock()
             return
         }
@@ -323,11 +341,23 @@ public final class SimulaPrivacy: ObservableObject {
         let statusRaw = await MainActor.run { advertisingTrackingStatusReader() }
         let shouldReadId = applyAutomaticAdvertisingStatus(statusRaw, generation: generation)
         if shouldReadId {
-            let id = await MainActor.run { advertisingIdReader() }
+            let id = await MainActor.run { readAutomaticAdvertisingId(generation: generation) }
             applyAutomaticAdvertisingId(id, generation: generation)
         } else {
             recompute()
         }
+    }
+
+    @MainActor
+    private func readAutomaticAdvertisingId(generation: Int) -> String? {
+        lock.lock()
+        let allowed = advertisingRefreshScheduled
+            && advertisingRefreshGeneration == generation
+            && explicitConfig.enableAdvertisingId
+            && !explicitConfig.coppaApplies
+            && attStatusRaw == 3
+        lock.unlock()
+        return allowed ? advertisingIdReader() : nil
     }
 
     private func finishAutomaticRefreshTask() {
@@ -357,7 +387,6 @@ public final class SimulaPrivacy: ObservableObject {
         defer { lock.unlock() }
         return advertisingRefreshScheduled
             && advertisingRefreshGeneration == generation
-            && explicitConfig.enableAdvertisingId
             && !explicitConfig.coppaApplies
     }
 
@@ -367,7 +396,7 @@ public final class SimulaPrivacy: ObservableObject {
             lock.unlock()
             return false
         }
-        guard explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies else {
+        guard !explicitConfig.coppaApplies else {
             advertisingRefreshScheduled = false
             lock.unlock()
             return false
@@ -376,6 +405,12 @@ public final class SimulaPrivacy: ObservableObject {
         attStatusRaw = statusRaw
         lastAdvertisingStatusRefresh = now()
         if statusRaw != 3 {
+            collectedAdvertisingId = nil
+            advertisingRefreshScheduled = false
+            lock.unlock()
+            return false
+        }
+        guard explicitConfig.enableAdvertisingId else {
             collectedAdvertisingId = nil
             advertisingRefreshScheduled = false
             lock.unlock()
@@ -411,14 +446,15 @@ public final class SimulaPrivacy: ObservableObject {
 
     private func applyPromptAdvertisingReading(statusRaw: Int, advertisingId: String?) {
         lock.lock()
-        guard explicitConfig.enableAdvertisingId, !explicitConfig.coppaApplies else {
+        guard !explicitConfig.coppaApplies else {
             lock.unlock()
             return
         }
         attStatusRaw = statusRaw
-        collectedAdvertisingId = statusRaw == 3 ? advertisingId : nil
+        let canCollectId = explicitConfig.enableAdvertisingId && statusRaw == 3
+        collectedAdvertisingId = canCollectId ? advertisingId : nil
         lastAdvertisingStatusRefresh = now()
-        if statusRaw == 3 { lastAdvertisingIdRefresh = now() }
+        if canCollectId { lastAdvertisingIdRefresh = now() }
         lock.unlock()
         recompute()
     }

@@ -53,6 +53,49 @@ final class DurableQueueStoreTests: XCTestCase {
         XCTAssertEqual(verifications(from: store.load()).map(\.serveId), ["A", "B", "C"])
     }
 
+    func testMalformedBeaconLegacyDataIsClearedAndDoesNotLatchWrites() {
+        let defaults = isolatedDefaults()
+        let key = "simula_pending_beacons"
+        defaults.set(Data("not-json".utf8), forKey: key)
+        defaults.set(Data("keep".utf8), forKey: "unrelated")
+        let store = FileAdBeaconStore(
+            fileURL: temporaryFile("beacon-legacy-corruption.json"),
+            legacyDefaults: defaults
+        )
+
+        guard case .missing = store.load() else { return XCTFail("obsolete malformed legacy data is missing") }
+        XCTAssertNil(defaults.object(forKey: key))
+        XCTAssertNotNil(defaults.object(forKey: "unrelated"))
+
+        let replacement = [PendingBeacon(impressionId: "new", action: "seen")]
+        XCTAssertTrue(store.save(replacement))
+        XCTAssertEqual(beacons(from: store.load()), replacement)
+    }
+
+    func testMalformedRewardLegacyDataIsClearedAndDoesNotLatchWrites() {
+        let defaults = isolatedDefaults()
+        let key = "simula_pending_reward_verifications"
+        defaults.set(Data("not-json".utf8), forKey: key)
+        defaults.set(Data("keep".utf8), forKey: "unrelated")
+        let store = FileRewardVerificationStore(
+            fileURL: temporaryFile("reward-legacy-corruption.json"),
+            legacyDefaults: defaults
+        )
+
+        guard case .missing = store.load() else { return XCTFail("obsolete malformed legacy data is missing") }
+        XCTAssertNil(defaults.object(forKey: key))
+        XCTAssertNotNil(defaults.object(forKey: "unrelated"))
+
+        let replacement = [
+            PendingVerification(
+                serveId: "new", sessionId: "s", elapsedPlayTime: 1,
+                retryCount: 0, lastAttemptTimestamp: 0
+            ),
+        ]
+        XCTAssertTrue(store.save(replacement))
+        XCTAssertEqual(verifications(from: store.load()), replacement)
+    }
+
     func testMigrationPreservesQueuesBeyondFormerRecordAndByteCaps() throws {
         let defaults = isolatedDefaults()
         let payload = String(repeating: "x", count: 1_100)

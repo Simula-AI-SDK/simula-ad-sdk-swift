@@ -299,6 +299,15 @@ public final class SimulaRewardedAd {
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
             delegate?.rewardedDidLoad(self)
+            #if os(iOS)
+            Task { [weak self, impressionId = response.impressionId] in
+                await LaunchSettledGate.shared.waitUntilSettled()
+                guard !Task.isCancelled, let self,
+                      case .ready(let readyResponse, _, _) = self.state,
+                      readyResponse.impressionId == impressionId else { return }
+                WebViewPool.shared.prewarm(trigger: "rewarded_ready")
+            }
+            #endif
         } catch let apiError as SimulaAPIError {
             Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaRewardedAd.load")
             // ad_unit_not_found is a distinct, non-retryable misconfiguration — surface it as its

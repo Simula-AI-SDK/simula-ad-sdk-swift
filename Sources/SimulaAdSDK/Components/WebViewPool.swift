@@ -217,7 +217,7 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
 
 // MARK: - WebViewPool
 
-/// Reuses `WKWebView` instances and supports explicit prewarming for an already-open minigame UI.
+/// Reuses `WKWebView` instances and supports explicit prewarming for demand and ready fullscreen ads.
 ///
 /// The first `WKWebView` an app creates is expensive: it allocates the view,
 /// initializes WebKit, and brings up a Web Content process. By creating a web
@@ -423,10 +423,11 @@ final class WebViewPool {
     }
 
     /// Returns a web view wired to `delegate` and `onMessage`, reusing a prewarmed one when available.
-    /// Acquiring never refills speculatively; only an explicit, open minigame surface may prewarm.
+    /// Acquiring never refills speculatively; only explicit demand or gated fullscreen-ready work may prewarm.
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
-        onMessage: @escaping (String) -> Void
+        onMessage: @escaping (String) -> Void,
+        surface: String? = nil
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
         // Drop any prewarmed views whose storage policy no longer matches the
@@ -449,7 +450,8 @@ final class WebViewPool {
         Telemetry.shared.recordOperation(
             name: reusedWarm ? "webview_acquire_warm" : "webview_acquire_cold",
             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
-            success: true
+            success: true,
+            breadcrumb: Self.acquireBreadcrumb(surface)
         )
         return pooled.webView
     }
@@ -531,10 +533,19 @@ final class WebViewPool {
 
     private static func prewarmTrigger(_ value: String) -> String {
         switch value {
-        case "minigame_menu", "minigame_game":
+        case "minigame_menu", "minigame_game", "interstitial_ready", "rewarded_ready":
             return value
         default:
             return "demand"
+        }
+    }
+
+    private static func acquireBreadcrumb(_ surface: String?) -> String? {
+        switch surface {
+        case "interstitial", "rewarded":
+            return "surface=\(surface ?? "")"
+        default:
+            return nil
         }
     }
 }

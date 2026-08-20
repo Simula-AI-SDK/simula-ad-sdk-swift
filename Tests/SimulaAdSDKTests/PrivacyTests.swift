@@ -189,7 +189,7 @@ final class PrivacyTests: XCTestCase {
     // MARK: - Deferred ATT / IDFA scheduling
 
     @MainActor
-    func testAdvertisingReadsStayDisabledByDefault() async {
+    func testDefaultConfigurationReadsAttButNotIdfa() async {
         let reader = AdvertisingReaderRecorder()
         let store = SimulaPrivacy(
             defaults: makeDefaults(),
@@ -202,9 +202,59 @@ final class PrivacyTests: XCTestCase {
         store.apply(SimulaPrivacyConfig())
         await store.waitForAdvertisingRefreshIdleForTests()
 
-        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 0)
-        XCTAssertNil(store.currentSnapshot.attStatus)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+    }
+
+    @MainActor
+    func testIdfaDisabledDefersAttReadUntilLaunchGate() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        reader.statusRaw = 2
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
+        await waitForGateWaiter(gate)
+        XCTAssertEqual(reader.statusCount, 0)
+
+        await gate.open()
+        await store.waitForAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(reader.statusCount, 1)
+        XCTAssertEqual(reader.idCount, 0)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+    }
+
+    @MainActor
+    func testDisablingIdfaWhileDeferredRefreshWaitsStillReadsOnlyAtt() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+        store.update(enableAdvertisingId: false)
+
+        await gate.open()
+        await store.waitForAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(reader.statusCount, 1)
+        XCTAssertEqual(reader.idCount, 0)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
     }
 
     @MainActor
@@ -273,13 +323,62 @@ final class PrivacyTests: XCTestCase {
 
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
         await store.waitForAdvertisingRefreshIdleForTests()
-        store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        store.update(enableAdvertisingId: false)
         XCTAssertNil(store.currentSnapshot.advertisingId)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3, "disabling IDFA must retain ATT status")
 
         clock.value += 1
-        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        store.update(enableAdvertisingId: true)
         await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+    }
+
+    @MainActor
+    func testPromptStoresAttWithoutReadingIdfaWhenCollectionDisabled() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
+        await waitForGateWaiter(gate)
+
+        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 0)
+
+        await gate.open()
+        await store.waitForAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(reader.statusCount, 0, "prompt result must supersede the deferred status read")
+        XCTAssertEqual(reader.idCount, 0)
+    }
+
+    @MainActor
+    func testCoppaSuppressesAutomaticAndPromptAdvertisingSignals() async {
+        let reader = AdvertisingReaderRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+
+        store.apply(SimulaPrivacyConfig(coppaApplies: true, enableAdvertisingId: true))
+        await store.waitForAdvertisingRefreshIdleForTests()
+        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertEqual(reader.idCount, 0)
+        XCTAssertNil(store.currentSnapshot.attStatus)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
     }
 
     @MainActor
@@ -370,6 +469,51 @@ final class PrivacyTests: XCTestCase {
 
         XCTAssertEqual(reader.idCount, 1)
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
+    }
+
+    // MARK: - Provider privacy-change classification
+
+    func testDeferredAttAndIdfaChangesResyncSessionWithoutResettingWebViews() {
+        let initial = ConsentSnapshot()
+        let withAtt = ConsentSnapshot(attStatus: 3)
+        let withIdfa = ConsentSnapshot(advertisingId: "test-idfa", attStatus: 3)
+
+        XCTAssertEqual(
+            classifyPrivacyChange(from: initial, to: withAtt),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+        )
+        XCTAssertEqual(
+            classifyPrivacyChange(from: withAtt, to: withIdfa),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+        )
+        XCTAssertEqual(
+            classifyPrivacyChange(from: withIdfa, to: withAtt),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+        )
+    }
+
+    func testStoragePolicyChangeResyncsSessionAndResetsWebViews() {
+        let persistent = ConsentSnapshot(gdprApplies: true, tcfPurpose1Consent: true)
+        let ephemeral = ConsentSnapshot(gdprApplies: true, tcfPurpose1Consent: false)
+
+        XCTAssertEqual(
+            classifyPrivacyChange(from: persistent, to: ephemeral),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: true)
+        )
+    }
+
+    func testWirePrivacyChangeWithSameStoragePolicyOnlyResyncsSession() {
+        let previous = ConsentSnapshot(tcString: "old", gdprApplies: true, tcfPurpose1Consent: true)
+        let current = ConsentSnapshot(tcString: "new", gdprApplies: true, tcfPurpose1Consent: true)
+
+        XCTAssertEqual(
+            classifyPrivacyChange(from: previous, to: current),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+        )
+        XCTAssertEqual(
+            classifyPrivacyChange(from: current, to: current),
+            PrivacyChangeImpact(requiresSessionResync: false, requiresWebViewReset: false)
+        )
     }
 
     // MARK: - Privacy resolution (shared by SimulaAds.initialize via SimulaProvider)

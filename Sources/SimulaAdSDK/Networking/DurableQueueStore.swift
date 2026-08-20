@@ -43,13 +43,19 @@ final class DurableJSONQueueStore<Record: Codable>: @unchecked Sendable {
             return .loaded(records)
         }
 
-        guard let legacyData = legacyDefaults.data(forKey: legacyKey) else {
+        guard let legacyValue = legacyDefaults.object(forKey: legacyKey) else {
+            refusesWrites = false
+            return .missing
+        }
+        guard let legacyData = legacyValue as? Data else {
+            legacyDefaults.removeObject(forKey: legacyKey)
             refusesWrites = false
             return .missing
         }
         guard let legacy = try? JSONDecoder().decode([Record].self, from: legacyData) else {
-            refusesWrites = true
-            return .failed
+            legacyDefaults.removeObject(forKey: legacyKey)
+            refusesWrites = false
+            return .missing
         }
         guard writeLocked(legacy) else {
             refusesWrites = true

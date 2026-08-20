@@ -82,6 +82,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private var persistenceRetryTask: Task<Void, Never>?
     private var loadRetryCount = 0
     private var loadRetryTask: Task<Void, Never>?
+    private var startupTriggerTask: Task<Void, Never>?
     private var pendingRemovalServeIds: Set<String> = []
     private var pendingCallbacks: [(@Sendable (Result<String?, Error>) -> Void, Result<String?, Error>)] = []
     private var pendingNetworkRetryDelay: TimeInterval?
@@ -244,7 +245,20 @@ public final class RewardVerificationManager: @unchecked Sendable {
     public func triggerProcessQueue() {
         executor.async { [weak self] in
             guard let self else { return }
+            guard self.startupTriggerTask == nil else { return }
+            self.startupTriggerTask = Task { await self.runStartupTrigger() }
+        }
+    }
+
+    private func runStartupTrigger() async {
+        await launchGate.waitUntilSettled()
+        guard !Task.isCancelled else { return }
+        executor.async { [weak self] in
+            guard let self else { return }
+            self.startupTriggerTask = nil
+            let wasLoaded = self.isLoaded
             guard self.loadIfNeeded() else { return }
+            guard wasLoaded else { return }
             if self.isDirty { self.persistIfNeeded() }
             else { self.processNextIfPossible() }
         }
@@ -263,7 +277,6 @@ public final class RewardVerificationManager: @unchecked Sendable {
     }
 
     private func verify(_ task: PendingVerification) async {
-        await launchGate.waitUntilSettled()
         let result: Result<String?, Error>
         do {
             let response = try await verifier.verifyReward(

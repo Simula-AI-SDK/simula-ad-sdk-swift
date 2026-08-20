@@ -378,6 +378,15 @@ public final class SimulaInterstitialAd {
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
             delegate?.interstitialDidLoad(self)
+            #if os(iOS)
+            Task { [weak self, impressionId = response.impressionId] in
+                await LaunchSettledGate.shared.waitUntilSettled()
+                guard !Task.isCancelled, let self,
+                      case .ready(let readyResponse, _, _) = self.state,
+                      readyResponse.impressionId == impressionId else { return }
+                WebViewPool.shared.prewarm(trigger: "interstitial_ready")
+            }
+            #endif
         } catch let apiError as SimulaAPIError {
             // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
             // lifecycle event comes from failLoad()).

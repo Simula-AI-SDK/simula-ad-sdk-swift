@@ -156,7 +156,9 @@ Select "No" for all of these:
 
 Out of the box the SDK is **contextual-only**: it does **not** read the IDFA,
 does not track across apps, and its bundled `PrivacyInfo.xcprivacy` keeps
-`NSPrivacyTracking = false`. Most integrations need no ATT prompt.
+`NSPrivacyTracking = false`. The SDK reads and reports the current ATT authorization
+status without prompting; this is separate from IDFA collection. Most integrations
+need no ATT prompt.
 
 ### Passing consent signals (GDPR / CCPA / GPP / COPPA)
 
@@ -185,7 +187,7 @@ Refresh at runtime when your CMP updates (handle inside child views via
 simula.updateConsent(tcString: newTC, gppString: newGPP)
 ```
 
-`coppaApplies: true` suppresses the `ppid` and the IDFA regardless of ATT.
+`coppaApplies: true` suppresses the `ppid`, ATT status, and IDFA.
 
 **Storage degradation (TCF Purpose 1).** When Purpose 1 ("store/access information
 on a device") is denied — or GDPR applies and it's unknown — the SDK's WebViews use
@@ -212,6 +214,10 @@ SimulaProviderView(
 // From your launch flow or a post-CMP callback:
 await simula.requestTrackingAuthorization()
 ```
+
+Prompt completion is reported even when `enableAdvertisingId` is `false`; in that
+case no IDFA is read. Turning IDFA collection off later clears any collected IDFA but
+retains the latest ATT status. COPPA suppresses both ATT status and IDFA in SDK wire data.
 
 **3. Add the usage string** to your app's `Info.plist`:
 

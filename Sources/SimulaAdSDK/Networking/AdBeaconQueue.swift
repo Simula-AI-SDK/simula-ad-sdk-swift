@@ -79,6 +79,7 @@ public final class AdBeaconManager: @unchecked Sendable {
     private let launchGate: LaunchSettling
     private let persistenceSleep: @Sendable (TimeInterval) async -> Void
     private let loadSleep: @Sendable (TimeInterval) async -> Void
+    private let sleep: @Sendable (TimeInterval) async -> Void
     private let executor = DispatchQueue(label: "ad.simula.beacon.queue", qos: .utility)
     private var queue: [PendingBeacon] = []
     private var pendingQueue: [PendingBeacon] = []
@@ -90,8 +91,10 @@ public final class AdBeaconManager: @unchecked Sendable {
     private var persistenceRetryTask: Task<Void, Never>?
     private var loadRetryCount = 0
     private var loadRetryTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var startupTriggerTask: Task<Void, Never>?
     private var pendingRemovalKeys: Set<BeaconKey> = []
-    private var pauseAfterPersistence = false
+    private var pendingNetworkRetryDelay: TimeInterval?
     private let maxPendingEnqueues = 100
 
     private init() {
@@ -105,6 +108,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         self.launchGate = LaunchSettledGate.shared
         self.persistenceSleep = Self.defaultPersistenceSleep
         self.loadSleep = Self.defaultPersistenceSleep
+        self.sleep = Self.defaultPersistenceSleep
     }
 
     /// Test seam: inject a fake sender, isolated `UserDefaults`, and a controllable clock.
@@ -115,6 +119,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         self.launchGate = ImmediateLaunchSettledGate.shared
         self.persistenceSleep = Self.defaultPersistenceSleep
         self.loadSleep = Self.defaultPersistenceSleep
+        self.sleep = Self.defaultPersistenceSleep
         self.apiKey = apiKey
     }
 
@@ -123,6 +128,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         store: AdBeaconStoring,
         now: @escaping @Sendable () -> TimeInterval,
         apiKey: String? = "test",
+        sleep: (@Sendable (TimeInterval) async -> Void)? = nil,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         persistenceSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
         loadSleep: (@Sendable (TimeInterval) async -> Void)? = nil
@@ -134,6 +140,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         self.launchGate = launchGate
         self.persistenceSleep = persistenceSleep ?? Self.defaultPersistenceSleep
         self.loadSleep = loadSleep ?? Self.defaultPersistenceSleep
+        self.sleep = sleep ?? Self.defaultPersistenceSleep
     }
 
     /// Provide the api key (the beacon endpoints are Bearer-authed). Call once at SDK init; first wins.
@@ -186,8 +193,6 @@ public final class AdBeaconManager: @unchecked Sendable {
         }
         let key = BeaconKey(impressionId: impressionId, action: action)
         guard !pendingRemovalKeys.contains(key) else { return }
-        // An explicit enqueue is a fresh drain trigger once the latest full candidate is durable.
-        pauseAfterPersistence = false
         var changed = false
         if let index = queue.firstIndex(where: { $0.impressionId == impressionId && $0.action == action }) {
             if let normalizedMetadata {
@@ -225,27 +230,40 @@ public final class AdBeaconManager: @unchecked Sendable {
     public func triggerProcessQueue() {
         executor.async { [weak self] in
             guard let self else { return }
+            guard self.startupTriggerTask == nil else { return }
+            self.startupTriggerTask = Task { await self.runStartupTrigger() }
+        }
+    }
+
+    private func runStartupTrigger() async {
+        await launchGate.waitUntilSettled()
+        guard !Task.isCancelled else { return }
+        executor.async { [weak self] in
+            guard let self else { return }
+            self.startupTriggerTask = nil
+            let wasLoaded = self.isLoaded
             guard self.loadIfNeeded() else { return }
-            self.pauseAfterPersistence = false
+            guard wasLoaded else { return }
             if self.isDirty { self.persistIfNeeded() }
-            else { self.processNextIfPossible() }
+            else { self.processOrScheduleRetry() }
         }
     }
 
     // MARK: - Processing
 
-    private func processNextIfPossible() {
-        guard isLoaded, !isDirty, !isProcessing, let key = apiKey else { return }
+    @discardableResult
+    private func processNextIfPossible() -> Bool {
+        guard isLoaded, !isDirty, !isProcessing, let key = apiKey else { return false }
         let nowTs = now()
         guard let task = queue.first(where: {
             nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
-        }) else { return }
+        }) else { return false }
         isProcessing = true
         Task { await self.send(task: task, apiKey: key) }
+        return true
     }
 
     private func send(task: PendingBeacon, apiKey: String) async {
-        await launchGate.waitUntilSettled()
         let delivered: Bool
         do {
             let code = try await sender.sendImpressionBeacon(
@@ -263,6 +281,7 @@ public final class AdBeaconManager: @unchecked Sendable {
 
     private func complete(task: PendingBeacon, delivered: Bool) {
         isProcessing = false
+        var retryDelay: TimeInterval?
         let index = queue.firstIndex {
             if let id = task.id { return $0.id == id }
             return $0.id == nil && $0.impressionId == task.impressionId && $0.action == task.action
@@ -271,14 +290,12 @@ public final class AdBeaconManager: @unchecked Sendable {
             if delivered {
                 pendingRemovalKeys.insert(BeaconKey(impressionId: task.impressionId, action: task.action))
                 queue.remove(at: index)
-                pauseAfterPersistence = false
             } else {
                 if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
                 queue[index].lastAttemptTimestamp = now()
-                // Preserve the existing bail-on-transient-failure behavior. A later enqueue,
-                // startup trigger, or explicit trigger can re-enter the drain after backoff.
-                pauseAfterPersistence = true
+                retryDelay = earliestRetryDelay()
             }
+            pendingNetworkRetryDelay = retryDelay
             isDirty = true
             persistIfNeeded()
             return
@@ -286,6 +303,44 @@ public final class AdBeaconManager: @unchecked Sendable {
         // A concurrent metadata merge replaces the stable id. Continue immediately with that newer
         // record; a retryable failure on the unchanged record remains backed off.
         if delivered || index == nil { processNextIfPossible() }
+    }
+
+    private func earliestRetryDelay() -> TimeInterval? {
+        guard !queue.isEmpty else { return nil }
+        let nowTs = now()
+        let soonest = queue.map {
+            rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
+        }.min() ?? 0
+        return max(soonest, 1)
+    }
+
+    private func processOrScheduleRetry() {
+        guard !processNextIfPossible(), apiKey != nil else { return }
+        let nowTs = now()
+        guard let delay = queue.map({
+            rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
+        }).filter({ $0 > 0 }).min() else {
+            return
+        }
+        scheduleRetry(after: max(delay, 1))
+    }
+
+    private func scheduleRetry(after delay: TimeInterval) {
+        // Recompute from the whole durable queue after every reconciliation. A newly failed row
+        // may become eligible before the existing wake, so keep exactly one task for the latest
+        // earliest deadline rather than leaving newer work parked behind an older backoff.
+        retryTask?.cancel()
+        retryTask = Task { await self.runRetryWake(delay: delay) }
+    }
+
+    private func runRetryWake(delay: TimeInterval) async {
+        await sleep(delay)
+        guard !Task.isCancelled else { return }
+        executor.async { [weak self] in
+            guard let self else { return }
+            self.retryTask = nil
+            self.processNextIfPossible()
+        }
     }
 
     // MARK: - Persistence
@@ -318,10 +373,9 @@ public final class AdBeaconManager: @unchecked Sendable {
         mergePendingQueue()
         if hadPending {
             isDirty = true
-            pauseAfterPersistence = false
             persistIfNeeded()
         } else {
-            processNextIfPossible()
+            processOrScheduleRetry()
         }
         return true
     }
@@ -330,19 +384,24 @@ public final class AdBeaconManager: @unchecked Sendable {
         guard isDirty, isLoaded, persistenceRetryTask == nil else { return }
         if store.save(queue) {
             isDirty = false
-            pendingRemovalKeys.removeAll()
             persistenceRetryCount = 0
             persistenceRetryTask?.cancel()
             persistenceRetryTask = nil
-            if pauseAfterPersistence {
-                pauseAfterPersistence = false
-            } else {
-                processNextIfPossible()
-            }
+            durabilityCommitted()
         } else {
             persistenceRetryCount += 1
             Telemetry.shared.recordError(signature: "beacon:persist_failed")
             schedulePersistenceRetry()
+        }
+    }
+
+    private func durabilityCommitted() {
+        pendingRemovalKeys.removeAll()
+        if let delay = pendingNetworkRetryDelay {
+            pendingNetworkRetryDelay = nil
+            scheduleRetry(after: delay)
+        } else {
+            processOrScheduleRetry()
         }
     }
 
@@ -441,6 +500,10 @@ public final class AdBeaconManager: @unchecked Sendable {
                 persistenceRetryTask = nil
                 loadRetryTask?.cancel()
                 loadRetryTask = nil
+                retryTask?.cancel()
+                retryTask = nil
+                startupTriggerTask?.cancel()
+                startupTriggerTask = nil
                 continuation.resume()
             }
         }
