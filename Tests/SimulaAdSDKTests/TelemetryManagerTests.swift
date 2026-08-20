@@ -155,6 +155,10 @@ final class TelemetryManagerTests: XCTestCase {
         let store = FakeStore(); let sender = FakeSender()
         let sleep = ControllablePersistenceSleep()
         let mgr = build(store: store, sender: sender, timedFlushSleep: { await sleep.sleep($0) })
+        // Recovery intentionally requests an immediate flush for recovered or concurrently recorded
+        // work. Settle it before exercising the independent periodic-flush path.
+        await mgr.waitForRecoveryForTests()
+        await mgr.waitForImmediateFlushIdleForTests()
 
         for _ in 0..<3 {
             mgr.recordNetwork(path: "/load/interstitial", method: "POST", statusCode: 200, durationMs: 12, requestBytes: 0, responseBytes: 100, failureClass: nil)

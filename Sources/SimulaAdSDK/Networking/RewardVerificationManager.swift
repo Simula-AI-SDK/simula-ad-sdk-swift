@@ -236,7 +236,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
             isDirty = true
             persistIfNeeded()
         } else if !isDirty {
-            processNextIfPossible()
+            processOrScheduleRetry()
         }
     }
 
@@ -260,20 +260,22 @@ public final class RewardVerificationManager: @unchecked Sendable {
             guard self.loadIfNeeded() else { return }
             guard wasLoaded else { return }
             if self.isDirty { self.persistIfNeeded() }
-            else { self.processNextIfPossible() }
+            else { self.processOrScheduleRetry() }
         }
     }
 
     // MARK: - Processing
 
-    private func processNextIfPossible() {
-        guard isLoaded, !isDirty, !isProcessing else { return }
+    @discardableResult
+    private func processNextIfPossible() -> Bool {
+        guard isLoaded, !isDirty, !isProcessing else { return false }
         let nowTs = now()
         guard let task = queue.first(where: {
             nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
-        }) else { return }
+        }) else { return false }
         isProcessing = true
         Task { await self.verify(task) }
+        return true
     }
 
     private func verify(_ task: PendingVerification) async {
@@ -334,6 +336,17 @@ public final class RewardVerificationManager: @unchecked Sendable {
         retryTask = Task { await self.runRetryWake(delay: delay) }
     }
 
+    private func processOrScheduleRetry() {
+        guard !processNextIfPossible() else { return }
+        let nowTs = now()
+        guard let delay = queue.map({
+            rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
+        }).filter({ $0 > 0 }).min() else {
+            return
+        }
+        scheduleRetry(after: max(delay, 1))
+    }
+
     /// Retry-wake task body (named method — see the task-shape note in TelemetryManager).
     private func runRetryWake(delay: TimeInterval) async {
         await sleep(delay)
@@ -378,7 +391,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
             isDirty = true
             persistIfNeeded()
         } else {
-            processNextIfPossible()
+            processOrScheduleRetry()
         }
         return true
     }
@@ -409,7 +422,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
             pendingNetworkRetryDelay = nil
             scheduleRetry(after: delay)
         } else {
-            processNextIfPossible()
+            processOrScheduleRetry()
         }
     }
 

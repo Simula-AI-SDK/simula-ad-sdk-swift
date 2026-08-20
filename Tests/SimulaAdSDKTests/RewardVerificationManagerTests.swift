@@ -475,6 +475,33 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(sleeper.count, 1, "success path must not schedule another wake")
     }
 
+    func testRecoveredBackedOffTaskSchedulesWakeWithoutNewEnqueue() async {
+        let seeded = [
+            PendingVerification(
+                serveId: "A", sessionId: "s", elapsedPlayTime: 5,
+                retryCount: 1, lastAttemptTimestamp: 98
+            ),
+        ]
+        let verifier = FakeVerifier()
+        let clock = TestClock(100)
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
+
+        mgr.triggerProcessQueue()
+        let requested = await sleeper.waitForSleepRequest()
+
+        XCTAssertEqual(requested, 3, accuracy: 0.01)
+        XCTAssertEqual(verifier.callCount("A"), 0)
+        XCTAssertEqual(sleeper.count, 1)
+    }
+
     /// A wake that finds nothing eligible (frozen clock) must terminate — not reschedule
     /// itself forever against a backend that just failed.
     func testRetryWakeDoesNotRescheduleWhenStillBackedOff() async {
