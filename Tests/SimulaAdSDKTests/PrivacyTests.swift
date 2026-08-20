@@ -473,23 +473,70 @@ final class PrivacyTests: XCTestCase {
 
     // MARK: - Provider privacy-change classification
 
-    func testDeferredAttAndIdfaChangesResyncSessionWithoutResettingWebViews() {
-        let initial = ConsentSnapshot()
-        let withAtt = ConsentSnapshot(attStatus: 3)
-        let withIdfa = ConsentSnapshot(advertisingId: "test-idfa", attStatus: 3)
+    func testAttTransitionMatrixOnlySuppressesInitialNilToNotDetermined() {
+        let statuses: [Int?] = [nil, 0, 1, 2, 3]
+
+        for previousStatus in statuses {
+            for currentStatus in statuses {
+                let expectedResync = previousStatus != currentStatus
+                    && !(previousStatus == nil && currentStatus == 0)
+                XCTAssertEqual(
+                    classifyPrivacyChange(
+                        from: ConsentSnapshot(attStatus: previousStatus),
+                        to: ConsentSnapshot(attStatus: currentStatus)
+                    ),
+                    PrivacyChangeImpact(
+                        requiresSessionResync: expectedResync,
+                        requiresWebViewReset: false
+                    ),
+                    "unexpected impact for ATT \(String(describing: previousStatus)) -> \(String(describing: currentStatus))"
+                )
+            }
+        }
+    }
+
+    func testNilToNotDeterminedWithAnotherPrivacyChangeStillResyncs() {
+        let previous = ConsentSnapshot(tcString: "old", attStatus: nil)
+        let current = ConsentSnapshot(tcString: "new", attStatus: 0)
 
         XCTAssertEqual(
-            classifyPrivacyChange(from: initial, to: withAtt),
+            classifyPrivacyChange(from: previous, to: current),
             PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
         )
+    }
+
+    func testNilToNotDeterminedWithStorageChangeResyncsAndResetsWebViews() {
+        let previous = ConsentSnapshot(
+            gdprApplies: true,
+            tcfPurpose1Consent: true,
+            attStatus: nil
+        )
+        let current = ConsentSnapshot(
+            gdprApplies: true,
+            tcfPurpose1Consent: false,
+            attStatus: 0
+        )
+
         XCTAssertEqual(
-            classifyPrivacyChange(from: withAtt, to: withIdfa),
-            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+            classifyPrivacyChange(from: previous, to: current),
+            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: true)
         )
-        XCTAssertEqual(
-            classifyPrivacyChange(from: withIdfa, to: withAtt),
-            PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
-        )
+    }
+
+    func testIdfaChangesResyncSessionWithoutResettingWebViews() {
+        let snapshots = [
+            ConsentSnapshot(attStatus: 3),
+            ConsentSnapshot(advertisingId: "first-idfa", attStatus: 3),
+            ConsentSnapshot(advertisingId: "second-idfa", attStatus: 3),
+            ConsentSnapshot(attStatus: 3),
+        ]
+
+        for (previous, current) in zip(snapshots, snapshots.dropFirst()) {
+            XCTAssertEqual(
+                classifyPrivacyChange(from: previous, to: current),
+                PrivacyChangeImpact(requiresSessionResync: true, requiresWebViewReset: false)
+            )
+        }
     }
 
     func testStoragePolicyChangeResyncsSessionAndResetsWebViews() {

@@ -301,11 +301,7 @@ public final class SimulaRewardedAd {
             delegate?.rewardedDidLoad(self)
             #if os(iOS)
             Task { [weak self, impressionId = response.impressionId] in
-                await LaunchSettledGate.shared.waitUntilSettled()
-                guard !Task.isCancelled, let self,
-                      case .ready(let readyResponse, _, _) = self.state,
-                      readyResponse.impressionId == impressionId else { return }
-                WebViewPool.shared.prewarm(trigger: "rewarded_ready")
+                await self?.prewarmWhenReady(impressionId: impressionId)
             }
             #endif
         } catch let apiError as SimulaAPIError {
@@ -322,6 +318,18 @@ public final class SimulaRewardedAd {
             failLoad(.network(.invalidResponse))
         }
     }
+
+    #if os(iOS)
+    private func prewarmWhenReady(impressionId: String) async {
+        await LaunchSettledGate.shared.waitUntilSettled()
+        guard !Task.isCancelled,
+              case .ready(let readyResponse, _, _) = state,
+              readyResponse.impressionId == impressionId else { return }
+        FullscreenPresentationRegistry.shared.prewarmIfEligible {
+            WebViewPool.shared.prewarm(trigger: "rewarded_ready")
+        }
+    }
+    #endif
 
     /// Dedup key: (ad unit id, character id, character name, current session id),
     /// joined with a NUL separator so values containing spaces can't collide.
@@ -407,7 +415,7 @@ public final class SimulaRewardedAd {
                     metadata: metadata
                 )
             },
-            onClose: { [weak self] earned, elapsedPlayTime in
+            onClose: { [weak self] earned, elapsedPlayTime, presentationLease in
                 guard let self else {
                     // The host destroyed this ad object while the playable was up (the presenter
                     // self-retains, so the unit stayed on screen). Delegates and fallback screens
@@ -420,6 +428,7 @@ public final class SimulaRewardedAd {
                         elapsedPlayTime: elapsedPlayTime,
                         adUnitId: salvageAdUnitId
                     )
+                    presentationLease.finishPostCloseTeardown()
                     return
                 }
                 self.presenter = nil
@@ -444,6 +453,7 @@ public final class SimulaRewardedAd {
                             attribution: response.skanAttribution
                         )
                     },
+                    presentationLease: presentationLease,
                     onAllClosed: { [weak self] in
                         guard let self else {
                             // The host destroyed this ad object during the fallback screens (they
@@ -579,7 +589,8 @@ public final class SimulaRewardedAd {
                 self.delegate?.rewardedDidRecordImpression(self)
                 self.delegate?.rewardedDidPay(self, value: AdValue.fromBidCpm(0))
             },
-            onClose: { [weak self] earned, _ in
+            onClose: { [weak self] earned, _, presentationLease in
+                defer { presentationLease.finishPostCloseTeardown() }
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
@@ -785,6 +796,7 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
@@ -793,17 +805,19 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
             // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed) }
+            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed) }
         } else {
             // No prefetch ran (e.g. empty impression id) — nothing to show, so the ad unit is
             // already fully closed; verify immediately.
             onAllClosed()
+            presentationLease.finishPostCloseTeardown()
         }
         #else
         onAllClosed()
+        presentationLease.finishPostCloseTeardown()
         #endif
     }
 
@@ -818,11 +832,16 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) async {
         let ads = await prefetch.value
-        guard let ad else { onAllClosed(); return }
-        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, onAllClosed: onAllClosed)
+        guard let ad else {
+            onAllClosed()
+            presentationLease.finishPostCloseTeardown()
+            return
+        }
+        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
     }
     #endif
 
@@ -832,11 +851,16 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
+        presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         #if os(iOS)
         // No fallback screens → the playable was the whole ad unit; it's already fully closed.
-        guard !ads.isEmpty else { onAllClosed(); return }
+        guard !ads.isEmpty else {
+            onAllClosed()
+            presentationLease.finishPostCloseTeardown()
+            return
+        }
         let presenter = FallbackAdPresenter()
         let didPresent = presenter.present(
             ads: ads,
@@ -846,7 +870,8 @@ public final class SimulaRewardedAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) }
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) },
+            presentationLease: presentationLease
         ) { [weak self] in
             self?.fallbackPresenter = nil
             onAllClosed()
@@ -857,6 +882,7 @@ public final class SimulaRewardedAd {
             // Couldn't present the fallback window (no scene) — don't strand the reward; treat the
             // unit as fully closed so verification still runs.
             onAllClosed()
+            presentationLease.finishPostCloseTeardown()
         }
         #endif
     }

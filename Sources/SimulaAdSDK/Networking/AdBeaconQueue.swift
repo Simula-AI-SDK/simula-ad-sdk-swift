@@ -336,11 +336,7 @@ public final class AdBeaconManager: @unchecked Sendable {
     private func runRetryWake(delay: TimeInterval) async {
         await sleep(delay)
         guard !Task.isCancelled else { return }
-        executor.async { [weak self] in
-            guard let self else { return }
-            self.retryTask = nil
-            self.processNextIfPossible()
-        }
+        executor.async { [weak self] in self?.processNextIfPossible() }
     }
 
     // MARK: - Persistence
@@ -490,6 +486,12 @@ public final class AdBeaconManager: @unchecked Sendable {
     func waitForExecutorForTests() async {
         await withCheckedContinuation { continuation in
             executor.async { continuation.resume() }
+        }
+    }
+
+    func retryTaskForTests() async -> Task<Void, Never>? {
+        await withCheckedContinuation { continuation in
+            executor.async { [self] in continuation.resume(returning: retryTask) }
         }
     }
 

@@ -11,12 +11,24 @@ struct PrivacyChangeImpact: Equatable, Sendable {
 }
 
 /// Privacy fields are wire-visible and require a fresh session, while WebView state only depends
-/// on the derived local-storage policy. In particular, deferred ATT/IDFA updates must not churn UI.
+/// on the derived local-storage policy. Resolving the initial ATT value to `notDetermined` is the
+/// sole wire-neutral transition; the observed snapshot still advances so later ATT changes resync.
 func classifyPrivacyChange(from previous: ConsentSnapshot, to current: ConsentSnapshot) -> PrivacyChangeImpact {
     let changed = previous != current
+    let onlyResolvedInitialAttNotDetermined = previous.attStatus == nil
+        && current.attStatus == 0
+        && previous.hasPrivacyConsent == current.hasPrivacyConsent
+        && previous.tcString == current.tcString
+        && previous.uspString == current.uspString
+        && previous.gppString == current.gppString
+        && previous.gppSid == current.gppSid
+        && previous.gdprApplies == current.gdprApplies
+        && previous.coppaApplies == current.coppaApplies
+        && previous.tcfPurpose1Consent == current.tcfPurpose1Consent
+        && previous.advertisingId == current.advertisingId
     return PrivacyChangeImpact(
-        requiresSessionResync: changed,
-        requiresWebViewReset: changed && previous.allowsLocalStorage != current.allowsLocalStorage
+        requiresSessionResync: changed && !onlyResolvedInitialAttNotDetermined,
+        requiresWebViewReset: previous.allowsLocalStorage != current.allowsLocalStorage
     )
 }
 

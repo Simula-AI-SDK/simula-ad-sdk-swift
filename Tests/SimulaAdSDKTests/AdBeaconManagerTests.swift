@@ -535,6 +535,54 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sleeper.count, 1, "an early wake must not start a retry loop")
     }
 
+    func testCompletedStaleWakeDoesNotClearNewerRetryTask() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "A", "seen")
+        sender.setCode(503, for: "B", "seen")
+        let clock = BeaconTestClock(0)
+        let sleeper = BeaconControllableSleep()
+        let store = BlockingNthSaveBeaconStore(blockingSave: 4)
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer {
+            store.release()
+            sleeper.release()
+        }
+
+        mgr.enqueue(impressionId: "A", action: "seen")
+        _ = await sleeper.waitForSleepRequest()
+        guard let staleWake = await mgr.retryTaskForTests() else {
+            XCTFail("expected first retry wake")
+            return
+        }
+
+        mgr.enqueue(impressionId: "B", action: "seen")
+        await waitUntil { store.isBlocked }
+        guard store.isBlocked else {
+            XCTFail("expected B retry persistence to block")
+            sleeper.release()
+            return
+        }
+
+        // Finish A's wake while B's failure owns the executor. Its drain is now queued behind
+        // the executor turn that replaces A with B's newer retry task.
+        sleeper.release()
+        await staleWake.value
+        store.release()
+        _ = await sleeper.waitForSleepRequest()
+        await mgr.waitForExecutorForTests()
+
+        let ownedRetryTask = await mgr.retryTaskForTests()
+        XCTAssertNotNil(ownedRetryTask, "the stale wake must not discard B's task handle")
+
+        await mgr.cancelPendingWorkForTests()
+        sleeper.release()
+    }
+
     private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
         let deadline = Date().addingTimeInterval(TestWait.timeout)
         while Date() <= deadline {
@@ -636,6 +684,51 @@ private final class BlockingBeaconStore: AdBeaconStoring, @unchecked Sendable {
         if shouldWait { gate.wait() }
         return true
     }
+    func release() {
+        lock.lock()
+        let shouldSignal = !didRelease
+        didRelease = true
+        lock.unlock()
+        if shouldSignal { gate.signal() }
+    }
+}
+
+private final class BlockingNthSaveBeaconStore: AdBeaconStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let blockingSave: Int
+    private var saves = 0
+    private var blocked = false
+    private var didRelease = false
+    private var durable: [PendingBeacon] = []
+
+    init(blockingSave: Int) { self.blockingSave = blockingSave }
+
+    func load() -> DurableQueueLoad<PendingBeacon> {
+        lock.lock(); defer { lock.unlock() }
+        return .loaded(durable)
+    }
+
+    func save(_ records: [PendingBeacon]) -> Bool {
+        lock.lock()
+        saves += 1
+        let shouldBlock = saves == blockingSave && !didRelease
+        if shouldBlock { blocked = true }
+        lock.unlock()
+
+        if shouldBlock { gate.wait() }
+
+        lock.lock()
+        durable = records
+        lock.unlock()
+        return true
+    }
+
+    var isBlocked: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return blocked && !didRelease
+    }
+
     func release() {
         lock.lock()
         let shouldSignal = !didRelease
