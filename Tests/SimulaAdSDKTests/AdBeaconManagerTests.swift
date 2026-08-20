@@ -63,6 +63,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(q.count, 1)
         XCTAssertEqual(q.first?.lastAttemptTimestamp, 1000)
         XCTAssertEqual(sender.callCount("imp", "seen"), 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testConnectivityFailureKeepsBeacon() async {
@@ -74,6 +75,7 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen")
         await waitUntil { store.persisted.first?.retryCount == 1 }
         XCTAssertEqual(store.persisted.count, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateBeaconEnqueuedOnce() async {
@@ -86,6 +88,7 @@ final class AdBeaconManagerTests: XCTestCase {
         mgr.enqueue(impressionId: "imp", action: "seen") // duplicate
         await waitUntil { store.persisted.first?.retryCount ?? 0 >= 1 }
         XCTAssertEqual(store.persisted.count, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testSeenMetadataIsPersistedAndForwarded() async {
@@ -103,6 +106,7 @@ final class AdBeaconManagerTests: XCTestCase {
         await waitUntil { store.persisted.first?.retryCount == 1 }
         XCTAssertEqual(store.persisted.first?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(sender.lastMetadata("imp", "seen"), ["page_name": "Search", "surface": "chat"])
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateSeenMergesMetadataWithoutResettingRetry() async {
@@ -119,6 +123,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let queued = store.persisted.first
         XCTAssertEqual(queued?.metadata, ["page_name": "Search", "surface": "chat"])
         XCTAssertEqual(queued?.retryCount, 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testDuplicateSeenMergeRemainsBounded() async {
@@ -137,6 +142,7 @@ final class AdBeaconManagerTests: XCTestCase {
         let metadata = store.persisted.first?.metadata
         XCTAssertEqual(metadata?.count, 10)
         XCTAssertTrue(second.keys.allSatisfy { metadata?[$0] == "v" }, "newest keys must survive the cap")
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testMetadataMergedDuringSuccessfulSendIsDeliveredThenQueueDrains() async {
@@ -584,13 +590,7 @@ final class AdBeaconManagerTests: XCTestCase {
     }
 
     private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
-        let deadline = Date().addingTimeInterval(TestWait.timeout)
-        while Date() <= deadline {
-            if await gate.waitCount > 0 { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        let waitCount = await gate.waitCount
-        XCTAssertGreaterThan(waitCount, 0)
+        await waitUntil { await gate.waitCount > 0 }
     }
 }
 
@@ -635,6 +635,7 @@ private actor BlockingBeaconSender: BeaconSending {
     private var metadata: [[String: String]?] = []
     private var firstCallWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstCallContinuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
     private let firstCode: Int
 
     init(firstCode: Int = 200) {
@@ -651,7 +652,14 @@ private actor BlockingBeaconSender: BeaconSending {
         guard self.metadata.count == 1 else { return 200 }
         firstCallWaiters.forEach { $0.resume() }
         firstCallWaiters.removeAll()
-        await withCheckedContinuation { firstCallContinuation = $0 }
+        await withCheckedContinuation { continuation in
+            if releaseRequested {
+                releaseRequested = false
+                continuation.resume()
+            } else {
+                firstCallContinuation = continuation
+            }
+        }
         return firstCode
     }
 
@@ -661,8 +669,12 @@ private actor BlockingBeaconSender: BeaconSending {
     }
 
     func releaseFirstCall() {
-        firstCallContinuation?.resume()
+        guard let continuation = firstCallContinuation else {
+            releaseRequested = true
+            return
+        }
         firstCallContinuation = nil
+        continuation.resume()
     }
 
     func metadataSnapshots() -> [[String: String]?] { metadata }

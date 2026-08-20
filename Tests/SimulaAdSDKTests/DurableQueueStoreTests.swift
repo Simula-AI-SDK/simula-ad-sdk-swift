@@ -11,7 +11,7 @@ final class DurableQueueStoreTests: XCTestCase {
 
     private func isolatedDefaults() -> UserDefaults {
         let name = "SimulaQueueMigration-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: name) ?? .standard
+        let defaults = UserDefaults(suiteName: name)!
         addTeardownBlock { defaults.removePersistentDomain(forName: name) }
         return defaults
     }

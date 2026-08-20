@@ -108,6 +108,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(queue.first?.retryCount, 1)
         XCTAssertEqual(queue.first?.lastAttemptTimestamp, 1000)
         XCTAssertEqual(verifier.callCount("A"), 1)
+        await mgr.cancelPendingWorkForTests()
     }
 
     func testVerificationEnqueuedDuringInFlightDrainIsRoutedToItsOwnCaller() async {
@@ -535,13 +536,7 @@ final class RewardVerificationManagerTests: XCTestCase {
     }
 
     private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
-        let deadline = Date().addingTimeInterval(TestWait.timeout)
-        while Date() <= deadline {
-            if await gate.waitCount > 0 { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        let waitCount = await gate.waitCount
-        XCTAssertGreaterThan(waitCount, 0)
+        await waitUntil { await gate.waitCount > 0 }
     }
 
     // Note: Kotlin additionally tests a throwing listener not derailing the drain — not
@@ -567,6 +562,7 @@ private final class ControllableSleep: @unchecked Sendable {
     private var pendingDelay: TimeInterval?
     private var delayWaiter: CheckedContinuation<TimeInterval, Never>?
     private var releaseCont: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
     private var _count = 0
     private var sleeping = false
 
@@ -592,6 +588,12 @@ private final class ControllableSleep: @unchecked Sendable {
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             lock.lock()
+            if releaseRequested {
+                releaseRequested = false
+                lock.unlock()
+                cont.resume()
+                return
+            }
             releaseCont = cont
             lock.unlock()
         }
@@ -619,6 +621,7 @@ private final class ControllableSleep: @unchecked Sendable {
         lock.lock()
         let cont = releaseCont
         releaseCont = nil
+        if cont == nil { releaseRequested = true }
         lock.unlock()
         cont?.resume()
     }

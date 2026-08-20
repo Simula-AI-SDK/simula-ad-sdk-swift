@@ -87,11 +87,4 @@ final class NativeAdMountSchedulerTests: XCTestCase {
         await Task.yield()
         XCTAssertFalse(admitted)
     }
-
-    private func waitUntil(_ condition: () -> Bool) async {
-        for _ in 0..<100 where !condition() {
-            await Task.yield()
-        }
-        XCTAssertTrue(condition())
-    }
 }

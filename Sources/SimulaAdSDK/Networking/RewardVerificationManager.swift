@@ -464,6 +464,22 @@ public final class RewardVerificationManager: @unchecked Sendable {
         }
     }
 
+    func cancelPendingWorkForTests() async {
+        await withCheckedContinuation { continuation in
+            executor.async { [self] in
+                persistenceRetryTask?.cancel()
+                persistenceRetryTask = nil
+                loadRetryTask?.cancel()
+                loadRetryTask = nil
+                retryTask?.cancel()
+                retryTask = nil
+                startupTriggerTask?.cancel()
+                startupTriggerTask = nil
+                continuation.resume()
+            }
+        }
+    }
+
     private static let defaultPersistenceSleep: @Sendable (TimeInterval) async -> Void = { delay in
         do { try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000)) } catch { return }
     }

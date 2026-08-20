@@ -632,10 +632,5 @@ private final class PrivacyClock: @unchecked Sendable {
 }
 
 private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
-    let deadline = Date().addingTimeInterval(TestWait.timeout)
-    while await gate.waitCount == 0, Date() < deadline {
-        try? await Task.sleep(nanoseconds: 5_000_000)
-    }
-    let count = await gate.waitCount
-    XCTAssertGreaterThan(count, 0)
+    await waitUntil { await gate.waitCount > 0 }
 }

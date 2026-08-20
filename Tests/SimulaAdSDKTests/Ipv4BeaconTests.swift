@@ -171,13 +171,13 @@ final class Ipv4BeaconTests: XCTestCase {
 
     func testAFailedSendStaysRetryable() async {
         let recorder = SendRecorder()
-        recorder.result = false
+        recorder.setResult(false)
         let beacon = makeBeacon(recorder: recorder)
 
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
         await waitUntil { recorder.count == 1 && beacon.isIdleForTests }
 
-        recorder.result = true
+        recorder.setResult(true)
         beacon.fire(apiKey: "k", sessionId: "sess", ppid: "u", reason: Ipv4Beacon.reasonInit)
         await waitUntil { recorder.count == 2 && beacon.isIdleForTests }
 
@@ -235,13 +235,7 @@ final class Ipv4BeaconTests: XCTestCase {
     }
 
     private func waitForGateWaiter(_ gate: ControllableLaunchSettledGate) async {
-        let deadline = Date().addingTimeInterval(TestWait.timeout)
-        while Date() <= deadline {
-            if await gate.waitCount > 0 { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        let count = await gate.waitCount
-        XCTAssertGreaterThan(count, 0)
+        await waitUntil { await gate.waitCount > 0 }
     }
 }
 
@@ -255,10 +249,11 @@ private final class SendRecorder: @unchecked Sendable {
     private var gateStream: AsyncStream<Void>?
     private var gateContinuation: AsyncStream<Void>.Continuation?
 
-    var result = true
+    private var result = true
 
     var count: Int { lock.lock(); defer { lock.unlock() }; return recorded.count }
     var urls: [URL] { lock.lock(); defer { lock.unlock() }; return recorded }
+    func setResult(_ value: Bool) { lock.lock(); result = value; lock.unlock() }
 
     /// Hold subsequent sends open until `open()` is called.
     func gate() {

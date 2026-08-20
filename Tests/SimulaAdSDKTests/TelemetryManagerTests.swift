@@ -62,7 +62,7 @@ final class TelemetryManagerTests: XCTestCase {
         private let lock = NSLock()
         private var _batches: [TelemetryEnvelope] = []
         private var acks: [TelemetryAck] = []
-        var defaultAck: TelemetryAck = .accepted
+        private var defaultAck: TelemetryAck = .accepted
         private var gateCont: CheckedContinuation<Void, Never>?
         private var gated = false
         private var _attemptCount = 0
@@ -70,6 +70,7 @@ final class TelemetryManagerTests: XCTestCase {
         var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
         var attemptCount: Int { lock.lock(); defer { lock.unlock() }; return _attemptCount }
         func enqueueAcks(_ a: [TelemetryAck]) { lock.lock(); acks = a; lock.unlock() }
+        func setDefaultAck(_ ack: TelemetryAck) { lock.lock(); defaultAck = ack; lock.unlock() }
         func gateFirst() { lock.lock(); gated = true; lock.unlock() }
         func release() {
             lock.lock(); let c = gateCont; gateCont = nil; gated = false; lock.unlock()
@@ -356,7 +357,7 @@ final class TelemetryManagerTests: XCTestCase {
 
     func testPermanent4xxDropsWithoutRetry() async {
         let store = FakeStore()
-        let sender = FakeSender(); sender.defaultAck = .drop
+        let sender = FakeSender(); sender.setDefaultAck(.drop)
         let mgr = build(store: store, sender: sender)
 
         mgr.recordError(signature: "api:bad", errorCode: "bad", message: "x")
@@ -488,12 +489,6 @@ final class TelemetryManagerTests: XCTestCase {
     }
 
     private func waitForGateWaiters(_ gate: ControllableLaunchSettledGate, count: Int) async {
-        let deadline = Date().addingTimeInterval(TestWait.timeout)
-        while Date() <= deadline {
-            if await gate.waitCount >= count { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        let waiterCount = await gate.waitCount
-        XCTAssertGreaterThanOrEqual(waiterCount, count)
+        await waitUntil { await gate.waitCount >= count }
     }
 }

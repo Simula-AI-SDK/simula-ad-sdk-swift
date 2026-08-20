@@ -8,7 +8,7 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.1.9-dev.5"
+let SIMULA_SDK_VERSION = "1.1.9-dev.6"
 
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
