@@ -24,6 +24,7 @@ let impressionTickNanos: UInt64 = 200_000_000
 @MainActor
 final class InterstitialPresenter {
     private var window: UIWindow?
+    private var creativeBridge: CreativeBridge?
     private var onClose: ((FullscreenPresentationLease) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so
@@ -64,6 +65,7 @@ final class InterstitialPresenter {
         // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
         // hosting controller + window created below.
         let bridge = CreativeBridge()
+        creativeBridge = bridge
 
         let root = CreativeInterstitialView(
             apiKey: apiKey,
@@ -109,6 +111,9 @@ final class InterstitialPresenter {
         // the time it returns. Operate on the locals afterwards instead of touching `self`.
         let win = window
         let hostKeyWindow = originalKeyWindow
+        let bridge = creativeBridge
+        creativeBridge = nil
+        bridge?.stop()
         window = nil
         originalKeyWindow = nil
         let callback = onClose

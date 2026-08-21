@@ -237,14 +237,14 @@ struct WebViewRepresentable: UIViewRepresentable {
             coordinator.currentURL = nil
             coordinator.currentBaseURL = baseURL
             coordinator.realLoadStarted = true
-            webView.loadHTMLString(html, baseURL: baseURL)
+            coordinator.trackRequestedNavigation(webView.loadHTMLString(html, baseURL: baseURL))
         } else if let url = url, url != currentURL {
             coordinator.currentURL = url
             coordinator.currentHTML = nil
             coordinator.currentBaseURL = nil
             coordinator.realLoadStarted = true
             let request = URLRequest(url: url)
-            webView.load(request)
+            coordinator.trackRequestedNavigation(webView.load(request))
         }
     }
 
@@ -284,6 +284,9 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         coordinator.unlockContentOffset()
+        coordinator.bridge?.stop()
+        coordinator.bridge = nil
+        coordinator.webView = nil
         // Stop forwarding visibility into a view that's about to be recycled/retained.
         coordinator.visibilityRelay?.bind(nil)
         if let impressionId = coordinator.retainedImpressionId,
@@ -352,6 +355,17 @@ struct WebViewRepresentable: UIViewRepresentable {
         var visibilityRelay: VisibilityRelay?
         /// Monotonic page-load start (set on provisional navigation start) for `webview_page_load`.
         private var pageStartUptime: TimeInterval?
+        /// Latest main-document navigation. Rejects late pool-reset callbacks from an older document.
+        private var activeBridgeNavigation: WKNavigation?
+        /// SDK-issued load awaiting its matching start callback; older pooled starts are ignored.
+        private var requestedBridgeNavigation: WKNavigation?
+
+        func trackRequestedNavigation(_ navigation: WKNavigation?) {
+            if let navigation {
+                activeBridgeNavigation = navigation
+                requestedBridgeNavigation = navigation
+            }
+        }
 
         /// Tracks the currently loaded URL to avoid redundant loads
         var currentURL: URL?
@@ -574,8 +588,18 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Gate on realLoadStarted, not the URL: a native creative loaded with a nil baseURL also
             // reports webView.url == about:blank, and must NOT be skipped.
             guard realLoadStarted else { return }
+            if let requestedBridgeNavigation {
+                guard requestedBridgeNavigation === navigation else { return }
+                self.requestedBridgeNavigation = nil
+            }
+            activeBridgeNavigation = navigation
             mainFrameHTTPFailed = false // fresh load — the previous HTTP verdict no longer applies
             pageStartUptime = ProcessInfo.processInfo.systemUptime
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            guard realLoadStarted, activeBridgeNavigation === navigation else { return }
+            bridge?.pageDidCommit()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -583,6 +607,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             // gating on the URL would also drop the native (nil-baseURL → about:blank) creative's load
             // and never inject the height-reporting script, collapsing the slot.
             guard realLoadStarted else { return }
+            // A pooled view may still deliver its reset-to-about:blank completion after the real
+            // navigation starts. Only the latest tracked main document may run success lifecycle.
+            guard activeBridgeNavigation === navigation else { return }
+            activeBridgeNavigation = nil
+            requestedBridgeNavigation = nil
             // Main-frame 4xx/5xx: this didFinish is WebKit rendering the ERROR page, not the
             // creative — the slot already collapsed via onNavigationFailed (decidePolicyFor). Run
             // NONE of the success path: don't mark the store session healthy (it was just flagged
@@ -609,6 +638,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                     stage: "webview_page_load", adFormat: telemetryAdFormat, adUnitId: nil, adId: nil,
                     serveId: nil, durationMs: Int((ProcessInfo.processInfo.systemUptime - start) * 1000), errorCode: nil
                 )
+            }
+            bridge?.pageDidFinishLoading { [weak self, weak webView] js in
+                guard let self, let webView, self.webView === webView else { return }
+                webView.evaluateJavaScript(js, completionHandler: nil)
             }
             onNavigationFinished?()
             // Native ad: start reporting content height so the slot can size its container.
@@ -646,12 +679,12 @@ struct WebViewRepresentable: UIViewRepresentable {
             if !renderRecoveryAttempted {
                 if let html = currentHTML {
                     renderRecoveryAttempted = true
-                    webView.loadHTMLString(html, baseURL: currentBaseURL)
+                    trackRequestedNavigation(webView.loadHTMLString(html, baseURL: currentBaseURL))
                     return
                 }
                 if let url = currentURL {
                     renderRecoveryAttempted = true
-                    webView.load(URLRequest(url: url))
+                    trackRequestedNavigation(webView.load(URLRequest(url: url)))
                     return
                 }
             }
@@ -685,12 +718,16 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            if activeBridgeNavigation === navigation { activeBridgeNavigation = nil }
+            if requestedBridgeNavigation === navigation { requestedBridgeNavigation = nil }
             if isCancelled(error) { return }
             noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            if activeBridgeNavigation === navigation { activeBridgeNavigation = nil }
+            if requestedBridgeNavigation === navigation { requestedBridgeNavigation = nil }
             // A cancelled provisional load happens when the real URL supersedes
             // the prewarm's about:blank load; it isn't a genuine failure.
             if isCancelled(error) { return }
