@@ -4,6 +4,16 @@ import WebKit
 import StoreKit
 import SafariServices
 
+internal func identicalNonNilObjects<T: AnyObject>(_ lhs: T?, _ rhs: T?) -> Bool {
+    guard let lhs, let rhs else { return false }
+    return lhs === rhs
+}
+
+internal func stopBeforeRecycling(stop: () -> Void, recycle: () -> Void) {
+    stop()
+    recycle()
+}
+
 // MARK: - WebViewRepresentable
 
 /// A UIViewRepresentable wrapper around WKWebView for loading game iframes and ad content.
@@ -284,16 +294,17 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         coordinator.unlockContentOffset()
-        coordinator.bridge?.stop()
-        coordinator.bridge = nil
-        coordinator.webView = nil
-        // Stop forwarding visibility into a view that's about to be recycled/retained.
-        coordinator.visibilityRelay?.bind(nil)
-        if let impressionId = coordinator.retainedImpressionId,
-           NativeAdWebViewStore.shared.detach(uiView, impressionId: impressionId) {
-            return // retained (or destroyed if render-dead) — never pool-released
+        stopBeforeRecycling(stop: { coordinator.bridge?.stop() }) {
+            coordinator.bridge = nil
+            coordinator.webView = nil
+            // Stop forwarding visibility into a view that's about to be recycled/retained.
+            coordinator.visibilityRelay?.bind(nil)
+            if let impressionId = coordinator.retainedImpressionId,
+               NativeAdWebViewStore.shared.detach(uiView, impressionId: impressionId) {
+                return // retained (or destroyed if render-dead) — never pool-released
+            }
+            WebViewPool.shared.release(uiView)
         }
-        WebViewPool.shared.release(uiView)
     }
 
     /// The creative-identity key for `NativeAdWebViewStore`: the iframe URL when loading by URL,
@@ -589,16 +600,17 @@ struct WebViewRepresentable: UIViewRepresentable {
             // reports webView.url == about:blank, and must NOT be skipped.
             guard realLoadStarted else { return }
             if let requestedBridgeNavigation {
-                guard requestedBridgeNavigation === navigation else { return }
+                guard identicalNonNilObjects(requestedBridgeNavigation, navigation) else { return }
                 self.requestedBridgeNavigation = nil
             }
+            guard let navigation else { return }
             activeBridgeNavigation = navigation
             mainFrameHTTPFailed = false // fresh load — the previous HTTP verdict no longer applies
             pageStartUptime = ProcessInfo.processInfo.systemUptime
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            guard realLoadStarted, activeBridgeNavigation === navigation else { return }
+            guard realLoadStarted, identicalNonNilObjects(activeBridgeNavigation, navigation) else { return }
             bridge?.pageDidCommit()
         }
 
@@ -609,7 +621,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             guard realLoadStarted else { return }
             // A pooled view may still deliver its reset-to-about:blank completion after the real
             // navigation starts. Only the latest tracked main document may run success lifecycle.
-            guard activeBridgeNavigation === navigation else { return }
+            guard identicalNonNilObjects(activeBridgeNavigation, navigation) else { return }
             activeBridgeNavigation = nil
             requestedBridgeNavigation = nil
             // Main-frame 4xx/5xx: this didFinish is WebKit rendering the ERROR page, not the
@@ -718,16 +730,16 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            if activeBridgeNavigation === navigation { activeBridgeNavigation = nil }
-            if requestedBridgeNavigation === navigation { requestedBridgeNavigation = nil }
+            if identicalNonNilObjects(activeBridgeNavigation, navigation) { activeBridgeNavigation = nil }
+            if identicalNonNilObjects(requestedBridgeNavigation, navigation) { requestedBridgeNavigation = nil }
             if isCancelled(error) { return }
             noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            if activeBridgeNavigation === navigation { activeBridgeNavigation = nil }
-            if requestedBridgeNavigation === navigation { requestedBridgeNavigation = nil }
+            if identicalNonNilObjects(activeBridgeNavigation, navigation) { activeBridgeNavigation = nil }
+            if identicalNonNilObjects(requestedBridgeNavigation, navigation) { requestedBridgeNavigation = nil }
             // A cancelled provisional load happens when the real URL supersedes
             // the prewarm's about:blank load; it isn't a genuine failure.
             if isCancelled(error) { return }

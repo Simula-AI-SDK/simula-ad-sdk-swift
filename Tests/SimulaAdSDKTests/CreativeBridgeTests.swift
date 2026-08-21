@@ -204,6 +204,29 @@ final class CreativeBridgeTests: XCTestCase {
         XCTAssertEqual(eventCount, 2)
     }
 
+    func testNavigationIdentityRequiresTwoNonNilMatchingObjects() {
+        final class NavigationToken {}
+        let first = NavigationToken()
+        let second = NavigationToken()
+        let missing: NavigationToken? = nil
+
+        XCTAssertTrue(identicalNonNilObjects(first, first))
+        XCTAssertFalse(identicalNonNilObjects(first, second))
+        XCTAssertFalse(identicalNonNilObjects(first, missing))
+        XCTAssertFalse(identicalNonNilObjects(missing, missing))
+    }
+
+    func testBridgeStopsBeforeWebViewRecycling() {
+        var events: [String] = []
+
+        stopBeforeRecycling(
+            stop: { events.append("stop") },
+            recycle: { events.append("recycle") }
+        )
+
+        XCTAssertEqual(events, ["stop", "recycle"])
+    }
+
     /// A numeric requestId is echoed back with its JSON type preserved.
     @MainActor
     func testGetOrientationReplyShape() {

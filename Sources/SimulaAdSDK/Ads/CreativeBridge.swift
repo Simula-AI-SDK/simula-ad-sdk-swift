@@ -58,7 +58,8 @@ protocol CreativeAudioVolumePolling: AnyObject {
 
 /** Fallback for iOS versions that emit output-volume KVO only while the host audio session is active. */
 private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling {
-    private static let interval: TimeInterval = 0.25
+    // KVO remains the fast path. This only closes inactive-session gaps, so sub-second polling is enough.
+    private static let interval: TimeInterval = 0.75
 
     private var timer: Timer?
     private var onPoll: (() -> Void)?
