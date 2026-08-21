@@ -51,6 +51,77 @@ private final class SystemCreativeAudioVolumeSource: CreativeAudioVolumeSource {
     }
 }
 
+protocol CreativeAudioVolumePolling: AnyObject {
+    func start(_ onPoll: @escaping () -> Void)
+    func stop()
+}
+
+/** Fallback for iOS versions that emit output-volume KVO only while the host audio session is active. */
+private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling {
+    private static let interval: TimeInterval = 0.25
+
+    private var timer: Timer?
+    private var onPoll: (() -> Void)?
+    private var backgroundObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
+
+    func start(_ onPoll: @escaping () -> Void) {
+        stop()
+        self.onPoll = onPoll
+
+        let center = NotificationCenter.default
+        backgroundObserver = center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stopTimer()
+        }
+        foregroundObserver = center.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.startTimer()
+            self.onPoll?()
+        }
+
+        if UIApplication.shared.applicationState != .background {
+            startTimer()
+        }
+    }
+
+    func stop() {
+        stopTimer()
+        let center = NotificationCenter.default
+        if let backgroundObserver { center.removeObserver(backgroundObserver) }
+        if let foregroundObserver { center.removeObserver(foregroundObserver) }
+        backgroundObserver = nil
+        foregroundObserver = nil
+        onPoll = nil
+    }
+
+    private func startTimer() {
+        guard timer == nil, onPoll != nil else { return }
+        let timer = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+            self?.onPoll?()
+        }
+        timer.tolerance = Self.interval / 5
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 /// Something whose allowed interface orientations the bridge can pin (the presenter's
 /// hosting controller). Kept as a protocol so `CreativeBridge` holds it without the
 /// hosting controller's generic `Content` leaking in.
@@ -87,17 +158,23 @@ final class CreativeBridge: ObservableObject {
     weak var window: UIWindow?
 
     private let audioVolumeSource: CreativeAudioVolumeSource
+    private let audioVolumePoller: CreativeAudioVolumePolling
     private var audioObservation: CreativeAudioVolumeObservation?
     private var audioEventReply: ((String) -> Void)?
     private var lastSentAudioState: CreativeAudioState?
     private var audioPageGeneration: UInt64 = 0
 
-    init(audioVolumeSource: CreativeAudioVolumeSource = SystemCreativeAudioVolumeSource()) {
+    init(
+        audioVolumeSource: CreativeAudioVolumeSource = SystemCreativeAudioVolumeSource(),
+        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller()
+    ) {
         self.audioVolumeSource = audioVolumeSource
+        self.audioVolumePoller = audioVolumePoller
     }
 
     deinit {
         audioObservation?.invalidate()
+        audioVolumePoller.stop()
     }
 
     // MARK: Entry point
@@ -184,6 +261,9 @@ final class CreativeBridge: ObservableObject {
             bridge.audioObservation = bridge.audioVolumeSource.observe { [weak bridge] volume in
                 bridge?.audioVolumeChanged(volume, generation: generation)
             }
+            bridge.audioVolumePoller.start { [weak bridge] in
+                bridge?.audioVolumePolled(generation: generation)
+            }
             bridge.publishAudioState(bridge.currentAudioState())
         }
     }
@@ -208,6 +288,7 @@ final class CreativeBridge: ObservableObject {
         audioPageGeneration &+= 1
         audioObservation?.invalidate()
         audioObservation = nil
+        audioVolumePoller.stop()
         audioEventReply = nil
         lastSentAudioState = nil
     }
@@ -216,6 +297,13 @@ final class CreativeBridge: ObservableObject {
         runOnMain { bridge in
             guard bridge.audioPageGeneration == generation else { return }
             bridge.publishAudioState(CreativeAudioState(outputVolume: outputVolume))
+        }
+    }
+
+    private func audioVolumePolled(generation: UInt64) {
+        runOnMain { bridge in
+            guard bridge.audioPageGeneration == generation else { return }
+            bridge.publishAudioState(bridge.currentAudioState())
         }
     }
 

@@ -39,6 +39,32 @@ final class CreativeBridgeTests: XCTestCase {
         }
     }
 
+    private final class FakeAudioVolumePoller: CreativeAudioVolumePolling {
+        private(set) var callbacks: [() -> Void] = []
+        private(set) var starts = 0
+        private(set) var stops = 0
+        private var active = false
+
+        func start(_ onPoll: @escaping () -> Void) {
+            starts += 1
+            active = true
+            callbacks.append(onPoll)
+        }
+
+        func stop() {
+            if active { stops += 1 }
+            active = false
+        }
+
+        func fire(_ index: Int? = nil) {
+            if let index {
+                callbacks[index]()
+            } else {
+                callbacks.last?()
+            }
+        }
+    }
+
     /// `AD_EARLY_COMPLETE` is a no-reply event that flips `earlyComplete` (the presenting view
     /// reveals the close button on it).
     @MainActor
@@ -98,7 +124,8 @@ final class CreativeBridgeTests: XCTestCase {
     @MainActor
     func testAudioStateEventsStartAfterLoadAndDeduplicate() {
         let source = FakeAudioVolumeSource(0.42)
-        let bridge = CreativeBridge(audioVolumeSource: source)
+        let poller = FakeAudioVolumePoller()
+        let bridge = CreativeBridge(audioVolumeSource: source, audioVolumePoller: poller)
         var events: [[String: Any]] = []
 
         source.emit(0.5)
@@ -125,23 +152,55 @@ final class CreativeBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testPollingCatchesChangesWithoutKVOAndDeduplicates() {
+        let source = FakeAudioVolumeSource(0.5)
+        let poller = FakeAudioVolumePoller()
+        let bridge = CreativeBridge(audioVolumeSource: source, audioVolumePoller: poller)
+        var events: [[String: Any]] = []
+
+        bridge.pageDidFinishLoading { [weak self] js in
+            if let event = self?.decodeMessage(js) { events.append(event) }
+        }
+        XCTAssertEqual(poller.starts, 1)
+        XCTAssertEqual(events.count, 1)
+
+        source.outputVolume = 0.2
+        poller.fire()
+        XCTAssertEqual(events.count, 2)
+        let changed = events[1]["payload"] as? [String: Any]
+        XCTAssertEqual(changed?["volume"] as? Int, 20)
+
+        poller.fire()
+        source.emit(0.2)
+        XCTAssertEqual(events.count, 2, "polling and KVO share one payload dedupe baseline")
+    }
+
+    @MainActor
     func testAudioObservationStopsAcrossReloadAndTeardown() {
         let source = FakeAudioVolumeSource(0.5)
-        let bridge = CreativeBridge(audioVolumeSource: source)
+        let poller = FakeAudioVolumePoller()
+        let bridge = CreativeBridge(audioVolumeSource: source, audioVolumePoller: poller)
         var eventCount = 0
 
         bridge.pageDidFinishLoading { _ in eventCount += 1 }
         XCTAssertEqual(eventCount, 1)
         bridge.pageDidCommit()
         XCTAssertTrue(source.observations[0].invalidated)
+        XCTAssertEqual(poller.stops, 1)
         source.emit(0, observation: 0)
+        source.outputVolume = 0
+        poller.fire(0)
         XCTAssertEqual(eventCount, 1, "queued callbacks from the old page must be ignored")
 
         bridge.pageDidFinishLoading { _ in eventCount += 1 }
+        XCTAssertEqual(poller.starts, 2)
         XCTAssertEqual(eventCount, 2, "each loaded document receives an initial state")
         bridge.stop()
         XCTAssertTrue(source.observations[1].invalidated)
+        XCTAssertEqual(poller.stops, 2)
         source.emit(1, observation: 1)
+        source.outputVolume = 1
+        poller.fire(1)
         XCTAssertEqual(eventCount, 2)
     }
 
