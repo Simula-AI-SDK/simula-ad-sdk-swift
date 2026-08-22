@@ -13,6 +13,7 @@ import Combine
 @MainActor
 final class RewardedPresenter {
     private var window: UIWindow?
+    private var creativeBridge: CreativeBridge?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
     private var onClose: ((Bool, Double, FullscreenPresentationLease) -> Void)?
@@ -65,6 +66,7 @@ final class RewardedPresenter {
         // orientation lock, and device/audio/orientation queries. Owned here so the orientation
         // handler can reach the hosting controller + window created below.
         let bridge = CreativeBridge()
+        creativeBridge = bridge
 
         let root = RewardedGameView(
             impressionId: impressionId,
@@ -121,6 +123,9 @@ final class RewardedPresenter {
         // the time it returns. Operate on the locals afterwards instead of touching `self`.
         let win = window
         let hostKeyWindow = originalKeyWindow
+        let bridge = creativeBridge
+        creativeBridge = nil
+        bridge?.stop()
         window = nil
         originalKeyWindow = nil
         let callback = onClose

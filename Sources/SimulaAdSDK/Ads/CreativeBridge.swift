@@ -15,6 +15,114 @@ enum BridgeOrientation: String {
     case portrait, landscape, auto
 }
 
+struct CreativeAudioState: Equatable {
+    let muted: Bool
+    let volume: Int
+
+    init(outputVolume: Float) {
+        let normalized = outputVolume.isFinite ? min(max(outputVolume, 0), 1) : 0
+        volume = min(max(Int((normalized * 100).rounded()), 0), 100)
+        muted = volume == 0
+    }
+
+    var payload: [String: Any] {
+        ["muted": muted, "volume": volume]
+    }
+}
+
+protocol CreativeAudioVolumeObservation: AnyObject {
+    func invalidate()
+}
+
+extension NSKeyValueObservation: CreativeAudioVolumeObservation {}
+
+protocol CreativeAudioVolumeSource: AnyObject {
+    var outputVolume: Float { get }
+    func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation?
+}
+
+private final class SystemCreativeAudioVolumeSource: CreativeAudioVolumeSource {
+    var outputVolume: Float { AVAudioSession.sharedInstance().outputVolume }
+
+    func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation? {
+        AVAudioSession.sharedInstance().observe(\.outputVolume, options: [.new]) { session, change in
+            onChange(change.newValue ?? session.outputVolume)
+        }
+    }
+}
+
+protocol CreativeAudioVolumePolling: AnyObject {
+    func start(_ onPoll: @escaping () -> Void)
+    func stop()
+}
+
+/** Fallback for iOS versions that emit output-volume KVO only while the host audio session is active. */
+private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling {
+    // KVO remains the fast path. This only closes inactive-session gaps, so sub-second polling is enough.
+    private static let interval: TimeInterval = 0.75
+
+    private var timer: Timer?
+    private var onPoll: (() -> Void)?
+    private var backgroundObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
+
+    func start(_ onPoll: @escaping () -> Void) {
+        stop()
+        self.onPoll = onPoll
+
+        let center = NotificationCenter.default
+        backgroundObserver = center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stopTimer()
+        }
+        foregroundObserver = center.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.startTimer()
+            self.onPoll?()
+        }
+
+        if UIApplication.shared.applicationState != .background {
+            startTimer()
+        }
+    }
+
+    func stop() {
+        stopTimer()
+        let center = NotificationCenter.default
+        if let backgroundObserver { center.removeObserver(backgroundObserver) }
+        if let foregroundObserver { center.removeObserver(foregroundObserver) }
+        backgroundObserver = nil
+        foregroundObserver = nil
+        onPoll = nil
+    }
+
+    private func startTimer() {
+        guard timer == nil, onPoll != nil else { return }
+        let timer = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+            self?.onPoll?()
+        }
+        timer.tolerance = Self.interval / 5
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 /// Something whose allowed interface orientations the bridge can pin (the presenter's
 /// hosting controller). Kept as a protocol so `CreativeBridge` holds it without the
 /// hosting controller's generic `Content` leaking in.
@@ -32,6 +140,10 @@ protocol OrientationLockable: AnyObject {
 /// a native action and, for `GET_*` queries, posts a reply back into the page echoing the
 /// same `requestId`.
 ///
+/// `GET_AUDIO_STATE` returns `{ muted, volume }`, where `volume` is the output-volume percentage
+/// from 0 to 100. Loaded creative pages also receive `AUDIO_STATE_CHANGED` with that payload when
+/// the normalized state changes.
+///
 /// Created by the rewarded / interstitial presenter (which owns the window + hosting
 /// controller the orientation handler needs). The presenting view observes `earlyComplete`
 /// to reveal its close button immediately on `AD_EARLY_COMPLETE`.
@@ -45,6 +157,26 @@ final class CreativeBridge: ObservableObject {
     weak var orientationHost: OrientationLockable?
     /// The presentation window — its `windowScene` is used to read/lock orientation.
     weak var window: UIWindow?
+
+    private let audioVolumeSource: CreativeAudioVolumeSource
+    private let audioVolumePoller: CreativeAudioVolumePolling
+    private var audioObservation: CreativeAudioVolumeObservation?
+    private var audioEventReply: ((String) -> Void)?
+    private var lastSentAudioState: CreativeAudioState?
+    private var audioPageGeneration: UInt64 = 0
+
+    init(
+        audioVolumeSource: CreativeAudioVolumeSource = SystemCreativeAudioVolumeSource(),
+        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller()
+    ) {
+        self.audioVolumeSource = audioVolumeSource
+        self.audioVolumePoller = audioVolumePoller
+    }
+
+    deinit {
+        audioObservation?.invalidate()
+        audioVolumePoller.stop()
+    }
 
     // MARK: Entry point
 
@@ -87,11 +219,11 @@ final class CreativeBridge: ObservableObject {
 
         // Queries (request/response)
         case "GET_DEVICE_CONTEXT":
-            sendReply(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
+            sendMessage(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
         case "GET_AUDIO_STATE":
-            sendReply(type: type, requestId: requestId, payload: ["muted": isMuted()], reply: reply)
+            sendMessage(type: type, requestId: requestId, payload: currentAudioState().payload, reply: reply)
         case "GET_ORIENTATION":
-            sendReply(type: type, requestId: requestId, payload: ["orientation": currentOrientation()], reply: reply)
+            sendMessage(type: type, requestId: requestId, payload: ["orientation": currentOrientation()], reply: reply)
 
         default:
             return // Unknown type: ignore (don't record telemetry for it).
@@ -105,13 +237,81 @@ final class CreativeBridge: ObservableObject {
     /// Posts `{ type, requestId, payload, __simulaSdkResponse: true }` back into the page
     /// via `window.postMessage`. The injected relay drops messages carrying
     /// `__simulaSdkResponse`, so this reply is not echoed back to native.
-    private func sendReply(type: String, requestId: Any?, payload: [String: Any], reply: (String) -> Void) {
+    private func sendMessage(type: String, requestId: Any?, payload: [String: Any], reply: (String) -> Void) {
         var resp: [String: Any] = ["type": type, "payload": payload, "__simulaSdkResponse": true]
         if let requestId { resp["requestId"] = requestId }
         guard let data = try? JSONSerialization.data(withJSONObject: resp),
               let body = String(data: data, encoding: .utf8) else { return }
         // `body` is valid JSON, hence a valid JS object literal.
         reply("window.postMessage(\(body), '*');")
+    }
+
+    // MARK: Audio events
+
+    /// Stops delivery to the old JavaScript world once a replacement main document commits.
+    func pageDidCommit() {
+        runOnMain { bridge in bridge.endAudioEvents() }
+    }
+
+    /// Sends one initial state after load, then observes distinct output-volume changes.
+    func pageDidFinishLoading(reply: @escaping (String) -> Void) {
+        runOnMain { bridge in
+            bridge.endAudioEvents()
+            bridge.audioEventReply = reply
+            let generation = bridge.audioPageGeneration
+            bridge.audioObservation = bridge.audioVolumeSource.observe { [weak bridge] volume in
+                bridge?.audioVolumeChanged(volume, generation: generation)
+            }
+            bridge.audioVolumePoller.start { [weak bridge] in
+                bridge?.audioVolumePolled(generation: generation)
+            }
+            bridge.publishAudioState(bridge.currentAudioState())
+        }
+    }
+
+    /// Presentation teardown backstop. Idempotent and safe if dismantle also invokes it.
+    func stop() {
+        runOnMain { bridge in bridge.endAudioEvents() }
+    }
+
+    private func runOnMain(_ work: @escaping (CreativeBridge) -> Void) {
+        if Thread.isMainThread {
+            work(self)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                work(self)
+            }
+        }
+    }
+
+    private func endAudioEvents() {
+        audioPageGeneration &+= 1
+        audioObservation?.invalidate()
+        audioObservation = nil
+        audioVolumePoller.stop()
+        audioEventReply = nil
+        lastSentAudioState = nil
+    }
+
+    private func audioVolumeChanged(_ outputVolume: Float, generation: UInt64) {
+        runOnMain { bridge in
+            guard bridge.audioPageGeneration == generation else { return }
+            bridge.publishAudioState(CreativeAudioState(outputVolume: outputVolume))
+        }
+    }
+
+    private func audioVolumePolled(generation: UInt64) {
+        runOnMain { bridge in
+            guard bridge.audioPageGeneration == generation else { return }
+            bridge.publishAudioState(bridge.currentAudioState())
+        }
+    }
+
+    private func publishAudioState(_ state: CreativeAudioState) {
+        guard let reply = audioEventReply, state != lastSentAudioState else { return }
+        lastSentAudioState = state
+        sendMessage(type: "AUDIO_STATE_CHANGED", requestId: nil, payload: state.payload, reply: reply)
     }
 
     // MARK: Handlers
@@ -145,10 +345,9 @@ final class CreativeBridge: ObservableObject {
         ]
     }
 
-    /// Best-effort mute state. iOS exposes no public silent-switch API, so a zero output
-    /// volume is the closest documented proxy.
-    private func isMuted() -> Bool {
-        AVAudioSession.sharedInstance().outputVolume < 0.01
+    /// iOS exposes no public silent-switch API; output volume is the documented media-volume proxy.
+    private func currentAudioState() -> CreativeAudioState {
+        CreativeAudioState(outputVolume: audioVolumeSource.outputVolume)
     }
 
     private func currentOrientation() -> String {
