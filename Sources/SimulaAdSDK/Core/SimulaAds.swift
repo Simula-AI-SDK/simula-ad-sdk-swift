@@ -126,6 +126,9 @@ public enum SimulaAds {
             telemetryEnabled: telemetryEnabled,
             adContext: adContext
         )
+        // Publish imperative identity before publishing the provider. It permanently outranks any
+        // declarative fallback while retaining only the provider's small lock-guarded source.
+        processTelemetryIdentityRouter.bindImperative(provider.telemetryIdentitySource)
         shared = provider
 
         // Publish readiness so observers (e.g. the React Native host views waiting to mount a
@@ -138,7 +141,7 @@ public enum SimulaAds {
         // drain also run there: the first touch of those singletons constructs a `SimulaAPI`,
         // which would otherwise build the shared `URLSession` (UA/IDFV headers) on the main
         // thread right here.
-        provider.start()
+        provider.start(bindProviderIdentity: false)
 
         return true
     }

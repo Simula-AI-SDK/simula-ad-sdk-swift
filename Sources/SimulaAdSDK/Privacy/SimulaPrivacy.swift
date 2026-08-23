@@ -319,13 +319,11 @@ public final class SimulaPrivacy: ObservableObject {
     func refreshAdvertisingTrackingAfterPrompt(statusRaw: Int) async {
         let claim = beginPromptAdvertisingRefresh(statusRaw: statusRaw)
         guard claim.reportStatus else { return }
-        let idReading = claim.readId ? await readAdvertisingId() : nil
-        applyPromptAdvertisingReading(
-            statusRaw: statusRaw,
-            advertisingId: idReading?.value,
-            generation: claim.generation
-        )
-        if let idReading { recordAdvertisingRead(operation: "idfa_read", reading: idReading) }
+        recompute()
+        guard claim.readId else { return }
+        let idReading = await readAdvertisingId()
+        applyPromptAdvertisingId(idReading.value, generation: claim.generation)
+        recordAdvertisingRead(operation: "idfa_read", reading: idReading)
     }
 
     private func beginPromptAdvertisingRefresh(
@@ -337,6 +335,11 @@ public final class SimulaPrivacy: ObservableObject {
         let generation = advertisingRefreshGeneration
         let reportStatus = !explicitConfig.coppaApplies
         let readId = reportStatus && explicitConfig.enableAdvertisingId && statusRaw == 3
+        if reportStatus {
+            attStatusRaw = statusRaw
+            lastAdvertisingStatusRefresh = now()
+            if !readId { collectedAdvertisingId = nil }
+        }
         lock.unlock()
         return (reportStatus, readId, generation)
     }
@@ -478,19 +481,17 @@ public final class SimulaPrivacy: ObservableObject {
         recompute()
     }
 
-    private func applyPromptAdvertisingReading(statusRaw: Int, advertisingId: String?, generation: Int) {
+    private func applyPromptAdvertisingId(_ advertisingId: String?, generation: Int) {
         lock.lock()
-        guard !explicitConfig.coppaApplies else {
+        guard advertisingRefreshGeneration == generation,
+              !explicitConfig.coppaApplies,
+              explicitConfig.enableAdvertisingId,
+              attStatusRaw == 3 else {
             lock.unlock()
             return
         }
-        attStatusRaw = statusRaw
-        let canCollectId = advertisingRefreshGeneration == generation
-            && explicitConfig.enableAdvertisingId
-            && statusRaw == 3
-        collectedAdvertisingId = canCollectId ? advertisingId : nil
-        lastAdvertisingStatusRefresh = now()
-        if canCollectId { lastAdvertisingIdRefresh = now() }
+        collectedAdvertisingId = advertisingId
+        lastAdvertisingIdRefresh = now()
         lock.unlock()
         recompute()
     }

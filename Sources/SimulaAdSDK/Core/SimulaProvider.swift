@@ -59,8 +59,9 @@ public final class SimulaProvider: ObservableObject {
 
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
-    public var primaryUserID: String? { ppidStore.current }
-    private let ppidStore: PPIDStore
+    public var primaryUserID: String? { telemetryIdentitySource.identity().primaryUserId }
+    let telemetryIdentitySource: TelemetryIdentitySource
+    private let telemetryIdentityToken = TelemetryProviderIdentityToken()
 
     /// Legacy coarse consent flag. When false, suppresses collection of PII.
     /// Retained as a convenience alias for `privacyConfig.hasPrivacyConsent`.
@@ -92,7 +93,7 @@ public final class SimulaProvider: ObservableObject {
 
     /// The server session ID, set after successful session creation
     @Published public private(set) var sessionId: String? {
-        didSet { Telemetry.shared.setSessionId(sessionId) } // correlate telemetry to the session
+        didSet { telemetryIdentitySource.setSessionId(sessionId) }
     }
 
     /// The in-flight session-creation task, if any. Lets concurrent callers
@@ -170,7 +171,7 @@ public final class SimulaProvider: ObservableObject {
 
         self.apiKey = apiKey
         self.devMode = devMode
-        self.ppidStore = PPIDStore(primaryUserID)
+        self.telemetryIdentitySource = TelemetryIdentitySource(primaryUserId: primaryUserID)
         self.hasPrivacyConsent = hasPrivacyConsent
         self.adContext = adContext
 
@@ -229,6 +230,12 @@ public final class SimulaProvider: ObservableObject {
             .store(in: &cancellables)
     }
 
+    deinit {
+        // Synchronous and lock-only: deinit may run off the main actor, and the router retains no
+        // provider/UI object. Removing this token restores the previous active provider, if any.
+        processTelemetryIdentityRouter.unbindProvider(telemetryIdentityToken)
+    }
+
     // MARK: - Deferred startup
 
     /// Begins the deferred startup exactly once (idempotent). Called by `SimulaAds.initialize`
@@ -241,8 +248,16 @@ public final class SimulaProvider: ObservableObject {
     /// URLSession build, telemetry-manager construction, the version-prefs check — now run
     /// here, off the caller's critical path.
     @MainActor
-    func start() {
+    func start(bindProviderIdentity: Bool = true) {
         guard startupTask == nil else { return }
+        // Binding here, rather than in init, prevents speculative SwiftUI view construction from
+        // replacing the identity of the provider whose startup actually committed.
+        if bindProviderIdentity {
+            processTelemetryIdentityRouter.bindProvider(
+                token: telemetryIdentityToken,
+                source: telemetryIdentitySource
+            )
+        }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         startupTask = Task { await self.runStartup() }
     }
@@ -252,7 +267,7 @@ public final class SimulaProvider: ObservableObject {
     private func runStartup() async {
         // Phase 1 (off-main): warm the one-time lazy costs and install telemetry.
         let lastSeenVersion = await Self.runStartupPrewarm(
-            apiKey: apiKey, devMode: devMode, telemetryEnabled: telemetryEnabled, ppidStore: ppidStore
+            apiKey: apiKey, devMode: devMode, telemetryEnabled: telemetryEnabled
         )
         // Phase 2 (main): beacons that need telemetry installed.
         recordStartupBeacons(lastSeenVersion: lastSeenVersion)
@@ -268,8 +283,7 @@ public final class SimulaProvider: ObservableObject {
     nonisolated private static func runStartupPrewarm(
         apiKey: String,
         devMode: Bool,
-        telemetryEnabled: Bool,
-        ppidStore: PPIDStore
+        telemetryEnabled: Bool
     ) async -> String? {
         // Warm the lazy statics OFF the main thread: `identifierForVendor` can block early in
         // launch and UA building is syscalls; building the shared session (URLSession + standard
@@ -282,12 +296,10 @@ public final class SimulaProvider: ObservableObject {
         // SDK request) is captured. First call wins, so a re-created provider doesn't churn it;
         // the facade re-gates PII on the live consent snapshot. Lock-guarded and its main-thread
         // needs (battery monitor) self-hop — safe from a background context.
-        Telemetry.shared.initialize(
+        await Telemetry.shared.initialize(
             apiKey: apiKey,
             devMode: devMode,
-            enabled: telemetryEnabled,
-            // Read the PPID live so a mid-session updatePrimaryUserID is honored; the box is Sendable.
-            primaryUserIDProvider: { [ppidStore] in ppidStore.current }
+            enabled: telemetryEnabled
         )
 
         // Capture uncaught SDK crashes into telemetry. MUST run after `Telemetry.initialize`:
@@ -448,7 +460,7 @@ public final class SimulaProvider: ObservableObject {
         // session's true identity (used to detect a stale session after a mid-session change).
         // Deliberately read at scheduling (not when the task runs): the created session represents
         // THIS identity, and `createAndPublishSession` reconciles any change that lands mid-flight.
-        let ppidAtCreation = ppidStore.current
+        let ppidAtCreation = telemetryIdentitySource.identity().primaryUserId
         sessionGeneration &+= 1
         let generation = sessionGeneration
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
@@ -480,17 +492,17 @@ public final class SimulaProvider: ObservableObject {
             // no-oped). Now that the session exists, drive it to the current ppid if it diverged
             // from the one it was created with — otherwise the server session would stay on the
             // old ppid until the host happened to call updatePrimaryUserID again.
-            if ppidStore.current != ppidAtCreation {
+            if telemetryIdentitySource.identity().primaryUserId != ppidAtCreation {
                 reconcileServerPpid()
             }
         }
-        if sessionGeneration == generation, ppidStore.current == ppidAtCreation {
+        if sessionGeneration == generation, telemetryIdentitySource.identity().primaryUserId == ppidAtCreation {
             // IPv4 capture for this session (fire-and-forget, deduped per identity). Fired even
             // when creation failed (sid omitted) so the backend can still key on ppid/did —
             // parity with the RN-layer beacon this replaces. Skipped when superseded:
             //   • by a resync (generation moved on) — the replacement creation fires for its
             //     own (current) session id;
-            //   • by a mid-creation login/switch/logout (ppidStore.current diverged from
+            //   • by a mid-creation login/switch/logout (the identity source diverged from
             //     ppidAtCreation) — beaconing the stale ppid would misattribute the capture;
             //     a login/switch is instead captured by the reconcile convergence beacon once
             //     the server session actually represents the new user, and a logout must not
@@ -587,7 +599,7 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     public func updatePrimaryUserID(_ id: String?) {
         let normalized = (id?.isEmpty == false) ? id : nil
-        ppidStore.set(normalized)
+        telemetryIdentitySource.setPrimaryUserId(normalized)
         // Reconcile the live server session toward the new id (serialized + single-flight). No-op
         // when there's no session yet (the next createSession carries the value) or on logout (which
         // can't be pushed server-side; the session is then treated as stale).
@@ -603,7 +615,7 @@ public final class SimulaProvider: ObservableObject {
         }
     }
 
-    /// Drive the server session's PPID toward the current `ppidStore` value and, on success, advance
+    /// Drive the server session's PPID toward the current identity-source value and, on success, advance
     /// `sessionUserID` to match — but only while that value is still the desired identity. Each call
     /// chains after the previous (`ppidSyncTask`), so reconciles run strictly serially: at most one
     /// PATCH is in flight, the server applies them in order, and a late/out-of-order PATCH can never
@@ -620,12 +632,12 @@ public final class SimulaProvider: ObservableObject {
 
     /// PPID-reconcile task body (named method — see the task-shape note in TelemetryManager):
     /// waits for the previous reconcile (strict serialization), then drives the server session's
-    /// PPID toward the current `ppidStore` value.
+    /// PPID toward the current identity-source value.
     @MainActor
     private func runPpidReconcile(after previous: Task<Void, Never>?) async {
         _ = await previous?.value
         while true {
-            let target = ppidStore.current
+            let target = telemetryIdentitySource.identity().primaryUserId
             guard let target, let sid = sessionId, !sid.isEmpty else { break }
             if target == sessionUserID {
                 // Converged: the server session now genuinely represents `target`. Fire the
@@ -778,18 +790,6 @@ extension EnvironmentValues {
         get { self[SimulaProviderKey.self] }
         set { self[SimulaProviderKey.self] = newValue }
     }
-}
-
-// MARK: - PPIDStore
-
-/// Thread-safe holder for the mutable PPID. `Sendable` so the telemetry flush closure and the
-/// session-create task read the live value off the main thread without a data race.
-final class PPIDStore: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: String?
-    init(_ initial: String?) { value = initial }
-    var current: String? { lock.lock(); defer { lock.unlock() }; return value }
-    func set(_ newValue: String?) { lock.lock(); value = newValue; lock.unlock() }
 }
 
 // MARK: - BoundedStore

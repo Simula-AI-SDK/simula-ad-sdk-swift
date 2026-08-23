@@ -411,6 +411,129 @@ final class PrivacyTests: XCTestCase {
     }
 
     @MainActor
+    func testBlockedPromptPublishesAttImmediatelyAndCannotOverwriteNewerPromptStatus() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = BlockingAdvertisingReader()
+        let telemetry = PrivacyReadTelemetryRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() },
+            advertisingReadTelemetry: { operation, durationMs, success, _ in
+                telemetry.record(operation: operation, snapshotDurationMs: durationMs, success: success)
+            }
+        )
+        telemetry.attach(store)
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+
+        let stalePrompt = Task { await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3) }
+        await waitUntil { reader.firstIdReadStarted }
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+
+        await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 2)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+
+        reader.releaseFirstIdRead()
+        await stalePrompt.value
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+        let staleReadEvent = telemetry.events.last { $0.operation == "idfa_read" }
+        XCTAssertEqual(staleReadEvent?.snapshot.attStatus, 2)
+        XCTAssertNil(staleReadEvent?.snapshot.advertisingId)
+
+        await gate.open()
+        await store.waitForAdvertisingRefreshIdleForTests()
+    }
+
+    @MainActor
+    func testForegroundRefreshSupersedesBlockedPromptIdfaRead() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = BlockingAdvertisingReader()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+
+        let stalePrompt = Task { await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3) }
+        await waitUntil { reader.firstIdReadStarted }
+        reader.statusRaw = 2
+        store.refreshAdvertisingTrackingOnForeground()
+
+        await gate.open()
+        reader.releaseFirstIdRead()
+        await stalePrompt.value
+        await store.waitForAdvertisingRefreshIdleForTests()
+
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+    }
+
+    @MainActor
+    func testDisableReenableSupersedesBlockedPromptAndKeepsFreshIdfa() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = BlockingAdvertisingReader()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+
+        let stalePrompt = Task { await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3) }
+        await waitUntil { reader.firstIdReadStarted }
+        store.update(enableAdvertisingId: false)
+        store.update(enableAdvertisingId: true)
+
+        await gate.open()
+        reader.releaseFirstIdRead()
+        await stalePrompt.value
+        await store.waitForAdvertisingRefreshIdleForTests()
+
+        XCTAssertEqual(reader.idCount, 2)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "fresh-idfa")
+    }
+
+    @MainActor
+    func testCoppaTransitionSupersedesBlockedPromptIdfaRead() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = BlockingAdvertisingReader()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitForGateWaiter(gate)
+
+        let stalePrompt = Task { await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3) }
+        await waitUntil { reader.firstIdReadStarted }
+        store.update(coppaApplies: true)
+
+        reader.releaseFirstIdRead()
+        await stalePrompt.value
+        XCTAssertNil(store.currentSnapshot.attStatus)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+
+        await gate.open()
+        await store.waitForAdvertisingRefreshIdleForTests()
+    }
+
+    @MainActor
     func testGenerationChangeDuringIdReadDropsStaleValueAndRunsNewRefreshSerially() async {
         let reader = BlockingAdvertisingReader()
         let store = SimulaPrivacy(
@@ -693,6 +816,7 @@ private final class PrivacyReadTelemetryRecorder: @unchecked Sendable {
 private final class BlockingAdvertisingReader: @unchecked Sendable {
     private let lock = NSLock()
     private let firstIdGate = DispatchSemaphore(value: 0)
+    private var _statusRaw = 3
     private var _statusCount = 0
     private var _idCount = 0
     private var activeReads = 0
@@ -700,6 +824,10 @@ private final class BlockingAdvertisingReader: @unchecked Sendable {
     private var _firstIdReadStarted = false
     private var _allReadsOffMain = true
 
+    var statusRaw: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _statusRaw }
+        set { lock.lock(); _statusRaw = newValue; lock.unlock() }
+    }
     var statusCount: Int { lock.lock(); defer { lock.unlock() }; return _statusCount }
     var idCount: Int { lock.lock(); defer { lock.unlock() }; return _idCount }
     var firstIdReadStarted: Bool { lock.lock(); defer { lock.unlock() }; return _firstIdReadStarted }
@@ -708,9 +836,12 @@ private final class BlockingAdvertisingReader: @unchecked Sendable {
 
     func readStatus() -> Int? {
         beginRead()
-        lock.lock(); _statusCount += 1; lock.unlock()
+        lock.lock()
+        _statusCount += 1
+        let status = _statusRaw
+        lock.unlock()
         endRead()
-        return 3
+        return status
     }
 
     func readId() -> String? {

@@ -61,7 +61,7 @@ final class TelemetryManager: @unchecked Sendable {
     private let ctx: TelemetryContext
     private let store: TelemetryStoring
     private let sender: TelemetrySending
-    private let primaryUserIdProvider: @Sendable () -> String?
+    private let identityProvider: @Sendable () -> TelemetryIdentity
     private let advertisingIdProvider: @Sendable () -> String?
     // Resolved fresh on each flush (off the UI path). Must be best-effort/non-throwing.
     private let connectionTypeProvider: @Sendable () -> String?
@@ -108,8 +108,6 @@ final class TelemetryManager: @unchecked Sendable {
     private var recoveryStarted = false
     private var recoveryCompleted = false
     private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var sessionId: String?
-
     // Aux session state for the funnel / time-to-first-ad / experiment, guarded by `lock`.
     private let createdAtMs: TimeInterval
     private var firstAdRecorded = false
@@ -122,7 +120,7 @@ final class TelemetryManager: @unchecked Sendable {
         ctx: TelemetryContext,
         store: TelemetryStoring,
         sender: TelemetrySending,
-        primaryUserIdProvider: @escaping @Sendable () -> String?,
+        identityProvider: @escaping @Sendable () -> TelemetryIdentity,
         advertisingIdProvider: @escaping @Sendable () -> String?,
         connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
         diagnosticsProvider: @escaping @Sendable () -> String? = { nil },
@@ -147,7 +145,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.ctx = ctx
         self.store = store
         self.sender = sender
-        self.primaryUserIdProvider = primaryUserIdProvider
+        self.identityProvider = identityProvider
         self.advertisingIdProvider = advertisingIdProvider
         self.connectionTypeProvider = connectionTypeProvider
         self.diagnosticsProvider = diagnosticsProvider
@@ -216,12 +214,6 @@ final class TelemetryManager: @unchecked Sendable {
         requestImmediateFlush()
         waiters.forEach { $0.resume() }
         store.save(snapshot)
-    }
-
-    /// Push the live session id (from `SimulaProvider`) so the envelope can carry it without
-    /// the manager reaching into non-Sendable provider state from a background flush.
-    func setSessionId(_ id: String?) {
-        lock.lock(); sessionId = id; lock.unlock()
     }
 
     /// Apply a server-side directive (kill-switch / sampling) from `/session/create`.
@@ -645,7 +637,6 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     private struct FlushContextSnapshot {
-        let sessionId: String?
         let experimentId: String?
         let variantId: String?
     }
@@ -671,7 +662,6 @@ final class TelemetryManager: @unchecked Sendable {
             pendingMetaEntries: Array(metaAgg),
             droppedSnap: droppedCount,
             context: FlushContextSnapshot(
-                sessionId: sessionId,
                 experimentId: experimentId,
                 variantId: variantId
             )
@@ -791,9 +781,11 @@ final class TelemetryManager: @unchecked Sendable {
             devMode: ctx.devMode,
             events: events
         )
-        env.sessionId = context.sessionId
-        // Providers are already consent-gated by the facade (re-checked at send time).
-        env.primaryUserId = primaryUserIdProvider()
+        // Resolve both identity fields once so an envelope can never mix different sources or
+        // different moments from the same source. The facade provider applies live consent.
+        let identity = identityProvider()
+        env.sessionId = identity.sessionId
+        env.primaryUserId = identity.primaryUserId
         env.advertisingId = advertisingIdProvider()
         env.connectionType = connectionTypeProvider()
         env.experimentId = context.experimentId

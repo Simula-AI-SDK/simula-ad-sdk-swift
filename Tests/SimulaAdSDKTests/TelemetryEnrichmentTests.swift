@@ -51,7 +51,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             ctx: ctx,
             store: store,
             sender: sender,
-            primaryUserIdProvider: { nil },
+            identityProvider: { TelemetryIdentity(sessionId: nil, primaryUserId: nil) },
             advertisingIdProvider: { nil },
             connectionTypeProvider: connectionType,
             diagnosticsProvider: diagnostics,

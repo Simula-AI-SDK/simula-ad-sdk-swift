@@ -36,26 +36,62 @@ struct DuplicateInitializeCountBuffer {
 final class Telemetry: @unchecked Sendable {
     static let shared = Telemetry()
 
+    typealias ManagerFactory = @Sendable (String, Bool) async -> TelemetryManager
+    private static let defaultManagerFactory: ManagerFactory = { apiKey, devMode in
+        await Telemetry.makeManager(apiKey: apiKey, devMode: devMode)
+    }
+
     private let lock = NSLock()
+    private let managerFactory: ManagerFactory
     private var manager: TelemetryManager?
-    private var initialized = false
+    private var initializationTask: Task<Void, Never>?
     private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
 
-    private init() {}
+    init(managerFactory: @escaping ManagerFactory = Telemetry.defaultManagerFactory) {
+        self.managerFactory = managerFactory
+    }
 
     /// Install the telemetry pipeline. Called once from `SimulaProvider`'s deferred startup (the
     /// path both the imperative and declarative entry points funnel through). First call wins, so the
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
     /// doesn't churn the buffer.
-    /// `primaryUserIDProvider` is read live on every flush so a mid-session `updatePrimaryUserID`
-    /// is honored, and it is additionally gated by the live consent snapshot.
-    func initialize(apiKey: String, devMode: Bool, enabled: Bool, primaryUserIDProvider: @escaping @Sendable () -> String?) {
-        lock.lock()
-        if initialized { lock.unlock(); return }
-        initialized = true
-        lock.unlock()
+    /// Every caller awaits the first process-owned installation task. The task is unstructured, so
+    /// caller cancellation cannot abandon installation, and immutable first-call configuration wins.
+    func initialize(apiKey: String, devMode: Bool, enabled: Bool) async {
+        let task = claimInitializationTask(apiKey: apiKey, devMode: devMode, enabled: enabled)
+        await task.value
+    }
 
+    private func claimInitializationTask(apiKey: String, devMode: Bool, enabled: Bool) -> Task<Void, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+        if let initializationTask {
+            return initializationTask
+        }
+        // Single-call task closure into a named method; see swift-concurrency-task-shape.
+        let created = Task { await self.install(apiKey: apiKey, devMode: devMode, enabled: enabled) }
+        initializationTask = created
+        return created
+    }
+
+    private func install(apiKey: String, devMode: Bool, enabled: Bool) async {
         guard enabled else { return } // host opt-out: no manager is ever created
+
+        let mgr = await managerFactory(apiKey, devMode)
+        mgr.start()
+        let duplicateCount = publish(mgr)
+        if duplicateCount > 0 { mgr.recordMeta(name: "duplicate_initialize", count: duplicateCount) }
+    }
+
+    private func publish(_ manager: TelemetryManager) -> Int {
+        lock.lock()
+        self.manager = manager
+        let duplicateCount = duplicateInitializeCount.drain()
+        lock.unlock()
+        return duplicateCount
+    }
+
+    private static func makeManager(apiKey: String, devMode: Bool) async -> TelemetryManager {
 
         // `SimulaConnectionType` is started independently (from `SimulaProvider.init`, ahead of
         // telemetry install) since the `X-Connection-Type` header must work even when telemetry is
@@ -82,14 +118,18 @@ final class Telemetry: @unchecked Sendable {
         // In dev mode, mirror every (redacted) event to the console for local verification.
         var consoleLog: (@Sendable (String) -> Void)?
         if devMode { consoleLog = { line in print("[SimulaTelemetry] \(line)") } }
-        let mgr = TelemetryManager(
+        return TelemetryManager(
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            // Read consent and PPID live so revocation and mid-session identity changes apply at flush.
-            primaryUserIdProvider: {
+            // Resolve one live identity, then gate only its PPID with the current consent snapshot.
+            identityProvider: {
+                let identity = processTelemetryIdentityRouter.identity()
                 let privacy = SimulaPrivacy.shared.currentSnapshot
-                return privacy.allowsPrimaryUserID ? primaryUserIDProvider() : nil
+                return TelemetryIdentity(
+                    sessionId: identity.sessionId,
+                    primaryUserId: privacy.allowsPrimaryUserID ? identity.primaryUserId : nil
+                )
             },
             advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             connectionTypeProvider: { SimulaConnectionType.shared.label },
@@ -99,12 +139,6 @@ final class Telemetry: @unchecked Sendable {
             launchGate: LaunchSettledGate.shared,
             debugLog: consoleLog
         )
-        lock.lock()
-        manager = mgr
-        let duplicateCount = duplicateInitializeCount.drain()
-        lock.unlock()
-        if duplicateCount > 0 { mgr.recordMeta(name: "duplicate_initialize", count: duplicateCount) }
-        mgr.start()
     }
 
     private var current: TelemetryManager? {
@@ -123,9 +157,6 @@ final class Telemetry: @unchecked Sendable {
         duplicateInitializeCount.increment()
         lock.unlock()
     }
-
-    /// Push the live session id (from `SimulaProvider`) so telemetry batches can be correlated.
-    func setSessionId(_ id: String?) { current?.setSessionId(id) }
 
     /// Apply a server-side directive (kill-switch / sampling) from `/session/create`.
     func applyServerConfig(enabled: Bool, sampleRate: Double) {
