@@ -418,7 +418,8 @@ final class WebViewPool {
             name: "webview_prewarm",
             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
             success: true,
-            breadcrumb: "trigger=\(Self.prewarmTrigger(trigger));result=\(result)"
+            breadcrumb: "trigger=\(Self.prewarmTrigger(trigger));result=\(result)",
+            timeSinceInitMs: SDKInitializationOrigin.shared.timeSinceInitMs()
         )
     }
 
@@ -451,7 +452,8 @@ final class WebViewPool {
             name: reusedWarm ? "webview_acquire_warm" : "webview_acquire_cold",
             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000),
             success: true,
-            breadcrumb: Self.acquireBreadcrumb(surface)
+            breadcrumb: Self.acquireBreadcrumb(surface),
+            timeSinceInitMs: SDKInitializationOrigin.shared.timeSinceInitMs()
         )
         return pooled.webView
     }

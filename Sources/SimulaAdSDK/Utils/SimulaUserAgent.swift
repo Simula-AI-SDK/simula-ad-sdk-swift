@@ -14,7 +14,7 @@ import UIKit
 ///
 /// Every field comes from `Foundation` / `Bundle` / `uname` / `sysctl` — no permissions, no UIKit.
 /// `value` is a lazily-initialized `static let`, so it self-constructs on first access (the
-/// `SimulaAPI` shared session config reads it, and the SDK forces it eagerly at `SimulaAds.initialize`).
+/// `SimulaAPI` shared session config reads it, and deferred SDK startup forces it off the init path).
 enum SimulaUserAgent {
 
     /// The composed UA string. Computed once, thread-safe via `static let` lazy init.

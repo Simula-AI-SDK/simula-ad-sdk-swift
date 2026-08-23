@@ -52,9 +52,10 @@ public enum SimulaAds {
     public static var userAgent: String { SimulaUserAgent.value }
 
     /// The device identifier the SDK sends as the `X-Device-Id` header on its native HTTP requests
-    /// (`identifierForVendor`). nil when the platform supplies none. Exposed so a React Native bridge
-    /// can retrieve the native value.
-    public static var deviceId: String? { SimulaDeviceId.value }
+    /// (`identifierForVendor`). Exposed for React Native without forcing the potentially blocking
+    /// platform read: nil means unavailable or still resolving during deferred startup. Native request
+    /// headers continue to await the forcing cache and include the ID once resolution completes.
+    public static var deviceId: String? { SimulaDeviceId.valueIfResolved }
 
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
@@ -95,6 +96,7 @@ public enum SimulaAds {
         telemetryEnabled: Bool = true,
         adContext: SimulaAdContext? = nil
     ) -> Bool {
+        SDKInitializationOrigin.shared.markEntry()
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
         do {
@@ -108,6 +110,7 @@ public enum SimulaAds {
 
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else {
+            Telemetry.shared.recordDuplicateInitialize()
             return false
         }
 

@@ -1,5 +1,8 @@
 import XCTest
 @testable import SimulaAdSDK
+#if os(iOS)
+import AppTrackingTransparency
+#endif
 
 /// Unit tests for the privacy/consent layer: snapshot wire formats, derived
 /// gating, and the `SimulaPrivacy` store's IAB auto-read + explicit overrides.
@@ -204,6 +207,7 @@ final class PrivacyTests: XCTestCase {
 
         XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 0)
+        XCTAssertTrue(reader.allReadsOffMain)
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
         XCTAssertNil(store.currentSnapshot.advertisingId)
     }
@@ -348,7 +352,7 @@ final class PrivacyTests: XCTestCase {
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
         await waitForGateWaiter(gate)
 
-        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
         XCTAssertNil(store.currentSnapshot.advertisingId)
         XCTAssertEqual(reader.statusCount, 0)
@@ -373,7 +377,7 @@ final class PrivacyTests: XCTestCase {
 
         store.apply(SimulaPrivacyConfig(coppaApplies: true, enableAdvertisingId: true))
         await store.waitForAdvertisingRefreshIdleForTests()
-        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
 
         XCTAssertEqual(reader.statusCount, 0)
         XCTAssertEqual(reader.idCount, 0)
@@ -395,7 +399,7 @@ final class PrivacyTests: XCTestCase {
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
         await waitForGateWaiter(gate)
 
-        store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
+        await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
         XCTAssertEqual(reader.statusCount, 0)
         XCTAssertEqual(reader.idCount, 1)
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
@@ -407,8 +411,8 @@ final class PrivacyTests: XCTestCase {
     }
 
     @MainActor
-    func testStaleIdReadDoesNotCancelNewerForegroundRefresh() async {
-        let reader = ReentrantAdvertisingReader()
+    func testGenerationChangeDuringIdReadDropsStaleValueAndRunsNewRefreshSerially() async {
+        let reader = BlockingAdvertisingReader()
         let store = SimulaPrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
@@ -416,13 +420,17 @@ final class PrivacyTests: XCTestCase {
             advertisingTrackingStatusReader: { reader.readStatus() },
             advertisingIdReader: { reader.readId() }
         )
-        reader.store = store
-
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await waitUntil { reader.firstIdReadStarted }
+        store.update(enableAdvertisingId: false)
+        store.update(enableAdvertisingId: true)
+        reader.releaseFirstIdRead()
         await store.waitForAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(reader.idCount, 2)
         XCTAssertEqual(store.currentSnapshot.advertisingId, "fresh-idfa")
+        XCTAssertEqual(reader.maxConcurrentReads, 1)
+        XCTAssertTrue(reader.allReadsOffMain)
     }
 
     @MainActor
@@ -448,6 +456,43 @@ final class PrivacyTests: XCTestCase {
         XCTAssertNil(store.currentSnapshot.advertisingId)
         XCTAssertEqual(reader.idCount, 1, "revocation must not touch the IDFA reader")
     }
+
+    @MainActor
+    func testReadTelemetryRunsAfterRevokedStateIsPublishedAndLockIsReleased() async {
+        let reader = AdvertisingReaderRecorder()
+        let telemetry = PrivacyReadTelemetryRecorder()
+        let store = SimulaPrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() },
+            advertisingReadTelemetry: { operation, durationMs, success, _ in
+                telemetry.record(operation: operation, snapshotDurationMs: durationMs, success: success)
+            }
+        )
+        telemetry.attach(store)
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await store.waitForAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(telemetry.events.last { $0.operation == "idfa_read" }?.snapshot.advertisingId, "test-idfa")
+
+        telemetry.clear()
+        reader.statusRaw = 2
+        store.refreshAdvertisingTrackingOnForeground()
+        await store.waitForAdvertisingRefreshIdleForTests()
+
+        let statusEvent = telemetry.events.last { $0.operation == "att_status_read" }
+        XCTAssertEqual(statusEvent?.snapshot.attStatus, 2)
+        XCTAssertNil(statusEvent?.snapshot.advertisingId)
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testPublicTrackingAuthorizationStatusReadsCurrentPlatformValueDirectly() {
+        let store = SimulaPrivacy(defaults: makeDefaults())
+        XCTAssertEqual(store.trackingAuthorizationStatus, ATTrackingManager.trackingAuthorizationStatus)
+    }
+    #endif
 
     @MainActor
     func testAuthorizedForegroundRefreshChecksStatusButThrottlesIdfa() async {
@@ -590,34 +635,108 @@ final class PrivacyTests: XCTestCase {
     }
 }
 
-@MainActor
-private final class AdvertisingReaderRecorder {
-    var statusRaw = 3
-    private(set) var statusCount = 0
-    private(set) var idCount = 0
-    func readStatus() -> Int? { statusCount += 1; return statusRaw }
-    func readId() -> String? { idCount += 1; return "test-idfa" }
-}
+private final class AdvertisingReaderRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _statusRaw = 3
+    private var _statusCount = 0
+    private var _idCount = 0
+    private var _allReadsOffMain = true
 
-@MainActor
-private final class ReentrantAdvertisingReader {
-    weak var store: SimulaPrivacy?
-    private(set) var statusCount = 0
-    private(set) var idCount = 0
+    var statusRaw: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _statusRaw }
+        set { lock.lock(); _statusRaw = newValue; lock.unlock() }
+    }
+    var statusCount: Int { lock.lock(); defer { lock.unlock() }; return _statusCount }
+    var idCount: Int { lock.lock(); defer { lock.unlock() }; return _idCount }
+    var allReadsOffMain: Bool { lock.lock(); defer { lock.unlock() }; return _allReadsOffMain }
 
     func readStatus() -> Int? {
-        statusCount += 1
+        lock.lock()
+        _statusCount += 1
+        _allReadsOffMain = _allReadsOffMain && !Thread.isMainThread
+        let status = _statusRaw
+        lock.unlock()
+        return status
+    }
+
+    func readId() -> String? {
+        lock.lock()
+        _idCount += 1
+        _allReadsOffMain = _allReadsOffMain && !Thread.isMainThread
+        lock.unlock()
+        return "test-idfa"
+    }
+}
+
+private final class PrivacyReadTelemetryRecorder: @unchecked Sendable {
+    struct Event {
+        let operation: String
+        let snapshot: ConsentSnapshot
+    }
+
+    private let lock = NSLock()
+    private weak var store: SimulaPrivacy?
+    private var recorded: [Event] = []
+
+    func attach(_ store: SimulaPrivacy) { lock.lock(); self.store = store; lock.unlock() }
+
+    func record(operation: String, snapshotDurationMs _: Int, success _: Bool) {
+        lock.lock(); let store = self.store; lock.unlock()
+        guard let snapshot = store?.currentSnapshot else { return }
+        lock.lock(); recorded.append(Event(operation: operation, snapshot: snapshot)); lock.unlock()
+    }
+
+    var events: [Event] { lock.lock(); defer { lock.unlock() }; return recorded }
+    func clear() { lock.lock(); recorded.removeAll(); lock.unlock() }
+}
+
+private final class BlockingAdvertisingReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let firstIdGate = DispatchSemaphore(value: 0)
+    private var _statusCount = 0
+    private var _idCount = 0
+    private var activeReads = 0
+    private var _maxConcurrentReads = 0
+    private var _firstIdReadStarted = false
+    private var _allReadsOffMain = true
+
+    var statusCount: Int { lock.lock(); defer { lock.unlock() }; return _statusCount }
+    var idCount: Int { lock.lock(); defer { lock.unlock() }; return _idCount }
+    var firstIdReadStarted: Bool { lock.lock(); defer { lock.unlock() }; return _firstIdReadStarted }
+    var maxConcurrentReads: Int { lock.lock(); defer { lock.unlock() }; return _maxConcurrentReads }
+    var allReadsOffMain: Bool { lock.lock(); defer { lock.unlock() }; return _allReadsOffMain }
+
+    func readStatus() -> Int? {
+        beginRead()
+        lock.lock(); _statusCount += 1; lock.unlock()
+        endRead()
         return 3
     }
 
     func readId() -> String? {
-        idCount += 1
-        guard idCount == 1 else { return "fresh-idfa" }
+        beginRead()
+        lock.lock()
+        _idCount += 1
+        let count = _idCount
+        if count == 1 { _firstIdReadStarted = true }
+        lock.unlock()
+        if count == 1 { firstIdGate.wait() }
+        endRead()
+        return count == 1 ? "stale-idfa" : "fresh-idfa"
+    }
 
-        // Model a prompt refresh and a newer foreground check completing while the old read is in flight.
-        store?.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
-        store?.refreshAdvertisingTrackingOnForeground()
-        return "stale-idfa"
+    func releaseFirstIdRead() { firstIdGate.signal() }
+
+    private func beginRead() {
+        lock.lock()
+        activeReads += 1
+        _maxConcurrentReads = max(_maxConcurrentReads, activeReads)
+        _allReadsOffMain = _allReadsOffMain && !Thread.isMainThread
+        lock.unlock()
+    }
+
+    private func endRead() {
+        lock.lock(); activeReads -= 1; lock.unlock()
     }
 }
 

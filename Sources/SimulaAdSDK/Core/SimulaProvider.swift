@@ -182,6 +182,8 @@ public final class SimulaProvider: ObservableObject {
         self.privacyConfig = resolved
         self.telemetryEnabled = telemetryEnabled
 
+        SDKInitializationOrigin.shared.markEntry()
+
         // Establish the one shared quiet-window deadline during the cheap init path. This performs
         // no I/O and never waits; recovery sends, telemetry, ATT/IDFA, and IPv4 work await it later.
         _ = LaunchSettledGate.shared

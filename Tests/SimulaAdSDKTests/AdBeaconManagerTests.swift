@@ -357,7 +357,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.callCount("A", "seen"), 1)
     }
 
-    func testMalformedStoreBlocksManagerAndIsNotOverwritten() async throws {
+    func testMalformedStoreIsQuarantinedBeforePendingBeaconPersistsAndSends() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MalformedBeaconManager-\(UUID().uuidString)", isDirectory: true)
         let fileURL = directory.appendingPathComponent("beacons.json")
@@ -366,21 +366,22 @@ final class AdBeaconManagerTests: XCTestCase {
         try malformed.write(to: fileURL)
         defer { try? FileManager.default.removeItem(at: directory) }
         let sender = FakeBeaconSender()
-        let loadSleep = ControllablePersistenceSleep()
         let mgr = AdBeaconManager(
             sender: sender,
             store: FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults),
-            now: { 0 },
-            loadSleep: { await loadSleep.sleep($0) }
+            now: { 0 }
         )
 
         mgr.enqueue(impressionId: "new", action: "seen")
-        _ = await loadSleep.waitForRequest()
+        await waitUntil { sender.callCount("new", "seen") == 1 }
 
-        XCTAssertEqual(sender.totalCalls, 0)
-        XCTAssertEqual(try Data(contentsOf: fileURL), malformed)
-        await mgr.cancelPendingWorkForTests()
-        loadSleep.release()
+        let quarantine = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).first { $0.lastPathComponent.hasPrefix("beacons.json.quarantine.") }
+        XCTAssertNotNil(quarantine)
+        if let quarantine { XCTAssertEqual(try Data(contentsOf: quarantine), malformed) }
+        XCTAssertEqual(try JSONDecoder().decode([PendingBeacon].self, from: Data(contentsOf: fileURL)), [])
     }
 
     func testTransientLoadRecoveryCoalescesPendingAndPersistsBeforeSending() async {

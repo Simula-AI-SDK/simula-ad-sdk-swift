@@ -8,7 +8,22 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.1.9-dev.6"
+let SIMULA_SDK_VERSION = "1.1.9-dev.7"
+
+struct DuplicateInitializeCountBuffer {
+    private(set) var count = 0
+    let limit: Int
+
+    mutating func increment() {
+        if count < limit { count += 1 }
+    }
+
+    mutating func drain() -> Int {
+        let drained = count
+        count = 0
+        return drained
+    }
+}
 
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
@@ -17,18 +32,19 @@ let SIMULA_SDK_VERSION = "1.1.9-dev.6"
 ///
 /// The manager is decoupled from the network layer: `TelemetryURLSessionDelegate` and the ad
 /// lifecycle just call these methods; this object owns the device context + consent-gated PII
-/// wiring. `@unchecked Sendable` is safe — the single mutable reference is guarded by `lock`.
+/// wiring. `@unchecked Sendable` is safe — mutable state is guarded by `lock`.
 final class Telemetry: @unchecked Sendable {
     static let shared = Telemetry()
 
     private let lock = NSLock()
     private var manager: TelemetryManager?
     private var initialized = false
+    private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
 
     private init() {}
 
-    /// Install the telemetry pipeline. Called once from `SimulaProvider.init` (the choke point
-    /// both the imperative and declarative entry points funnel through). First call wins, so the
+    /// Install the telemetry pipeline. Called once from `SimulaProvider`'s deferred startup (the
+    /// path both the imperative and declarative entry points funnel through). First call wins, so the
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
     /// doesn't churn the buffer.
     /// `primaryUserIDProvider` is read live on every flush so a mid-session `updatePrimaryUserID`
@@ -83,12 +99,29 @@ final class Telemetry: @unchecked Sendable {
             launchGate: LaunchSettledGate.shared,
             debugLog: consoleLog
         )
+        lock.lock()
+        manager = mgr
+        let duplicateCount = duplicateInitializeCount.drain()
+        lock.unlock()
+        if duplicateCount > 0 { mgr.recordMeta(name: "duplicate_initialize", count: duplicateCount) }
         mgr.start()
-        lock.lock(); manager = mgr; lock.unlock()
     }
 
     private var current: TelemetryManager? {
         lock.lock(); defer { lock.unlock() }; return manager
+    }
+
+    /// Count duplicate imperative initialization without requiring telemetry to be installed yet.
+    /// The pending value is capped, then drained into the manager's counted meta aggregate.
+    func recordDuplicateInitialize() {
+        lock.lock()
+        if let manager {
+            lock.unlock()
+            manager.recordMeta(name: "duplicate_initialize", count: 1)
+            return
+        }
+        duplicateInitializeCount.increment()
+        lock.unlock()
     }
 
     /// Push the live session id (from `SimulaProvider`) so telemetry batches can be correlated.
@@ -114,8 +147,22 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
-    func recordOperation(name: String, durationMs: Int, success: Bool, failureClass: String? = nil, breadcrumb: String? = nil) {
-        current?.recordOperation(name: name, durationMs: durationMs, success: success, failureClass: failureClass, breadcrumb: breadcrumb)
+    func recordOperation(
+        name: String,
+        durationMs: Int,
+        success: Bool,
+        failureClass: String? = nil,
+        breadcrumb: String? = nil,
+        timeSinceInitMs: Int? = nil
+    ) {
+        current?.recordOperation(
+            name: name,
+            durationMs: durationMs,
+            success: success,
+            failureClass: failureClass,
+            breadcrumb: breadcrumb,
+            timeSinceInitMs: timeSinceInitMs
+        )
     }
 
     func recordLifecycle(

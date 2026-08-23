@@ -114,6 +114,7 @@ final class CreativeBridgeTests: XCTestCase {
         XCTAssertTrue(CreativeAudioState(outputVolume: 0).muted)
         XCTAssertTrue(CreativeAudioState(outputVolume: 0.004).muted)
         XCTAssertFalse(CreativeAudioState(outputVolume: 0.005).muted)
+        XCTAssertEqual(CreativeAudioState(outputVolume: 0.005).volume, 1)
         XCTAssertEqual(CreativeAudioState(outputVolume: 0.5).volume, 50)
         XCTAssertFalse(CreativeAudioState(outputVolume: 0.5).muted)
         XCTAssertEqual(CreativeAudioState(outputVolume: 2).volume, 100)

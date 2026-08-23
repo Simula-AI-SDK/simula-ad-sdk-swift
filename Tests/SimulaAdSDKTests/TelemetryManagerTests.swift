@@ -99,6 +99,49 @@ final class TelemetryManagerTests: XCTestCase {
         }
     }
 
+    private final class BlockingProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        private let gate = DispatchSemaphore(value: 0)
+        private var shouldBlock = true
+        private var _started = false
+
+        var started: Bool { lock.lock(); defer { lock.unlock() }; return _started }
+
+        func value() -> String? {
+            lock.lock()
+            _started = true
+            let block = shouldBlock
+            lock.unlock()
+            if block { gate.wait() }
+            return nil
+        }
+
+        func release() {
+            lock.lock()
+            let signal = shouldBlock
+            shouldBlock = false
+            lock.unlock()
+            if signal { gate.signal() }
+        }
+    }
+
+    private final class ReentrantProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        weak var manager: TelemetryManager?
+        private var didRecord = false
+
+        func value() -> String? {
+            lock.lock()
+            let shouldRecord = !didRecord
+            didRecord = true
+            lock.unlock()
+            if shouldRecord {
+                manager?.recordOperation(name: "provider_reentrant", durationMs: 0, success: true)
+            }
+            return nil
+        }
+    }
+
     // MARK: - Builder
 
     private func build(
@@ -109,6 +152,7 @@ final class TelemetryManagerTests: XCTestCase {
         random: @escaping @Sendable () -> Double = { 0.0 },
         ppid: String? = nil,
         gaid: String? = nil,
+        primaryUserIdProvider: (@Sendable () -> String?)? = nil,
         debugLog: (@Sendable (String) -> Void)? = nil,
         persistenceWaitTimeout: TimeInterval = 0.1,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
@@ -121,7 +165,7 @@ final class TelemetryManagerTests: XCTestCase {
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
             store: store,
             sender: sender,
-            primaryUserIdProvider: { ppid },
+            primaryUserIdProvider: primaryUserIdProvider ?? { ppid },
             advertisingIdProvider: { gaid },
             enabled: enabled,
             sampleRate: sampleRate,
@@ -235,6 +279,105 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertEqual(env.platform, "ios")
         XCTAssertEqual(env.hostAppId, "com.test")
         XCTAssertEqual(env.sessionId, "sess-42")
+    }
+
+    func testBlockingFlushProviderDoesNotBlockConcurrentRecording() async {
+        let provider = BlockingProvider()
+        let sender = FakeSender()
+        let mgr = build(
+            store: FakeStore(),
+            sender: sender,
+            primaryUserIdProvider: { provider.value() }
+        )
+        defer { provider.release() }
+
+        mgr.recordError(signature: "api:flush_provider")
+        await waitUntil { provider.started }
+
+        let started = ProcessInfo.processInfo.systemUptime
+        mgr.recordOperation(name: "while_provider_blocked", durationMs: 0, success: true)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.1)
+
+        provider.release()
+        await waitUntil { !sender.batches.isEmpty }
+    }
+
+    func testReentrantFlushProviderDoesNotDeadlock() async {
+        let provider = ReentrantProvider()
+        let sender = FakeSender()
+        let mgr = build(
+            store: FakeStore(),
+            sender: sender,
+            primaryUserIdProvider: { provider.value() }
+        )
+        provider.manager = mgr
+
+        mgr.recordError(signature: "api:reentrant_provider")
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "provider_reentrant" }
+        }
+
+        XCTAssertTrue(allEvents(sender.batches).contains { $0.name == "api:reentrant_provider" })
+    }
+
+    func testDuplicateInitializeMetaCountsAggregateIntoOneEvent() async {
+        let sender = FakeSender()
+        let mgr = build(store: FakeStore(), sender: sender)
+        await mgr.waitForRecoveryForTests()
+        await mgr.waitForImmediateFlushIdleForTests()
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 2)
+        mgr.recordMeta(name: "duplicate_initialize", count: 3)
+        mgr.recordError(signature: "api:flush_meta")
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "duplicate_initialize" }
+        }
+
+        let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
+        XCTAssertEqual(duplicates.count, 1)
+        XCTAssertEqual(duplicates.first?.type, TelemetryType.meta)
+        XCTAssertEqual(duplicates.first?.count, 5)
+    }
+
+    func testDuplicateMetaRemainderAfterAcceptedInflightClaimGetsNewEventId() async {
+        let sender = FakeSender()
+        sender.gateFirst()
+        let mgr = build(store: FakeStore(), sender: sender)
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 2)
+        mgr.recordError(signature: "api:flush_meta")
+        await waitUntil { sender.attemptCount == 1 }
+        mgr.recordMeta(name: "duplicate_initialize", count: 3)
+        sender.release()
+        await waitUntil {
+            self.allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }.count == 2
+        }
+
+        let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
+        XCTAssertEqual(duplicates.map { $0.count ?? 0 }, [2, 3])
+        XCTAssertEqual(Set(duplicates.map(\.eventId)).count, 2)
+    }
+
+    func testDuplicateMetaUpdateIsPersistedPromptlyWhileSendIsLaunchGated() async {
+        let store = FakeStore()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: store, sender: FakeSender(), launchGate: gate)
+        await mgr.waitForRecoveryForTests()
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 4)
+        await waitUntil {
+            store.load().contains { $0.name == "duplicate_initialize" && $0.count == 4 }
+        }
+        await gate.open()
+    }
+
+    func testDuplicateInitializePendingCountIsBoundedAndDrainsOnce() {
+        var buffer = DuplicateInitializeCountBuffer(limit: 3)
+        for _ in 0..<10 { buffer.increment() }
+
+        XCTAssertEqual(buffer.count, 3)
+        XCTAssertEqual(buffer.drain(), 3)
+        XCTAssertEqual(buffer.drain(), 0)
     }
 
     // MARK: - Error dedup + eager flush

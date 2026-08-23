@@ -29,6 +29,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     let eventId: String
     let timestamp: Double
     var durationMs: Int?
+    /// Monotonic elapsed time since the process's first SDK initialization entry point.
+    var timeSinceInitMs: Int?
     var statusCode: Int?
     var responseBytes: Int64?
     var requestBytes: Int64?
@@ -59,6 +61,7 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case eventId = "event_id"
         case timestamp
         case durationMs = "duration_ms"
+        case timeSinceInitMs = "time_since_init_ms"
         case statusCode = "status_code"
         case responseBytes = "response_bytes"
         case requestBytes = "request_bytes"

@@ -21,7 +21,7 @@ struct CreativeAudioState: Equatable {
 
     init(outputVolume: Float) {
         let normalized = outputVolume.isFinite ? min(max(outputVolume, 0), 1) : 0
-        volume = min(max(Int((normalized * 100).rounded()), 0), 100)
+        volume = min(max(Int((normalized * 100).rounded(.toNearestOrAwayFromZero)), 0), 100)
         muted = volume == 0
     }
 
