@@ -76,6 +76,7 @@ public final class SimulaProvider: ObservableObject {
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
     public var primaryUserID: String? { telemetryIdentitySource.identity().primaryUserId }
+    private let matchingPrimaryUserID: String?
     let telemetryIdentitySource: TelemetryIdentitySource
     private let telemetryIdentityToken = TelemetryProviderIdentityToken()
     private var telemetryIdentityBound = false
@@ -238,6 +239,7 @@ public final class SimulaProvider: ObservableObject {
         )
         self.processEffectsEnabled = processEffectsEnabled
         self.activeProviderRegistry = activeProviderRegistry
+        self.matchingPrimaryUserID = primaryUserID
         self.telemetryIdentitySource = TelemetryIdentitySource(apiKey: apiKey, primaryUserId: primaryUserID)
         self.hasPrivacyConsent = hasPrivacyConsent
         self.adContext = adContext
@@ -317,7 +319,7 @@ public final class SimulaProvider: ObservableObject {
         SimulaProviderCoreConfiguration(
             apiKey: apiKey,
             devMode: devMode,
-            primaryUserID: primaryUserID,
+            primaryUserID: matchingPrimaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
             telemetryEnabled: telemetryEnabled
         )
@@ -1003,21 +1005,22 @@ public struct SimulaProviderView<Content: View>: View {
             hasPrivacyConsent: hasPrivacyConsent,
             telemetryEnabled: telemetryEnabled
         )
-        let provider = selectSimulaProvider(
-            shared: SimulaAds.shared,
-            configuration: coreConfiguration
-        ) {
-            SimulaProvider(
-                apiKey: apiKey,
-                devMode: devMode,
-                primaryUserID: primaryUserID,
-                hasPrivacyConsent: hasPrivacyConsent,
-                privacy: privacy,
-                telemetryEnabled: telemetryEnabled,
-                adContext: adContext
-            )
-        }
-        self._provider = StateObject(wrappedValue: provider)
+        self._provider = StateObject(
+            wrappedValue: selectSimulaProvider(
+                shared: SimulaAds.shared,
+                configuration: coreConfiguration
+            ) {
+                SimulaProvider(
+                    apiKey: apiKey,
+                    devMode: devMode,
+                    primaryUserID: primaryUserID,
+                    hasPrivacyConsent: hasPrivacyConsent,
+                    privacy: privacy,
+                    telemetryEnabled: telemetryEnabled,
+                    adContext: adContext
+                )
+            }
+        )
         self.content = content
     }
 

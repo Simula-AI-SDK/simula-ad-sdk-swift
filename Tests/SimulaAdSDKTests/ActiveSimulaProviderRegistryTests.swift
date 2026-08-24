@@ -98,6 +98,48 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
         XCTAssertFalse(created)
     }
 
+    func testLivePPIDUpdateDoesNotChangeProviderMatchingConfiguration() {
+        let registry = ActiveSimulaProviderRegistry()
+        let ownership = ProcessApiKeyOwnership()
+        let configuration = coreConfiguration()
+        let provider = makeProvider(
+            configuration: configuration,
+            ownership: ownership,
+            registry: registry
+        )
+
+        provider.telemetryIdentitySource.setPrimaryUserId("updated-user")
+
+        XCTAssertEqual(provider.primaryUserID, "updated-user")
+        guard case .adopt(let adopted) = registry.resolve(configuration) else {
+            return XCTFail("a live PPID update must not change construction-time provider matching")
+        }
+        XCTAssertTrue(adopted === provider)
+    }
+
+    func testLivePPIDUpdateStillRejectsDifferentConstructionConfiguration() {
+        let registry = ActiveSimulaProviderRegistry()
+        let ownership = ProcessApiKeyOwnership()
+        let configuration = coreConfiguration()
+        let provider = makeProvider(
+            configuration: configuration,
+            ownership: ownership,
+            registry: registry
+        )
+        provider.telemetryIdentitySource.setPrimaryUserId("updated-user")
+        let different = SimulaProviderCoreConfiguration(
+            apiKey: configuration.apiKey,
+            devMode: configuration.devMode,
+            primaryUserID: "different-initial-user",
+            hasPrivacyConsent: configuration.hasPrivacyConsent,
+            telemetryEnabled: configuration.telemetryEnabled
+        )
+
+        guard case .conflict = registry.resolve(different) else {
+            return XCTFail("different construction-time PPIDs must remain incompatible")
+        }
+    }
+
     private func coreConfiguration() -> SimulaProviderCoreConfiguration {
         SimulaProviderCoreConfiguration(
             apiKey: "same-key",
