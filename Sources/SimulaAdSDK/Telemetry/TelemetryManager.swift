@@ -62,7 +62,6 @@ final class TelemetryManager: @unchecked Sendable {
     private let store: TelemetryStoring
     private let sender: TelemetrySending
     private let identityProvider: @Sendable () -> TelemetryIdentity
-    private let advertisingIdProvider: @Sendable () -> String?
     // Resolved fresh on each flush (off the UI path). Must be best-effort/non-throwing.
     private let connectionTypeProvider: @Sendable () -> String?
     // Compact diagnostics breadcrumb (memory etc.), sampled on flush. Best-effort.
@@ -121,7 +120,6 @@ final class TelemetryManager: @unchecked Sendable {
         store: TelemetryStoring,
         sender: TelemetrySending,
         identityProvider: @escaping @Sendable () -> TelemetryIdentity,
-        advertisingIdProvider: @escaping @Sendable () -> String?,
         connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
         diagnosticsProvider: @escaping @Sendable () -> String? = { nil },
         batteryProvider: @escaping @Sendable () -> BatteryInfo? = { nil },
@@ -146,7 +144,6 @@ final class TelemetryManager: @unchecked Sendable {
         self.store = store
         self.sender = sender
         self.identityProvider = identityProvider
-        self.advertisingIdProvider = advertisingIdProvider
         self.connectionTypeProvider = connectionTypeProvider
         self.diagnosticsProvider = diagnosticsProvider
         self.batteryProvider = batteryProvider
@@ -786,7 +783,7 @@ final class TelemetryManager: @unchecked Sendable {
         let identity = identityProvider()
         env.sessionId = identity.sessionId
         env.primaryUserId = identity.primaryUserId
-        env.advertisingId = advertisingIdProvider()
+        env.advertisingId = identity.advertisingId
         env.connectionType = connectionTypeProvider()
         env.experimentId = context.experimentId
         env.variantId = context.variantId

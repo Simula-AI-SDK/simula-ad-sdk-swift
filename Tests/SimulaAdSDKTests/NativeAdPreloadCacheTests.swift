@@ -15,10 +15,8 @@ final class NativeAdPreloadCacheTests: XCTestCase {
                 renderedHtml: "<div>ad</div>"
             )
         }
-        let provider = SimulaProvider(apiKey: "test-api-key")
 
-        let id = cache.preload(
-            provider: provider,
+        let id = cache.preloadForTests(
             adUnitId: "feed",
             position: 1,
             theme: nil
@@ -43,9 +41,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
                 renderedHtml: "<div>ad</div>"
             )
         }
-        let provider = SimulaProvider(apiKey: "test-api-key")
-        let id = try XCTUnwrap(cache.preload(
-            provider: provider,
+        let id = try XCTUnwrap(cache.preloadForTests(
             adUnitId: "feed",
             position: 3,
             theme: nil
@@ -89,14 +85,34 @@ final class NativeAdPreloadCacheTests: XCTestCase {
             loadCount += 1
             throw LoadError.failed
         }
-        let provider = SimulaProvider(apiKey: "test-api-key")
 
         for position in 0..<5 {
-            XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: position, theme: nil))
+            XCTAssertNotNil(cache.preloadForTests(adUnitId: "feed", position: position, theme: nil))
         }
         await waitUntil { loadCount == 5 }
 
-        XCTAssertNotNil(cache.preload(provider: provider, adUnitId: "feed", position: 6, theme: nil))
+        XCTAssertNotNil(cache.preloadForTests(adUnitId: "feed", position: 6, theme: nil))
+    }
+
+    func testMismatchedProviderNativeLoadFailsBeforeSessionOrNetwork() async {
+        let ownership = ProcessApiKeyOwnership()
+        _ = SimulaProvider(testApiKey: "winning-key", apiKeyOwnership: ownership)
+        let mismatched = SimulaProvider(testApiKey: "losing-key", apiKeyOwnership: ownership)
+
+        do {
+            _ = try await NativeAdController.load(
+                provider: mismatched,
+                adUnitId: "feed",
+                position: 0
+            )
+            XCTFail("mismatched provider must not load an ad")
+        } catch let error as SimulaAdError {
+            guard case .noSession = error else {
+                return XCTFail("unexpected SimulaAdError: \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 }
 #endif

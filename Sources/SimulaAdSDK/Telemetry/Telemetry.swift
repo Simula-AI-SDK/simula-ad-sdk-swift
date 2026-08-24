@@ -25,6 +25,12 @@ struct DuplicateInitializeCountBuffer {
     }
 }
 
+struct TelemetryInitialization: Equatable, Sendable {
+    let apiKey: String
+    let devMode: Bool
+    let enabled: Bool
+}
+
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
 /// no-ops until `initialize` installs a `TelemetryManager`, and a true no-op forever when the
@@ -44,7 +50,7 @@ final class Telemetry: @unchecked Sendable {
     private let lock = NSLock()
     private let managerFactory: ManagerFactory
     private var manager: TelemetryManager?
-    private var initializationTask: Task<Void, Never>?
+    private var initializationTask: Task<TelemetryInitialization, Never>?
     private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
 
     init(managerFactory: @escaping ManagerFactory = Telemetry.defaultManagerFactory) {
@@ -55,14 +61,19 @@ final class Telemetry: @unchecked Sendable {
     /// path both the imperative and declarative entry points funnel through). First call wins, so the
     /// host's `telemetryEnabled` choice sticks and `SimulaProviderView` recreating a provider
     /// doesn't churn the buffer.
-    /// Every caller awaits the first process-owned installation task. The task is unstructured, so
-    /// caller cancellation cannot abandon installation, and immutable first-call configuration wins.
-    func initialize(apiKey: String, devMode: Bool, enabled: Bool) async {
+    /// Every caller awaits the first process-owned installation task and receives that task's
+    /// effective configuration. The task is unstructured, so caller cancellation cannot abandon
+    /// installation, and immutable first-call configuration wins.
+    func initialize(apiKey: String, devMode: Bool, enabled: Bool) async -> TelemetryInitialization {
         let task = claimInitializationTask(apiKey: apiKey, devMode: devMode, enabled: enabled)
-        await task.value
+        return await task.value
     }
 
-    private func claimInitializationTask(apiKey: String, devMode: Bool, enabled: Bool) -> Task<Void, Never> {
+    private func claimInitializationTask(
+        apiKey: String,
+        devMode: Bool,
+        enabled: Bool
+    ) -> Task<TelemetryInitialization, Never> {
         lock.lock()
         defer { lock.unlock() }
         if let initializationTask {
@@ -74,13 +85,15 @@ final class Telemetry: @unchecked Sendable {
         return created
     }
 
-    private func install(apiKey: String, devMode: Bool, enabled: Bool) async {
-        guard enabled else { return } // host opt-out: no manager is ever created
+    private func install(apiKey: String, devMode: Bool, enabled: Bool) async -> TelemetryInitialization {
+        let effective = TelemetryInitialization(apiKey: apiKey, devMode: devMode, enabled: enabled)
+        guard enabled else { return effective } // host opt-out: no manager is ever created
 
         let mgr = await managerFactory(apiKey, devMode)
         mgr.start()
         let duplicateCount = publish(mgr)
         if duplicateCount > 0 { mgr.recordMeta(name: "duplicate_initialize", count: duplicateCount) }
+        return effective
     }
 
     private func publish(_ manager: TelemetryManager) -> Int {
@@ -122,22 +135,34 @@ final class Telemetry: @unchecked Sendable {
             ctx: ctx,
             store: UserDefaultsTelemetryStore(),
             sender: ApiTelemetrySender(apiKey: apiKey),
-            // Resolve one live identity, then gate only its PPID with the current consent snapshot.
+            // Resolve one live identity and one privacy snapshot for the entire envelope identity.
             identityProvider: {
-                let identity = processTelemetryIdentityRouter.identity()
-                let privacy = SimulaPrivacy.shared.currentSnapshot
-                return TelemetryIdentity(
-                    sessionId: identity.sessionId,
-                    primaryUserId: privacy.allowsPrimaryUserID ? identity.primaryUserId : nil
+                Telemetry.resolveFlushIdentity(
+                    apiKey: apiKey,
+                    router: processTelemetryIdentityRouter,
+                    privacySnapshot: { SimulaPrivacy.shared.currentSnapshot }
                 )
             },
-            advertisingIdProvider: { SimulaPrivacy.shared.currentSnapshot.advertisingId },
             connectionTypeProvider: { SimulaConnectionType.shared.label },
             diagnosticsProvider: { Telemetry.resolveDiagnostics() },
             batteryProvider: { Telemetry.resolveBattery() },
             carrierProvider: { Telemetry.resolveCarrier() },
             launchGate: LaunchSettledGate.shared,
             debugLog: consoleLog
+        )
+    }
+
+    static func resolveFlushIdentity(
+        apiKey: String,
+        router: TelemetryIdentityRouter,
+        privacySnapshot: () -> ConsentSnapshot
+    ) -> TelemetryIdentity {
+        let identity = router.identity(apiKey: apiKey)
+        let privacy = privacySnapshot()
+        return TelemetryIdentity(
+            sessionId: identity.sessionId,
+            primaryUserId: privacy.allowsPrimaryUserID ? identity.primaryUserId : nil,
+            advertisingId: privacy.advertisingId
         )
     }
 

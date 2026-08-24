@@ -93,6 +93,7 @@ struct SimulaWebViewPrewarmSkipGate {
 @MainActor
 final class NativeAdMountScheduler {
     typealias FrameWait = @MainActor () async -> Void
+    typealias AdmissionCompletion = @MainActor (Bool) -> Void
 
     #if os(iOS)
     static let shared = NativeAdMountScheduler(waitForNextFrame: waitForNativeAdDisplayFrame)
@@ -100,14 +101,15 @@ final class NativeAdMountScheduler {
 
     private let waitForNextFrame: FrameWait
     private var order: [UUID] = []
-    private var continuations: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var completions: [UUID: AdmissionCompletion] = [:]
     private var frameTask: Task<Void, Never>?
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(waitForNextFrame: @escaping FrameWait) {
         self.waitForNextFrame = waitForNextFrame
     }
 
-    var pendingCount: Int { continuations.count }
+    var pendingCount: Int { completions.count }
 
     func waitForAdmission() async -> Bool {
         let id = UUID()
@@ -118,9 +120,7 @@ final class NativeAdMountScheduler {
                     continuation.resume(returning: false)
                     return
                 }
-                order.append(id)
-                continuations[id] = continuation
-                scheduleFrameIfNeeded()
+                enqueue(id: id) { continuation.resume(returning: $0) }
             }
         } onCancel: { [weak self] in
             Task { @MainActor in self?.cancel(id) }
@@ -128,19 +128,20 @@ final class NativeAdMountScheduler {
     }
 
     private func scheduleFrameIfNeeded() {
-        guard frameTask == nil, !continuations.isEmpty else { return }
+        guard frameTask == nil, !completions.isEmpty else { return }
         frameTask = Task { @MainActor [weak self] in await self?.runFrame() }
     }
 
     private func runFrame() async {
         await waitForNextFrame()
         frameTask = nil
+        defer { resumeIdleWaitersIfNeeded() }
         guard !Task.isCancelled else { return }
 
         while !order.isEmpty {
             let id = order.removeFirst()
-            if let continuation = continuations.removeValue(forKey: id) {
-                continuation.resume(returning: true)
+            if let completion = completions.removeValue(forKey: id) {
+                completion(true)
                 break
             }
         }
@@ -149,7 +150,34 @@ final class NativeAdMountScheduler {
 
     private func cancel(_ id: UUID) {
         if let index = order.firstIndex(of: id) { order.remove(at: index) }
-        continuations.removeValue(forKey: id)?.resume(returning: false)
+        completions.removeValue(forKey: id)?(false)
+    }
+
+    private func enqueue(id: UUID, completion: @escaping AdmissionCompletion) {
+        order.append(id)
+        completions[id] = completion
+        scheduleFrameIfNeeded()
+    }
+
+    @discardableResult
+    func enqueueForTests(completion: @escaping AdmissionCompletion) -> UUID {
+        let id = UUID()
+        enqueue(id: id, completion: completion)
+        return id
+    }
+
+    func cancelForTests(_ id: UUID) { cancel(id) }
+
+    func waitForIdleForTests() async {
+        if frameTask == nil { return }
+        await withCheckedContinuation { idleWaiters.append($0) }
+    }
+
+    private func resumeIdleWaitersIfNeeded() {
+        guard frameTask == nil else { return }
+        let waiters = idleWaiters
+        idleWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

@@ -108,6 +108,10 @@ public enum SimulaAds {
             return false
         }
 
+        guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+            return false
+        }
+
         // First valid initialization wins so already-created ads keep their session.
         guard shared == nil else {
             Telemetry.shared.recordDuplicateInitialize()
@@ -146,6 +150,13 @@ public enum SimulaAds {
         return true
     }
 
+    nonisolated static func claimApiKeyForInitialization(
+        _ apiKey: String,
+        ownership: ProcessApiKeyOwnership
+    ) -> Bool {
+        ownership.claim(apiKey).isCompatible
+    }
+
     // MARK: - Native ad targeting context + preloading
 
     /// Replace the native-ad targeting context at runtime (e.g. when the feed category changes).
@@ -178,7 +189,9 @@ public enum SimulaAds {
     /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
-        guard let provider = shared, !adUnitId.isEmpty else { return false }
+        guard let provider = shared, provider.isProcessApiKeyCompatible, !adUnitId.isEmpty else {
+            return false
+        }
         // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback
         // tracks the provider's live PPID (resolved below, after the session await).
         let explicitPPID = (primaryUserID?.isEmpty == false) ? primaryUserID : nil

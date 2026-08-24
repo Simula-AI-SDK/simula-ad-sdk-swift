@@ -2,6 +2,46 @@ internal func nativeAdMountTaskIdentity(response: NativeAdResponse, mountAdmitte
     "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)|\(mountAdmitted)"
 }
 
+struct NativeAdSlotStartupPlan: Equatable {
+    let rendersContent: Bool
+    let readsPreload: Bool
+    let readsCache: Bool
+    let restoresRetainedCreative: Bool
+    let loadsNetwork: Bool
+}
+
+func nativeAdSlotStartupPlan(
+    providerCompatible: Bool?,
+    hasPreview: Bool,
+    hasPreloadedAd: Bool
+) -> NativeAdSlotStartupPlan {
+    if hasPreview, providerCompatible != false {
+        return NativeAdSlotStartupPlan(
+            rendersContent: true,
+            readsPreload: false,
+            readsCache: false,
+            restoresRetainedCreative: false,
+            loadsNetwork: false
+        )
+    }
+    guard providerCompatible == true else {
+        return NativeAdSlotStartupPlan(
+            rendersContent: false,
+            readsPreload: false,
+            readsCache: false,
+            restoresRetainedCreative: false,
+            loadsNetwork: false
+        )
+    }
+    return NativeAdSlotStartupPlan(
+        rendersContent: true,
+        readsPreload: hasPreloadedAd,
+        readsCache: true,
+        restoresRetainedCreative: true,
+        loadsNetwork: true
+    )
+}
+
 #if os(iOS)
 import SwiftUI
 import UIKit
@@ -173,21 +213,17 @@ public struct NativeAdSlot: View {
         self.onError = onError
         self.onClick = onClick
 
-        // Seed the initial state from the per-slot cache so a recycled row paints the SAME ad on its
-        // first frame (no shimmer flash, no refetch). A preview / preload resolves in `.task`.
-        if previewHTML == nil, preloadedAdId == nil, let entry = NativeAdCache.shared.get(adUnitId, position) {
-            if let response = entry.response {
-                _phase = State(initialValue: .filled(response))
-                _heightPt = State(initialValue: entry.heightPt)
-                _impressionFired = State(initialValue: entry.impressionFired)
-                _impressionMetadata = State(initialValue: entry.metadata)
-            } else {
-                _phase = State(initialValue: .empty)
-            }
-        }
     }
 
     public var body: some View {
+        if startupPlan.rendersContent {
+            compatibleBody
+        } else {
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    private var compatibleBody: some View {
         sizedSlot
             .task(id: taskKey) { await load() }
             .task(id: mountRequestKey) { await requestMount() }
@@ -325,6 +361,13 @@ public struct NativeAdSlot: View {
     }
 
     private var taskKey: String { "\(adUnitId ?? "")|\(position)|\(preloadedAdId ?? "")|\(previewHTML != nil)" }
+    private var startupPlan: NativeAdSlotStartupPlan {
+        nativeAdSlotStartupPlan(
+            providerCompatible: resolvedProvider?.canMakeRequests,
+            hasPreview: previewHTML != nil,
+            hasPreloadedAd: preloadedAdId != nil
+        )
+    }
 
     private var mountRequestKey: String? {
         guard case .filled(let response) = phase else { return nil }
@@ -334,7 +377,8 @@ public struct NativeAdSlot: View {
 
     @MainActor
     private func restoreRetainedMountIfAvailable() {
-        guard !mountAdmitted,
+        guard startupPlan.restoresRetainedCreative,
+              !mountAdmitted,
               case .filled(let response) = phase,
               let impressionId = response.impressionId, !impressionId.isEmpty,
               NativeAdWebViewStore.shared.canReattach(
@@ -355,7 +399,8 @@ public struct NativeAdSlot: View {
 
     @MainActor
     private func requestMount() async {
-        guard !mountAdmitted, let requestedKey = mountRequestKey else { return }
+        guard startupPlan.rendersContent,
+              !mountAdmitted, let requestedKey = mountRequestKey else { return }
         let admitted = await NativeAdMountScheduler.shared.waitForAdmission()
         guard admitted, !Task.isCancelled, mountRequestKey == requestedKey else { return }
         mountAdmitted = true
@@ -363,6 +408,10 @@ public struct NativeAdSlot: View {
 
     @MainActor
     private func load() async {
+        guard startupPlan.rendersContent else {
+            phase = .empty
+            return
+        }
         // Preview/QA: render the supplied HTML with no network (mirrors imperative showPreview).
         if let previewHTML {
             impressionMetadata = nil
@@ -377,20 +426,22 @@ public struct NativeAdSlot: View {
         }
 
         // 1. Honor a fresh preload first (a new id the publisher just preloaded).
-        switch await resolveNativeAdPreload(preloadedAdId) {
-        case .cancelled:
-            // A cancelled SwiftUI task leaves the preload available for remount. Do not reinterpret
-            // it as a failed preload and start a duplicate cache/live path in this dead slot.
-            return
-        case .loaded(let response):
-            apply(response, source: "preload", metadata: metadata)
-            return
-        case .unavailable:
-            break
+        if startupPlan.readsPreload {
+            switch await resolveNativeAdPreload(preloadedAdId) {
+            case .cancelled:
+                // A cancelled SwiftUI task leaves the preload available for remount. Do not reinterpret
+                // it as a failed preload and start a duplicate cache/live path in this dead slot.
+                return
+            case .loaded(let response):
+                apply(response, source: "preload", metadata: metadata)
+                return
+            case .unavailable:
+                break
+            }
         }
 
         // 2. Per-slot cache hit → render without a network call (no duplicate serve / impression).
-        if let entry = NativeAdCache.shared.get(adUnitId, position) {
+        if startupPlan.readsCache, let entry = NativeAdCache.shared.get(adUnitId, position) {
             if let response = entry.response {
                 heightPt = entry.heightPt
                 impressionFired = entry.impressionFired
@@ -405,6 +456,7 @@ public struct NativeAdSlot: View {
         }
 
         // 3. Live request.
+        guard startupPlan.loadsNetwork else { return }
         mountAdmitted = false
         phase = .loading
         guard let provider = resolvedProvider else {

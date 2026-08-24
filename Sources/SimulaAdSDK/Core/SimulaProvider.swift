@@ -32,6 +32,16 @@ func classifyPrivacyChange(from previous: ConsentSnapshot, to current: ConsentSn
     )
 }
 
+func resolvePrivacyConfig(
+    hasPrivacyConsent: Bool,
+    privacy: SimulaPrivacyConfig?
+) -> SimulaPrivacyConfig {
+    guard let privacy else {
+        return SimulaPrivacyConfig(hasPrivacyConsent: hasPrivacyConsent)
+    }
+    return privacy
+}
+
 // MARK: - SimulaProvider
 
 /// The central state manager for the Simula Ad SDK.
@@ -57,11 +67,18 @@ public final class SimulaProvider: ObservableObject {
     /// Whether the SDK is in development mode
     public let devMode: Bool
 
+    /// False when another API key already owns process-wide SDK infrastructure. Such providers
+    /// remain inert so a SwiftUI construction mismatch cannot send requests through mixed keys.
+    let isProcessApiKeyCompatible: Bool
+    private let processEffectsEnabled: Bool
+    var canMakeRequests: Bool { isProcessApiKeyCompatible }
+
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
     public var primaryUserID: String? { telemetryIdentitySource.identity().primaryUserId }
     let telemetryIdentitySource: TelemetryIdentitySource
     private let telemetryIdentityToken = TelemetryProviderIdentityToken()
+    private var telemetryIdentityBound = false
 
     /// Legacy coarse consent flag. When false, suppresses collection of PII.
     /// Retained as a convenience alias for `privacyConfig.hasPrivacyConsent`.
@@ -152,7 +169,7 @@ public final class SimulaProvider: ObservableObject {
 
     // MARK: - Init
 
-    public init(
+    public convenience init(
         apiKey: String,
         devMode: Bool = false,
         primaryUserID: String? = nil,
@@ -161,27 +178,64 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool = true,
         adContext: SimulaAdContext? = nil
     ) {
-        // Validate at init (matches React's validateSimulaProviderProps call)
-        do {
-            try validateSimulaProviderProps(apiKey: apiKey)
-        } catch {
-            // In React, this throws and prevents render. In Swift, we assert in debug.
-            assertionFailure("[SimulaSDK] \(error.localizedDescription)")
-        }
+        self.init(
+            apiKey: apiKey,
+            devMode: devMode,
+            primaryUserID: primaryUserID,
+            hasPrivacyConsent: hasPrivacyConsent,
+            privacy: privacy,
+            telemetryEnabled: telemetryEnabled,
+            adContext: adContext,
+            apiKeyOwnership: processApiKeyOwnership,
+            processEffectsEnabled: true
+        )
+    }
 
+    convenience init(testApiKey apiKey: String, apiKeyOwnership: ProcessApiKeyOwnership) {
+        self.init(
+            apiKey: apiKey,
+            devMode: false,
+            primaryUserID: nil,
+            hasPrivacyConsent: true,
+            privacy: nil,
+            telemetryEnabled: true,
+            adContext: nil,
+            apiKeyOwnership: apiKeyOwnership,
+            processEffectsEnabled: false
+        )
+    }
+
+    init(
+        apiKey: String,
+        devMode: Bool,
+        primaryUserID: String?,
+        hasPrivacyConsent: Bool,
+        privacy: SimulaPrivacyConfig?,
+        telemetryEnabled: Bool,
+        adContext: SimulaAdContext?,
+        apiKeyOwnership: ProcessApiKeyOwnership,
+        processEffectsEnabled: Bool
+    ) {
         self.apiKey = apiKey
         self.devMode = devMode
-        self.telemetryIdentitySource = TelemetryIdentitySource(primaryUserId: primaryUserID)
+        self.isProcessApiKeyCompatible = claimProcessApiKeyIfValid(
+            apiKey,
+            ownership: apiKeyOwnership,
+            reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
+        )
+        self.processEffectsEnabled = processEffectsEnabled
+        self.telemetryIdentitySource = TelemetryIdentitySource(apiKey: apiKey, primaryUserId: primaryUserID)
         self.hasPrivacyConsent = hasPrivacyConsent
         self.adContext = adContext
 
         // When an explicit `privacy` config is given it wins; otherwise the legacy
         // `hasPrivacyConsent` flag seeds the config so existing call sites behave
         // exactly as before.
-        var resolved = privacy ?? SimulaPrivacyConfig()
-        if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
+        let resolved = resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy)
         self.privacyConfig = resolved
         self.telemetryEnabled = telemetryEnabled
+
+        guard isProcessApiKeyCompatible, processEffectsEnabled else { return }
 
         SDKInitializationOrigin.shared.markEntry()
 
@@ -233,7 +287,9 @@ public final class SimulaProvider: ObservableObject {
     deinit {
         // Synchronous and lock-only: deinit may run off the main actor, and the router retains no
         // provider/UI object. Removing this token restores the previous active provider, if any.
-        processTelemetryIdentityRouter.unbindProvider(telemetryIdentityToken)
+        if telemetryIdentityBound {
+            processTelemetryIdentityRouter.unbindProvider(telemetryIdentityToken)
+        }
     }
 
     // MARK: - Deferred startup
@@ -249,7 +305,7 @@ public final class SimulaProvider: ObservableObject {
     /// here, off the caller's critical path.
     @MainActor
     func start(bindProviderIdentity: Bool = true) {
-        guard startupTask == nil else { return }
+        guard canMakeRequests, processEffectsEnabled, startupTask == nil else { return }
         // Binding here, rather than in init, prevents speculative SwiftUI view construction from
         // replacing the identity of the provider whose startup actually committed.
         if bindProviderIdentity {
@@ -257,6 +313,7 @@ public final class SimulaProvider: ObservableObject {
                 token: telemetryIdentityToken,
                 source: telemetryIdentitySource
             )
+            telemetryIdentityBound = true
         }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         startupTask = Task { await self.runStartup() }
@@ -266,11 +323,14 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     private func runStartup() async {
         // Phase 1 (off-main): warm the one-time lazy costs and install telemetry.
-        let lastSeenVersion = await Self.runStartupPrewarm(
+        let prewarm = await Self.runStartupPrewarm(
             apiKey: apiKey, devMode: devMode, telemetryEnabled: telemetryEnabled
         )
         // Phase 2 (main): beacons that need telemetry installed.
-        recordStartupBeacons(lastSeenVersion: lastSeenVersion)
+        recordStartupBeacons(
+            lastSeenVersion: prewarm.lastSeenVersion,
+            telemetryEnabled: prewarm.telemetry.enabled
+        )
         // Phase 3: warm the session. Ungated variant — this task IS the startup gate
         // (`ensureSession` awaits its completion), so the task must END here.
         _ = await ensureSessionCoalesced()
@@ -279,12 +339,17 @@ public final class SimulaProvider: ObservableObject {
     /// Off-main startup phase (named method — see the task-shape note in TelemetryManager).
     /// `nonisolated` so it runs on the cooperative pool: every singleton touched here is
     /// lock-guarded or self-hops to the main thread for its main-only parts.
-    /// Returns the previously persisted SDK version (for the `sdk_upgrade` beacon).
+    /// Returns the previously persisted SDK version plus the winning telemetry configuration.
+    private struct StartupPrewarmResult: Sendable {
+        let lastSeenVersion: String?
+        let telemetry: TelemetryInitialization
+    }
+
     nonisolated private static func runStartupPrewarm(
         apiKey: String,
         devMode: Bool,
         telemetryEnabled: Bool
-    ) async -> String? {
+    ) async -> StartupPrewarmResult {
         // Warm the lazy statics OFF the main thread: `identifierForVendor` can block early in
         // launch and UA building is syscalls; building the shared session (URLSession + standard
         // headers) reads both, so this single touch completes all three off-main.
@@ -296,7 +361,7 @@ public final class SimulaProvider: ObservableObject {
         // SDK request) is captured. First call wins, so a re-created provider doesn't churn it;
         // the facade re-gates PII on the live consent snapshot. Lock-guarded and its main-thread
         // needs (battery monitor) self-hop — safe from a background context.
-        await Telemetry.shared.initialize(
+        let effectiveTelemetry = await Telemetry.shared.initialize(
             apiKey: apiKey,
             devMode: devMode,
             enabled: telemetryEnabled
@@ -306,14 +371,13 @@ public final class SimulaProvider: ObservableObject {
         // the install replays any prior-process crash records into the pipeline, and a record
         // landing before the manager exists is permanently dropped. Thread-safe (its main-thread
         // needs — MetricKit — self-hop).
-        SimulaCrashGuard.shared.install(enabled: telemetryEnabled)
+        installTelemetryDependentInfrastructure(effectiveTelemetry)
 
         // Queue drains + beacon recovery. The first touch of these singletons constructs a
         // `SimulaAPI` (their sender/verifier), so they MUST come after the shared-session build
         // above — otherwise `initialize` would build `defaultSession` (URLSession + UA/IDFV
         // headers) on the main thread. Lock-guarded; each drain runs in its own Task.
         RewardVerificationManager.shared.triggerProcessQueue()
-        AdBeaconManager.shared.configure(apiKey: apiKey)
         AdBeaconManager.shared.triggerProcessQueue()
 
         // SDK-upgrade bookkeeping: read + persist off-main; the beacon itself is recorded in the
@@ -323,14 +387,27 @@ public final class SimulaProvider: ObservableObject {
         if lastVersion != SIMULA_SDK_VERSION {
             UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
         }
-        return lastVersion
+        return StartupPrewarmResult(lastSeenVersion: lastVersion, telemetry: effectiveTelemetry)
+    }
+
+    nonisolated static func installTelemetryDependentInfrastructure(
+        _ effectiveTelemetry: TelemetryInitialization,
+        installCrashGuard: @escaping @Sendable (Bool) -> Void = {
+            SimulaCrashGuard.shared.install(enabled: $0)
+        },
+        configureBeaconManager: @escaping @Sendable (String) -> Void = {
+            AdBeaconManager.shared.configure(apiKey: $0)
+        }
+    ) {
+        installCrashGuard(effectiveTelemetry.enabled)
+        configureBeaconManager(effectiveTelemetry.apiKey)
     }
 
     /// Main-actor startup phase (named method — see the task-shape note in TelemetryManager):
     /// emits the `sdk_init` beacon (duration measured from the start of `init`) and the
     /// `sdk_upgrade` beacon on a version change. No-ops when telemetry is disabled.
     @MainActor
-    private func recordStartupBeacons(lastSeenVersion: String?) {
+    private func recordStartupBeacons(lastSeenVersion: String?, telemetryEnabled: Bool) {
         // SDK-init beacon, now that telemetry is installed. Best-effort; the config summary
         // carries no PII.
         let initMs = Int((DispatchTime.now().uptimeNanoseconds &- initStartNanos) / 1_000_000)
@@ -404,6 +481,7 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func ensureSession() async -> String? {
+        guard canMakeRequests, processEffectsEnabled else { return nil }
         start()
         if let startupTask { await startupTask.value }
         return await ensureSessionCoalesced()
@@ -574,6 +652,7 @@ public final class SimulaProvider: ObservableObject {
     /// gathers or refreshes consent). Forwarded to the process-wide store; the
     /// session re-syncs automatically.
     public func updateConsent(_ config: SimulaPrivacyConfig) {
+        guard isProcessApiKeyCompatible else { return }
         SimulaPrivacy.shared.apply(config)
     }
 
@@ -583,6 +662,7 @@ public final class SimulaProvider: ObservableObject {
     /// A full replacement, not a merge (PRD); all subsequent `POST /load/native` calls use the new
     /// value. Ads already preloaded under the old context are unaffected.
     public func updateContext(_ context: SimulaAdContext?) {
+        guard isProcessApiKeyCompatible else { return }
         adContext = context
     }
 
@@ -598,6 +678,7 @@ public final class SimulaProvider: ObservableObject {
     /// express an empty id. The network call is best-effort.
     @MainActor
     public func updatePrimaryUserID(_ id: String?) {
+        guard isProcessApiKeyCompatible else { return }
         let normalized = (id?.isEmpty == false) ? id : nil
         telemetryIdentitySource.setPrimaryUserId(normalized)
         // Reconcile the live server session toward the new id (serialized + single-flight). No-op
@@ -687,6 +768,7 @@ public final class SimulaProvider: ObservableObject {
         coppaApplies: Bool? = nil,
         enableAdvertisingId: Bool? = nil
     ) {
+        guard isProcessApiKeyCompatible else { return }
         SimulaPrivacy.shared.update(
             hasPrivacyConsent: hasPrivacyConsent,
             tcString: tcString,
@@ -711,6 +793,7 @@ public final class SimulaProvider: ObservableObject {
         gdprApplies: Bool = false,
         tcfPurpose1Consent: Bool = false
     ) {
+        guard isProcessApiKeyCompatible else { return }
         SimulaPrivacy.shared.clearConsent(
             tcString: tcString,
             uspString: uspString,
@@ -729,7 +812,10 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {
-        await SimulaPrivacy.shared.requestTrackingAuthorization()
+        guard isProcessApiKeyCompatible else {
+            return SimulaPrivacy.shared.trackingAuthorizationStatus
+        }
+        return await SimulaPrivacy.shared.requestTrackingAuthorization()
     }
     #endif
 
@@ -744,31 +830,37 @@ public final class SimulaProvider: ObservableObject {
 
     /// Get cached ad for a slot/position (translates `getCachedAd`)
     public func getCachedAd(slot: String, position: Int) -> AdData? {
-        adCache[cacheKey(slot: slot, position: position)]
+        guard isProcessApiKeyCompatible else { return nil }
+        return adCache[cacheKey(slot: slot, position: position)]
     }
 
     /// Cache an ad for a slot/position (translates `cacheAd`)
     public func cacheAd(slot: String, position: Int, ad: AdData) {
+        guard isProcessApiKeyCompatible else { return }
         adCache[cacheKey(slot: slot, position: position)] = ad
     }
 
     /// Get cached height for a slot/position (translates `getCachedHeight`)
     public func getCachedHeight(slot: String, position: Int) -> CGFloat? {
-        heightCache[cacheKey(slot: slot, position: position)]
+        guard isProcessApiKeyCompatible else { return nil }
+        return heightCache[cacheKey(slot: slot, position: position)]
     }
 
     /// Cache height for a slot/position (translates `cacheHeight`)
     public func cacheHeight(slot: String, position: Int, height: CGFloat) {
+        guard isProcessApiKeyCompatible else { return }
         heightCache[cacheKey(slot: slot, position: position)] = height
     }
 
     /// Check if a slot/position has no fill (translates `hasNoFill`)
     public func hasNoFill(slot: String, position: Int) -> Bool {
-        noFillCache.contains(cacheKey(slot: slot, position: position))
+        guard isProcessApiKeyCompatible else { return false }
+        return noFillCache.contains(cacheKey(slot: slot, position: position))
     }
 
     /// Mark a slot/position as having no fill (translates `markNoFill`)
     public func markNoFill(slot: String, position: Int) {
+        guard isProcessApiKeyCompatible else { return }
         noFillCache[cacheKey(slot: slot, position: position)] = true
     }
 }
@@ -860,9 +952,10 @@ public struct SimulaProviderView<Content: View>: View {
         // Resolve the privacy config: an explicit `privacy` wins; otherwise the
         // legacy `hasPrivacyConsent` flag seeds it. Kept so prop changes can be
         // pushed into the store via `.task(id: resolvedConfig)` below.
-        var resolved = privacy ?? SimulaPrivacyConfig()
-        if privacy == nil { resolved.hasPrivacyConsent = hasPrivacyConsent }
-        self.resolvedConfig = resolved
+        self.resolvedConfig = resolvePrivacyConfig(
+            hasPrivacyConsent: hasPrivacyConsent,
+            privacy: privacy
+        )
 
         // Reuse the process-wide provider when its core config matches, to avoid
         // recreating the session/store. A divergent privacy config on the shared

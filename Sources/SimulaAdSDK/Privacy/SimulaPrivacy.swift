@@ -12,6 +12,28 @@ typealias AdvertisingTrackingStatusReader = @Sendable () -> Int?
 typealias AdvertisingIdReader = @Sendable () -> String?
 typealias AdvertisingReadTelemetry = @Sendable (String, Int, Bool, Int?) -> Void
 
+struct SimulaPrivacyTestOptions {
+    let launchGate: LaunchSettling
+    let now: @Sendable () -> TimeInterval
+    let advertisingTrackingStatusReader: AdvertisingTrackingStatusReader
+    let advertisingIdReader: AdvertisingIdReader
+    let advertisingReadTelemetry: AdvertisingReadTelemetry
+
+    init(
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
+        now: @escaping @Sendable () -> TimeInterval = { 0 },
+        advertisingTrackingStatusReader: @escaping AdvertisingTrackingStatusReader = { nil },
+        advertisingIdReader: @escaping AdvertisingIdReader = { nil },
+        advertisingReadTelemetry: @escaping AdvertisingReadTelemetry = { _, _, _, _ in }
+    ) {
+        self.launchGate = launchGate
+        self.now = now
+        self.advertisingTrackingStatusReader = advertisingTrackingStatusReader
+        self.advertisingIdReader = advertisingIdReader
+        self.advertisingReadTelemetry = advertisingReadTelemetry
+    }
+}
+
 /// Process-wide consent store and source of truth for the SDK's privacy signals.
 ///
 /// Responsibilities:
@@ -83,7 +105,20 @@ public final class SimulaPrivacy: ObservableObject {
             launchGate: LaunchSettledGate.shared,
             now: { ProcessInfo.processInfo.systemUptime },
             advertisingTrackingStatusReader: { SimulaPrivacy.defaultAdvertisingTrackingStatus() },
-            advertisingIdReader: { SimulaPrivacy.defaultAdvertisingId() }
+            advertisingIdReader: { SimulaPrivacy.defaultAdvertisingId() },
+            observesNotifications: true
+        )
+    }
+
+    convenience init(testDefaults defaults: UserDefaults, options: SimulaPrivacyTestOptions = .init()) {
+        self.init(
+            defaults: defaults,
+            launchGate: options.launchGate,
+            now: options.now,
+            advertisingTrackingStatusReader: options.advertisingTrackingStatusReader,
+            advertisingIdReader: options.advertisingIdReader,
+            advertisingReadTelemetry: options.advertisingReadTelemetry,
+            observesNotifications: false
         )
     }
 
@@ -100,7 +135,8 @@ public final class SimulaPrivacy: ObservableObject {
                 success: success,
                 timeSinceInitMs: timeSinceInitMs
             )
-        }
+        },
+        observesNotifications: Bool = true
     ) {
         self.defaults = defaults
         self.launchGate = launchGate
@@ -116,23 +152,27 @@ public final class SimulaPrivacy: ObservableObject {
         // CMPs write the IAB keys asynchronously and may refresh them later; pick
         // changes up automatically. `object: nil` because the notification is not
         // reliably posted with the defaults instance as its object.
-        observer = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.recompute()
+        if observesNotifications {
+            observer = NotificationCenter.default.addObserver(
+                forName: UserDefaults.didChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.recompute()
+            }
         }
         #if os(iOS)
         // ATT/IDFA can change while backgrounded (Settings, IDFA reset). Re-read
         // ATT status and, when enabled, the advertising id on foreground.
-        foregroundObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.refreshAdvertisingTrackingOnForeground()
-            self?.recompute()
+        if observesNotifications {
+            foregroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.refreshAdvertisingTrackingOnForeground()
+                self?.recompute()
+            }
         }
         #endif
     }
@@ -417,6 +457,12 @@ public final class SimulaPrivacy: ObservableObject {
                 lock.unlock()
             }
         }
+        // Automatic refresh may publish its lock-guarded snapshot with DispatchQueue.main.async.
+        // Drain publications queued before the task became idle so no test-owned object mutates
+        // after isolated defaults and collaborators begin teardown.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     private func shouldReadAdvertisingTracking(generation: Int) -> Bool {
@@ -562,7 +608,7 @@ public final class SimulaPrivacy: ObservableObject {
     }
 
     #if os(iOS)
-    private static func authorizationStatus(from raw: Int?) -> ATTrackingManager.AuthorizationStatus {
+    static func authorizationStatus(from raw: Int?) -> ATTrackingManager.AuthorizationStatus {
         switch raw {
         case 1: return .restricted
         case 2: return .denied

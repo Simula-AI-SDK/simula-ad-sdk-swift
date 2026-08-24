@@ -19,53 +19,74 @@ final class SimulaDeviceIdTests: XCTestCase {
         XCTAssertEqual(resolver.count, 1)
     }
 
-    func testResolvedOnlyAccessorDoesNotWaitForInProgressResolution() {
-        let started = expectation(description: "resolver started")
-        let completed = expectation(description: "forcing read completed")
-        let release = DispatchSemaphore(value: 0)
+    func testResolvedOnlyAccessorCompletesBeforeInProgressResolutionIsReleased() async {
+        let resolverStarted = DeviceIdSignal()
+        let resolverCompleted = DeviceIdSignal()
+        let releaseResolver = DispatchSemaphore(value: 0)
         let cache = SimulaDeviceIdCache {
-            started.fulfill()
-            release.wait()
+            resolverStarted.signal()
+            releaseResolver.wait()
             return "device-1"
         }
-        DispatchQueue.global(qos: .utility).async {
+        let resolverQueue = DispatchQueue(label: "device-id-resolver")
+        let accessorQueue = DispatchQueue(label: "device-id-resolved-only")
+        let accessorCompleted = expectation(description: "resolved-only accessor completed")
+        let result = DeviceIdResults()
+
+        resolverQueue.async {
             _ = cache.value
-            completed.fulfill()
+            resolverCompleted.signal()
         }
-        wait(for: [started], timeout: 1)
+        await resolverStarted.wait()
+        accessorQueue.async {
+            result.append(cache.valueIfResolved)
+            accessorCompleted.fulfill()
+        }
 
-        let before = ProcessInfo.processInfo.systemUptime
-        XCTAssertNil(cache.valueIfResolved)
-        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - before, 0.1)
+        await fulfillment(of: [accessorCompleted], timeout: TestWait.timeout)
+        XCTAssertEqual(result.values, [nil], "resolved-only access must complete before resolver release")
 
-        release.signal()
-        wait(for: [completed], timeout: 1)
+        releaseResolver.signal()
+        await resolverCompleted.wait()
+        await drainQueue(resolverQueue)
+        await drainQueue(accessorQueue)
         XCTAssertEqual(cache.valueIfResolved, "device-1")
     }
 
-    func testForcingAccessorResolvesOnlyOnceAcrossConcurrentReaders() {
-        let started = expectation(description: "resolver started")
-        let release = DispatchSemaphore(value: 0)
+    func testForcingAccessorResolvesOnlyOnceAcrossConcurrentReaders() async {
+        let resolverStarted = DeviceIdSignal()
+        let releaseResolver = DispatchSemaphore(value: 0)
         let resolver = DeviceIdResolverCounter(value: "device-1")
         let cache = SimulaDeviceIdCache {
             let value = resolver.resolve()
-            started.fulfill()
-            release.wait()
+            resolverStarted.signal()
+            releaseResolver.wait()
             return value
         }
-        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "device-id-concurrent-readers", attributes: .concurrent)
+        let ready = DispatchGroup()
+        let completed = DispatchGroup()
+        let start = DispatchSemaphore(value: 0)
         let results = DeviceIdResults()
+
         for _ in 0..<16 {
-            group.enter()
-            DispatchQueue.global(qos: .utility).async {
+            ready.enter()
+            completed.enter()
+            queue.async {
+                ready.leave()
+                start.wait()
                 results.append(cache.value)
-                group.leave()
+                completed.leave()
             }
         }
-        wait(for: [started], timeout: 1)
-        release.signal()
 
-        XCTAssertEqual(group.wait(timeout: .now() + 2), .success)
+        await waitForGroup(ready, label: "device-id-readers-ready")
+        for _ in 0..<16 { start.signal() }
+        await resolverStarted.wait()
+        releaseResolver.signal()
+        await waitForGroup(completed, label: "device-id-readers-completed")
+        await drainQueue(queue)
+
         XCTAssertEqual(resolver.count, 1)
         XCTAssertEqual(results.values, Array(repeating: "device-1", count: 16))
     }
@@ -92,4 +113,44 @@ private final class DeviceIdResults: @unchecked Sendable {
 
     func append(_ value: String?) { lock.lock(); storage.append(value); lock.unlock() }
     var values: [String?] { lock.lock(); defer { lock.unlock() }; return storage }
+}
+
+private final class DeviceIdSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        lock.lock()
+        signaled = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if signaled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+}
+
+private func waitForGroup(_ group: DispatchGroup, label: String) async {
+    await withCheckedContinuation { continuation in
+        group.notify(queue: DispatchQueue(label: label)) { continuation.resume() }
+    }
+}
+
+private func drainQueue(_ queue: DispatchQueue) async {
+    await withCheckedContinuation { continuation in
+        queue.async { continuation.resume() }
+    }
 }

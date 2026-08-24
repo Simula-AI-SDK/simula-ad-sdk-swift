@@ -17,6 +17,26 @@ final class PrivacyTests: XCTestCase {
         return defaults
     }
 
+    private func makePrivacy(
+        defaults: UserDefaults,
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
+        now: @escaping @Sendable () -> TimeInterval = { 0 },
+        advertisingTrackingStatusReader: @escaping AdvertisingTrackingStatusReader = { nil },
+        advertisingIdReader: @escaping AdvertisingIdReader = { nil },
+        advertisingReadTelemetry: @escaping AdvertisingReadTelemetry = { _, _, _, _ in }
+    ) -> SimulaPrivacy {
+        SimulaPrivacy(
+            testDefaults: defaults,
+            options: SimulaPrivacyTestOptions(
+                launchGate: launchGate,
+                now: now,
+                advertisingTrackingStatusReader: advertisingTrackingStatusReader,
+                advertisingIdReader: advertisingIdReader,
+                advertisingReadTelemetry: advertisingReadTelemetry
+            )
+        )
+    }
+
     // MARK: - ConsentSnapshot wire formats
 
     func testConsentHeaders() {
@@ -91,7 +111,7 @@ final class PrivacyTests: XCTestCase {
     // MARK: - Store: IAB auto-read
 
     func testStoreReadsIABKeys() {
-        let store = SimulaPrivacy(defaults: makeDefaults([
+        let store = makePrivacy(defaults: makeDefaults([
             "IABTCF_TCString": "CPtcstring",
             "IABTCF_gdprApplies": 1,
             "IABTCF_PurposeConsents": "10000",
@@ -109,13 +129,13 @@ final class PrivacyTests: XCTestCase {
     }
 
     func testStoreUnsetGdprAppliesIsNil() {
-        let store = SimulaPrivacy(defaults: makeDefaults())
+        let store = makePrivacy(defaults: makeDefaults())
         XCTAssertNil(store.currentSnapshot.gdprApplies)
     }
 
     func testStoreCoercesNumericIABValues() {
         // Some CMPs store a single-section GppSID (and gdprApplies) as Numbers.
-        let store = SimulaPrivacy(defaults: makeDefaults([
+        let store = makePrivacy(defaults: makeDefaults([
             "IABGPP_GppSID": 2,
             "IABTCF_gdprApplies": 1,
         ]))
@@ -125,66 +145,72 @@ final class PrivacyTests: XCTestCase {
 
     func testGppSidParsesArrayStringAndNumber() {
         // CMPs write IABGPP_GppSID inconsistently: array, underscore string, or number.
-        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": [2, 6]])).currentSnapshot.gppSid, "2,6")
-        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2_6"])).currentSnapshot.gppSid, "2,6")
-        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2,6"])).currentSnapshot.gppSid, "2,6")
-        XCTAssertEqual(SimulaPrivacy(defaults: makeDefaults(["IABGPP_GppSID": 2])).currentSnapshot.gppSid, "2")
+        XCTAssertEqual(makePrivacy(defaults: makeDefaults(["IABGPP_GppSID": [2, 6]])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(makePrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2_6"])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(makePrivacy(defaults: makeDefaults(["IABGPP_GppSID": "2,6"])).currentSnapshot.gppSid, "2,6")
+        XCTAssertEqual(makePrivacy(defaults: makeDefaults(["IABGPP_GppSID": 2])).currentSnapshot.gppSid, "2")
     }
 
     func testStorePurpose1Denied() {
-        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "0111"]))
+        let store = makePrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "0111"]))
         XCTAssertEqual(store.currentSnapshot.tcfPurpose1Consent, false)
         XCTAssertFalse(store.currentSnapshot.allowsLocalStorage)
     }
 
     // MARK: - Store: explicit overrides
 
-    func testExplicitConfigOverridesIAB() {
-        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
+    func testExplicitConfigOverridesIAB() async {
+        let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
         store.apply(SimulaPrivacyConfig(tcString: "EXPLICIT"))
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "EXPLICIT")
     }
 
-    func testExplicitPurpose1OverrideWinsOverIAB() {
+    func testExplicitPurpose1OverrideWinsOverIAB() async {
         // IAB says Purpose 1 granted ("1..."), explicit override denies it.
-        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "10000"]))
+        let store = makePrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "10000"]))
         store.apply(SimulaPrivacyConfig(gdprApplies: true, tcfPurpose1Consent: false))
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcfPurpose1Consent, false)
         XCTAssertFalse(store.currentSnapshot.allowsLocalStorage)
     }
 
-    func testExplicitNilFallsBackToIAB() {
-        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
+    func testExplicitNilFallsBackToIAB() async {
+        let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
         store.apply(SimulaPrivacyConfig(tcString: nil))
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "IAB_VALUE")
     }
 
-    func testClearConsentFallsBackToIAB() {
+    func testClearConsentFallsBackToIAB() async {
         // Clearing an explicit override falls back to the auto-read IAB value.
-        let store = SimulaPrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_TC"]))
+        let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_TC"]))
         store.apply(SimulaPrivacyConfig(tcString: "EXPLICIT", uspString: "1YNN"))
         store.clearConsent(tcString: true)
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "IAB_TC")  // fell back to IAB
         XCTAssertEqual(store.currentSnapshot.uspString, "1YNN")   // untouched
     }
 
-    func testClearConsentToNilWhenNoIAB() {
-        let store = SimulaPrivacy(defaults: makeDefaults())
+    func testClearConsentToNilWhenNoIAB() async {
+        let store = makePrivacy(defaults: makeDefaults())
         store.apply(SimulaPrivacyConfig(gppString: "GPP"))
         store.clearConsent(gppString: true)
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertNil(store.currentSnapshot.gppString)
     }
 
-    func testUpdatePartialMergeKeepsOtherFields() {
-        let store = SimulaPrivacy(defaults: makeDefaults())
+    func testUpdatePartialMergeKeepsOtherFields() async {
+        let store = makePrivacy(defaults: makeDefaults())
         store.apply(SimulaPrivacyConfig(tcString: "TC1", uspString: "1YNN"))
         store.update(tcString: "TC2")
+        await store.waitForAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "TC2")
         XCTAssertEqual(store.currentSnapshot.uspString, "1YNN")
     }
 
     func testCoppaSuppressesAdvertisingIdInStore() {
-        let store = SimulaPrivacy(defaults: makeDefaults())
+        let store = makePrivacy(defaults: makeDefaults())
         store.apply(SimulaPrivacyConfig(coppaApplies: true, enableAdvertisingId: true))
         XCTAssertNil(store.currentSnapshot.advertisingId)
     }
@@ -194,7 +220,7 @@ final class PrivacyTests: XCTestCase {
     @MainActor
     func testDefaultConfigurationReadsAttButNotIdfa() async {
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { 0 },
@@ -217,7 +243,7 @@ final class PrivacyTests: XCTestCase {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
         reader.statusRaw = 2
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -241,7 +267,7 @@ final class PrivacyTests: XCTestCase {
     func testDisablingIdfaWhileDeferredRefreshWaitsStillReadsOnlyAtt() async {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -265,7 +291,7 @@ final class PrivacyTests: XCTestCase {
     func testOptInReadsOnceOnlyAfterLaunchGateOpens() async {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -291,7 +317,7 @@ final class PrivacyTests: XCTestCase {
     func testUnchangedRefreshesAreThrottledForFourHours() async {
         let reader = AdvertisingReaderRecorder()
         let clock = PrivacyClock(100)
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { clock.value },
@@ -317,7 +343,7 @@ final class PrivacyTests: XCTestCase {
     func testReenablingAdvertisingIdRefreshesWithoutWaitingFourHours() async {
         let reader = AdvertisingReaderRecorder()
         let clock = PrivacyClock(100)
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { clock.value },
@@ -342,7 +368,7 @@ final class PrivacyTests: XCTestCase {
     func testPromptStoresAttWithoutReadingIdfaWhenCollectionDisabled() async {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -367,7 +393,7 @@ final class PrivacyTests: XCTestCase {
     @MainActor
     func testCoppaSuppressesAutomaticAndPromptAdvertisingSignals() async {
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { 0 },
@@ -389,7 +415,7 @@ final class PrivacyTests: XCTestCase {
     func testPromptCompletionRefreshesImmediatelyAndCancelsDeferredRead() async {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -415,7 +441,7 @@ final class PrivacyTests: XCTestCase {
         let gate = ControllableLaunchSettledGate()
         let reader = BlockingAdvertisingReader()
         let telemetry = PrivacyReadTelemetryRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -453,7 +479,7 @@ final class PrivacyTests: XCTestCase {
     func testForegroundRefreshSupersedesBlockedPromptIdfaRead() async {
         let gate = ControllableLaunchSettledGate()
         let reader = BlockingAdvertisingReader()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -481,7 +507,7 @@ final class PrivacyTests: XCTestCase {
     func testDisableReenableSupersedesBlockedPromptAndKeepsFreshIdfa() async {
         let gate = ControllableLaunchSettledGate()
         let reader = BlockingAdvertisingReader()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -510,7 +536,7 @@ final class PrivacyTests: XCTestCase {
     func testCoppaTransitionSupersedesBlockedPromptIdfaRead() async {
         let gate = ControllableLaunchSettledGate()
         let reader = BlockingAdvertisingReader()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: gate,
             now: { 0 },
@@ -536,7 +562,7 @@ final class PrivacyTests: XCTestCase {
     @MainActor
     func testGenerationChangeDuringIdReadDropsStaleValueAndRunsNewRefreshSerially() async {
         let reader = BlockingAdvertisingReader()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { 0 },
@@ -560,7 +586,7 @@ final class PrivacyTests: XCTestCase {
     func testForegroundRevocationClearsIdfaInsideFourHours() async {
         let reader = AdvertisingReaderRecorder()
         let clock = PrivacyClock(100)
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { clock.value },
@@ -584,7 +610,7 @@ final class PrivacyTests: XCTestCase {
     func testReadTelemetryRunsAfterRevokedStateIsPublishedAndLockIsReleased() async {
         let reader = AdvertisingReaderRecorder()
         let telemetry = PrivacyReadTelemetryRecorder()
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { 0 },
@@ -610,10 +636,13 @@ final class PrivacyTests: XCTestCase {
     }
 
     #if os(iOS)
-    @MainActor
-    func testPublicTrackingAuthorizationStatusReadsCurrentPlatformValueDirectly() {
-        let store = SimulaPrivacy(defaults: makeDefaults())
-        XCTAssertEqual(store.trackingAuthorizationStatus, ATTrackingManager.trackingAuthorizationStatus)
+    func testTrackingAuthorizationStatusMappingDoesNotReadLiveTccState() {
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: nil), .notDetermined)
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: 0), .notDetermined)
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: 1), .restricted)
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: 2), .denied)
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: 3), .authorized)
+        XCTAssertEqual(SimulaPrivacy.authorizationStatus(from: 99), .notDetermined)
     }
     #endif
 
@@ -621,7 +650,7 @@ final class PrivacyTests: XCTestCase {
     func testAuthorizedForegroundRefreshChecksStatusButThrottlesIdfa() async {
         let reader = AdvertisingReaderRecorder()
         let clock = PrivacyClock(100)
-        let store = SimulaPrivacy(
+        let store = makePrivacy(
             defaults: makeDefaults(),
             launchGate: ImmediateLaunchSettledGate.shared,
             now: { clock.value },
@@ -733,28 +762,22 @@ final class PrivacyTests: XCTestCase {
 
     // MARK: - Privacy resolution (shared by SimulaAds.initialize via SimulaProvider)
 
-    @MainActor
     func testProviderExplicitPrivacyConfigWins() {
         // An explicit `privacy` config is stored verbatim (the imperative
         // `SimulaAds.initialize(privacy:)` forwards straight into this init).
         let cfg = SimulaPrivacyConfig(hasPrivacyConsent: true, gdprApplies: true, coppaApplies: true)
-        let provider = SimulaProvider(apiKey: "test-key", privacy: cfg)
-        XCTAssertEqual(provider.privacyConfig, cfg)
+        XCTAssertEqual(resolvePrivacyConfig(hasPrivacyConsent: false, privacy: cfg), cfg)
     }
 
-    @MainActor
     func testProviderSeedsConfigFromLegacyFlagWhenNoPrivacy() {
         // No `privacy` given → the legacy `hasPrivacyConsent` flag seeds the config.
-        let provider = SimulaProvider(apiKey: "test-key", hasPrivacyConsent: false)
-        XCTAssertFalse(provider.privacyConfig.hasPrivacyConsent)
+        XCTAssertFalse(resolvePrivacyConfig(hasPrivacyConsent: false, privacy: nil).hasPrivacyConsent)
     }
 
-    @MainActor
     func testProviderExplicitPrivacyOverridesLegacyFlag() {
         // Explicit `privacy` (consent granted) wins even when the legacy flag says false.
         let cfg = SimulaPrivacyConfig(hasPrivacyConsent: true)
-        let provider = SimulaProvider(apiKey: "test-key", hasPrivacyConsent: false, privacy: cfg)
-        XCTAssertTrue(provider.privacyConfig.hasPrivacyConsent)
+        XCTAssertTrue(resolvePrivacyConfig(hasPrivacyConsent: false, privacy: cfg).hasPrivacyConsent)
     }
 }
 
