@@ -96,7 +96,6 @@ public enum SimulaAds {
         telemetryEnabled: Bool = true,
         adContext: SimulaAdContext? = nil
     ) -> Bool {
-        SDKInitializationOrigin.shared.markEntry()
         // Fail fast on a missing API key — do not register a shared provider so
         // that subsequent `load()` calls report LOAD_FAILED(.notInitialized).
         do {
@@ -148,6 +147,7 @@ public enum SimulaAds {
                 adContext: adContext
             )
         }
+        SDKInitializationOrigin.shared.markEntry()
         // Publish imperative identity before publishing the provider. It permanently outranks any
         // declarative fallback while retaining only the provider's small lock-guarded source.
         processTelemetryIdentityRouter.bindImperative(provider.telemetryIdentitySource)

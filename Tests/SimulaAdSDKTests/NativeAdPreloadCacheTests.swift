@@ -107,7 +107,7 @@ final class NativeAdPreloadCacheTests: XCTestCase {
             )
             XCTFail("mismatched provider must not load an ad")
         } catch let error as SimulaAdError {
-            guard case .noSession = error else {
+            guard case .notInitialized = error else {
                 return XCTFail("unexpected SimulaAdError: \(error)")
             }
         } catch {
