@@ -27,6 +27,7 @@ final class TelemetryManagerTests: XCTestCase {
         private var _saveStarted = false
         private var _saveCount = 0
         private var _savedNames: [[String]] = []
+        private let startedSignal = TestSignal()
 
         var saveStarted: Bool { lock.lock(); defer { lock.unlock() }; return _saveStarted }
         var saveCount: Int { lock.lock(); defer { lock.unlock() }; return _saveCount }
@@ -39,6 +40,7 @@ final class TelemetryManagerTests: XCTestCase {
             _saveStarted = true
             let shouldBlock = shouldBlockFirstSave
             lock.unlock()
+            startedSignal.signal()
             if shouldBlock { firstSaveGate.wait() }
             lock.lock()
             data = events
@@ -54,6 +56,9 @@ final class TelemetryManagerTests: XCTestCase {
             lock.unlock()
             if shouldSignal { firstSaveGate.signal() }
         }
+
+
+        func waitForSaveStarted() async { await startedSignal.wait() }
     }
 
     /// Records decoded batches; replays queued acks then falls back to `defaultAck`. Optional
@@ -99,6 +104,109 @@ final class TelemetryManagerTests: XCTestCase {
         }
     }
 
+    private final class BlockingProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        private let gate = DispatchSemaphore(value: 0)
+        private var shouldBlock = true
+        private var _started = false
+        private let startedSignal = TestSignal()
+
+        var started: Bool { lock.lock(); defer { lock.unlock() }; return _started }
+
+        func value() -> TelemetryIdentity {
+            lock.lock()
+            _started = true
+            let block = shouldBlock
+            lock.unlock()
+            startedSignal.signal()
+            if block { gate.wait() }
+            return TelemetryIdentity(sessionId: nil, primaryUserId: nil)
+        }
+
+        func release() {
+            lock.lock()
+            let signal = shouldBlock
+            shouldBlock = false
+            lock.unlock()
+            if signal { gate.signal() }
+        }
+
+        func waitUntilStarted() async { await startedSignal.wait() }
+    }
+
+    private final class ReentrantProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        weak var manager: TelemetryManager?
+        private var didRecord = false
+
+        func value() -> TelemetryIdentity {
+            lock.lock()
+            let shouldRecord = !didRecord
+            didRecord = true
+            lock.unlock()
+            if shouldRecord {
+                manager?.recordOperation(name: "provider_reentrant", durationMs: 0, success: true)
+            }
+            return TelemetryIdentity(sessionId: nil, primaryUserId: nil)
+        }
+    }
+
+    private final class CountingIdentityProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _callCount = 0
+
+        var callCount: Int { lock.lock(); defer { lock.unlock() }; return _callCount }
+
+        func value() -> TelemetryIdentity {
+            lock.lock()
+            _callCount += 1
+            let suffix = _callCount
+            lock.unlock()
+            return TelemetryIdentity(sessionId: "session-\(suffix)", primaryUserId: "user-\(suffix)")
+        }
+    }
+
+    private final class CompletionFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: TelemetryInitialization?
+
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value != nil }
+        var initialization: TelemetryInitialization? {
+            lock.lock(); defer { lock.unlock() }; return value
+        }
+        func set(_ initialization: TelemetryInitialization) {
+            lock.lock(); value = initialization; lock.unlock()
+        }
+    }
+
+    private final class BlockingManagerFactory: @unchecked Sendable {
+        private let lock = NSLock()
+        private let gate: LaunchSettling
+        private let manager: TelemetryManager
+        private var calls: [(String, Bool)] = []
+        private let callSignal = TestSignal()
+
+        init(gate: LaunchSettling, manager: TelemetryManager) {
+            self.gate = gate
+            self.manager = manager
+        }
+
+        var recordedCalls: [(String, Bool)] { lock.lock(); defer { lock.unlock() }; return calls }
+
+        func make(apiKey: String, devMode: Bool) async -> TelemetryManager {
+            record(apiKey: apiKey, devMode: devMode)
+            await gate.waitUntilSettled()
+            return manager
+        }
+
+        private func record(apiKey: String, devMode: Bool) {
+            lock.lock(); calls.append((apiKey, devMode)); lock.unlock()
+            callSignal.signal()
+        }
+
+        func waitForCall() async { await callSignal.wait() }
+    }
+
     // MARK: - Builder
 
     private func build(
@@ -107,8 +215,10 @@ final class TelemetryManagerTests: XCTestCase {
         enabled: Bool = true,
         sampleRate: Double = 1.0,
         random: @escaping @Sendable () -> Double = { 0.0 },
+        sessionId: String? = nil,
         ppid: String? = nil,
         gaid: String? = nil,
+        identityProvider: (@Sendable () -> TelemetryIdentity)? = nil,
         debugLog: (@Sendable (String) -> Void)? = nil,
         persistenceWaitTimeout: TimeInterval = 0.1,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
@@ -121,8 +231,9 @@ final class TelemetryManagerTests: XCTestCase {
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
             store: store,
             sender: sender,
-            primaryUserIdProvider: { ppid },
-            advertisingIdProvider: { gaid },
+            identityProvider: identityProvider ?? {
+                TelemetryIdentity(sessionId: sessionId, primaryUserId: ppid, advertisingId: gaid)
+            },
             enabled: enabled,
             sampleRate: sampleRate,
             now: now,
@@ -214,19 +325,22 @@ final class TelemetryManagerTests: XCTestCase {
         )
         defer { store.release() }
         mgr.recordError(signature: "api:blocked_persistence")
-        await waitUntil { store.saveStarted }
+        await store.waitForSaveStarted()
 
-        let started = ProcessInfo.processInfo.systemUptime
-        mgr.flushNow()
-        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let completion = TestSignal()
+        let queue = DispatchQueue(label: "telemetry-flush-now-probe")
+        queue.async {
+            mgr.flushNow()
+            completion.signal()
+        }
+        await completion.wait()
 
-        XCTAssertLessThan(elapsed, 0.25)
+        XCTAssertEqual(store.saveCount, 0, "flush returns while the first persistence write remains blocked")
     }
 
     func testEnvelopeCarriesContextAndSessionId() async {
         let sender = FakeSender()
-        let mgr = build(store: FakeStore(), sender: sender)
-        mgr.setSessionId("sess-42")
+        let mgr = build(store: FakeStore(), sender: sender, sessionId: "sess-42")
         mgr.recordError(signature: "api:boom", errorCode: "boom", message: "msg")
         await waitUntil { !sender.batches.isEmpty }
 
@@ -235,6 +349,234 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertEqual(env.platform, "ios")
         XCTAssertEqual(env.hostAppId, "com.test")
         XCTAssertEqual(env.sessionId, "sess-42")
+    }
+
+    func testEnvelopeReadsOneCoherentIdentitySnapshot() async {
+        let provider = CountingIdentityProvider()
+        let sender = FakeSender()
+        let mgr = build(
+            store: FakeStore(), sender: sender,
+            identityProvider: { provider.value() }
+        )
+
+        mgr.recordError(signature: "api:coherent_identity")
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertEqual(sender.batches.first?.sessionId, "session-1")
+        XCTAssertEqual(sender.batches.first?.primaryUserId, "user-1")
+        XCTAssertEqual(provider.callCount, 1)
+    }
+
+    func testBlockingFlushProviderDoesNotBlockConcurrentRecording() async {
+        let provider = BlockingProvider()
+        let sender = FakeSender()
+        let mgr = build(
+            store: FakeStore(),
+            sender: sender,
+            identityProvider: { provider.value() }
+        )
+        defer { provider.release() }
+
+        mgr.recordError(signature: "api:flush_provider")
+        await provider.waitUntilStarted()
+
+        let recorded = TestSignal()
+        DispatchQueue(label: "telemetry-provider-record-probe").async {
+            mgr.recordOperation(name: "while_provider_blocked", durationMs: 0, success: true)
+            recorded.signal()
+        }
+        await recorded.wait()
+
+        provider.release()
+        await waitUntil { !sender.batches.isEmpty }
+    }
+
+    func testReentrantFlushProviderDoesNotDeadlock() async {
+        let provider = ReentrantProvider()
+        let sender = FakeSender()
+        let mgr = build(
+            store: FakeStore(),
+            sender: sender,
+            identityProvider: { provider.value() }
+        )
+        provider.manager = mgr
+
+        mgr.recordError(signature: "api:reentrant_provider")
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "provider_reentrant" }
+        }
+
+        XCTAssertTrue(allEvents(sender.batches).contains { $0.name == "api:reentrant_provider" })
+    }
+
+    func testDuplicateInitializeMetaCountsAggregateIntoOneEvent() async {
+        let sender = FakeSender()
+        let sleep = ControllablePersistenceSleep()
+        let mgr = build(
+            store: FakeStore(), sender: sender,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
+        await mgr.waitForRecoveryForTests()
+        await mgr.waitForImmediateFlushIdleForTests()
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 2)
+        mgr.recordMeta(name: "duplicate_initialize", count: 3)
+        _ = await sleep.waitForRequest()
+        mgr.recordError(signature: "api:flush_meta")
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "duplicate_initialize" }
+        }
+
+        let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
+        XCTAssertEqual(duplicates.count, 1)
+        XCTAssertEqual(duplicates.first?.type, TelemetryType.meta)
+        XCTAssertEqual(duplicates.first?.count, 5)
+        sleep.release()
+        await sleep.waitForCompletion()
+    }
+
+    func testDuplicateMetaRemainderAfterAcceptedInflightClaimGetsNewEventId() async {
+        let sender = FakeSender()
+        sender.gateFirst()
+        let sleep = ControllablePersistenceSleep()
+        let mgr = build(
+            store: FakeStore(), sender: sender,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 2)
+        _ = await sleep.waitForRequest()
+        mgr.recordError(signature: "api:flush_meta")
+        await waitUntil { sender.attemptCount == 1 }
+        mgr.recordMeta(name: "duplicate_initialize", count: 3)
+        sender.release()
+        await waitUntil {
+            self.allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }.count == 2
+        }
+
+        let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
+        XCTAssertEqual(duplicates.map { $0.count ?? 0 }, [2, 3])
+        XCTAssertEqual(Set(duplicates.map(\.eventId)).count, 2)
+        sleep.release()
+        await sleep.waitForCompletion()
+    }
+
+    func testDuplicateMetaUpdateIsPersistedPromptlyWhileSendIsLaunchGated() async {
+        let store = FakeStore()
+        let gate = ControllableLaunchSettledGate()
+        let mgr = build(store: store, sender: FakeSender(), launchGate: gate)
+        await mgr.waitForRecoveryForTests()
+
+        mgr.recordMeta(name: "duplicate_initialize", count: 4)
+        await waitUntil {
+            store.load().contains { $0.name == "duplicate_initialize" && $0.count == 4 }
+        }
+        await gate.open()
+    }
+
+    func testDuplicateInitializePendingCountIsBoundedAndDrainsOnce() {
+        var buffer = DuplicateInitializeCountBuffer(limit: 3)
+        for _ in 0..<10 { buffer.increment() }
+
+        XCTAssertEqual(buffer.count, 3)
+        XCTAssertEqual(buffer.drain(), 3)
+        XCTAssertEqual(buffer.drain(), 0)
+    }
+
+    func testLaterInitializeWaitsForWinningManagerPublicationAndCallerCancellationDoesNotAbandonIt() async {
+        let sender = FakeSender()
+        let manager = build(store: FakeStore(), sender: sender)
+        await manager.waitForRecoveryForTests()
+        await manager.waitForImmediateFlushIdleForTests()
+        let gate = ControllableLaunchSettledGate()
+        let factory = BlockingManagerFactory(gate: gate, manager: manager)
+        let telemetry = Telemetry(managerFactory: { apiKey, devMode in
+            await factory.make(apiKey: apiKey, devMode: devMode)
+        })
+        let winnerCompleted = CompletionFlag()
+        let laterCompleted = CompletionFlag()
+        let laterStarted = TestSignal()
+
+        let winner = Task {
+            await Self.runInitialize(
+                telemetry, apiKey: "winning-key", devMode: true, enabled: true,
+                completion: winnerCompleted
+            )
+        }
+        await factory.waitForCall()
+        winner.cancel()
+        telemetry.recordDuplicateInitialize()
+        let later = Task {
+            laterStarted.signal()
+            await Self.runInitialize(
+                telemetry, apiKey: "losing-key", devMode: false, enabled: false,
+                completion: laterCompleted
+            )
+        }
+        await laterStarted.wait()
+
+        XCTAssertFalse(winnerCompleted.isSet)
+        XCTAssertFalse(laterCompleted.isSet)
+        XCTAssertEqual(factory.recordedCalls.count, 1)
+
+        await gate.open()
+        await winner.value
+        await later.value
+        XCTAssertTrue(winnerCompleted.isSet)
+        XCTAssertTrue(laterCompleted.isSet)
+        XCTAssertEqual(factory.recordedCalls.first?.0, "winning-key")
+        XCTAssertEqual(factory.recordedCalls.first?.1, true)
+        XCTAssertEqual(winnerCompleted.initialization?.enabled, true)
+        XCTAssertEqual(laterCompleted.initialization, winnerCompleted.initialization)
+
+        telemetry.recordError(signature: "api:published")
+        await waitUntil {
+            let events = self.allEvents(sender.batches)
+            return events.contains { $0.name == "api:published" }
+                && events.contains { $0.name == "duplicate_initialize" && $0.count == 1 }
+        }
+    }
+
+    private static func runInitialize(
+        _ telemetry: Telemetry,
+        apiKey: String,
+        devMode: Bool,
+        enabled: Bool,
+        completion: CompletionFlag
+    ) async {
+        let effective = await telemetry.initialize(apiKey: apiKey, devMode: devMode, enabled: enabled)
+        completion.set(effective)
+    }
+
+    func testDisabledFirstEnabledSecondReturnsDisabledWinningStateToBothCallers() async {
+        let factoryCalled = CompletionFlag()
+        let unexpectedManager = build(store: FakeStore(), sender: FakeSender())
+        let telemetry = Telemetry(managerFactory: { _, _ in
+            factoryCalled.set(TelemetryInitialization(apiKey: "unexpected", devMode: false, enabled: true))
+            return unexpectedManager
+        })
+
+        let first = await telemetry.initialize(apiKey: "disabled-key", devMode: true, enabled: false)
+        let second = await telemetry.initialize(apiKey: "enabled-key", devMode: false, enabled: true)
+
+        XCTAssertEqual(first, TelemetryInitialization(apiKey: "disabled-key", devMode: true, enabled: false))
+        XCTAssertEqual(second, first)
+        XCTAssertFalse(factoryCalled.isSet)
+    }
+
+    func testEnabledFirstDisabledSecondReturnsEnabledWinningStateToBothCallers() async {
+        let manager = build(store: FakeStore(), sender: FakeSender())
+        let factory = BlockingManagerFactory(gate: ImmediateLaunchSettledGate.shared, manager: manager)
+        let telemetry = Telemetry(managerFactory: { apiKey, devMode in
+            await factory.make(apiKey: apiKey, devMode: devMode)
+        })
+
+        let first = await telemetry.initialize(apiKey: "enabled-key", devMode: true, enabled: true)
+        let second = await telemetry.initialize(apiKey: "disabled-key", devMode: false, enabled: false)
+
+        XCTAssertEqual(first, TelemetryInitialization(apiKey: "enabled-key", devMode: true, enabled: true))
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(factory.recordedCalls.count, 1)
     }
 
     // MARK: - Error dedup + eager flush
@@ -490,5 +832,33 @@ final class TelemetryManagerTests: XCTestCase {
 
     private func waitForGateWaiters(_ gate: ControllableLaunchSettledGate, count: Int) async {
         await waitUntil { await gate.waitCount >= count }
+    }
+}
+
+private final class TestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        lock.lock()
+        signaled = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if signaled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 }

@@ -262,11 +262,13 @@ final class AdBeaconManagerTests: XCTestCase {
         let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
         defer { store.release() }
 
-        let started = ProcessInfo.processInfo.systemUptime
-        mgr.enqueue(impressionId: "imp", action: "seen")
-        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let enqueueReturned = BeaconTestSignal()
+        DispatchQueue(label: "beacon-enqueue-probe").async {
+            mgr.enqueue(impressionId: "imp", action: "seen")
+            enqueueReturned.signal()
+        }
 
-        XCTAssertLessThan(elapsed, 0.1, "enqueue must not wait for persistence")
+        await enqueueReturned.wait()
         await waitUntil { store.saveStarted }
         XCTAssertEqual(sender.totalCalls, 0, "delivery starts only after the durable write attempt returns")
 
@@ -357,7 +359,7 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(sender.callCount("A", "seen"), 1)
     }
 
-    func testMalformedStoreBlocksManagerAndIsNotOverwritten() async throws {
+    func testMalformedStoreIsQuarantinedBeforePendingBeaconPersistsAndSends() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MalformedBeaconManager-\(UUID().uuidString)", isDirectory: true)
         let fileURL = directory.appendingPathComponent("beacons.json")
@@ -366,21 +368,29 @@ final class AdBeaconManagerTests: XCTestCase {
         try malformed.write(to: fileURL)
         defer { try? FileManager.default.removeItem(at: directory) }
         let sender = FakeBeaconSender()
-        let loadSleep = ControllablePersistenceSleep()
+        let store = SignalingBeaconStore(
+            wrapping: FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults)
+        )
         let mgr = AdBeaconManager(
             sender: sender,
-            store: FileAdBeaconStore(fileURL: fileURL, legacyDefaults: defaults),
-            now: { 0 },
-            loadSleep: { await loadSleep.sleep($0) }
+            store: store,
+            now: { 0 }
         )
 
-        mgr.enqueue(impressionId: "new", action: "seen")
-        _ = await loadSleep.waitForRequest()
-
-        XCTAssertEqual(sender.totalCalls, 0)
-        XCTAssertEqual(try Data(contentsOf: fileURL), malformed)
+        mgr.enqueue(impressionId: "new", action: "shown")
+        await store.waitForTerminalEmptySave()
+        await mgr.waitForExecutorForTests()
         await mgr.cancelPendingWorkForTests()
-        loadSleep.release()
+        await mgr.waitForExecutorForTests()
+
+        let quarantine = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).first { $0.lastPathComponent.hasPrefix("beacons.json.quarantine.") }
+        XCTAssertNotNil(quarantine)
+        if let quarantine { XCTAssertEqual(try Data(contentsOf: quarantine), malformed) }
+        XCTAssertEqual(try JSONDecoder().decode([PendingBeacon].self, from: Data(contentsOf: fileURL)), [])
+        XCTAssertEqual(sender.callCount("new", "shown"), 1)
     }
 
     func testTransientLoadRecoveryCoalescesPendingAndPersistsBeforeSending() async {
@@ -628,6 +638,70 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
         lock.unlock()
         if let error { throw error }
         return code
+    }
+}
+
+private final class SignalingBeaconStore: AdBeaconStoring, @unchecked Sendable {
+    private let wrapped: AdBeaconStoring
+    private let lock = NSLock()
+    private var terminalEmptySaved = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(wrapping wrapped: AdBeaconStoring) { self.wrapped = wrapped }
+
+    func load() -> DurableQueueLoad<PendingBeacon> { wrapped.load() }
+
+    func save(_ records: [PendingBeacon]) -> Bool {
+        let saved = wrapped.save(records)
+        guard saved, records.isEmpty else { return saved }
+        lock.lock()
+        terminalEmptySaved = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+        return true
+    }
+
+    func waitForTerminalEmptySave() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if terminalEmptySaved {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+}
+
+private final class BeaconTestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        lock.lock()
+        signaled = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if signaled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 }
 

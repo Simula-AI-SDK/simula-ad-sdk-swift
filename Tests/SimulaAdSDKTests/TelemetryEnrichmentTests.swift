@@ -51,8 +51,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             ctx: ctx,
             store: store,
             sender: sender,
-            primaryUserIdProvider: { nil },
-            advertisingIdProvider: { nil },
+            identityProvider: { TelemetryIdentity(sessionId: nil, primaryUserId: nil) },
             connectionTypeProvider: connectionType,
             diagnosticsProvider: diagnostics,
             batteryProvider: battery,
@@ -113,16 +112,39 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let sender = FakeSender()
         let m = build(store: FakeStore(), sender: sender, clock: clock)
 
-        m.recordOperation(name: "session_failed", durationMs: 12, success: false, failureClass: "no_session", breadcrumb: "ctx=true")
+        m.recordOperation(
+            name: "session_failed",
+            durationMs: 12,
+            success: false,
+            failureClass: "no_session",
+            breadcrumb: "ctx=true",
+            timeSinceInitMs: -4
+        )
         m.recordLifecycle(stage: "store_opened", adFormat: "interstitial", adUnitId: nil, adId: "a1", serveId: nil, durationMs: 1500, errorCode: nil, trigger: "cta")
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "store_opened" } }
 
         let op = allEvents(sender.batches).first { $0.name == "session_failed" }
         XCTAssertEqual(op?.failureClass, "no_session")
         XCTAssertEqual(op?.breadcrumb, "ctx=true")
+        XCTAssertEqual(op?.timeSinceInitMs, 0)
         let life = allEvents(sender.batches).first { $0.name == "store_opened" }
         XCTAssertEqual(life?.trigger, "cta")
         XCTAssertEqual(life?.durationMs, 1500)
+    }
+
+    func testOldPersistedEventDecodesWithoutTimeSinceInit() throws {
+        let data = Data(#"{"type":"operation","name":"old","event_id":"e1","timestamp":1}"#.utf8)
+        let event = try JSONDecoder().decode(TelemetryEvent.self, from: data)
+        XCTAssertNil(event.timeSinceInitMs)
+    }
+
+    func testInitializationOriginIsFirstWinsMonotonicAndClamped() {
+        let origin = SDKInitializationOrigin()
+        XCTAssertNil(origin.timeSinceInitMs(nowNanos: 9_000_000))
+        XCTAssertEqual(origin.markEntry(nowNanos: 10_000_000), 10_000_000)
+        XCTAssertEqual(origin.markEntry(nowNanos: 20_000_000), 10_000_000)
+        XCTAssertEqual(origin.timeSinceInitMs(nowNanos: 9_000_000), 0)
+        XCTAssertEqual(origin.timeSinceInitMs(nowNanos: 12_500_000), 2)
     }
 
     func testTimeToFirstAdEmittedOnce() async {

@@ -17,7 +17,7 @@ final class NativeAdPreloadCache {
     static let shared = NativeAdPreloadCache()
 
     typealias Loader = @MainActor (
-        _ provider: SimulaProvider,
+        _ provider: SimulaProvider?,
         _ adUnitId: String?,
         _ position: Int,
         _ theme: String?
@@ -32,8 +32,11 @@ final class NativeAdPreloadCache {
     private let loader: Loader
     private var entries: [String: Entry] = [:]
 
+    private enum PreloadError: Error { case missingProvider }
+
     init(loader: @escaping Loader = { provider, adUnitId, position, theme in
-        try await NativeAdController.load(
+        guard let provider else { throw PreloadError.missingProvider }
+        return try await NativeAdController.load(
             provider: provider,
             adUnitId: adUnitId,
             position: position,
@@ -47,6 +50,19 @@ final class NativeAdPreloadCache {
     /// here (imperative context → `UITraitCollection`) since there's no SwiftUI environment.
     func preload(
         provider: SimulaProvider,
+        adUnitId: String?,
+        position: Int,
+        theme: String?
+    ) -> String? {
+        startPreload(provider: provider, adUnitId: adUnitId, position: position, theme: theme)
+    }
+
+    func preloadForTests(adUnitId: String?, position: Int, theme: String?) -> String? {
+        startPreload(provider: nil, adUnitId: adUnitId, position: position, theme: theme)
+    }
+
+    private func startPreload(
+        provider: SimulaProvider?,
         adUnitId: String?,
         position: Int,
         theme: String?
@@ -75,7 +91,7 @@ final class NativeAdPreloadCache {
 
     /// Named task entry point required by the optimizer-safe task-shape contract.
     private func runLoad(
-        provider: SimulaProvider,
+        provider: SimulaProvider?,
         adUnitId: String?,
         position: Int,
         theme: String?,

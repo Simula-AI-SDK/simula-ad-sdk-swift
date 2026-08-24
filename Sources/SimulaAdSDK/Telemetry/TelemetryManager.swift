@@ -61,8 +61,7 @@ final class TelemetryManager: @unchecked Sendable {
     private let ctx: TelemetryContext
     private let store: TelemetryStoring
     private let sender: TelemetrySending
-    private let primaryUserIdProvider: @Sendable () -> String?
-    private let advertisingIdProvider: @Sendable () -> String?
+    private let identityProvider: @Sendable () -> TelemetryIdentity
     // Resolved fresh on each flush (off the UI path). Must be best-effort/non-throwing.
     private let connectionTypeProvider: @Sendable () -> String?
     // Compact diagnostics breadcrumb (memory etc.), sampled on flush. Best-effort.
@@ -95,6 +94,7 @@ final class TelemetryManager: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer: [TelemetryEvent] = []
     private var errorAgg: [String: TelemetryEvent] = [:]
+    private var metaAgg: [String: TelemetryEvent] = [:]
     private var droppedCount = 0
     private var isFlushing = false
     private var flushScheduled = false
@@ -107,8 +107,6 @@ final class TelemetryManager: @unchecked Sendable {
     private var recoveryStarted = false
     private var recoveryCompleted = false
     private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var sessionId: String?
-
     // Aux session state for the funnel / time-to-first-ad / experiment, guarded by `lock`.
     private let createdAtMs: TimeInterval
     private var firstAdRecorded = false
@@ -121,8 +119,7 @@ final class TelemetryManager: @unchecked Sendable {
         ctx: TelemetryContext,
         store: TelemetryStoring,
         sender: TelemetrySending,
-        primaryUserIdProvider: @escaping @Sendable () -> String?,
-        advertisingIdProvider: @escaping @Sendable () -> String?,
+        identityProvider: @escaping @Sendable () -> TelemetryIdentity,
         connectionTypeProvider: @escaping @Sendable () -> String? = { nil },
         diagnosticsProvider: @escaping @Sendable () -> String? = { nil },
         batteryProvider: @escaping @Sendable () -> BatteryInfo? = { nil },
@@ -146,8 +143,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.ctx = ctx
         self.store = store
         self.sender = sender
-        self.primaryUserIdProvider = primaryUserIdProvider
-        self.advertisingIdProvider = advertisingIdProvider
+        self.identityProvider = identityProvider
         self.connectionTypeProvider = connectionTypeProvider
         self.diagnosticsProvider = diagnosticsProvider
         self.batteryProvider = batteryProvider
@@ -199,6 +195,8 @@ final class TelemetryManager: @unchecked Sendable {
                     } else {
                         errorAgg[key] = event
                     }
+                } else if event.type == TelemetryType.meta, !event.name.isEmpty {
+                    mergeCountedEvent(event, into: &metaAgg, key: event.name)
                 } else {
                     recoveredBuffer.append(event)
                 }
@@ -215,12 +213,6 @@ final class TelemetryManager: @unchecked Sendable {
         store.save(snapshot)
     }
 
-    /// Push the live session id (from `SimulaProvider`) so the envelope can carry it without
-    /// the manager reaching into non-Sendable provider state from a background flush.
-    func setSessionId(_ id: String?) {
-        lock.lock(); sessionId = id; lock.unlock()
-    }
-
     /// Apply a server-side directive (kill-switch / sampling) from `/session/create`.
     func applyServerConfig(enabled: Bool, sampleRate: Double) {
         lock.lock()
@@ -229,6 +221,7 @@ final class TelemetryManager: @unchecked Sendable {
         if !enabled {
             buffer.removeAll()
             errorAgg.removeAll()
+            metaAgg.removeAll()
             droppedCount = 0
             funnel.removeAll()
             retryCount = 0
@@ -257,13 +250,36 @@ final class TelemetryManager: @unchecked Sendable {
         enqueuePerf(e)
     }
 
-    func recordOperation(name: String, durationMs: Int, success: Bool, failureClass: String? = nil, breadcrumb: String? = nil) {
+    func recordOperation(
+        name: String,
+        durationMs: Int,
+        success: Bool,
+        failureClass: String? = nil,
+        breadcrumb: String? = nil,
+        timeSinceInitMs: Int? = nil
+    ) {
         var e = newEvent(type: TelemetryType.operation, name: name)
         e.durationMs = durationMs
+        e.timeSinceInitMs = timeSinceInitMs.map { max(0, $0) }
         e.success = success
         e.failureClass = failureClass
         e.breadcrumb = breadcrumb
         enqueuePerf(e)
+    }
+
+    func recordMeta(name: String, count: Int) {
+        guard !name.isEmpty, count > 0 else { return }
+        lock.lock()
+        guard isEnabled else { lock.unlock(); return }
+        var event = metaAgg[name] ?? newEvent(type: TelemetryType.meta, name: name)
+        let existing = max(0, event.count ?? 0)
+        event.count = existing >= Int.max - count ? Int.max : existing + count
+        metaAgg[name] = event
+        // Duplicate-init counts are process-local until they reach this manager. Persist each
+        // aggregate update with the same prompt serial-queue path used by handled errors.
+        if recoveryCompleted { persistAsync(snapshotLocked()) }
+        lock.unlock()
+        scheduleTimedFlush()
     }
 
     func recordLifecycle(
@@ -562,7 +578,24 @@ final class TelemetryManager: @unchecked Sendable {
     }
 
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
-    private func snapshotLocked() -> [TelemetryEvent] { buffer + Array(errorAgg.values) }
+    private func snapshotLocked() -> [TelemetryEvent] {
+        buffer + Array(errorAgg.values) + Array(metaAgg.values)
+    }
+
+    private func mergeCountedEvent(
+        _ incoming: TelemetryEvent,
+        into aggregate: inout [String: TelemetryEvent],
+        key: String
+    ) {
+        guard var existing = aggregate[key] else {
+            aggregate[key] = incoming
+            return
+        }
+        let existingCount = max(1, existing.count ?? 1)
+        let incomingCount = max(1, incoming.count ?? 1)
+        existing.count = existingCount >= Int.max - incomingCount ? Int.max : existingCount + incomingCount
+        aggregate[key] = existing
+    }
 
     /// Enqueue while holding `lock` so queue order matches the state transitions that produced
     /// each snapshot. The returned work item lets explicit durability paths wait off the lock.
@@ -573,12 +606,13 @@ final class TelemetryManager: @unchecked Sendable {
         return persistence
     }
 
-    /// One flush attempt: claim + snapshot + encode (sync, under lock), send (async, off lock),
-    /// reconcile (sync, under lock). All `NSLock` use stays in the synchronous helpers.
+    /// One flush attempt: claim + snapshot under lock, enrich + encode and send off lock, then
+    /// reconcile under lock. The claim remains active while providers run so only one flush is in flight.
     private func flush() async {
         await launchGate.waitUntilSettled()
         guard !Task.isCancelled else { return }
-        guard let batch = beginFlush() else { return }
+        guard let claim = beginFlush() else { return }
+        let batch = buildFlushBatch(from: claim)
         let ack: TelemetryAck = batch.body.isEmpty ? .retry : await sender.send(batch.body)
         let outcome = completeFlush(ack: ack, batch: batch)
         if outcome.needRetry { scheduleRetry() } else if outcome.reFlush { await flush() }
@@ -590,23 +624,62 @@ final class TelemetryManager: @unchecked Sendable {
         /// Internal aggregation key → count. The wire `name` may intentionally be shared by
         /// different crash fingerprints/builds, so it cannot reconcile the dictionary safely.
         let pendingErrors: [String: Int]
+        let pendingMeta: [String: CountedEventClaim]
         let droppedSnap: Int
     }
 
-    /// Claims the flush, snapshots the pending events, and encodes the body — all under `lock`.
-    /// Returns `nil` when another flush is in flight or there's nothing to send.
-    private func beginFlush() -> FlushBatch? {
+    private struct CountedEventClaim {
+        let eventId: String
+        let count: Int
+    }
+
+    private struct FlushContextSnapshot {
+        let experimentId: String?
+        let variantId: String?
+    }
+
+    private struct FlushClaim {
+        let pendingBuffer: [TelemetryEvent]
+        let pendingErrorEntries: [(key: String, value: TelemetryEvent)]
+        let pendingMetaEntries: [(key: String, value: TelemetryEvent)]
+        let droppedSnap: Int
+        let context: FlushContextSnapshot
+    }
+
+    /// Claims one flush and snapshots manager-owned mutable state. No provider or encoder is called
+    /// here because either may block or re-enter a record API.
+    private func beginFlush() -> FlushClaim? {
         lock.lock(); defer { lock.unlock() }
         if !recoveryCompleted || !isEnabled || retryScheduled || isFlushing
-            || (buffer.isEmpty && errorAgg.isEmpty) { return nil }
+            || (buffer.isEmpty && errorAgg.isEmpty && metaAgg.isEmpty) { return nil }
         isFlushing = true
-        let pendingBuffer = buffer
-        let pendingErrorEntries = Array(errorAgg)
+        return FlushClaim(
+            pendingBuffer: buffer,
+            pendingErrorEntries: Array(errorAgg),
+            pendingMetaEntries: Array(metaAgg),
+            droppedSnap: droppedCount,
+            context: FlushContextSnapshot(
+                experimentId: experimentId,
+                variantId: variantId
+            )
+        )
+    }
+
+    /// Resolves external state and JSON-encodes entirely outside `lock`. Buffered originals remain
+    /// untouched; age stamps and the dropped meta event exist only in this claimed wire batch.
+    private func buildFlushBatch(from claim: FlushClaim) -> FlushBatch {
+        let pendingBuffer = claim.pendingBuffer
+        let pendingErrorEntries = claim.pendingErrorEntries
         let pendingErrorEvents = pendingErrorEntries.map { $0.value }
+        let pendingMetaEvents = claim.pendingMetaEntries.map { $0.value }
         var pendingErrors: [String: Int] = [:]
         for (key, event) in pendingErrorEntries { pendingErrors[key] = event.count ?? 1 }
-        let droppedSnap = droppedCount
-        var events = pendingBuffer + pendingErrorEvents
+        var pendingMeta: [String: CountedEventClaim] = [:]
+        for (key, event) in claim.pendingMetaEntries {
+            pendingMeta[key] = CountedEventClaim(eventId: event.eventId, count: event.count ?? 1)
+        }
+        let droppedSnap = claim.droppedSnap
+        var events = pendingBuffer + pendingErrorEvents + pendingMetaEvents
         if droppedSnap > 0 {
             var meta = newEvent(type: TelemetryType.meta, name: "dropped")
             meta.count = droppedSnap
@@ -627,8 +700,14 @@ final class TelemetryManager: @unchecked Sendable {
             }
             return c
         }
-        let body = (try? JSONEncoder().encode(envelopeLocked(events: events))) ?? Data()
-        return FlushBatch(body: body, pendingBuffer: pendingBuffer, pendingErrors: pendingErrors, droppedSnap: droppedSnap)
+        let body = (try? JSONEncoder().encode(buildEnvelope(events: events, context: claim.context))) ?? Data()
+        return FlushBatch(
+            body: body,
+            pendingBuffer: pendingBuffer,
+            pendingErrors: pendingErrors,
+            pendingMeta: pendingMeta,
+            droppedSnap: droppedSnap
+        )
     }
 
     /// Reconciles the buffer with the send outcome under `lock`; returns whether to re-drain
@@ -649,6 +728,20 @@ final class TelemetryManager: @unchecked Sendable {
                     if remaining <= 0 { errorAgg[key] = nil } else { e.count = remaining; errorAgg[key] = e }
                 }
             }
+            for (key, claim) in batch.pendingMeta {
+                if var event = metaAgg[key] {
+                    let remaining = (event.count ?? 0) - claim.count
+                    if remaining <= 0 { metaAgg[key] = nil }
+                    else if event.eventId == claim.eventId {
+                        var remainder = newEvent(type: TelemetryType.meta, name: event.name)
+                        remainder.count = remaining
+                        metaAgg[key] = remainder
+                    } else {
+                        event.count = remaining
+                        metaAgg[key] = event
+                    }
+                }
+            }
             droppedCount = max(0, droppedCount - batch.droppedSnap)
             retryCount = 0
             snapshot = snapshotLocked()
@@ -658,7 +751,10 @@ final class TelemetryManager: @unchecked Sendable {
             let hasPendingSummary = buffer.contains {
                 $0.type == TelemetryType.operation && ($0.name == "funnel_summary" || $0.name == "diagnostics")
             }
-            result = (buffer.count >= flushThreshold || !errorAgg.isEmpty || hasPendingSummary, false)
+            result = (
+                buffer.count >= flushThreshold || !errorAgg.isEmpty || !metaAgg.isEmpty || hasPendingSummary,
+                false
+            )
         case .retry:
             snapshot = snapshotLocked()
             if retryCount < Int.max { retryCount += 1 }
@@ -670,8 +766,9 @@ final class TelemetryManager: @unchecked Sendable {
         return result
     }
 
-    /// Caller holds `lock` (reads `sessionId`).
-    private func envelopeLocked(events: [TelemetryEvent]) -> TelemetryEnvelope {
+    /// Builds a flush envelope from immutable manager state plus fresh external-provider values.
+    /// Called without `lock`; providers may safely block briefly or re-enter telemetry recording.
+    private func buildEnvelope(events: [TelemetryEvent], context: FlushContextSnapshot) -> TelemetryEnvelope {
         var env = TelemetryEnvelope(
             sdkVersion: ctx.sdkVersion,
             platform: ctx.platform,
@@ -681,14 +778,15 @@ final class TelemetryManager: @unchecked Sendable {
             devMode: ctx.devMode,
             events: events
         )
-        env.sessionId = sessionId
-        // Providers are already consent-gated by the facade (re-checked at send time).
-        env.primaryUserId = primaryUserIdProvider()
-        env.advertisingId = advertisingIdProvider()
+        // Resolve both identity fields once so an envelope can never mix different sources or
+        // different moments from the same source. The facade provider applies live consent.
+        let identity = identityProvider()
+        env.sessionId = identity.sessionId
+        env.primaryUserId = identity.primaryUserId
+        env.advertisingId = identity.advertisingId
         env.connectionType = connectionTypeProvider()
-        // Aux state guarded by the same `lock` already held by beginFlush's caller.
-        env.experimentId = experimentId
-        env.variantId = variantId
+        env.experimentId = context.experimentId
+        env.variantId = context.variantId
         // Always-on device diagnostics: statics from ctx + flush-time battery/carrier providers.
         env.manufacturer = ctx.manufacturer
         env.locale = ctx.locale
@@ -761,7 +859,7 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         immediateFlushScheduled = false
         let needsAnotherFlush = isEnabled && !retryScheduled && !isFlushing
-            && (!errorAgg.isEmpty || buffer.count >= flushThreshold)
+            && (!errorAgg.isEmpty || !metaAgg.isEmpty || buffer.count >= flushThreshold)
         let waiters = needsAnotherFlush ? [] : immediateFlushIdleWaiters
         if !needsAnotherFlush { immediateFlushIdleWaiters.removeAll() }
         lock.unlock()

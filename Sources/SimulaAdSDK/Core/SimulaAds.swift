@@ -52,9 +52,10 @@ public enum SimulaAds {
     public static var userAgent: String { SimulaUserAgent.value }
 
     /// The device identifier the SDK sends as the `X-Device-Id` header on its native HTTP requests
-    /// (`identifierForVendor`). nil when the platform supplies none. Exposed so a React Native bridge
-    /// can retrieve the native value.
-    public static var deviceId: String? { SimulaDeviceId.value }
+    /// (`identifierForVendor`). Exposed for React Native without forcing the potentially blocking
+    /// platform read: nil means unavailable or still resolving during deferred startup. Native request
+    /// headers continue to await the forcing cache and include the ID once resolution completes.
+    public static var deviceId: String? { SimulaDeviceId.valueIfResolved }
 
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
@@ -106,23 +107,50 @@ public enum SimulaAds {
             return false
         }
 
-        // First valid initialization wins so already-created ads keep their session.
-        guard shared == nil else {
+        guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
             return false
         }
 
-        // Keep this call cheap: it runs on the main thread, typically during app launch. The
-        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up) is deferred to `provider.start()`.
-        let provider = SimulaProvider(
+        // First valid initialization wins so already-created ads keep their session.
+        guard shared == nil else {
+            Telemetry.shared.recordDuplicateInitialize()
+            return false
+        }
+
+        let coreConfiguration = SimulaProviderCoreConfiguration(
             apiKey: apiKey,
             devMode: devMode,
             primaryUserID: primaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
-            privacy: privacy,
-            telemetryEnabled: telemetryEnabled,
-            adContext: adContext
+            telemetryEnabled: telemetryEnabled
         )
+
+        // Keep this call cheap: it runs on the main thread, typically during app launch. The
+        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
+        // version check, session warm-up) is deferred to `provider.start()`.
+        let provider: SimulaProvider
+        switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
+        case .adopt(let active):
+            provider = active
+            provider.updateConsent(resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy))
+            if let adContext { provider.updateContext(adContext) }
+        case .conflict:
+            return false
+        case .none:
+            provider = SimulaProvider(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: primaryUserID,
+                hasPrivacyConsent: hasPrivacyConsent,
+                privacy: privacy,
+                telemetryEnabled: telemetryEnabled,
+                adContext: adContext
+            )
+        }
+        SDKInitializationOrigin.shared.markEntry()
+        // Publish imperative identity before publishing the provider. It permanently outranks any
+        // declarative fallback while retaining only the provider's small lock-guarded source.
+        processTelemetryIdentityRouter.bindImperative(provider.telemetryIdentitySource)
         shared = provider
 
         // Publish readiness so observers (e.g. the React Native host views waiting to mount a
@@ -135,9 +163,16 @@ public enum SimulaAds {
         // drain also run there: the first touch of those singletons constructs a `SimulaAPI`,
         // which would otherwise build the shared `URLSession` (UA/IDFV headers) on the main
         // thread right here.
-        provider.start()
+        provider.start(bindProviderIdentity: false)
 
         return true
+    }
+
+    nonisolated static func claimApiKeyForInitialization(
+        _ apiKey: String,
+        ownership: ProcessApiKeyOwnership
+    ) -> Bool {
+        ownership.claim(apiKey).isCompatible
     }
 
     // MARK: - Native ad targeting context + preloading
@@ -172,7 +207,9 @@ public enum SimulaAds {
     /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
-        guard let provider = shared, !adUnitId.isEmpty else { return false }
+        guard let provider = shared, provider.isProcessApiKeyCompatible, !adUnitId.isEmpty else {
+            return false
+        }
         // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback
         // tracks the provider's live PPID (resolved below, after the session await).
         let explicitPPID = (primaryUserID?.isEmpty == false) ? primaryUserID : nil

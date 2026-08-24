@@ -90,6 +90,14 @@ public struct GameIframeView: View {
     // MARK: - Body
 
     public var body: some View {
+        if provider.canMakeRequests {
+            compatibleBody
+        } else {
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    private var compatibleBody: some View {
         ZStack {
             // Backdrop (matching React's backgroundColor: 'rgba(0, 0, 0, 0.8)')
             Color.black.opacity(0.8)
@@ -227,6 +235,7 @@ public struct GameIframeView: View {
     /// fade in, then fetch the minigame.
     @MainActor
     private func appear() async {
+        guard provider.canMakeRequests else { return }
         currentHeight = calculateInitialHeight()
         appeared = true
         await loadMinigame()
@@ -235,6 +244,7 @@ public struct GameIframeView: View {
     // MARK: - Close Handler
 
     private func handleClose() {
+        guard provider.canMakeRequests else { return }
         // Report dimensions on close (matching Kotlin's onDimensionsOnClose)
         if isBottomSheetMode {
             let isStillBottomSheet = currentHeight < screenHeight * 0.95
@@ -251,6 +261,7 @@ public struct GameIframeView: View {
     /// thread (otherwise the URLSession continuation can land off-main).
     @MainActor
     private func loadMinigame() async {
+        guard provider.canMakeRequests else { return }
         // Wait for the session to be ready (or retried) rather than failing the
         // instant it isn't — a fast tap during launch, or a transient launch
         // failure, no longer hard-fails the minigame.
@@ -300,4 +311,3 @@ public struct GameIframeView: View {
     }
 
 }
-

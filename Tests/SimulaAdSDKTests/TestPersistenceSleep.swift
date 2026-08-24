@@ -7,6 +7,8 @@ final class ControllablePersistenceSleep: @unchecked Sendable {
     private var releaseContinuation: CheckedContinuation<Void, Never>?
     private var releaseRequested = false
     private var requests = 0
+    private var completions = 0
+    private var completionWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     var requestCount: Int { lock.lock(); defer { lock.unlock() }; return requests }
 
@@ -31,6 +33,13 @@ final class ControllablePersistenceSleep: @unchecked Sendable {
                 lock.unlock()
             }
         }
+
+        lock.lock()
+        completions += 1
+        let ready = completionWaiters.filter { $0.0 <= completions }
+        completionWaiters.removeAll { $0.0 <= completions }
+        lock.unlock()
+        ready.forEach { $0.1.resume() }
     }
 
     func waitForRequest() async -> TimeInterval {
@@ -54,5 +63,18 @@ final class ControllablePersistenceSleep: @unchecked Sendable {
         if continuation == nil { releaseRequested = true }
         lock.unlock()
         continuation?.resume()
+    }
+
+    func waitForCompletion(_ count: Int = 1) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if completions >= count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                completionWaiters.append((count, continuation))
+                lock.unlock()
+            }
+        }
     }
 }

@@ -2,6 +2,42 @@ import SwiftUI
 
 // MARK: - MiniGameMenu
 
+struct MiniGameCompatibilityPlan: Equatable {
+    let rendersContent: Bool
+    let seedsPreloadedCatalog: Bool
+    let prewarmsWebView: Bool
+    let fetchesCatalog: Bool
+    let tracksClick: Bool
+    let loadsGame: Bool
+    let fetchesFallbacks: Bool
+}
+
+func miniGameCompatibilityPlan(
+    providerCompatible: Bool,
+    hasPreloadedCatalog: Bool
+) -> MiniGameCompatibilityPlan {
+    guard providerCompatible else {
+        return MiniGameCompatibilityPlan(
+            rendersContent: false,
+            seedsPreloadedCatalog: false,
+            prewarmsWebView: false,
+            fetchesCatalog: false,
+            tracksClick: false,
+            loadsGame: false,
+            fetchesFallbacks: false
+        )
+    }
+    return MiniGameCompatibilityPlan(
+        rendersContent: true,
+        seedsPreloadedCatalog: hasPreloadedCatalog,
+        prewarmsWebView: true,
+        fetchesCatalog: !hasPreloadedCatalog,
+        tracksClick: true,
+        loadsGame: true,
+        fetchesFallbacks: true
+    )
+}
+
 /// A modal game catalog menu that displays available games and launches game iframes.
 /// After a game session, can display a post-game ad.
 ///
@@ -78,6 +114,12 @@ public struct MiniGameMenu: View {
     #endif
 
     private let api = SimulaAPI()
+    private var compatibilityPlan: MiniGameCompatibilityPlan {
+        miniGameCompatibilityPlan(
+            providerCompatible: provider.canMakeRequests,
+            hasPreloadedCatalog: preloadedCatalog != nil
+        )
+    }
 
     // MARK: - Computed
 
@@ -97,6 +139,14 @@ public struct MiniGameMenu: View {
     // MARK: - Body
 
     public var body: some View {
+        if compatibilityPlan.rendersContent {
+            compatibleBody
+        } else {
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    private var compatibleBody: some View {
         ZStack {
             // Game Iframe (full-screen cover)
             if showGameIframe, let gameId = selectedGameId {
@@ -195,9 +245,11 @@ public struct MiniGameMenu: View {
                         // Warm a web view as soon as the menu opens so the game
                         // (and post-game ad) load from a warm process instead of
                         // paying cold-start right after the user taps.
-                        #if os(iOS)
-                        WebViewPool.shared.prewarm(trigger: "minigame_menu")
-                        #endif
+                        if compatibilityPlan.prewarmsWebView {
+                            #if os(iOS)
+                            WebViewPool.shared.prewarm(trigger: "minigame_menu")
+                            #endif
+                        }
                     }
 
                 // Modal content
@@ -295,6 +347,7 @@ public struct MiniGameMenu: View {
     /// Task body for the menu-open catalog load (named method — see the task-shape note in
     /// TelemetryManager).
     private func loadCatalogIfOpen() async {
+        guard compatibilityPlan.rendersContent else { return }
         if isOpen { await loadCatalog() }
     }
 
@@ -490,7 +543,8 @@ public struct MiniGameMenu: View {
     }
 
     private func handleGameSelect(gameId: String, gameName: String) {
-        if let menuId = menuId {
+        guard compatibilityPlan.loadsGame else { return }
+        if compatibilityPlan.tracksClick, let menuId = menuId {
             // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { await api.trackMenuGameClick(menuId: menuId, gameName: gameName, apiKey: provider.apiKey) }
         }
@@ -504,14 +558,16 @@ public struct MiniGameMenu: View {
     }
 
     private func handleServeIdReceived(_ serveId: String) {
+        guard compatibilityPlan.loadsGame else { return }
         currentServeId = serveId
     }
 
     private func handleIframeClose() {
+        guard compatibilityPlan.loadsGame else { return }
         showGameIframe = false
         selectedGameId = nil
 
-        if !adFetched, let serveId = currentServeId {
+        if compatibilityPlan.fetchesFallbacks, !adFetched, let serveId = currentServeId {
             adLoading = true
             // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { await loadFallbacksAfterIframeClose(serveId: serveId) }
@@ -523,6 +579,7 @@ public struct MiniGameMenu: View {
     /// exactly like the previous `MainActor.run` block.
     @MainActor
     private func loadFallbacksAfterIframeClose(serveId: String) async {
+        guard compatibilityPlan.fetchesFallbacks else { return }
         let ads: [FallbackAd]
         do { ads = try await api.fetchFallbacks(impressionId: serveId) } catch { ads = [] }
         adLoading = false
@@ -546,12 +603,13 @@ public struct MiniGameMenu: View {
     }
 
     private func loadCatalog() async {
+        guard compatibilityPlan.rendersContent else { return }
         catalogLoading = true
         catalogError = false
 
         // When a preloaded catalog is supplied (imperative interstitial load()),
         // seed the grid from it and skip the network fetch.
-        if let preloaded = preloadedCatalog {
+        if compatibilityPlan.seedsPreloadedCatalog, let preloaded = preloadedCatalog {
             await MainActor.run {
                 self.games = preloaded.games
                 self.menuId = preloaded.menuId.isEmpty ? nil : preloaded.menuId
@@ -565,6 +623,7 @@ public struct MiniGameMenu: View {
             return
         }
 
+        guard compatibilityPlan.fetchesCatalog else { return }
         do {
             let sessionId = await provider.ensureSession()
             let response = try await api.fetchCatalog(sessionId: sessionId)
