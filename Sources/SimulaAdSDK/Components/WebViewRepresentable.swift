@@ -738,6 +738,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
+            bridge?.stop()
             // A renderer death is a real pressure signal: drain idle views and suppress retention /
             // explicit minigame prewarm for the cooldown. Ordinary backgrounding does not do this.
             WebViewPool.shared.handleRendererDeath()
@@ -794,6 +795,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             guard navigationTracker.didFail(navigation.map(ObjectIdentifier.init)) else { return }
             if isCancelled(error) { return }
+            bridge?.stop()
             noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
@@ -803,6 +805,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // A cancelled provisional load happens when the real URL supersedes
             // the prewarm's about:blank load; it isn't a genuine failure.
             if isCancelled(error) { return }
+            bridge?.stop()
             noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
