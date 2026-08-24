@@ -13,6 +13,7 @@ struct WebNavigationTracker<Token: Hashable> {
     mutating func trackRequested(_ token: Token?) {
         if active != token { reject(active) }
         if requested != token { reject(requested) }
+        if let token { rejected.removeAll { $0 == token } }
         active = token
         requested = token
     }

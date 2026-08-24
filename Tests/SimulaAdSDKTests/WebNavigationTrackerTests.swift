@@ -45,4 +45,18 @@ final class WebNavigationTrackerTests: XCTestCase {
         XCTAssertTrue(tracker.isActive(20))
         XCTAssertTrue(tracker.didFinish(20))
     }
+
+    func testFreshRequestRehabilitatesARejectedReusedToken() {
+        var tracker = WebNavigationTracker<Int>()
+        tracker.trackRequested(1)
+        XCTAssertTrue(tracker.didStart(1))
+        tracker.resetForRebind()
+        XCTAssertFalse(tracker.didStart(1))
+
+        tracker.trackRequested(1)
+
+        XCTAssertTrue(tracker.didStart(1))
+        XCTAssertTrue(tracker.isActive(1))
+        XCTAssertTrue(tracker.didFinish(1))
+    }
 }
