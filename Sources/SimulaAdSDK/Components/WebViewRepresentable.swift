@@ -1,3 +1,58 @@
+struct WebNavigationTracker<Token: Hashable> {
+    private(set) var active: Token?
+    private(set) var requested: Token?
+    private var rejected: [Token] = []
+
+    mutating func resetForRebind() {
+        reject(active)
+        reject(requested)
+        active = nil
+        requested = nil
+    }
+
+    mutating func trackRequested(_ token: Token?) {
+        if active != token { reject(active) }
+        if requested != token { reject(requested) }
+        active = token
+        requested = token
+    }
+
+    mutating func didStart(_ token: Token?) -> Bool {
+        guard let token, !rejected.contains(token) else { return false }
+        if let requested, requested != token { return false }
+        requested = nil
+        active = token
+        return true
+    }
+
+    func isActive(_ token: Token?) -> Bool {
+        guard let token else { return false }
+        return active == token && !rejected.contains(token)
+    }
+
+    mutating func didFinish(_ token: Token?) -> Bool {
+        guard isActive(token) else { return false }
+        active = nil
+        requested = nil
+        return true
+    }
+
+    mutating func didFail(_ token: Token?) -> Bool {
+        guard let token, !rejected.contains(token), token == active || token == requested else {
+            return false
+        }
+        if active == token { active = nil }
+        if requested == token { requested = nil }
+        return true
+    }
+
+    private mutating func reject(_ token: Token?) {
+        guard let token, !rejected.contains(token) else { return }
+        rejected.append(token)
+        if rejected.count > 8 { rejected.removeFirst() }
+    }
+}
+
 #if os(iOS)
 import SwiftUI
 import WebKit
@@ -194,7 +249,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onNavigationFailed = onNavigationFailed
         coordinator.onMessageReceived = onMessageReceived
         coordinator.onAdClick = onAdClick
-        coordinator.bridge = bridge
+        if coordinator.bridge !== bridge {
+            coordinator.bridge?.stop()
+            coordinator.bridge = bridge
+        }
         coordinator.attribution = attribution
         coordinator.externalClickOnly = externalClickOnly
         coordinator.ctaTrackingUrl = ctaTrackingUrl
@@ -227,6 +285,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 )
             }
             coordinator.retainedImpressionId = retainedImpressionId
+            coordinator.prepareForRetainedServeRebind()
             // A DIFFERENT serve must always issue a fresh navigation, even when its markup is
             // byte-identical to the previous serve's (templated creatives): the old page is live
             // DOM with the old serve's state (timers, macros, viewed animations) while clicks and
@@ -366,16 +425,24 @@ struct WebViewRepresentable: UIViewRepresentable {
         var visibilityRelay: VisibilityRelay?
         /// Monotonic page-load start (set on provisional navigation start) for `webview_page_load`.
         private var pageStartUptime: TimeInterval?
-        /// Latest main-document navigation. Rejects late pool-reset callbacks from an older document.
-        private var activeBridgeNavigation: WKNavigation?
-        /// SDK-issued load awaiting its matching start callback; older pooled starts are ignored.
-        private var requestedBridgeNavigation: WKNavigation?
+        /// Main-document navigation state. Object identifiers avoid retaining WebKit's navigation
+        /// objects while rejecting late callbacks from pooled or rebound documents.
+        private var navigationTracker = WebNavigationTracker<ObjectIdentifier>()
 
         func trackRequestedNavigation(_ navigation: WKNavigation?) {
-            if let navigation {
-                activeBridgeNavigation = navigation
-                requestedBridgeNavigation = navigation
-            }
+            navigationTracker.trackRequested(navigation.map(ObjectIdentifier.init))
+        }
+
+        /// A retained view is about to load a different serve into the same WKWebView. Clear every
+        /// old-document verdict before issuing the new load and disarm bridge audio immediately;
+        /// stale callbacks remain explicitly rejected by the navigation tracker.
+        func prepareForRetainedServeRebind() {
+            navigationTracker.resetForRebind()
+            pageStartUptime = nil
+            mainFrameHTTPFailed = false
+            renderRecoveryAttempted = false
+            realLoadStarted = false
+            bridge?.stop()
         }
 
         /// Tracks the currently loaded URL to avoid redundant loads
@@ -599,18 +666,14 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Gate on realLoadStarted, not the URL: a native creative loaded with a nil baseURL also
             // reports webView.url == about:blank, and must NOT be skipped.
             guard realLoadStarted else { return }
-            if let requestedBridgeNavigation {
-                guard identicalNonNilObjects(requestedBridgeNavigation, navigation) else { return }
-                self.requestedBridgeNavigation = nil
-            }
-            guard let navigation else { return }
-            activeBridgeNavigation = navigation
+            guard navigationTracker.didStart(navigation.map(ObjectIdentifier.init)) else { return }
             mainFrameHTTPFailed = false // fresh load — the previous HTTP verdict no longer applies
             pageStartUptime = ProcessInfo.processInfo.systemUptime
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            guard realLoadStarted, identicalNonNilObjects(activeBridgeNavigation, navigation) else { return }
+            guard realLoadStarted,
+                  navigationTracker.isActive(navigation.map(ObjectIdentifier.init)) else { return }
             bridge?.pageDidCommit()
         }
 
@@ -621,9 +684,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             guard realLoadStarted else { return }
             // A pooled view may still deliver its reset-to-about:blank completion after the real
             // navigation starts. Only the latest tracked main document may run success lifecycle.
-            guard identicalNonNilObjects(activeBridgeNavigation, navigation) else { return }
-            activeBridgeNavigation = nil
-            requestedBridgeNavigation = nil
+            guard navigationTracker.didFinish(navigation.map(ObjectIdentifier.init)) else { return }
             // Main-frame 4xx/5xx: this didFinish is WebKit rendering the ERROR page, not the
             // creative — the slot already collapsed via onNavigationFailed (decidePolicyFor). Run
             // NONE of the success path: don't mark the store session healthy (it was just flagged
@@ -730,16 +791,14 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            if identicalNonNilObjects(activeBridgeNavigation, navigation) { activeBridgeNavigation = nil }
-            if identicalNonNilObjects(requestedBridgeNavigation, navigation) { requestedBridgeNavigation = nil }
+            guard navigationTracker.didFail(navigation.map(ObjectIdentifier.init)) else { return }
             if isCancelled(error) { return }
             noteRetainedUnusable(webView)
             onNavigationFailed?(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            if identicalNonNilObjects(activeBridgeNavigation, navigation) { activeBridgeNavigation = nil }
-            if identicalNonNilObjects(requestedBridgeNavigation, navigation) { requestedBridgeNavigation = nil }
+            guard navigationTracker.didFail(navigation.map(ObjectIdentifier.init)) else { return }
             // A cancelled provisional load happens when the real URL supersedes
             // the prewarm's about:blank load; it isn't a genuine failure.
             if isCancelled(error) { return }

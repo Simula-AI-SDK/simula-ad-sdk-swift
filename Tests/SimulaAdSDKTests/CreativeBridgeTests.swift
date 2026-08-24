@@ -205,6 +205,30 @@ final class CreativeBridgeTests: XCTestCase {
         XCTAssertEqual(eventCount, 2)
     }
 
+    @MainActor
+    func testRetainedServeRebindDisarmsBridgeAudioBeforeFreshLoad() {
+        let source = FakeAudioVolumeSource(0.5)
+        let poller = FakeAudioVolumePoller()
+        let bridge = CreativeBridge(audioVolumeSource: source, audioVolumePoller: poller)
+        let coordinator = WebViewRepresentable.Coordinator(
+            onNavigationFinished: nil,
+            onNavigationFailed: nil,
+            onMessageReceived: nil,
+            bridge: bridge,
+            retainedImpressionId: "old-serve"
+        )
+        var eventCount = 0
+        bridge.pageDidFinishLoading { _ in eventCount += 1 }
+
+        coordinator.prepareForRetainedServeRebind()
+
+        XCTAssertTrue(source.observations[0].invalidated)
+        XCTAssertEqual(poller.stops, 1)
+        source.emit(0, observation: 0)
+        poller.fire(0)
+        XCTAssertEqual(eventCount, 1, "old page audio callbacks must stay disarmed during rebind")
+    }
+
     func testNavigationIdentityRequiresTwoNonNilMatchingObjects() {
         final class NavigationToken {}
         let first = NavigationToken()

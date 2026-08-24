@@ -118,18 +118,36 @@ public enum SimulaAds {
             return false
         }
 
-        // Keep this call cheap: it runs on the main thread, typically during app launch. The
-        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up) is deferred to `provider.start()`.
-        let provider = SimulaProvider(
+        let coreConfiguration = SimulaProviderCoreConfiguration(
             apiKey: apiKey,
             devMode: devMode,
             primaryUserID: primaryUserID,
             hasPrivacyConsent: hasPrivacyConsent,
-            privacy: privacy,
-            telemetryEnabled: telemetryEnabled,
-            adContext: adContext
+            telemetryEnabled: telemetryEnabled
         )
+
+        // Keep this call cheap: it runs on the main thread, typically during app launch. The
+        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
+        // version check, session warm-up) is deferred to `provider.start()`.
+        let provider: SimulaProvider
+        switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
+        case .adopt(let active):
+            provider = active
+            provider.updateConsent(resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy))
+            if let adContext { provider.updateContext(adContext) }
+        case .conflict:
+            return false
+        case .none:
+            provider = SimulaProvider(
+                apiKey: apiKey,
+                devMode: devMode,
+                primaryUserID: primaryUserID,
+                hasPrivacyConsent: hasPrivacyConsent,
+                privacy: privacy,
+                telemetryEnabled: telemetryEnabled,
+                adContext: adContext
+            )
+        }
         // Publish imperative identity before publishing the provider. It permanently outranks any
         // declarative fallback while retaining only the provider's small lock-guarded source.
         processTelemetryIdentityRouter.bindImperative(provider.telemetryIdentitySource)

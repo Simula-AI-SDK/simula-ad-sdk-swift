@@ -46,6 +46,38 @@ func nativeAdSlotStartupPlan(
 import SwiftUI
 import UIKit
 
+struct NativeAdSlotCacheSeed {
+    enum Phase {
+        case loading
+        case empty
+        case filled(NativeAdResponse)
+    }
+
+    let phase: Phase
+    let heightPt: CGFloat
+    let impressionFired: Bool
+    let metadata: [String: String]?
+}
+
+func nativeAdSlotCacheSeed(
+    hasPreview: Bool,
+    hasPreloadedAd: Bool,
+    cachedEntry: @autoclosure () -> NativeAdCache.Entry?
+) -> NativeAdSlotCacheSeed {
+    guard !hasPreview, !hasPreloadedAd, let entry = cachedEntry() else {
+        return NativeAdSlotCacheSeed(phase: .loading, heightPt: 0, impressionFired: false, metadata: nil)
+    }
+    guard let response = entry.response else {
+        return NativeAdSlotCacheSeed(phase: .empty, heightPt: 0, impressionFired: false, metadata: nil)
+    }
+    return NativeAdSlotCacheSeed(
+        phase: .filled(response),
+        heightPt: entry.heightPt,
+        impressionFired: entry.impressionFired,
+        metadata: entry.metadata
+    )
+}
+
 internal enum NativeAdPreloadResolution {
     case unavailable
     case cancelled
@@ -213,6 +245,25 @@ public struct NativeAdSlot: View {
         self.onError = onError
         self.onClick = onClick
 
+        // Seed the first frame synchronously so a recycled row never flashes a provisional shimmer
+        // or loses its measured height/impression state. Compatibility still gates `body` before
+        // this harmless process-local snapshot can become visible or trigger any effect.
+        let cacheSeed = nativeAdSlotCacheSeed(
+            hasPreview: previewHTML != nil,
+            hasPreloadedAd: preloadedAdId != nil,
+            cachedEntry: NativeAdCache.shared.get(adUnitId, position)
+        )
+        switch cacheSeed.phase {
+        case .loading:
+            break
+        case .empty:
+            _phase = State(initialValue: .empty)
+        case .filled(let response):
+            _phase = State(initialValue: .filled(response))
+            _heightPt = State(initialValue: cacheSeed.heightPt)
+            _impressionFired = State(initialValue: cacheSeed.impressionFired)
+            _impressionMetadata = State(initialValue: cacheSeed.metadata)
+        }
     }
 
     public var body: some View {

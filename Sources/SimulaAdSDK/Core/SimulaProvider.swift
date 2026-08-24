@@ -96,6 +96,8 @@ public final class SimulaProvider: ObservableObject {
     /// The host's telemetry opt-in, kept so the deferred startup can install the pipeline
     /// (it was previously consumed only inside `init`).
     private let telemetryEnabled: Bool
+    private let activeProviderRegistry: ActiveSimulaProviderRegistry?
+    private let activeProviderToken = ActiveSimulaProviderToken()
 
     /// Monotonic marker captured at the START of `init`, so the `sdk_init` beacon (emitted by
     /// the deferred startup once telemetry is installed) measures the full bring-up span.
@@ -187,21 +189,31 @@ public final class SimulaProvider: ObservableObject {
             telemetryEnabled: telemetryEnabled,
             adContext: adContext,
             apiKeyOwnership: processApiKeyOwnership,
-            processEffectsEnabled: true
+            processEffectsEnabled: true,
+            activeProviderRegistry: processActiveSimulaProviderRegistry
         )
     }
 
-    convenience init(testApiKey apiKey: String, apiKeyOwnership: ProcessApiKeyOwnership) {
+    convenience init(
+        testApiKey apiKey: String,
+        apiKeyOwnership: ProcessApiKeyOwnership,
+        devMode: Bool = false,
+        primaryUserID: String? = nil,
+        hasPrivacyConsent: Bool = true,
+        telemetryEnabled: Bool = true,
+        activeProviderRegistry: ActiveSimulaProviderRegistry? = nil
+    ) {
         self.init(
             apiKey: apiKey,
-            devMode: false,
-            primaryUserID: nil,
-            hasPrivacyConsent: true,
+            devMode: devMode,
+            primaryUserID: primaryUserID,
+            hasPrivacyConsent: hasPrivacyConsent,
             privacy: nil,
-            telemetryEnabled: true,
+            telemetryEnabled: telemetryEnabled,
             adContext: nil,
             apiKeyOwnership: apiKeyOwnership,
-            processEffectsEnabled: false
+            processEffectsEnabled: false,
+            activeProviderRegistry: activeProviderRegistry
         )
     }
 
@@ -214,7 +226,8 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool,
         adContext: SimulaAdContext?,
         apiKeyOwnership: ProcessApiKeyOwnership,
-        processEffectsEnabled: Bool
+        processEffectsEnabled: Bool,
+        activeProviderRegistry: ActiveSimulaProviderRegistry?
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
@@ -224,6 +237,7 @@ public final class SimulaProvider: ObservableObject {
             reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
         )
         self.processEffectsEnabled = processEffectsEnabled
+        self.activeProviderRegistry = activeProviderRegistry
         self.telemetryIdentitySource = TelemetryIdentitySource(apiKey: apiKey, primaryUserId: primaryUserID)
         self.hasPrivacyConsent = hasPrivacyConsent
         self.adContext = adContext
@@ -235,7 +249,11 @@ public final class SimulaProvider: ObservableObject {
         self.privacyConfig = resolved
         self.telemetryEnabled = telemetryEnabled
 
-        guard isProcessApiKeyCompatible, processEffectsEnabled else { return }
+        guard isProcessApiKeyCompatible else { return }
+        guard processEffectsEnabled else {
+            activeProviderRegistry?.register(token: activeProviderToken, provider: self)
+            return
+        }
 
         SDKInitializationOrigin.shared.markEntry()
 
@@ -282,6 +300,8 @@ public final class SimulaProvider: ObservableObject {
                 Task { @MainActor in await self.handlePrivacyChange(impact) }
             }
             .store(in: &cancellables)
+
+        activeProviderRegistry?.register(token: activeProviderToken, provider: self)
     }
 
     deinit {
@@ -290,6 +310,21 @@ public final class SimulaProvider: ObservableObject {
         if telemetryIdentityBound {
             processTelemetryIdentityRouter.unbindProvider(telemetryIdentityToken)
         }
+        activeProviderRegistry?.unregister(activeProviderToken)
+    }
+
+    var coreConfiguration: SimulaProviderCoreConfiguration {
+        SimulaProviderCoreConfiguration(
+            apiKey: apiKey,
+            devMode: devMode,
+            primaryUserID: primaryUserID,
+            hasPrivacyConsent: hasPrivacyConsent,
+            telemetryEnabled: telemetryEnabled
+        )
+    }
+
+    func matchesCoreConfiguration(_ configuration: SimulaProviderCoreConfiguration) -> Bool {
+        coreConfiguration == configuration
     }
 
     // MARK: - Deferred startup
@@ -961,15 +996,18 @@ public struct SimulaProviderView<Content: View>: View {
         // recreating the session/store. A divergent privacy config on the shared
         // instance is reconciled by `updateConsent(resolvedConfig)` in the
         // `.task(id:)` below, so reuse stays safe.
-        let provider: SimulaProvider
-        if let shared = SimulaAds.shared,
-           shared.apiKey == apiKey,
-           shared.devMode == devMode,
-           shared.primaryUserID == primaryUserID,
-           shared.hasPrivacyConsent == hasPrivacyConsent {
-            provider = shared
-        } else {
-            provider = SimulaProvider(
+        let coreConfiguration = SimulaProviderCoreConfiguration(
+            apiKey: apiKey,
+            devMode: devMode,
+            primaryUserID: primaryUserID,
+            hasPrivacyConsent: hasPrivacyConsent,
+            telemetryEnabled: telemetryEnabled
+        )
+        let provider = selectSimulaProvider(
+            shared: SimulaAds.shared,
+            configuration: coreConfiguration
+        ) {
+            SimulaProvider(
                 apiKey: apiKey,
                 devMode: devMode,
                 primaryUserID: primaryUserID,
