@@ -39,7 +39,9 @@ public struct AdOverlayView: View {
     /// Attribution tokens carried into the store sheet the end-screen CTA opens.
     var attribution: AdAttribution? = nil
 
-    @State private var appeared = false
+    /// The pooled WebView is transparent, so keep native black above it until the current page is
+    /// actually ready. A failed navigation deliberately leaves the safe surface in place.
+    @State private var adPageReady = false
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -110,13 +112,42 @@ public struct AdOverlayView: View {
 
                     // Main content area
                     ZStack {
+                        Color.black
+
                         // Ad creative: prefer the inline html (rendered with the iframe origin as base
                         // so the end screen's own click beacon stays same-origin), else load the url.
                         // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
                         if let html, !html.isEmpty {
-                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick, attribution: attribution, ctaTrackingUrl: ctaTrackingUrl, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
+                            WebViewRepresentable(
+                                htmlString: html,
+                                baseURL: URL(string: iframeUrl),
+                                onNavigationFinished: { adPageReady = true },
+                                onNavigationFailed: { _ in adPageReady = false },
+                                onAdClick: onAdClick,
+                                attribution: attribution,
+                                ctaTrackingUrl: ctaTrackingUrl,
+                                ctaDestination: ctaDestination,
+                                ctaStoreUrl: ctaStoreUrl
+                            )
                         } else if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url, onAdClick: onAdClick, attribution: attribution, ctaTrackingUrl: ctaTrackingUrl, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
+                            WebViewRepresentable(
+                                url: url,
+                                onNavigationFinished: { adPageReady = true },
+                                onNavigationFailed: { _ in adPageReady = false },
+                                onAdClick: onAdClick,
+                                attribution: attribution,
+                                ctaTrackingUrl: ctaTrackingUrl,
+                                ctaDestination: ctaDestination,
+                                ctaStoreUrl: ctaStoreUrl
+                            )
+                        }
+
+                        if !adPageReady {
+                            ZStack {
+                                Color.black
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            }
                         }
 
                         // Close button / countdown ring — top right
@@ -197,10 +228,7 @@ public struct AdOverlayView: View {
         }
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)
-        .opacity(appeared ? 1 : 0)
-        .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
-            appeared = true
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             startCountdown()
         }
@@ -292,4 +320,3 @@ private struct AdCountdownLifecycle: ViewModifier {
         #endif
     }
 }
-

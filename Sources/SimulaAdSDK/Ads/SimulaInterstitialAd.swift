@@ -759,7 +759,8 @@ public final class SimulaInterstitialAd {
     /// order. When the prefetch has landed (the common case) it presents **synchronously**, so the
     /// fallback window is on screen before the primary window is torn down (see the presenter's
     /// `dismiss`) — no fetch-after-close gap and no handoff flash. If the user closed before the
-    /// prefetch finished (rare), it awaits and presents on the next runloop. Empty → nothing shown.
+    /// prefetch finished (rare), it installs an opaque loading window synchronously, then resolves
+    /// that same window after the await. Empty → nothing shown.
     private func presentFallbackAds(
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
@@ -775,8 +776,14 @@ public final class SimulaInterstitialAd {
         if let ready {
             presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
-            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed) }
+            presentFallbackLoadingWindow(
+                prefetch: prefetch,
+                response: response,
+                autoStoreRedirect: autoStoreRedirect,
+                onAutoStoreRedirect: onAutoStoreRedirect,
+                presentationLease: presentationLease,
+                onAllClosed: onAllClosed
+            )
         } else {
             onAllClosed()
             presentationLease.finishPostCloseTeardown()
@@ -788,26 +795,48 @@ public final class SimulaInterstitialAd {
     }
 
     #if os(iOS)
-    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager):
-    /// wait for the in-flight prefetch, then present. Static with an optional `ad` so a released
-    /// ad object still completes the close flow via `onAllClosed`, as before.
-    @MainActor
-    private static func awaitPrefetchAndPresent(
-        ad: SimulaInterstitialAd?,
+    /// Installs the pending-prefetch safety window before returning to the primary presenter, then
+    /// resolves it asynchronously. The fallback presenter self-retains if the ad object is released.
+    private func presentFallbackLoadingWindow(
         prefetch: Task<[FallbackAd], Never>,
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
-    ) async {
-        let ads = await prefetch.value
-        guard let ad else {
+    ) {
+        let presenter = FallbackAdPresenter()
+        let didPresent = presenter.presentLoading(
+            ctaTrackingUrl: response.trackingUrl,
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
+            autoStoreRedirect: autoStoreRedirect,
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) },
+            presentationLease: presentationLease
+        ) { [weak self] in
+            self?.fallbackPresenter = nil
+            onAllClosed()
+        }
+        guard didPresent else {
             onAllClosed()
             presentationLease.finishPostCloseTeardown()
             return
         }
-        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
+        fallbackPresenter = presenter
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch) }
+    }
+
+    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private static func awaitPrefetchAndResolve(
+        presenter: FallbackAdPresenter,
+        prefetch: Task<[FallbackAd], Never>
+    ) async {
+        let ads = await prefetch.value
+        presenter.resolveLoading(with: ads)
     }
     #endif
 

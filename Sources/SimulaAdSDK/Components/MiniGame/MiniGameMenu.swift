@@ -214,7 +214,7 @@ public struct MiniGameMenu: View {
                     }
                     .ignoresSafeArea()
                 }
-                .transition(.opacity)
+                .transition(.identity)
                 .zIndex(2.5)
             }
 
@@ -226,10 +226,11 @@ public struct MiniGameMenu: View {
                     onClose: { handleAdIframeClose() },
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
                     playableBorderColor: theme.resolvedPlayableBorderColor,
-                    adId: fallbackAd.adId
+                    adId: fallbackAd.adId,
+                    html: fallbackAd.html
                 )
                 .id(fallbackAdIndex)
-                .transition(.opacity)
+                .transition(.identity)
                 .zIndex(3)
             }
 
@@ -339,7 +340,6 @@ public struct MiniGameMenu: View {
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.2), value: isOpen)
         .animation(.easeInOut(duration: 0.2), value: showGameIframe)
-        .animation(.easeInOut(duration: 0.2), value: showAdOverlay)
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         .task(id: isOpen) { await loadCatalogIfOpen() }
     }
@@ -564,13 +564,14 @@ public struct MiniGameMenu: View {
 
     private func handleIframeClose() {
         guard compatibilityPlan.loadsGame else { return }
-        showGameIframe = false
-        selectedGameId = nil
-
+        guard !adLoading else { return }
         if compatibilityPlan.fetchesFallbacks, !adFetched, let serveId = currentServeId {
             adLoading = true
             // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { await loadFallbacksAfterIframeClose(serveId: serveId) }
+        } else {
+            showGameIframe = false
+            selectedGameId = nil
         }
     }
 
@@ -582,13 +583,17 @@ public struct MiniGameMenu: View {
         guard compatibilityPlan.fetchesFallbacks else { return }
         let ads: [FallbackAd]
         do { ads = try await api.fetchFallbacks(impressionId: serveId) } catch { ads = [] }
-        adLoading = false
         if !ads.isEmpty {
             fallbackAds = ads
             fallbackAdIndex = 0
             adFetched = true
             showAdOverlay = true
         }
+        // Match Kotlin: keep the outgoing game mounted until fallback resolution, then replace it
+        // with the already-opaque end-screen shell in the same main-actor update.
+        showGameIframe = false
+        selectedGameId = nil
+        adLoading = false
     }
 
     private func handleAdIframeClose() {

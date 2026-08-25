@@ -16,6 +16,10 @@ import UIKit
 @MainActor
 final class FallbackAdPresenter {
     private var window: UIWindow?
+    /// One opaque host survives loading and every screen swap. Replacing its root view lets SwiftUI
+    /// dismantle the previous representable before creating the next one, so only one fallback
+    /// WebView is owned at a time.
+    private var hostingController: UIHostingController<AnyView>?
     private var onClose: (() -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     private var ads: [FallbackAd] = []
@@ -62,7 +66,66 @@ final class FallbackAdPresenter {
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
-        guard let firstAd = ads.first, let scene = Self.activeWindowScene() else { return false }
+        guard !ads.isEmpty else { return false }
+        return beginPresentation(
+            ads: ads,
+            startsLoading: false,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl,
+            attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: onAdClick,
+            presentationLease: presentationLease,
+            onClose: onClose
+        )
+    }
+
+    /// Installs an SDK-owned opaque fallback window synchronously while fallback prefetch is still
+    /// in flight. The same window and hosting controller are reused when `resolveLoading` supplies
+    /// the screens, preventing the primary presenter from exposing the host app during handoff.
+    @discardableResult
+    func presentLoading(
+        ctaTrackingUrl: String? = nil,
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil,
+        attribution: AdAttribution? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
+        onAdClick: (() -> Void)? = nil,
+        presentationLease: FullscreenPresentationLease,
+        onClose: @escaping () -> Void
+    ) -> Bool {
+        beginPresentation(
+            ads: [],
+            startsLoading: true,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl,
+            attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: onAdClick,
+            presentationLease: presentationLease,
+            onClose: onClose
+        )
+    }
+
+    private func beginPresentation(
+        ads: [FallbackAd],
+        startsLoading: Bool,
+        ctaTrackingUrl: String?,
+        ctaDestination: AdDestination,
+        ctaStoreUrl: String?,
+        attribution: AdAttribution?,
+        autoStoreRedirect: AutoStoreRedirect?,
+        onAutoStoreRedirect: (@MainActor () -> Void)?,
+        onAdClick: (() -> Void)?,
+        presentationLease: FullscreenPresentationLease,
+        onClose: @escaping () -> Void
+    ) -> Bool {
+        guard window == nil, let scene = Self.activeWindowScene() else { return false }
         self.ads = ads
         self.index = 0
         self.onClose = onClose
@@ -77,20 +140,42 @@ final class FallbackAdPresenter {
 
         originalKeyWindow = scene.keyWindow
 
+        let rootView = startsLoading ? loadingView() : adView(at: 0)
+        let hosting = UIHostingController(rootView: rootView)
+        hosting.view.backgroundColor = .black
+        hosting.view.isOpaque = true
+
         let window = UIWindow(windowScene: scene)
         window.windowLevel = .normal + 1
         // Opaque black (not clear) so the host app never shows through — both behind the
         // end screen's safe area and during the rootViewController swap between screens.
         window.backgroundColor = .black
-        window.rootViewController = hostingController(for: firstAd)
+        window.rootViewController = hosting
         window.makeKeyAndVisible()
         self.window = window
+        hostingController = hosting
         retainedWhilePresenting = self
         // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
         // where `.hideStatusBar` in the end-screen view is a no-op. No-op in native hosts.
         SimulaAppStatusBar.hide()
-        fireAutoStoreRedirectIfMatching(index: 0)
+        if !startsLoading {
+            fireAutoStoreRedirectIfMatching(index: 0)
+        }
         return true
+    }
+
+    /// Replaces the native loading surface with End Screen 1, or safely tears down when the
+    /// best-effort prefetch returned no usable screens. The presenter self-retains across the await.
+    func resolveLoading(with ads: [FallbackAd]) {
+        guard window != nil else { return }
+        guard !ads.isEmpty else {
+            dismiss()
+            return
+        }
+        self.ads = ads
+        index = 0
+        hostingController?.rootView = adView(at: index)
+        fireAutoStoreRedirectIfMatching(index: index)
     }
 
     /// END_SCREEN_N: open the primary ad's store once, when the fallback screen whose index matches
@@ -103,9 +188,11 @@ final class FallbackAdPresenter {
         onAutoStoreRedirect?()
     }
 
-    /// A fresh hosting controller per screen so each gets its own overlay state (countdown ring).
-    private func hostingController(for ad: FallbackAd) -> UIHostingController<AdOverlayView> {
-        let root = AdOverlayView(
+    /// `.id` gives each screen fresh overlay state while the opaque host itself stays installed.
+    private func adView(at index: Int) -> AnyView {
+        guard ads.indices.contains(index) else { return loadingView() }
+        let ad = ads[index]
+        return AnyView(AdOverlayView(
             iframeUrl: ad.iframeUrl,
             onClose: { [weak self] in self?.advance() },
             adId: ad.adId,
@@ -115,17 +202,25 @@ final class FallbackAdPresenter {
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution
+        ).id(index))
+    }
+
+    private func loadingView() -> AnyView {
+        AnyView(
+            ZStack {
+                Color.black
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            }
+            .ignoresSafeArea()
         )
-        let hosting = UIHostingController(rootView: root)
-        hosting.view.backgroundColor = .black
-        return hosting
     }
 
     /// Reveal the next screen on each close tap; tear down after the last one.
     private func advance() {
         index += 1
-        if index < ads.count, let window {
-            window.rootViewController = hostingController(for: ads[index])
+        if index < ads.count {
+            hostingController?.rootView = adView(at: index)
             fireAutoStoreRedirectIfMatching(index: index)
         } else {
             dismiss()
@@ -141,6 +236,7 @@ final class FallbackAdPresenter {
         let win = window
         let hostKeyWindow = originalKeyWindow
         window = nil
+        hostingController = nil
         originalKeyWindow = nil
         let callback = onClose
         onClose = nil

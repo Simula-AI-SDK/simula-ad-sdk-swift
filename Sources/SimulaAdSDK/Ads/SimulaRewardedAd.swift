@@ -790,8 +790,9 @@ public final class SimulaRewardedAd {
     /// Presents the prefetched fallback ad screens on close. Synchronous when the prefetch has
     /// landed (the common case), so the fallback window is up before the minigame window is torn
     /// down (see the presenter's `dismiss`) — no handoff flash; awaits only if the user closed
-    /// before the prefetch finished. Empty → nothing shown. `response` carries the serve's CTA
-    /// routing context (destination / raw store link / attribution) into the end-screen WebViews.
+    /// before the prefetch finished, with an opaque loading window installed synchronously across
+    /// that await. Empty → nothing shown. `response` carries the serve's CTA routing context
+    /// (destination / raw store link / attribution) into the end-screen WebViews.
     private func presentFallbackAds(
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
@@ -807,8 +808,14 @@ public final class SimulaRewardedAd {
         if let ready {
             presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
-            // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-            Task { [weak self] in await Self.awaitPrefetchAndPresent(ad: self, prefetch: prefetch, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed) }
+            presentFallbackLoadingWindow(
+                prefetch: prefetch,
+                response: response,
+                autoStoreRedirect: autoStoreRedirect,
+                onAutoStoreRedirect: onAutoStoreRedirect,
+                presentationLease: presentationLease,
+                onAllClosed: onAllClosed
+            )
         } else {
             // No prefetch ran (e.g. empty impression id) — nothing to show, so the ad unit is
             // already fully closed; verify immediately.
@@ -822,26 +829,48 @@ public final class SimulaRewardedAd {
     }
 
     #if os(iOS)
-    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager):
-    /// wait for the in-flight prefetch, then present. Static with an optional `ad` so a released
-    /// ad object still completes the close flow via `onAllClosed`, as before.
-    @MainActor
-    private static func awaitPrefetchAndPresent(
-        ad: SimulaRewardedAd?,
+    /// Installs the pending-prefetch safety window before returning to the primary presenter, then
+    /// resolves it asynchronously. The fallback presenter self-retains if the ad object is released.
+    private func presentFallbackLoadingWindow(
         prefetch: Task<[FallbackAd], Never>,
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: @escaping @MainActor () -> Void,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
-    ) async {
-        let ads = await prefetch.value
-        guard let ad else {
+    ) {
+        let presenter = FallbackAdPresenter()
+        let didPresent = presenter.presentLoading(
+            ctaTrackingUrl: response.trackingUrl,
+            ctaDestination: response.destinationKind,
+            ctaStoreUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
+            autoStoreRedirect: autoStoreRedirect,
+            onAutoStoreRedirect: onAutoStoreRedirect,
+            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) },
+            presentationLease: presentationLease
+        ) { [weak self] in
+            self?.fallbackPresenter = nil
+            onAllClosed()
+        }
+        guard didPresent else {
             onAllClosed()
             presentationLease.finishPostCloseTeardown()
             return
         }
-        ad.presentFallbackWindow(ads, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, presentationLease: presentationLease, onAllClosed: onAllClosed)
+        fallbackPresenter = presenter
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
+        Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch) }
+    }
+
+    /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager).
+    @MainActor
+    private static func awaitPrefetchAndResolve(
+        presenter: FallbackAdPresenter,
+        prefetch: Task<[FallbackAd], Never>
+    ) async {
+        let ads = await prefetch.value
+        presenter.resolveLoading(with: ads)
     }
     #endif
 
