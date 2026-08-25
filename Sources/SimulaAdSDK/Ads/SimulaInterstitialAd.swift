@@ -378,7 +378,8 @@ public final class SimulaInterstitialAd {
             Telemetry.shared.setExperiment(experimentId: response.experiment?.experimentId, variantId: response.experiment?.variantId)
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
-                adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
+                adId: response.impressionId, serveId: response.impressionId,
+                durationMs: msSince(loadStartNanos), errorCode: nil
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
             delegate?.interstitialDidLoad(self)
@@ -464,9 +465,21 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
-            onClick: { [weak self] in
+            onClick: { [weak self] interaction in
                 guard let self else { return }
-                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: response.impressionId,
+                    interactionId: interaction.id, clickSource: interaction.source
+                )
+                AdBeaconManager.shared.enqueue(
+                    impressionId: response.impressionId,
+                    action: "click",
+                    adFormat: Self.adFormat,
+                    adUnitId: self.adUnitId,
+                    interactionId: interaction.id,
+                    clickSource: interaction.source.rawValue
+                )
                 self.delegate?.interstitialDidClick(self)
             },
             onImpression: { [weak self] in
@@ -474,8 +487,8 @@ public final class SimulaInterstitialAd {
                 // IMPRESSION + PAID (the billable impression + paid event), fired together ~2s
                 // after begin-to-render by the presenter (foreground-aware). The `/seen` beacon is the
                 // billing source of truth; `didPay` is local analytics (value already on-device).
-                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
-                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
+                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
+                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
                 self.delegate?.interstitialDidRecordImpression(self)
                 self.delegate?.interstitialDidPay(self, value: response.adValue)
                 // Durable billable-impression beacon (was a fire-and-forget trackImpression).
@@ -494,7 +507,7 @@ public final class SimulaInterstitialAd {
                 }
                 self.presenter = nil
                 self.state = .idle
-                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId)
+                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
@@ -552,7 +565,8 @@ public final class SimulaInterstitialAd {
         startFallbackPrefetch(impressionId: response.impressionId)
         Telemetry.shared.recordLifecycle(
             stage: "displayed", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: response.impressionId, serveId: nil, durationMs: msSince(showStartNanos), errorCode: nil
+            adId: response.impressionId, serveId: response.impressionId,
+            durationMs: msSince(showStartNanos), errorCode: nil
         )
         delegate?.interstitialDidDisplay(self)
         // SHOWN — the `/shown` beacon, fired at present. The
@@ -652,7 +666,7 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
-            onClick: { [weak self] in
+            onClick: { [weak self] _ in
                 guard let self else { return }
                 self.delegate?.interstitialDidClick(self)
             },
@@ -833,7 +847,15 @@ public final class SimulaInterstitialAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) },
+            onAdClick: { [weak self] interaction in
+                guard let self else { return }
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: response.impressionId,
+                    interactionId: interaction.id, clickSource: .fallbackCTA
+                )
+                self.delegate?.interstitialDidClick(self)
+            },
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] in
@@ -889,7 +911,15 @@ public final class SimulaInterstitialAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.interstitialDidClick(self) },
+            onAdClick: { [weak self] interaction in
+                guard let self else { return }
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: response.impressionId,
+                    interactionId: interaction.id, clickSource: .fallbackCTA
+                )
+                self.delegate?.interstitialDidClick(self)
+            },
             presentationLease: presentationLease
         ) { [weak self] in
             self?.fallbackPresenter = nil

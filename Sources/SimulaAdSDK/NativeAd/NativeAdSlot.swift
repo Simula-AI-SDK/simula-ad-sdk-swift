@@ -307,14 +307,16 @@ public struct NativeAdSlot: View {
                         htmlString: response.renderedHTML,
                         onNavigationFailed: { _ in handleLoadFailure() },
                         onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
-                        onAdClick: {
+                        onAdClick: { interaction in
                             // Surface the click to the publisher (parity with the interstitial's
                             // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
                             onClick()
                             // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
                             Telemetry.shared.recordLifecycle(
                                 stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
-                                adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+                                adId: impressionId.isEmpty ? nil : impressionId, serveId: nil,
+                                durationMs: nil, errorCode: nil,
+                                interactionId: interaction.id, clickSource: interaction.source
                             )
                         },
                         // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an

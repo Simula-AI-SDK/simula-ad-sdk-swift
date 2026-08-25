@@ -16,12 +16,15 @@ final class TelemetryEnrichmentTests: XCTestCase {
     private final class FakeSender: TelemetrySending, @unchecked Sendable {
         private let lock = NSLock()
         private var _batches: [TelemetryEnvelope] = []
+        private var ack: TelemetryAck = .accepted
         var batches: [TelemetryEnvelope] { lock.lock(); defer { lock.unlock() }; return _batches }
+        func setAck(_ ack: TelemetryAck) { lock.lock(); self.ack = ack; lock.unlock() }
         func send(_ body: Data) async -> TelemetryAck {
             lock.lock()
             if let env = try? JSONDecoder().decode(TelemetryEnvelope.self, from: body) { _batches.append(env) }
+            let result = ack
             lock.unlock()
-            return .accepted
+            return result
         }
     }
 
@@ -45,6 +48,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
         carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
         ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
         flushThreshold: Int = 20,
+        launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) -> TelemetryManager {
         let manager = TelemetryManager(
@@ -62,6 +66,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             random: { 0.0 },
             backoff: { _ in 0 },
             timedFlushSleep: timedFlushSleep,
+            launchGate: launchGate,
             flushThreshold: flushThreshold,
             flushInterval: 0.05
         )
@@ -130,6 +135,108 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let life = allEvents(sender.batches).first { $0.name == "store_opened" }
         XCTAssertEqual(life?.trigger, "cta")
         XCTAssertEqual(life?.durationMs, 1500)
+    }
+
+    func testClickSerializationCarriesInteractionSourceServeAndSampleRate() async throws {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.recordLifecycle(
+            stage: "click",
+            adFormat: "interstitial",
+            adUnitId: "unit",
+            adId: "impression",
+            serveId: "impression",
+            durationMs: nil,
+            errorCode: nil,
+            interactionId: "interaction",
+            clickSource: ClickSource.fallbackCTA.rawValue
+        )
+        await waitUntil { !sender.batches.isEmpty }
+
+        let envelope = sender.batches.first
+        let click = envelope?.events.first { $0.name == "click" }
+        XCTAssertEqual(envelope?.sampleRate, 1)
+        XCTAssertEqual(click?.adId, "impression")
+        XCTAssertEqual(click?.serveId, "impression")
+        XCTAssertEqual(click?.interactionId, "interaction")
+        XCTAssertEqual(click?.clickSource, "fallback_cta")
+        let data = try JSONEncoder().encode(envelope)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let events = try XCTUnwrap(json["events"] as? [[String: Any]])
+        let wireClick = try XCTUnwrap(events.first { ($0["name"] as? String) == "click" })
+        XCTAssertEqual(json["sample_rate"] as? Double, 1)
+        XCTAssertEqual(wireClick["interaction_id"] as? String, "interaction")
+        XCTAssertEqual(wireClick["click_source"] as? String, "fallback_cta")
+        XCTAssertEqual(wireClick["serve_id"] as? String, "impression")
+        XCTAssertEqual(wireClick["sample_rate"] as? Double, 1)
+    }
+
+    func testSampleRateIsStampedAtAdmissionAcrossServerConfigChange() async {
+        let clock = Clock(1_000)
+        let store = FakeStore()
+        let sender = FakeSender()
+        let gate = ControllableLaunchSettledGate()
+        let m = build(
+            store: store,
+            sender: sender,
+            clock: clock,
+            launchGate: gate
+        )
+        await m.waitForRecoveryForTests()
+
+        m.recordLifecycle(
+            stage: "click", adFormat: "interstitial", adUnitId: "unit", adId: "imp",
+            serveId: "imp", durationMs: nil, errorCode: nil,
+            interactionId: "before", clickSource: "primary_cta"
+        )
+        m.applyServerConfig(enabled: true, sampleRate: 0.25)
+        m.recordLifecycle(
+            stage: "click", adFormat: "interstitial", adUnitId: "unit", adId: "imp",
+            serveId: "imp", durationMs: nil, errorCode: nil,
+            interactionId: "after", clickSource: "store_prompt"
+        )
+
+        await waitUntil { store.load().filter { $0.name == "click" }.count == 2 }
+        let persisted = store.load().filter { $0.name == "click" }
+        XCTAssertEqual(persisted.first { $0.interactionId == "before" }?.sampleRate, 1)
+        XCTAssertEqual(persisted.first { $0.interactionId == "after" }?.sampleRate, 0.25)
+
+        await gate.open()
+        await waitUntil { !sender.batches.isEmpty }
+        let envelope = sender.batches.first
+        XCTAssertNil(envelope?.sampleRate, "a mixed-rate envelope must not claim one batch-wide rate")
+        XCTAssertEqual(
+            Set(envelope?.events.filter { $0.name == "click" }.compactMap(\.sampleRate) ?? []),
+            Set([1.0, 0.25])
+        )
+    }
+
+    func testBackgroundObserverPersistsBeforeFlushAttempt() async {
+        let clock = Clock(1_000)
+        let store = FakeStore()
+        let sender = FakeSender()
+        let sleep = ControllablePersistenceSleep()
+        let m = build(
+            store: store,
+            sender: sender,
+            clock: clock,
+            timedFlushSleep: { await sleep.sleep($0) }
+        )
+        await m.waitForRecoveryForTests()
+        await m.waitForImmediateFlushIdleForTests()
+        sender.setAck(.retry)
+        let center = NotificationCenter()
+        let name = Notification.Name("telemetry-background-test")
+        let observer = TelemetryBackgroundFlushObserver(center: center, name: name) { m.flushNow() }
+        _ = observer
+
+        m.recordOperation(name: "pending_before_background", durationMs: 1, success: true)
+        center.post(name: name, object: nil)
+
+        await waitUntil { store.load().contains { $0.name == "pending_before_background" } }
+        XCTAssertTrue(store.load().contains { $0.name == "pending_before_background" })
     }
 
     func testOldPersistedEventDecodesWithoutTimeSinceInit() throws {

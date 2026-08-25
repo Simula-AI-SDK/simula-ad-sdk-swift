@@ -43,7 +43,7 @@ final class FallbackAdPresenter {
     private var onAutoStoreRedirect: (@MainActor () -> Void)?
     private var autoRedirectFired = false
     /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
-    private var onAdClick: (() -> Void)?
+    private var onAdClick: ((ClickInteraction) -> Void)?
     /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
     /// opens deterministically (in-app store sheet from the raw `ios_store_url` + background tracker
     /// fire) instead of resolving the tracker's redirect chain. Defaults keep today's behavior.
@@ -67,7 +67,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil,
+        onAdClick: ((ClickInteraction) -> Void)? = nil,
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
@@ -100,7 +100,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil,
+        onAdClick: ((ClickInteraction) -> Void)? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
@@ -139,7 +139,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution?,
         autoStoreRedirect: AutoStoreRedirect?,
         onAutoStoreRedirect: (@MainActor () -> Void)?,
-        onAdClick: (() -> Void)?,
+        onAdClick: ((ClickInteraction) -> Void)?,
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
@@ -227,7 +227,7 @@ final class FallbackAdPresenter {
             onClose: { [weak self] in self?.advance(from: index) },
             adId: ad.adId,
             html: ad.html,
-            onAdClick: { [weak self] in self?.onAdClick?() },
+            onAdClick: { [weak self] interaction in self?.onAdClick?(interaction) },
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,

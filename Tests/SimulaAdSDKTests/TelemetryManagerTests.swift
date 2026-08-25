@@ -338,6 +338,19 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertEqual(store.saveCount, 0, "flush returns while the first persistence write remains blocked")
     }
 
+    func testHandoffPersistenceBarrierFallsBackWhenStoreStalls() async {
+        let store = SlowStore()
+        let sender = FakeSender()
+        let mgr = build(store: store, sender: sender)
+        defer { store.release() }
+        await store.waitForSaveStarted()
+        let released = expectation(description: "bounded telemetry persistence fallback")
+
+        mgr.afterPendingPersistence(timeout: 0.02) { released.fulfill() }
+
+        await fulfillment(of: [released], timeout: 0.5)
+    }
+
     func testEnvelopeCarriesContextAndSessionId() async {
         let sender = FakeSender()
         let mgr = build(store: FakeStore(), sender: sender, sessionId: "sess-42")

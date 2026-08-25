@@ -103,6 +103,7 @@ final class TelemetryManager: @unchecked Sendable {
     private var retryScheduled = false
     private var retryCount = 0
     private var isEnabled: Bool
+    private var sampleRate: Double
     private var perfSampledIn: Bool
     private var recoveryStarted = false
     private var recoveryCompleted = false
@@ -161,8 +162,10 @@ final class TelemetryManager: @unchecked Sendable {
         self.maxErrorSignatures = maxErrorSignatures
         self.flushInterval = flushInterval
         self.persistenceWaitTimeout = max(0, persistenceWaitTimeout)
+        let normalizedSampleRate = min(max(sampleRate, 0), 1)
         self.isEnabled = enabled
-        self.perfSampledIn = enabled && random() < sampleRate
+        self.sampleRate = normalizedSampleRate
+        self.perfSampledIn = enabled && random() < normalizedSampleRate
     }
 
     /// Recover any buffer left by a prior process, then attempt a flush.
@@ -182,7 +185,12 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         if isEnabled {
             var recoveredBuffer: [TelemetryEvent] = []
-            for event in recovered {
+            for recoveredEvent in recovered {
+                var event = recoveredEvent
+                // Pre-sampling-metadata events cannot reveal their historical rate. Admit them
+                // under the current effective rate so aggregation and envelope weighting remain
+                // internally consistent rather than mixing an unknown rate into a known bucket.
+                if event.sampleRate == nil { event.sampleRate = sampleRate }
                 if event.type == TelemetryType.error, !event.name.isEmpty {
                     let key = aggregationKey(for: event)
                     if var existing = errorAgg[key] {
@@ -196,7 +204,11 @@ final class TelemetryManager: @unchecked Sendable {
                         errorAgg[key] = event
                     }
                 } else if event.type == TelemetryType.meta, !event.name.isEmpty {
-                    mergeCountedEvent(event, into: &metaAgg, key: event.name)
+                    mergeCountedEvent(
+                        event,
+                        into: &metaAgg,
+                        key: sampledAggregationKey(event.name, sampleRate: event.sampleRate)
+                    )
                 } else {
                     recoveredBuffer.append(event)
                 }
@@ -217,7 +229,8 @@ final class TelemetryManager: @unchecked Sendable {
     func applyServerConfig(enabled: Bool, sampleRate: Double) {
         lock.lock()
         isEnabled = enabled
-        perfSampledIn = enabled && random() < min(max(sampleRate, 0), 1)
+        self.sampleRate = min(max(sampleRate, 0), 1)
+        perfSampledIn = enabled && random() < self.sampleRate
         if !enabled {
             buffer.removeAll()
             errorAgg.removeAll()
@@ -271,10 +284,12 @@ final class TelemetryManager: @unchecked Sendable {
         guard !name.isEmpty, count > 0 else { return }
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
-        var event = metaAgg[name] ?? newEvent(type: TelemetryType.meta, name: name)
+        let key = sampledAggregationKey(name, sampleRate: sampleRate)
+        var event = metaAgg[key] ?? newEvent(type: TelemetryType.meta, name: name)
+        if event.sampleRate == nil { event.sampleRate = sampleRate }
         let existing = max(0, event.count ?? 0)
         event.count = existing >= Int.max - count ? Int.max : existing + count
-        metaAgg[name] = event
+        metaAgg[key] = event
         // Duplicate-init counts are process-local until they reach this manager. Persist each
         // aggregate update with the same prompt serial-queue path used by handled errors.
         if recoveryCompleted { persistAsync(snapshotLocked()) }
@@ -294,18 +309,54 @@ final class TelemetryManager: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil
     ) {
+        recordLifecycle(
+            stage: stage,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            adId: adId,
+            serveId: serveId,
+            durationMs: durationMs,
+            errorCode: errorCode,
+            trigger: trigger,
+            cacheSource: cacheSource,
+            breadcrumb: breadcrumb,
+            interactionId: nil,
+            clickSource: nil
+        )
+    }
+
+    func recordLifecycle(
+        stage: String,
+        adFormat: String?,
+        adUnitId: String?,
+        adId: String?,
+        serveId: String?,
+        durationMs: Int?,
+        errorCode: String?,
+        trigger: String? = nil,
+        cacheSource: String? = nil,
+        breadcrumb: String? = nil,
+        interactionId: String?,
+        clickSource: String?
+    ) {
         var e = newEvent(type: TelemetryType.lifecycle, name: stage)
         e.adFormat = adFormat
         e.adUnitId = adUnitId
         e.adId = adId
         e.serveId = serveId
+        e.interactionId = interactionId
+        e.clickSource = clickSource
         e.durationMs = durationMs
         e.errorCode = errorCode
         e.trigger = trigger
         e.cacheSource = cacheSource
         e.breadcrumb = breadcrumb
         let accumulatedFunnel = accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
-        enqueuePerf(e)
+        if stage == "click" {
+            enqueueCritical(e)
+        } else {
+            enqueuePerf(e)
+        }
         // A threshold-triggered send can drain the lifecycle event immediately, but the derived
         // funnel delta still needs its periodic turn even when it is then the only pending data.
         if accumulatedFunnel { scheduleTimedFlush() }
@@ -370,12 +421,13 @@ final class TelemetryManager: @unchecked Sendable {
         let stackFingerprint = stack.flatMap {
             $0.isEmpty ? nil : SimulaMetricKitParser.fingerprint(for: Array($0.prefix(8)))
         }
-        let aggregateKey = aggregationKey(
+        let baseAggregateKey = aggregationKey(
             signature: signature,
             discriminator: dedupeDiscriminator ?? stackFingerprint
         )
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
+        let aggregateKey = sampledAggregationKey(baseAggregateKey, sampleRate: sampleRate)
         if var existing = errorAgg[aggregateKey] {
             let count = existing.count ?? 1
             existing.count = count < Int.max ? count + 1 : Int.max
@@ -389,6 +441,7 @@ final class TelemetryManager: @unchecked Sendable {
             // `message` they carry no URLs/tokens/PII and need no redaction.
             e.stack = stack
             e.count = 1
+            e.sampleRate = sampleRate
             errorAgg[aggregateKey] = e
         } else {
             droppedCount += 1
@@ -530,7 +583,15 @@ final class TelemetryManager: @unchecked Sendable {
         let stackFingerprint = event.stack.flatMap {
             $0.isEmpty ? nil : SimulaMetricKitParser.fingerprint(for: Array($0.prefix(8)))
         }
-        return aggregationKey(signature: event.name, discriminator: value ?? stackFingerprint)
+        return sampledAggregationKey(
+            aggregationKey(signature: event.name, discriminator: value ?? stackFingerprint),
+            sampleRate: event.sampleRate
+        )
+    }
+
+    private func sampledAggregationKey(_ base: String, sampleRate: Double?) -> String {
+        guard let sampleRate else { return base }
+        return "\(base)\u{1e}sample_rate=\(sampleRate)"
     }
 
     private func boundedDedupeToken(_ value: String?) -> String? {
@@ -563,6 +624,8 @@ final class TelemetryManager: @unchecked Sendable {
     private func enqueuePerf(_ event: TelemetryEvent, triggersFlush: Bool) {
         lock.lock()
         guard isEnabled, perfSampledIn else { lock.unlock(); return }
+        var event = event
+        event.sampleRate = sampleRate
         buffer.append(event)
         while buffer.count > maxBuffer { buffer.removeFirst(); droppedCount += 1 }
         let shouldFlush = buffer.count >= flushThreshold
@@ -575,6 +638,38 @@ final class TelemetryManager: @unchecked Sendable {
                 scheduleTimedFlush()
             }
         }
+    }
+
+    /// Click lifecycle is conversion-critical and must survive an immediate StoreKit/Safari handoff.
+    /// It bypasses performance sampling and queues a durable snapshot before returning to the caller.
+    private func enqueueCritical(_ event: TelemetryEvent) {
+        lock.lock()
+        guard isEnabled else { lock.unlock(); return }
+        var event = event
+        event.sampleRate = sampleRate
+        buffer.append(event)
+        while buffer.count > maxBuffer { buffer.removeFirst(); droppedCount += 1 }
+        if recoveryCompleted { persistAsync(snapshotLocked()) }
+        lock.unlock()
+        debugLog?(formatForLog(event))
+        requestImmediateFlush()
+    }
+
+    /// Runs after every persistence item currently queued. A click caller records synchronously,
+    /// then uses this barrier before leaving the app, without blocking the UI thread.
+    func afterPendingPersistence(
+        timeout: TimeInterval,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        let gate = BoundedCompletion(completion)
+        persistQueue.async { gate.complete() }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0, timeout)) {
+            gate.complete()
+        }
+    }
+
+    func afterPendingPersistence(_ completion: @escaping @Sendable () -> Void) {
+        afterPendingPersistence(timeout: 0.35, completion: completion)
     }
 
     /// Buffer + aggregated errors as one list for persistence / recovery. Caller holds `lock`.
@@ -636,6 +731,7 @@ final class TelemetryManager: @unchecked Sendable {
     private struct FlushContextSnapshot {
         let experimentId: String?
         let variantId: String?
+        let sampleRate: Double
     }
 
     private struct FlushClaim {
@@ -660,7 +756,8 @@ final class TelemetryManager: @unchecked Sendable {
             droppedSnap: droppedCount,
             context: FlushContextSnapshot(
                 experimentId: experimentId,
-                variantId: variantId
+                variantId: variantId,
+                sampleRate: sampleRate
             )
         )
     }
@@ -683,6 +780,7 @@ final class TelemetryManager: @unchecked Sendable {
         if droppedSnap > 0 {
             var meta = newEvent(type: TelemetryType.meta, name: "dropped")
             meta.count = droppedSnap
+            meta.sampleRate = claim.context.sampleRate
             events.append(meta)
         }
         // Stamp wall-clock staleness per event at flush time (copies leave buffered originals intact).
@@ -787,6 +885,13 @@ final class TelemetryManager: @unchecked Sendable {
         env.connectionType = connectionTypeProvider()
         env.experimentId = context.experimentId
         env.variantId = context.variantId
+        let eventRates = events.compactMap(\.sampleRate)
+        if eventRates.count == events.count, let first = eventRates.first,
+           eventRates.allSatisfy({ $0 == first }) {
+            env.sampleRate = first
+        } else {
+            env.sampleRate = nil
+        }
         // Always-on device diagnostics: statics from ctx + flush-time battery/carrier providers.
         env.manufacturer = ctx.manufacturer
         env.locale = ctx.locale

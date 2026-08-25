@@ -1615,12 +1615,29 @@ public final class SimulaAPI: @unchecked Sendable {
     /// tapped. `adId` is the serve handle for rewarded/interstitial and the ad id for native; the
     /// backend resolves either. Best-effort, silent-fail.
     public func trackClick(adId: String, apiKey: String) async {
+        await trackClick(
+            adId: adId,
+            apiKey: apiKey,
+            interactionId: UUID().uuidString,
+            clickSource: ClickSource.primaryCTA.rawValue
+        )
+    }
+
+    public func trackClick(
+        adId: String,
+        apiKey: String,
+        interactionId: String,
+        clickSource: String
+    ) async {
         guard !adId.isEmpty else { return }
         guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/click") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        let normalizedSource = ClickSource(rawValue: clickSource)?.rawValue ?? ClickSource.primaryCTA.rawValue
+        request.setValue(interactionId, forHTTPHeaderField: "X-Simula-Click-Event-Id")
+        request.setValue(normalizedSource, forHTTPHeaderField: "X-Simula-Click-Source")
 
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
         do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
@@ -1680,12 +1697,36 @@ public final class SimulaAPI: @unchecked Sendable {
         apiKey: String,
         metadata: [String: String]? = nil
     ) async throws -> Int {
+        try await sendImpressionBeacon(
+            adId: adId,
+            action: action,
+            apiKey: apiKey,
+            metadata: metadata,
+            interactionId: nil,
+            clickSource: nil
+        )
+    }
+
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]? = nil,
+        interactionId: String?,
+        clickSource: String?
+    ) async throws -> Int {
         guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/\(action)") else {
             throw SimulaAPIError.invalidURL
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        if action == "click",
+           let interactionId, !interactionId.isEmpty,
+           let clickSource, !clickSource.isEmpty {
+            request.setValue(interactionId, forHTTPHeaderField: "X-Simula-Click-Event-Id")
+            request.setValue(clickSource, forHTTPHeaderField: "X-Simula-Click-Source")
+        }
         if action == "seen", let metadata, !metadata.isEmpty {
             request.httpBody = try JSONEncoder().encode(["metadata": metadata])
         }

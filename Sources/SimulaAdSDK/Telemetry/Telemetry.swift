@@ -31,6 +31,20 @@ struct TelemetryInitialization: Equatable, Sendable {
     let enabled: Bool
 }
 
+final class TelemetryBackgroundFlushObserver: @unchecked Sendable {
+    private let center: NotificationCenter
+    private var token: NSObjectProtocol?
+
+    init(center: NotificationCenter = .default, name: Notification.Name, flush: @escaping @Sendable () -> Void) {
+        self.center = center
+        token = center.addObserver(forName: name, object: nil, queue: nil) { _ in flush() }
+    }
+
+    deinit {
+        if let token { center.removeObserver(token) }
+    }
+}
+
 /// Process-wide facade for in-house telemetry (handled errors + performance), mirroring the
 /// singleton style of `SimulaPrivacy` / `RewardVerificationManager`. All record calls are cheap
 /// no-ops until `initialize` installs a `TelemetryManager`, and a true no-op forever when the
@@ -52,6 +66,7 @@ final class Telemetry: @unchecked Sendable {
     private var manager: TelemetryManager?
     private var initializationTask: Task<TelemetryInitialization, Never>?
     private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
+    private var backgroundFlushObserver: TelemetryBackgroundFlushObserver?
 
     init(managerFactory: @escaping ManagerFactory = Telemetry.defaultManagerFactory) {
         self.managerFactory = managerFactory
@@ -99,6 +114,14 @@ final class Telemetry: @unchecked Sendable {
     private func publish(_ manager: TelemetryManager) -> Int {
         lock.lock()
         self.manager = manager
+        #if canImport(UIKit)
+        if backgroundFlushObserver == nil {
+            backgroundFlushObserver = TelemetryBackgroundFlushObserver(
+                name: UIApplication.didEnterBackgroundNotification,
+                flush: { [weak self] in self?.flush() }
+            )
+        }
+        #endif
         let duplicateCount = duplicateInitializeCount.drain()
         lock.unlock()
         return duplicateCount
@@ -240,6 +263,28 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
+    func recordLifecycle(
+        stage: String,
+        adFormat: String? = nil,
+        adUnitId: String? = nil,
+        adId: String? = nil,
+        serveId: String? = nil,
+        durationMs: Int? = nil,
+        errorCode: String? = nil,
+        trigger: String? = nil,
+        cacheSource: String? = nil,
+        breadcrumb: String? = nil,
+        interactionId: String,
+        clickSource: ClickSource
+    ) {
+        current?.recordLifecycle(
+            stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
+            serveId: serveId, durationMs: durationMs, errorCode: errorCode,
+            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb,
+            interactionId: interactionId, clickSource: clickSource.rawValue
+        )
+    }
+
     func recordError(
         signature: String,
         errorCode: String? = nil,
@@ -260,6 +305,21 @@ final class Telemetry: @unchecked Sendable {
 
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
+
+    func afterPendingPersistence(
+        timeout: TimeInterval,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        guard let current else {
+            completion()
+            return
+        }
+        current.afterPendingPersistence(timeout: timeout, completion: completion)
+    }
+
+    func afterPendingPersistence(_ completion: @escaping @Sendable () -> Void) {
+        afterPendingPersistence(timeout: 0.35, completion: completion)
+    }
 
     /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
     func setExperiment(experimentId: String?, variantId: String?) {

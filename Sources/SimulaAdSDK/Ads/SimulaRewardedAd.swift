@@ -395,10 +395,19 @@ public final class SimulaRewardedAd {
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
-            onClick: { [weak self] in
+            onClick: { [weak self] interaction in
                 guard let self else { return }
                 // CLICKED — a user-gesture CTA / store-prompt tap (parity with the interstitial).
-                Telemetry.shared.recordLifecycle(stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: nil,
+                    interactionId: interaction.id, clickSource: interaction.source
+                )
+                AdBeaconManager.shared.enqueue(
+                    impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
+                    adUnitId: self.adUnitId, interactionId: interaction.id,
+                    clickSource: interaction.source.rawValue
+                )
                 self.delegate?.rewardedDidClick(self)
             },
             onImpression: { [weak self] in
@@ -583,7 +592,7 @@ public final class SimulaRewardedAd {
             destination: .appstore,
             storeOpen: .skstoreproduct,
             previewHTML: Self.previewMinigameHTML,
-            onClick: { [weak self] in
+            onClick: { [weak self] _ in
                 // Preview is local-only: surface the click callback, no telemetry.
                 guard let self else { return }
                 self.delegate?.rewardedDidClick(self)
@@ -867,7 +876,15 @@ public final class SimulaRewardedAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) },
+            onAdClick: { [weak self] interaction in
+                guard let self else { return }
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: nil,
+                    interactionId: interaction.id, clickSource: .fallbackCTA
+                )
+                self.delegate?.rewardedDidClick(self)
+            },
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] in
@@ -922,7 +939,15 @@ public final class SimulaRewardedAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
             onAutoStoreRedirect: onAutoStoreRedirect,
-            onAdClick: { [weak self] in guard let self else { return }; self.delegate?.rewardedDidClick(self) },
+            onAdClick: { [weak self] interaction in
+                guard let self else { return }
+                Telemetry.shared.recordLifecycle(
+                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    adId: response.impressionId, serveId: nil,
+                    interactionId: interaction.id, clickSource: .fallbackCTA
+                )
+                self.delegate?.rewardedDidClick(self)
+            },
             presentationLease: presentationLease
         ) { [weak self] in
             self?.fallbackPresenter = nil

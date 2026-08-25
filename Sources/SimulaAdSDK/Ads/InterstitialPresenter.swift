@@ -48,7 +48,7 @@ final class InterstitialPresenter {
     func present(
         apiKey: String,
         response: AdLoadResponse,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -98,6 +98,23 @@ final class InterstitialPresenter {
         // where `.hideStatusBar(true)` in the creative view is a no-op. No-op in native hosts.
         SimulaAppStatusBar.hide()
         return true
+    }
+
+    @discardableResult
+    func present(
+        apiKey: String,
+        response: AdLoadResponse,
+        onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
+        onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
+    ) -> Bool {
+        present(
+            apiKey: apiKey,
+            response: response,
+            onClick: { _ in onClick() },
+            onImpression: onImpression,
+            onClose: onClose
+        )
     }
 
     /// Fires the CLOSED callback, then tears down the presentation window — in that order.
@@ -171,7 +188,7 @@ private struct CreativeInterstitialView: View {
     let response: AdLoadResponse
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
-    let onClick: () -> Void
+    let onClick: (ClickInteraction) -> Void
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onRequestDismiss: () -> Void
@@ -233,7 +250,7 @@ private struct CreativeInterstitialView: View {
         apiKey: String,
         response: AdLoadResponse,
         bridge: CreativeBridge,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
@@ -287,7 +304,7 @@ private struct CreativeInterstitialView: View {
             // the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 // Center the badge in the same 44pt touch-target band as the close button (so they line up).
-                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { onClick(); trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { handleStorePromptClick() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -308,7 +325,13 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
-            if storeExit == nil { storeExit = StoreExitTracker(adId: response.impressionId, adFormat: "interstitial") }
+            if storeExit == nil {
+                storeExit = StoreExitTracker(
+                    adId: response.impressionId,
+                    adFormat: "interstitial",
+                    adUnitId: response.adUnitId
+                )
+            }
             startGate()
             startImpressionTimer()
             startStorePromptTrigger()
@@ -374,7 +397,15 @@ private struct CreativeInterstitialView: View {
         guard !autoRedirectFired else { return }
         autoRedirectFired = true
         storeExit?.recordStoreOpen("auto_redirect")
-        handleStorePromptTap()
+        let interaction = ClickInteraction(source: .autoRedirect)
+        Telemetry.shared.recordLifecycle(
+            stage: "click", adFormat: "interstitial", adUnitId: response.adUnitId,
+            adId: response.impressionId, serveId: response.impressionId,
+            interactionId: interaction.id, clickSource: interaction.source
+        )
+        ClickHandoffPersistence.wait(interaction: interaction, beaconImpressionId: nil) {
+            DispatchQueue.main.async { handleStorePromptTap() }
+        }
     }
 
     /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
@@ -393,7 +424,8 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onAdClick: { handleHtmlClick() },
+            onAdClick: { handleHtmlClick($0) },
+            clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
             attribution: response.skanAttribution,
             ctaTrackingUrl: response.trackingUrl,
@@ -415,8 +447,8 @@ private struct CreativeInterstitialView: View {
     /// still-live interstitial window), so here we only emit CLICKED and, when configured, present
     /// an `on_click`-timed SKOverlay. We intentionally do NOT auto-dismiss: tearing the window down
     /// would destroy the just-presented sheet. Dismissal is driven by the close button.
-    private func handleHtmlClick() {
-        onClick() // CLICKED
+    private func handleHtmlClick(_ interaction: ClickInteraction) {
+        onClick(interaction) // CLICKED
         storeExit?.recordStoreOpen("cta") // the creative CTA opens the advertiser store
         presentSKOverlayOnClickIfNeeded()
     }
@@ -598,11 +630,16 @@ private struct CreativeInterstitialView: View {
         )
     }
 
-    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
-    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
-    private func trackStorePromptClick() {
-        // Durable click beacon (was a fire-and-forget trackClick).
-        AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "click", adFormat: "interstitial")
+    private func handleStorePromptClick() {
+        let interaction = ClickInteraction(source: .storePrompt)
+        onClick(interaction)
+        storeExit?.recordStoreOpen("store_prompt")
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: response.impressionId
+        ) {
+            DispatchQueue.main.async { handleStorePromptTap() }
+        }
     }
 
     // MARK: SKOverlay (install banner)

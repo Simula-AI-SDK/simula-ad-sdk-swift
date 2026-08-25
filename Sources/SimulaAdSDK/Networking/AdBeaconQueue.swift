@@ -13,6 +13,8 @@ struct PendingBeacon: Codable, Equatable {
     let impressionId: String
     let action: String
     let metadata: [String: String]?
+    let interactionId: String?
+    let clickSource: String?
     var retryCount: Int = 0
     var lastAttemptTimestamp: Double = 0
 
@@ -24,10 +26,34 @@ struct PendingBeacon: Codable, Equatable {
         retryCount: Int = 0,
         lastAttemptTimestamp: Double = 0
     ) {
+        self.init(
+            id: id,
+            impressionId: impressionId,
+            action: action,
+            metadata: metadata,
+            interactionId: nil,
+            clickSource: nil,
+            retryCount: retryCount,
+            lastAttemptTimestamp: lastAttemptTimestamp
+        )
+    }
+
+    init(
+        id: String? = UUID().uuidString,
+        impressionId: String,
+        action: String,
+        metadata: [String: String]? = nil,
+        interactionId: String?,
+        clickSource: String?,
+        retryCount: Int = 0,
+        lastAttemptTimestamp: Double = 0
+    ) {
         self.id = id
         self.impressionId = impressionId
         self.action = action
         self.metadata = metadata
+        self.interactionId = interactionId
+        self.clickSource = clickSource
         self.retryCount = retryCount
         self.lastAttemptTimestamp = lastAttemptTimestamp
     }
@@ -42,8 +68,28 @@ protocol BeaconSending: Sendable {
         adId: String,
         action: String,
         apiKey: String,
-        metadata: [String: String]?
+        metadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
     ) async throws -> Int
+}
+
+extension BeaconSending {
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]?
+    ) async throws -> Int {
+        try await sendImpressionBeacon(
+            adId: adId,
+            action: action,
+            apiKey: apiKey,
+            metadata: metadata,
+            interactionId: nil,
+            clickSource: nil
+        )
+    }
 }
 
 extension SimulaAPI: BeaconSending {}
@@ -54,11 +100,9 @@ extension SimulaAPI: BeaconSending {}
 /// reliably and off the UI path — the same durable, conflict-free design as `RewardVerificationManager`.
 /// The ad fires-and-forgets into this queue; the queue owns delivery.
 ///
-/// - Deduped: at most one in-flight entry per `(impressionId, action)`. Retries only happen for sends
-///   that did NOT get a 2xx, so a beacon the server already accepted isn't re-sent. (`/seen` is deduped
-///   server-side per impression; `/click` increments a counter, so a lost-response retry carries a small
-///   over-count risk — acceptable vs. today's silent loss, removable once the endpoint takes an
-///   idempotency key.)
+/// - Deduped: shown/seen use `(impressionId, action)`; each click uses its stable interaction id.
+///   Retries only happen for sends that did NOT get a terminal response, and click retries carry the
+///   same event-id header so the backend can reconcile a lost response idempotently.
 /// - Durable: atomically persisted under Application Support; survives relaunch and migrates the
 ///   exact legacy `simula_pending_beacons` UserDefaults entry once.
 /// - Backed off: failed attempts retry with the shared exponential backoff (5s → 60s cap).
@@ -71,6 +115,7 @@ public final class AdBeaconManager: @unchecked Sendable {
     private struct BeaconKey: Hashable {
         let impressionId: String
         let action: String
+        let interactionId: String?
     }
 
     private let sender: BeaconSending
@@ -94,6 +139,8 @@ public final class AdBeaconManager: @unchecked Sendable {
     private var retryTask: Task<Void, Never>?
     private var startupTriggerTask: Task<Void, Never>?
     private var pendingRemovalKeys: Set<BeaconKey> = []
+    private var durableKeys: Set<BeaconKey> = []
+    private var persistenceWaiters: [UUID: (key: BeaconKey, completion: @Sendable () -> Void)] = [:]
     private var pendingNetworkRetryDelay: TimeInterval?
     private let maxPendingEnqueues = 100
 
@@ -163,13 +210,64 @@ public final class AdBeaconManager: @unchecked Sendable {
         adUnitId: String? = nil,
         metadata: [String: String]? = nil
     ) {
+        enqueueInternal(
+            impressionId: impressionId,
+            action: action,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            metadata: metadata,
+            interactionId: nil,
+            clickSource: nil
+        )
+    }
+
+    public func enqueue(
+        impressionId: String,
+        action: String,
+        adFormat: String? = nil,
+        adUnitId: String? = nil,
+        metadata: [String: String]? = nil,
+        interactionId: String,
+        clickSource: String
+    ) {
+        enqueueInternal(
+            impressionId: impressionId,
+            action: action,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            metadata: metadata,
+            interactionId: interactionId,
+            clickSource: clickSource
+        )
+    }
+
+    private func enqueueInternal(
+        impressionId: String,
+        action: String,
+        adFormat: String?,
+        adUnitId: String?,
+        metadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
+    ) {
         guard !impressionId.isEmpty else { return }
         let normalizedMetadata = action == "seen" ? metadata.flatMap { normalizeExtraParameters($0) } : nil
+        let resolvedInteractionId = action == "click"
+            ? ((interactionId?.isEmpty == false) ? interactionId : UUID().uuidString)
+            : nil
+        let normalizedClickSource = clickSource.flatMap(ClickSource.init(rawValue:)) ?? .primaryCTA
+        let resolvedClickSource = action == "click" ? normalizedClickSource.rawValue : nil
         switch action {
         case "seen":
             Telemetry.shared.recordLifecycle(stage: "impression_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId)
         case "click":
-            Telemetry.shared.recordLifecycle(stage: "click_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId)
+            if let resolvedInteractionId {
+                Telemetry.shared.recordLifecycle(
+                    stage: "click_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId,
+                    serveId: adFormat == "interstitial" ? impressionId : nil,
+                    interactionId: resolvedInteractionId, clickSource: normalizedClickSource
+                )
+            }
         default:
             break
         }
@@ -177,24 +275,60 @@ public final class AdBeaconManager: @unchecked Sendable {
             self?.enqueueOnExecutor(
                 impressionId: impressionId,
                 action: action,
-                normalizedMetadata: normalizedMetadata
+                normalizedMetadata: normalizedMetadata,
+                interactionId: resolvedInteractionId,
+                clickSource: resolvedClickSource
             )
+        }
+    }
+
+    /// Waits until this click row has reached durable storage. The timeout always releases the
+    /// caller, so a broken filesystem cannot swallow the user's external navigation.
+    func afterClickPersistence(
+        impressionId: String,
+        interactionId: String,
+        timeout: TimeInterval,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        guard !impressionId.isEmpty, !interactionId.isEmpty else {
+            completion()
+            return
+        }
+        let gate = BoundedCompletion(completion)
+        let waiterId = UUID()
+        let key = BeaconKey(impressionId: impressionId, action: "click", interactionId: interactionId)
+        executor.async { [weak self] in
+            guard let self else { gate.complete(); return }
+            if self.clickPersistenceSatisfied(key) {
+                gate.complete()
+            } else {
+                self.persistenceWaiters[waiterId] = (key, { gate.complete() })
+            }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0, timeout)) { [weak self] in
+            gate.complete()
+            self?.executor.async { self?.persistenceWaiters[waiterId] = nil }
         }
     }
 
     private func enqueueOnExecutor(
         impressionId: String,
         action: String,
-        normalizedMetadata: [String: String]?
+        normalizedMetadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
     ) {
         guard loadIfNeeded() else {
-            enqueuePending(impressionId: impressionId, action: action, metadata: normalizedMetadata)
+            enqueuePending(
+                impressionId: impressionId, action: action, metadata: normalizedMetadata,
+                interactionId: interactionId, clickSource: clickSource
+            )
             return
         }
-        let key = BeaconKey(impressionId: impressionId, action: action)
+        let key = BeaconKey(impressionId: impressionId, action: action, interactionId: interactionId)
         guard !pendingRemovalKeys.contains(key) else { return }
         var changed = false
-        if let index = queue.firstIndex(where: { $0.impressionId == impressionId && $0.action == action }) {
+        if let index = queue.firstIndex(where: { beaconKey($0) == key }) {
             if let normalizedMetadata {
                 var shouldWarnForMergedMetadata = false
                 let merged = mergeExtraParameters(
@@ -207,6 +341,8 @@ public final class AdBeaconManager: @unchecked Sendable {
                         impressionId: queue[index].impressionId,
                         action: queue[index].action,
                         metadata: merged,
+                        interactionId: queue[index].interactionId,
+                        clickSource: queue[index].clickSource,
                         retryCount: queue[index].retryCount,
                         lastAttemptTimestamp: queue[index].lastAttemptTimestamp
                     )
@@ -215,7 +351,10 @@ public final class AdBeaconManager: @unchecked Sendable {
                 if shouldWarnForMergedMetadata { warnInvalidExtraParameters() }
             }
         } else {
-            queue.append(PendingBeacon(impressionId: impressionId, action: action, metadata: normalizedMetadata))
+            queue.append(PendingBeacon(
+                impressionId: impressionId, action: action, metadata: normalizedMetadata,
+                interactionId: interactionId, clickSource: clickSource
+            ))
             changed = true
         }
         if changed {
@@ -270,7 +409,9 @@ public final class AdBeaconManager: @unchecked Sendable {
                 adId: task.impressionId,
                 action: task.action,
                 apiKey: apiKey,
-                metadata: task.metadata
+                metadata: task.metadata,
+                interactionId: task.interactionId,
+                clickSource: task.clickSource
             )
             delivered = (200...299).contains(code) || ((400...499).contains(code) && code != 408 && code != 429)
         } catch {
@@ -288,7 +429,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         }
         if let index {
             if delivered {
-                pendingRemovalKeys.insert(BeaconKey(impressionId: task.impressionId, action: task.action))
+                pendingRemovalKeys.insert(beaconKey(task))
                 queue.remove(at: index)
             } else {
                 if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
@@ -350,11 +491,25 @@ public final class AdBeaconManager: @unchecked Sendable {
 
     @discardableResult
     private func attemptLoad() -> Bool {
+        var migratedClickRecords = false
         switch store.load() {
         case .missing:
             queue = []
         case .loaded(let records):
-            queue = records
+            // Legacy click rows intentionally remain headerless. Assigning a new event id after an
+            // upgrade could double-count a click whose accepted response was lost before persistence.
+            queue = records.map { record in
+                guard record.action == "click", let interactionId = record.interactionId,
+                      !interactionId.isEmpty else { return record }
+                let source = record.clickSource.flatMap(ClickSource.init(rawValue:)) ?? .primaryCTA
+                let normalized = PendingBeacon(
+                    id: record.id, impressionId: record.impressionId, action: record.action,
+                    metadata: record.metadata, interactionId: interactionId, clickSource: source.rawValue,
+                    retryCount: record.retryCount, lastAttemptTimestamp: record.lastAttemptTimestamp
+                )
+                if normalized != record { migratedClickRecords = true }
+                return normalized
+            }
         case .failed:
             loadRetryCount += 1
             Telemetry.shared.recordError(signature: "beacon:load_failed")
@@ -362,12 +517,13 @@ public final class AdBeaconManager: @unchecked Sendable {
             return false
         }
         isLoaded = true
+        durableKeys = Set(queue.map(beaconKey))
         loadRetryCount = 0
         loadRetryTask?.cancel()
         loadRetryTask = nil
         let hadPending = !pendingQueue.isEmpty
         mergePendingQueue()
-        if hadPending {
+        if hadPending || migratedClickRecords {
             isDirty = true
             persistIfNeeded()
         } else {
@@ -380,10 +536,12 @@ public final class AdBeaconManager: @unchecked Sendable {
         guard isDirty, isLoaded, persistenceRetryTask == nil else { return }
         if store.save(queue) {
             isDirty = false
+            durableKeys = Set(queue.map(beaconKey))
             persistenceRetryCount = 0
             persistenceRetryTask?.cancel()
             persistenceRetryTask = nil
             durabilityCommitted()
+            resolvePersistenceWaiters()
         } else {
             persistenceRetryCount += 1
             Telemetry.shared.recordError(signature: "beacon:persist_failed")
@@ -417,10 +575,15 @@ public final class AdBeaconManager: @unchecked Sendable {
         }
     }
 
-    private func enqueuePending(impressionId: String, action: String, metadata: [String: String]?) {
-        if let index = pendingQueue.firstIndex(where: {
-            $0.impressionId == impressionId && $0.action == action
-        }) {
+    private func enqueuePending(
+        impressionId: String,
+        action: String,
+        metadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
+    ) {
+        let key = BeaconKey(impressionId: impressionId, action: action, interactionId: interactionId)
+        if let index = pendingQueue.firstIndex(where: { beaconKey($0) == key }) {
             guard let metadata else { return }
             let merged = mergeExtraParameters(existing: pendingQueue[index].metadata, newest: metadata)
             if merged != pendingQueue[index].metadata {
@@ -428,6 +591,8 @@ public final class AdBeaconManager: @unchecked Sendable {
                     impressionId: impressionId,
                     action: action,
                     metadata: merged,
+                    interactionId: pendingQueue[index].interactionId,
+                    clickSource: pendingQueue[index].clickSource,
                     retryCount: pendingQueue[index].retryCount,
                     lastAttemptTimestamp: pendingQueue[index].lastAttemptTimestamp
                 )
@@ -440,15 +605,16 @@ public final class AdBeaconManager: @unchecked Sendable {
                 )
                 return
             }
-            pendingQueue.append(PendingBeacon(impressionId: impressionId, action: action, metadata: metadata))
+            pendingQueue.append(PendingBeacon(
+                impressionId: impressionId, action: action, metadata: metadata,
+                interactionId: interactionId, clickSource: clickSource
+            ))
         }
     }
 
     private func mergePendingQueue() {
         for pending in pendingQueue {
-            if let index = queue.firstIndex(where: {
-                $0.impressionId == pending.impressionId && $0.action == pending.action
-            }) {
+            if let index = queue.firstIndex(where: { beaconKey($0) == beaconKey(pending) }) {
                 guard let metadata = pending.metadata else { continue }
                 let merged = mergeExtraParameters(existing: queue[index].metadata, newest: metadata)
                 if merged != queue[index].metadata {
@@ -456,6 +622,8 @@ public final class AdBeaconManager: @unchecked Sendable {
                         impressionId: queue[index].impressionId,
                         action: queue[index].action,
                         metadata: merged,
+                        interactionId: queue[index].interactionId,
+                        clickSource: queue[index].clickSource,
                         retryCount: queue[index].retryCount,
                         lastAttemptTimestamp: queue[index].lastAttemptTimestamp
                     )
@@ -465,6 +633,29 @@ public final class AdBeaconManager: @unchecked Sendable {
             }
         }
         pendingQueue.removeAll()
+    }
+
+    private func beaconKey(_ beacon: PendingBeacon) -> BeaconKey {
+        BeaconKey(
+            impressionId: beacon.impressionId,
+            action: beacon.action,
+            interactionId: beacon.action == "click" ? beacon.interactionId : nil
+        )
+    }
+
+    private func clickPersistenceSatisfied(_ key: BeaconKey) -> Bool {
+        if durableKeys.contains(key) { return true }
+        guard isLoaded else { return false }
+        return !queue.contains { beaconKey($0) == key }
+            && !pendingQueue.contains { beaconKey($0) == key }
+    }
+
+    private func resolvePersistenceWaiters() {
+        let ready = persistenceWaiters.filter { clickPersistenceSatisfied($0.value.key) }
+        for (id, waiter) in ready {
+            persistenceWaiters[id] = nil
+            waiter.completion()
+        }
     }
 
     private func scheduleLoadRetry() {

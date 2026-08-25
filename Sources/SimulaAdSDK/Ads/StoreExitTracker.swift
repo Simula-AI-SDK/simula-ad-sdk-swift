@@ -18,6 +18,7 @@ final class StoreExitTracker {
     private let adId: String?
     private let adFormat: String?
     private let adUnitId: String?
+    private var serveId: String? { adFormat == "interstitial" ? adId : nil }
 
     private var foregroundMs: Double = 0
     private var resumedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -41,7 +42,7 @@ final class StoreExitTracker {
         pendingTrigger = trigger
         Telemetry.shared.recordLifecycle(
             stage: "store_opened", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: Int(dwellMs), errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: Int(dwellMs), errorCode: nil, trigger: trigger
         )
     }
 
@@ -73,7 +74,7 @@ final class StoreExitTracker {
         pendingTrigger = nil
         Telemetry.shared.recordLifecycle(
             stage: "store_returned", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: Int(max(0, now - openedAt) * 1000), errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: Int(max(0, now - openedAt) * 1000), errorCode: nil, trigger: trigger
         )
     }
 
@@ -83,7 +84,7 @@ final class StoreExitTracker {
         pendingTrigger = nil
         Telemetry.shared.recordLifecycle(
             stage: "store_abandoned", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: nil, errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: nil, errorCode: nil, trigger: trigger
         )
     }
 }

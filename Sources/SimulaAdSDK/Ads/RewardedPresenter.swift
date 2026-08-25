@@ -49,7 +49,7 @@ final class RewardedPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -111,6 +111,45 @@ final class RewardedPresenter {
         // where `.hideStatusBar(true)` in the creative view is a no-op. No-op in native hosts.
         SimulaAppStatusBar.hide()
         return true
+    }
+
+    @discardableResult
+    func present(
+        impressionId: String,
+        apiKey: String,
+        iframeUrl: String,
+        renderedHtml: String = "",
+        close: CloseBehavior? = nil,
+        storePrompt: StorePrompt? = nil,
+        trackingUrl: String? = nil,
+        destination: AdDestination = .appstore,
+        storeOpen: StoreOpen = .skstoreproduct,
+        storeUrl: String? = nil,
+        attribution: AdAttribution? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        previewHTML: String? = nil,
+        onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
+        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
+    ) -> Bool {
+        present(
+            impressionId: impressionId,
+            apiKey: apiKey,
+            iframeUrl: iframeUrl,
+            renderedHtml: renderedHtml,
+            close: close,
+            storePrompt: storePrompt,
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeOpen: storeOpen,
+            storeUrl: storeUrl,
+            attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
+            previewHTML: previewHTML,
+            onClick: { _ in onClick() },
+            onImpression: onImpression,
+            onClose: onClose
+        )
     }
 
     /// Fires the close callback, then tears down the presentation window — in that order, so the
@@ -203,7 +242,7 @@ private struct RewardedGameView: View {
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
     /// Fired on a user-gesture CTA / store-prompt tap (the CLICKED signal); parity with the interstitial.
-    let onClick: () -> Void
+    let onClick: (ClickInteraction) -> Void
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onFinish: (Bool, Double) -> Void
@@ -261,14 +300,14 @@ private struct RewardedGameView: View {
             // an in-playable CTA opens the store deterministically (in-app sheet + background
             // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -292,7 +331,7 @@ private struct RewardedGameView: View {
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
                 // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
                 // touch-target band so the two share one centerline (parity with the interstitial).
-                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { onClick(); trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { handleStorePromptClick() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
@@ -472,8 +511,8 @@ private struct RewardedGameView: View {
     /// store-exit funnel (the creative's CTA opens the advertiser store). Mirrors the interstitial's
     /// `handleHtmlClick` (minus SKOverlay — the rewarded uses post-close fallback ads instead). The
     /// WebView coordinator does the actual store routing.
-    private func handleHtmlClick() {
-        onClick()
+    private func handleHtmlClick(_ interaction: ClickInteraction) {
+        onClick(interaction)
         storeExit?.recordStoreOpen("cta")
     }
 
@@ -482,11 +521,16 @@ private struct RewardedGameView: View {
         CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
     }
 
-    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
-    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
-    private func trackStorePromptClick() {
-        // Durable click beacon (was a fire-and-forget trackClick).
-        AdBeaconManager.shared.enqueue(impressionId: impressionId, action: "click", adFormat: "rewarded")
+    private func handleStorePromptClick() {
+        let interaction = ClickInteraction(source: .storePrompt)
+        onClick(interaction)
+        storeExit?.recordStoreOpen("store_prompt")
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: impressionId
+        ) {
+            DispatchQueue.main.async { handleStorePromptTap() }
+        }
     }
 
     // MARK: Close

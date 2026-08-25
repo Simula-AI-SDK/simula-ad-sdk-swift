@@ -34,8 +34,8 @@ enum SKOverlayPresenter {
         // postback when the overlay drives the install. The SKAdImpression initializer is iOS
         // 16+, and older servers omit the view signature; both cases fall back to the
         // undocumented `setAdditionalValue` conveyance with the shared
-        // `SKStoreProductParameterAdNetwork*` keys. The MMP click for this engagement is fired
-        // separately when the app id is resolved (`is_skoverlay=true`).
+        // `SKStoreProductParameterAdNetwork*` keys. App-id resolution is side-effect free; StoreKit
+        // owns any later user engagement with the install banner.
         if let campaign = attribution?.campaignToken, !campaign.isEmpty { appConfig.campaignToken = campaign }
         if let provider = attribution?.providerToken, !provider.isEmpty { appConfig.providerToken = provider }
         if #available(iOS 16.0, *), let impression = Self.adImpression(appID: appID, attribution: attribution) {

@@ -227,13 +227,19 @@ private func waitForNativeAdDisplayFrame() async {
 /// closure when the view is handed out. The closure captures the coordinator
 /// weakly, so it introduces no retain cycle through the content controller.
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
+    static let trustedActivationMessage = "__simula_trusted_user_activation__"
     var onMessage: ((String) -> Void)?
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        if message.name == WebViewPool.userActivationHandlerName {
+            onMessage?(Self.trustedActivationMessage)
+            return
+        }
         if let body = message.body as? String {
+            guard body != Self.trustedActivationMessage else { return }
             onMessage?(body)
         } else if let dict = message.body as? [String: Any],
                   let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -261,6 +267,7 @@ final class WebViewPool {
 
     /// JS → native channel name. Must match the injected script below.
     static let messageHandlerName = "simulaSDK"
+    static let userActivationHandlerName = "simulaUserActivation"
 
     private struct Pooled {
         let webView: WKWebView
@@ -365,6 +372,22 @@ final class WebViewPool {
         forMainFrameOnly: false
     )
 
+    /// Isolated-world listener for a genuine pointer activation. Creative JavaScript cannot access
+    /// this message handler or forge `Event.isTrusted`; the short-lived native marker lets
+    /// user-triggered `window.open()` through even when WebKit labels its navigation type `.other`.
+    private static let userActivationScript = WKUserScript(
+        source: """
+        window.addEventListener('pointerdown', function(event) {
+            if (!event.isTrusted) { return; }
+            if (navigator.userActivation && !navigator.userActivation.isActive) { return; }
+            window.webkit.messageHandlers.simulaUserActivation.postMessage('active');
+        }, true);
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false,
+        in: .defaultClient
+    )
+
     private func makePooled() -> Pooled {
         let interval = signposter.beginInterval("WebViewCreate")
         defer { signposter.endInterval("WebViewCreate", interval) }
@@ -372,8 +395,14 @@ final class WebViewPool {
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
+        controller.add(
+            forwarder,
+            contentWorld: .defaultClient,
+            name: WebViewPool.userActivationHandlerName
+        )
         controller.addUserScript(WebViewPool.postMessageScript)
         controller.addUserScript(WebViewPool.errorCaptureScript)
+        controller.addUserScript(WebViewPool.userActivationScript)
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true

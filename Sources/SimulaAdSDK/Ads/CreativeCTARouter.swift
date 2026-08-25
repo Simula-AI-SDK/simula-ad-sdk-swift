@@ -1,5 +1,120 @@
 import Foundation
 
+final class BoundedCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: (@Sendable () -> Void)?
+
+    init(_ completion: @escaping @Sendable () -> Void) {
+        self.completion = completion
+    }
+
+    func complete() {
+        lock.lock()
+        let callback = completion
+        completion = nil
+        lock.unlock()
+        callback?()
+    }
+}
+
+final class CompletionLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: Int
+    private var completion: (@Sendable () -> Void)?
+
+    init(count: Int, completion: @escaping @Sendable () -> Void) {
+        self.remaining = max(1, count)
+        self.completion = completion
+    }
+
+    func satisfy() {
+        lock.lock()
+        guard completion != nil else { lock.unlock(); return }
+        remaining -= 1
+        guard remaining <= 0 else { lock.unlock(); return }
+        let callback = completion
+        completion = nil
+        lock.unlock()
+        callback?()
+    }
+}
+
+enum ClickSource: String, Codable, Sendable {
+    case primaryCTA = "primary_cta"
+    case storePrompt = "store_prompt"
+    case installBanner = "install_banner"
+    case fallbackCTA = "fallback_cta"
+    case autoRedirect = "auto_redirect"
+}
+
+struct ClickInteraction: Equatable, Sendable {
+    let id: String
+    let source: ClickSource
+
+    init(id: String = UUID().uuidString, source: ClickSource) {
+        self.id = id
+        self.source = source
+    }
+}
+
+enum ClickHandoffPersistence {
+    static let timeout: TimeInterval = 0.35
+
+    static func wait(
+        interaction: ClickInteraction,
+        beaconImpressionId: String?,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        let bounded = BoundedCompletion(completion)
+        let requiresBeacon = beaconImpressionId?.isEmpty == false
+        let latch = CompletionLatch(count: requiresBeacon ? 2 : 1) { bounded.complete() }
+
+        Telemetry.shared.afterPendingPersistence(timeout: timeout) { latch.satisfy() }
+        if let beaconImpressionId, !beaconImpressionId.isEmpty {
+            AdBeaconManager.shared.afterClickPersistence(
+                impressionId: beaconImpressionId,
+                interactionId: interaction.id,
+                timeout: timeout
+            ) { latch.satisfy() }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+            bounded.complete()
+        }
+    }
+}
+
+/// Pure one-gesture claim shared by both WebKit delegate paths. The coordinator is main-actor
+/// isolated, so claiming the callback and destination route through this value is atomic.
+struct CreativeClickClaim {
+    private var lastClaimUptime: TimeInterval = -1
+
+    mutating func claim(
+        userActivated: Bool,
+        source: ClickSource,
+        now: TimeInterval,
+        interactionId: String = UUID().uuidString
+    ) -> ClickInteraction? {
+        guard userActivated, now - lastClaimUptime >= 0.5 else { return nil }
+        lastClaimUptime = now
+        return ClickInteraction(id: interactionId, source: source)
+    }
+}
+
+struct CreativeUserActivation {
+    private var trustedActivationUptime: TimeInterval?
+
+    mutating func noteTrustedActivation(now: TimeInterval) {
+        trustedActivationUptime = now
+    }
+
+    mutating func consume(explicitLinkActivation: Bool, now: TimeInterval) -> Bool {
+        defer { trustedActivationUptime = nil }
+        if explicitLinkActivation { return true }
+        guard let trustedActivationUptime else { return false }
+        return now - trustedActivationUptime >= 0 && now - trustedActivationUptime <= 1
+    }
+}
+
 /// Prefer the attribution URL carried outside rendered HTML, whose script text may HTML-escape
 /// query separators. Older payloads without a usable field keep using the creative's tapped URL.
 func preferredCreativeClickURL(trackingUrl: String?, fallback: URL) -> URL {
@@ -220,11 +335,10 @@ enum CreativeCTARouter {
     /// Resolves the advertised app's numeric App Store id (adamId) for `SKOverlay.AppConfiguration`.
     /// Resolution order mirrors the CTA paths (`open` / `routeCreativeTap`) exactly, so every store
     /// surface of one serve always lands on the SAME app id: (1) a tracking URL that is itself an
-    /// App Store link wins; (2) the serve's raw store link (`storeUrl` — deterministic, the
-    /// SKOverlay click still fires in the background); (3) an http(s) attribution tracker for a
-    /// store CTA falls back to following the redirect chain (the same `RedirectResolver` the CTA
-    /// uses) to the final App Store URL. Calls back with `nil` when none can be resolved (the
-    /// overlay then safely no-ops). The completion is always delivered on the main thread.
+    /// App Store link wins; (2) the serve's raw store link (`storeUrl`) supplies it directly.
+    /// A tracker redirect is intentionally not followed here because that request is click-classified;
+    /// when it is the only source, resolution returns nil and the overlay safely no-ops. The
+    /// completion is always delivered on the calling main thread.
     static func resolveAppStoreID(
         trackingUrl: String?,
         destination: AdDestination,
@@ -240,46 +354,17 @@ enum CreativeCTARouter {
             return
         }
         // (2) Deterministic path: the raw store link carries the id — no redirect resolution
-        // needed. The MMP click (flagged `is_skoverlay=true`, matching the resolver path below)
-        // still fires so the SKOverlay engagement is registered. Gated on an `.appstore`
+        // needed. Resolution is deliberately side-effect free: merely displaying an overlay is
+        // not a click. Gated on an `.appstore`
         // destination — a web campaign that happens to carry an ios_store_url must not surface
         // SKOverlay (the resolver fallback below returns nil for `.web`, and this branch must agree).
         if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
-            if let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) {
-                fireClickTracker(appendingQueryItem(url, name: "is_skoverlay", value: "true"))
-            }
             completion(appID)
             return
         }
-        guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
-            completion(nil)
-            return
-        }
-        // Only http(s) trackers for an appstore destination are worth resolving.
-        let scheme = url.scheme?.lowercased() ?? ""
-        guard destination == .appstore, scheme == "http" || scheme == "https" else {
-            completion(nil)
-            return
-        }
-
-        weak var resolverRef: RedirectResolver?
-        let resolver = RedirectResolver { finalURL in
-            DispatchQueue.main.async {
-                completion(appStoreID(from: finalURL))
-                if let r = resolverRef { activeResolvers.remove(r) }
-            }
-        }
-        resolverRef = resolver
-        activeResolvers.insert(resolver)
-        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
-        resolver.session = session
-        // This GET both resolves the advertised app id AND is the MMP click for the SKOverlay
-        // engagement — `is_skoverlay=true` tells AppsFlyer/Adjust it's an SKOverlay view/click (so it's
-        // matched to the StoreKit/SKAN install). Folding it into this one request avoids firing the
-        // tracker twice (and double-counting the click). `resolveAppStoreID` is only ever called for
-        // the SKOverlay flow, so flagging every request here is correct.
-        let clickURL = appendingQueryItem(url, name: "is_skoverlay", value: "true")
-        session.dataTask(with: URLRequest(url: clickURL)).resume()
+        // A tracker redirect can only be resolved by issuing its click-classified request. Skip the
+        // overlay instead of manufacturing engagement before the user taps it.
+        completion(nil)
     }
 
     // MARK: - Presentation
@@ -365,17 +450,6 @@ enum CreativeCTARouter {
             values[SKStoreProductParameterAdNetworkCampaignIdentifier] = NSNumber(value: campaignID)
         }
         return values
-    }
-
-    /// Appends a query item to `url` (no-op if the name is already present), used to fold
-    /// `is_skoverlay=true` into the SKOverlay click without disturbing the rest of the tracker URL.
-    nonisolated static func appendingQueryItem(_ url: URL, name: String, value: String) -> URL {
-        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        var items = comps.queryItems ?? []
-        guard !items.contains(where: { $0.name == name }) else { return url }
-        items.append(URLQueryItem(name: name, value: value))
-        comps.queryItems = items
-        return comps.url ?? url
     }
 
     /// Presents `SFSafariViewController` for external links.

@@ -29,7 +29,7 @@ public struct AdOverlayView: View {
     /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin so its click beacon stays same-origin.
     var html: String? = nil
     /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
-    var onAdClick: (() -> Void)? = nil
+    var onAdClick: ((ClickInteraction) -> Void)? = nil
     /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
     /// the in-app store sheet deterministically (tracker fired in the background) instead of
     /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
@@ -130,6 +130,7 @@ public struct AdOverlayView: View {
                                 onNavigationFinished: { adPageReady = true; adPageFailed = false },
                                 onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
                                 onAdClick: onAdClick,
+                                clickSource: .fallbackCTA,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
@@ -142,6 +143,7 @@ public struct AdOverlayView: View {
                                 onNavigationFinished: { adPageReady = true; adPageFailed = false },
                                 onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
                                 onAdClick: onAdClick,
+                                clickSource: .fallbackCTA,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,

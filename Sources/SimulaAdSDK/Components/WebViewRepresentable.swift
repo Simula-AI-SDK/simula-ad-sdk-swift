@@ -107,7 +107,11 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// Called when a user-initiated link inside the content is intercepted for
     /// routing (App Store / cross-domain click-through). Lets the imperative HTML
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
-    var onAdClick: (() -> Void)?
+    var onAdClick: ((ClickInteraction) -> Void)?
+    var clickSource: ClickSource
+    /// Non-nil only when the SDK owns this surface's backend click beacon. Native/fallback HTML
+    /// self-report and deliberately leave this nil.
+    var clickBeaconImpressionId: String?
 
     /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the
     /// creative are routed to it (and `GET_*` replies are posted back via the web view). `nil`
@@ -163,7 +167,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil,
+        onAdClick: ((ClickInteraction) -> Void)? = nil,
+        clickSource: ClickSource = .primaryCTA,
+        clickBeaconImpressionId: String? = nil,
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
@@ -183,6 +189,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.clickSource = clickSource
+        self.clickBeaconImpressionId = clickBeaconImpressionId
         self.bridge = bridge
         self.attribution = attribution
         self.externalClickOnly = externalClickOnly
@@ -193,6 +201,48 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.retainedImpressionId = retainedImpressionId
         self.telemetryAdFormat = telemetryAdFormat
         self.visibilityRelay = visibilityRelay
+    }
+
+    init(
+        url: URL? = nil,
+        htmlString: String? = nil,
+        baseURL: URL? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
+        onNavigationFinished: (() -> Void)? = nil,
+        onNavigationFailed: ((Error) -> Void)? = nil,
+        onMessageReceived: ((String) -> Void)? = nil,
+        onAdClick: (() -> Void)?,
+        bridge: CreativeBridge? = nil,
+        attribution: AdAttribution? = nil,
+        externalClickOnly: Bool = false,
+        ctaTrackingUrl: String? = nil,
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil,
+        reportsContentHeight: Bool = false,
+        retainedImpressionId: String? = nil,
+        telemetryAdFormat: String? = nil,
+        visibilityRelay: VisibilityRelay? = nil
+    ) {
+        self.init(
+            url: url,
+            htmlString: htmlString,
+            baseURL: baseURL,
+            onNavigationCommitted: onNavigationCommitted,
+            onNavigationFinished: onNavigationFinished,
+            onNavigationFailed: onNavigationFailed,
+            onMessageReceived: onMessageReceived,
+            onAdClick: onAdClick.map { callback in { _ in callback() } },
+            bridge: bridge,
+            attribution: attribution,
+            externalClickOnly: externalClickOnly,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl,
+            reportsContentHeight: reportsContentHeight,
+            retainedImpressionId: retainedImpressionId,
+            telemetryAdFormat: telemetryAdFormat,
+            visibilityRelay: visibilityRelay
+        )
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -256,6 +306,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onNavigationFailed = onNavigationFailed
         coordinator.onMessageReceived = onMessageReceived
         coordinator.onAdClick = onAdClick
+        coordinator.clickSource = clickSource
+        coordinator.clickBeaconImpressionId = clickBeaconImpressionId
         if coordinator.bridge !== bridge {
             coordinator.bridge?.stop()
             coordinator.bridge = bridge
@@ -388,6 +440,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
+            clickSource: clickSource,
+            clickBeaconImpressionId: clickBeaconImpressionId,
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
@@ -408,7 +462,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
-        var onAdClick: (() -> Void)?
+        var onAdClick: ((ClickInteraction) -> Void)?
+        var clickSource: ClickSource
+        var clickBeaconImpressionId: String?
         /// The WebView ↔ SDK bridge (PRD §3); `nil` for non-ad web views.
         var bridge: CreativeBridge?
         /// Attribution tokens applied to the in-app store sheet this coordinator routes CTAs to.
@@ -479,21 +535,32 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// new load starts.
         private var mainFrameHTTPFailed = false
 
-        /// Monotonic time of the last fired CTA click. A single `window.open`/`target=_blank` tap can
-        /// surface via BOTH `decidePolicyFor` and `createWebViewWith`, so the publisher click is fired
-        /// at most once per ~0.5s window (de-dupes the delegate double-call). See `fireAdClickOnce`.
-        private var lastAdClickUptime: TimeInterval = -1
+        /// One atomic claim guards both publisher notification and destination routing when WebKit
+        /// reports one target=_blank gesture through both delegate methods.
+        private var clickClaim = CreativeClickClaim()
+        private var userActivation = CreativeUserActivation()
 
         /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
         /// use KVO instead of becoming the scroll delegate.
         private var contentOffsetObservation: NSKeyValueObservation?
 
-        /// Fire the publisher CLICKED callback at most once per CTA tap.
-        private func fireAdClickOnce() {
+        /// Claims a genuine activation, records it, then waits behind telemetry persistence before
+        /// handing off to StoreKit/Safari. Returning false means this delegate path must not route.
+        private func routeClaimedClick(userActivated: Bool, route: @escaping @MainActor () -> Void) -> Bool {
             let now = ProcessInfo.processInfo.systemUptime
-            guard now - lastAdClickUptime >= 0.5 else { return }
-            lastAdClickUptime = now
-            onAdClick?()
+            guard let interaction = clickClaim.claim(
+                userActivated: userActivation.consume(explicitLinkActivation: userActivated, now: now),
+                source: clickSource,
+                now: now
+            ) else { return false }
+            onAdClick?(interaction)
+            ClickHandoffPersistence.wait(
+                interaction: interaction,
+                beaconImpressionId: clickBeaconImpressionId
+            ) {
+                DispatchQueue.main.async { route() }
+            }
+            return true
         }
 
         /// Continuously cancel any WebKit-driven offset nudge (sub-pt content overflow).
@@ -544,7 +611,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
-            onAdClick: (() -> Void)? = nil,
+            onAdClick: ((ClickInteraction) -> Void)? = nil,
+            clickSource: ClickSource = .primaryCTA,
+            clickBeaconImpressionId: String? = nil,
             bridge: CreativeBridge? = nil,
             attribution: AdAttribution? = nil,
             externalClickOnly: Bool = false,
@@ -560,6 +629,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
+            self.clickSource = clickSource
+            self.clickBeaconImpressionId = clickBeaconImpressionId
             self.bridge = bridge
             self.attribution = attribution
             self.externalClickOnly = externalClickOnly
@@ -575,6 +646,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// when one is attached — which posts `GET_*` replies back via this web view — else to
         /// the legacy `onMessageReceived` callback (game iframe).
         func handleMessage(_ body: String) {
+            if body == WebViewMessageForwarder.trustedActivationMessage {
+                userActivation.noteTrustedActivation(now: ProcessInfo.processInfo.systemUptime)
+                return
+            }
             // Intercept creative JS errors (window.onerror → simulaSDK) before normal routing, so they
             // are captured for ALL modes (bridge + native). Recorded as deduped, redacted telemetry.
             if body.contains("SIMULA_JS_ERROR"),
@@ -612,24 +687,34 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
         /// install postback credits the campaign (StoreKit tokens can't ride an external open). Absent /
         /// token-less attribution, or a `.web` destination, keeps today's external behavior unchanged.
-        private func openNativeCTA(fallback: URL) {
+        private func nativeCTARoute(fallback: URL) -> @MainActor () -> Void {
             let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
             let trackingURL = tracking.flatMap { $0.isEmpty ? nil : URL(string: $0) }
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
-            // Single-call task closure — see the task-shape note in TelemetryManager.
-            Task { @MainActor in Self.routeNativeCTA(trackingURL: trackingURL, destination: destination, storeUrl: storeUrl, attribution: attribution, fallback: fallback) }
+            return {
+                Self.routeNativeCTA(
+                    trackingURL: trackingURL,
+                    destination: destination,
+                    storeUrl: storeUrl,
+                    attribution: attribution,
+                    fallback: fallback
+                )
+            }
         }
 
         /// Imperative interstitial/rewarded/fallback CTA routing. The HTML navigation proves a user
         /// interaction; the separately decoded tracker remains the attribution source of truth.
-        private func openCreativeCTA(fallback: URL, fallbackStoreAppID: String? = nil) {
+        private func creativeCTARoute(
+            fallback: URL,
+            fallbackStoreAppID: String? = nil
+        ) -> @MainActor () -> Void {
             let target = preferredCreativeClickURL(trackingUrl: ctaTrackingUrl, fallback: fallback)
             let destination = ctaDestination
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
-            Task { @MainActor in
+            return {
                 CreativeCTARouter.routeCreativeTap(
                     url: target,
                     destination: destination,
@@ -854,9 +939,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             if externalClickOnly {
                 if navigationAction.navigationType == .linkActivated,
                    scheme == "http" || scheme == "https" || scheme == "itms-apps" || scheme == "itms" {
-                    onAdClick?()
                     // Prefer the server tracking URL (attribution-preserving); fall back to the tapped URL.
-                    openNativeCTA(fallback: url)
+                    _ = routeClaimedClick(
+                        userActivated: true,
+                        route: nativeCTARoute(fallback: url)
+                    )
                     decisionHandler(.cancel)
                     return
                 }
@@ -875,8 +962,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // programmatic redirect to the store can't fake a click. Routing is
                 // unconditional (the game iframe's post-game auto-redirect still opens).
                 if navigationAction.navigationType == .linkActivated {
-                    fireAdClickOnce()
-                    openCreativeCTA(fallback: url, fallbackStoreAppID: appID)
+                    _ = routeClaimedClick(
+                        userActivated: true,
+                        route: creativeCTARoute(fallback: url, fallbackStoreAppID: appID)
+                    )
                     decisionHandler(.cancel)
                     return
                 }
@@ -889,8 +978,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
                 if navigationAction.navigationType == .linkActivated {
-                    fireAdClickOnce()
-                    openCreativeCTA(fallback: url)
+                    _ = routeClaimedClick(
+                        userActivated: true,
+                        route: creativeCTARoute(fallback: url)
+                    )
                     decisionHandler(.cancel)
                     return
                 }
@@ -914,8 +1005,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
-                    fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
-                    openCreativeCTA(fallback: url)
+                    _ = routeClaimedClick(
+                        userActivated: true,
+                        route: creativeCTARoute(fallback: url)
+                    )
                     decisionHandler(.cancel)
                     return
                 }
@@ -939,9 +1032,11 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // Native ad: target="_blank" / window.open → external browser (PRD).
                 if externalClickOnly {
                     if scheme == "http" || scheme == "https" {
-                        fireAdClickOnce()
                         // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
-                        openNativeCTA(fallback: url)
+                        _ = routeClaimedClick(
+                            userActivated: navigationAction.navigationType == .linkActivated,
+                            route: nativeCTARoute(fallback: url)
+                        )
                     }
                     return nil
                 }
@@ -952,11 +1047,12 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // Cross-domain → deterministic store route when the serve supplied its raw
                         // store link, else resolve redirects then route. Router entry point is
                         // `@MainActor`; this delegate runs on main, so hop explicitly rather than
-                        // asserting isolation. `createWebViewWith` is only invoked for
-                        // user-initiated new-window requests (target="_blank" / window.open), so
-                        // this is a real click.
-                        fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
-                        openCreativeCTA(fallback: url)
+                        // asserting isolation. WebKit can also invoke this for programmatic
+                        // `window.open`; the claim below therefore requires `.linkActivated`.
+                        _ = routeClaimedClick(
+                            userActivated: navigationAction.navigationType == .linkActivated,
+                            route: creativeCTARoute(fallback: url)
+                        )
                     } else {
                         // Same-origin → load in webview
                         webView.load(URLRequest(url: url))
@@ -1176,7 +1272,8 @@ struct WebViewRepresentable: NSViewRepresentable {
     var onMessageReceived: ((String) -> Void)?
     /// Accepted for signature parity with the iOS variant (the imperative HTML
     /// creative is iOS-only, so these are unused on macOS).
-    var onAdClick: (() -> Void)?
+    var onAdClick: ((ClickInteraction) -> Void)?
+    var clickSource: ClickSource
     var attribution: AdAttribution?
     var ctaTrackingUrl: String?
     var ctaDestination: AdDestination
@@ -1190,7 +1287,8 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
-        onAdClick: (() -> Void)? = nil,
+        onAdClick: ((ClickInteraction) -> Void)? = nil,
+        clickSource: ClickSource = .primaryCTA,
         attribution: AdAttribution? = nil,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
@@ -1204,10 +1302,41 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.clickSource = clickSource
         self.attribution = attribution
         self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
         self.ctaStoreUrl = ctaStoreUrl
+    }
+
+    init(
+        url: URL? = nil,
+        htmlString: String? = nil,
+        baseURL: URL? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
+        onNavigationFinished: (() -> Void)? = nil,
+        onNavigationFailed: ((Error) -> Void)? = nil,
+        onMessageReceived: ((String) -> Void)? = nil,
+        onAdClick: (() -> Void)?,
+        attribution: AdAttribution? = nil,
+        ctaTrackingUrl: String? = nil,
+        ctaDestination: AdDestination = .appstore,
+        ctaStoreUrl: String? = nil
+    ) {
+        self.init(
+            url: url,
+            htmlString: htmlString,
+            baseURL: baseURL,
+            onNavigationCommitted: onNavigationCommitted,
+            onNavigationFinished: onNavigationFinished,
+            onNavigationFailed: onNavigationFailed,
+            onMessageReceived: onMessageReceived,
+            onAdClick: onAdClick.map { callback in { _ in callback() } },
+            attribution: attribution,
+            ctaTrackingUrl: ctaTrackingUrl,
+            ctaDestination: ctaDestination,
+            ctaStoreUrl: ctaStoreUrl
+        )
     }
 
     func makeNSView(context: Context) -> WKWebView {

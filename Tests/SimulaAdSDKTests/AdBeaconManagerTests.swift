@@ -236,6 +236,60 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(decoded.id, "stable-id")
     }
 
+    func testClickInteractionSurvivesDurableRetry() async {
+        let sender = FakeBeaconSender()
+        sender.setCode(503, for: "imp", "click")
+        let clock = BeaconTestClock(0)
+        let sleeper = BeaconControllableSleep()
+        let store = ScriptedBeaconStore()
+        let mgr = AdBeaconManager(
+            sender: sender,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        mgr.enqueue(
+            impressionId: "imp",
+            action: "click",
+            interactionId: "interaction-1",
+            clickSource: "store_prompt"
+        )
+        _ = await sleeper.waitForSleepRequest()
+        XCTAssertEqual(store.persisted.first?.interactionId, "interaction-1")
+        XCTAssertEqual(store.persisted.first?.clickSource, "store_prompt")
+
+        sender.setCode(200, for: "imp", "click")
+        clock.time = 5
+        sleeper.release()
+        await waitUntil { sender.callCount("imp", "click") == 2 && store.persisted.isEmpty }
+
+        XCTAssertEqual(sender.interactionIds("imp", "click"), ["interaction-1", "interaction-1"])
+        XCTAssertEqual(sender.clickSources("imp", "click"), ["store_prompt", "store_prompt"])
+    }
+
+    func testClickRequestUsesContractHeadersAndShownDoesNot() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BeaconHeaderURLProtocol.self]
+        let api = SimulaAPI(session: URLSession(configuration: configuration))
+
+        _ = try await api.sendImpressionBeacon(
+            adId: "imp",
+            action: "click",
+            apiKey: "key",
+            interactionId: "event-id",
+            clickSource: "primary_cta"
+        )
+        _ = try await api.sendImpressionBeacon(adId: "imp", action: "shown", apiKey: "key")
+
+        let requests = BeaconHeaderURLProtocol.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "X-Simula-Click-Event-Id"), "event-id")
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "X-Simula-Click-Source"), "primary_cta")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "X-Simula-Click-Event-Id"))
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "X-Simula-Click-Source"))
+    }
+
     func testLegacyPersistedBeaconWithoutMetadataDecodes() throws {
         let legacy = #"[{"impressionId":"imp","action":"seen","retryCount":0,"lastAttemptTimestamp":0}]"#
         defaults.set(Data(legacy.utf8), forKey: queueKey)
@@ -244,6 +298,22 @@ final class AdBeaconManagerTests: XCTestCase {
         XCTAssertEqual(queue.count, 1)
         XCTAssertNil(queue.first?.id)
         XCTAssertNil(queue.first?.metadata)
+    }
+
+    func testLegacyClickRemainsHeaderlessDuringRecovery() async {
+        let sender = FakeBeaconSender()
+        let store = ScriptedBeaconStore(initial: [
+            PendingBeacon(id: "legacy-row", impressionId: "imp", action: "click")
+        ])
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
+
+        mgr.triggerProcessQueue()
+        await waitUntil { sender.callCount("imp", "click") == 1 && store.persisted.isEmpty }
+
+        XCTAssertEqual(sender.interactionIds("imp", "click").count, 1)
+        XCTAssertNil(sender.interactionIds("imp", "click")[0])
+        XCTAssertEqual(sender.clickSources("imp", "click").count, 1)
+        XCTAssertNil(sender.clickSources("imp", "click")[0])
     }
 
     func testBlankImpressionIdIgnored() async {
@@ -274,6 +344,57 @@ final class AdBeaconManagerTests: XCTestCase {
 
         store.release()
         await waitUntil { sender.callCount("imp", "seen") == 1 }
+    }
+
+    func testClickHandoffWaitsForSuccessfulBeaconPersistence() async {
+        let sender = FakeBeaconSender()
+        let store = BlockingBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
+        let persisted = BeaconTestSignal()
+
+        mgr.enqueue(
+            impressionId: "imp",
+            action: "click",
+            interactionId: "interaction",
+            clickSource: "primary_cta"
+        )
+        await waitUntil { store.saveStarted }
+        mgr.afterClickPersistence(
+            impressionId: "imp",
+            interactionId: "interaction",
+            timeout: 1
+        ) { persisted.signal() }
+
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(persisted.isSignaled)
+        store.release()
+        await persisted.wait()
+        XCTAssertTrue(persisted.isSignaled)
+    }
+
+    func testClickHandoffTimeoutDoesNotBlockBehindStalledPersistence() async {
+        let sender = FakeBeaconSender()
+        let store = BlockingBeaconStore()
+        let mgr = AdBeaconManager(sender: sender, store: store, now: { 0 })
+        let fallback = BeaconTestSignal()
+        defer { store.release() }
+
+        mgr.enqueue(
+            impressionId: "imp",
+            action: "click",
+            interactionId: "interaction",
+            clickSource: "primary_cta"
+        )
+        await waitUntil { store.saveStarted }
+        mgr.afterClickPersistence(
+            impressionId: "imp",
+            interactionId: "interaction",
+            timeout: 0.02
+        ) { fallback.signal() }
+
+        await fallback.wait()
+        XCTAssertTrue(fallback.isSignaled)
+        XCTAssertEqual(sender.totalCalls, 0)
     }
 
     func testLiveEnqueuePersistsAndSendsWithoutWaitingForLaunchGate() async {
@@ -612,6 +733,8 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
     private var errors: [String: Error] = [:]
     private var counts: [String: Int] = [:]
     private var metadataByKey: [String: [String: String]] = [:]
+    private var interactionIdsByKey: [String: [String?]] = [:]
+    private var clickSourcesByKey: [String: [String?]] = [:]
 
     private func key(_ id: String, _ action: String) -> String { "\(id):\(action)" }
 
@@ -622,17 +745,27 @@ private final class FakeBeaconSender: BeaconSending, @unchecked Sendable {
     func lastMetadata(_ id: String, _ action: String) -> [String: String]? {
         lock.lock(); defer { lock.unlock() }; return metadataByKey[key(id, action)]
     }
+    func interactionIds(_ id: String, _ action: String) -> [String?] {
+        lock.lock(); defer { lock.unlock() }; return interactionIdsByKey[key(id, action)] ?? []
+    }
+    func clickSources(_ id: String, _ action: String) -> [String?] {
+        lock.lock(); defer { lock.unlock() }; return clickSourcesByKey[key(id, action)] ?? []
+    }
 
     func sendImpressionBeacon(
         adId: String,
         action: String,
         apiKey: String,
-        metadata: [String: String]?
+        metadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
     ) async throws -> Int {
         lock.lock()
         let k = key(adId, action)
         counts[k, default: 0] += 1
         metadataByKey[k] = metadata
+        interactionIdsByKey[k, default: []].append(interactionId)
+        clickSourcesByKey[k, default: []].append(clickSource)
         let error = errors[k]
         let code = codes[k] ?? 200
         lock.unlock()
@@ -682,6 +815,8 @@ private final class BeaconTestSignal: @unchecked Sendable {
     private var signaled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    var isSignaled: Bool { lock.lock(); defer { lock.unlock() }; return signaled }
+
     func signal() {
         lock.lock()
         signaled = true
@@ -720,7 +855,9 @@ private actor BlockingBeaconSender: BeaconSending {
         adId: String,
         action: String,
         apiKey: String,
-        metadata: [String: String]?
+        metadata: [String: String]?,
+        interactionId: String?,
+        clickSource: String?
     ) async throws -> Int {
         self.metadata.append(metadata)
         guard self.metadata.count == 1 else { return 200 }
@@ -752,6 +889,26 @@ private actor BlockingBeaconSender: BeaconSending {
     }
 
     func metadataSnapshots() -> [[String: String]?] { metadata }
+}
+
+private final class BeaconHeaderURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var captured: [URLRequest] = []
+
+    static var requests: [URLRequest] {
+        lock.lock(); defer { lock.unlock() }; return captured
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.lock.lock(); Self.captured.append(request); Self.lock.unlock()
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data())
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 private final class BlockingBeaconStore: AdBeaconStoring, @unchecked Sendable {
