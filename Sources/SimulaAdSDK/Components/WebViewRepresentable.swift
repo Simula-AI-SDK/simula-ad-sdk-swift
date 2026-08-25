@@ -540,7 +540,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         init(
-            onNavigationCommitted: (() -> Void)?,
+            onNavigationCommitted: (() -> Void)? = nil,
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
