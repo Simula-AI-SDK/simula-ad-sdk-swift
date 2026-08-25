@@ -38,10 +38,15 @@ public struct AdOverlayView: View {
     var ctaStoreUrl: String? = nil
     /// Attribution tokens carried into the store sheet the end-screen CTA opens.
     var attribution: AdAttribution? = nil
+    /// Fires after lifecycle observers are mounted, so automatic store presentation cannot race
+    /// ahead of the sheet/background notifications that pause the close gate.
+    var onPresented: (() -> Void)? = nil
 
     /// The pooled WebView is transparent, so keep native black above it until the current page is
     /// actually ready. A failed navigation deliberately leaves the safe surface in place.
     @State private var adPageReady = false
+    /// Terminal load failure keeps the native black shield but removes the indefinite spinner.
+    @State private var adPageFailed = false
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -121,8 +126,9 @@ public struct AdOverlayView: View {
                             WebViewRepresentable(
                                 htmlString: html,
                                 baseURL: URL(string: iframeUrl),
-                                onNavigationFinished: { adPageReady = true },
-                                onNavigationFailed: { _ in adPageReady = false },
+                                onNavigationCommitted: { adPageReady = true; adPageFailed = false },
+                                onNavigationFinished: { adPageReady = true; adPageFailed = false },
+                                onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
                                 onAdClick: onAdClick,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
@@ -132,8 +138,9 @@ public struct AdOverlayView: View {
                         } else if let url = URL(string: iframeUrl) {
                             WebViewRepresentable(
                                 url: url,
-                                onNavigationFinished: { adPageReady = true },
-                                onNavigationFailed: { _ in adPageReady = false },
+                                onNavigationCommitted: { adPageReady = true; adPageFailed = false },
+                                onNavigationFinished: { adPageReady = true; adPageFailed = false },
+                                onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
                                 onAdClick: onAdClick,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
@@ -145,8 +152,10 @@ public struct AdOverlayView: View {
                         if !adPageReady {
                             ZStack {
                                 Color.black
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                if !adPageFailed {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                }
                             }
                         }
 
@@ -230,7 +239,11 @@ public struct AdOverlayView: View {
         .hideStatusBar(shouldHideStatusBar)
         .onAppear {
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
-            startCountdown()
+            #if os(iOS)
+            appForegrounded = UIApplication.shared.applicationState == .active
+            #endif
+            reconcileCountdown()
+            onPresented?()
         }
         .onDisappear {
             countdownTask?.cancel()

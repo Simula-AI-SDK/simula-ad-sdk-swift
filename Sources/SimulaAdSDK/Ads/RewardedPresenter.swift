@@ -16,7 +16,7 @@ final class RewardedPresenter {
     private var creativeBridge: CreativeBridge?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
-    private var onClose: ((Bool, Double, FullscreenPresentationLease) -> Void)?
+    private var onClose: ((Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so the
     /// host regains touch/keyboard focus (a new key window doesn't auto-revert).
@@ -51,7 +51,7 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onClick: @escaping () -> Void,
         onImpression: @escaping () -> Void,
-        onClose: @escaping (Bool, Double, FullscreenPresentationLease) -> Void
+        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
@@ -137,19 +137,22 @@ final class RewardedPresenter {
         retainedWhilePresenting = nil
         if let presentationLease {
             if let callback {
-                callback(earned, elapsedPlayTime, presentationLease)
+                callback(earned, elapsedPlayTime, presentationLease, hostKeyWindow)
             } else {
                 presentationLease.finishPostCloseTeardown()
             }
         }
+        let shouldRestoreHostKeyWindow = win?.isKeyWindow == true
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).
         SimulaAppStatusBar.restore()
         win?.isHidden = true
         win?.rootViewController = nil
-        // Restore the host's key window so it regains focus. A fallback window presented in the
-        // callback stays visible on top and still receives touches via hit-testing.
-        hostKeyWindow?.makeKey()
+        // Restore the host only when the primary still owns key status. A successor fallback or
+        // loading window made key by the callback owns the handoff until its final dismiss.
+        if shouldRestoreHostKeyWindow {
+            hostKeyWindow?.makeKey()
+        }
         presentationLease?.finishPrimaryTeardown()
     }
 

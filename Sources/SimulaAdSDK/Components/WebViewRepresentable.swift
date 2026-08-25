@@ -92,7 +92,10 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// the interstitial / native html (no in-creative same-origin calls).
     var baseURL: URL?
 
-    /// Called when the web view finishes loading content
+    /// Called when the current main document commits, before subresources finish loading.
+    var onNavigationCommitted: (() -> Void)?
+
+    /// Called when the web view finishes loading content.
     var onNavigationFinished: (() -> Void)?
 
     /// Called when the web view fails to load content
@@ -156,6 +159,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         url: URL? = nil,
         htmlString: String? = nil,
         baseURL: URL? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -174,6 +178,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.url = url
         self.htmlString = htmlString
         self.baseURL = baseURL
+        self.onNavigationCommitted = onNavigationCommitted
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -246,6 +251,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         let coordinator = context.coordinator
+        coordinator.onNavigationCommitted = onNavigationCommitted
         coordinator.onNavigationFinished = onNavigationFinished
         coordinator.onNavigationFailed = onNavigationFailed
         coordinator.onMessageReceived = onMessageReceived
@@ -377,6 +383,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
+            onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
@@ -397,6 +404,7 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     @preconcurrency
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+        var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
@@ -532,6 +540,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         }
 
         init(
+            onNavigationCommitted: (() -> Void)?,
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
@@ -546,6 +555,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             retainedImpressionId: String? = nil,
             telemetryAdFormat: String? = nil
         ) {
+            self.onNavigationCommitted = onNavigationCommitted
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
@@ -674,8 +684,10 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             guard realLoadStarted,
-                  navigationTracker.isActive(navigation.map(ObjectIdentifier.init)) else { return }
+                  navigationTracker.isActive(navigation.map(ObjectIdentifier.init)),
+                  !mainFrameHTTPFailed else { return }
             bridge?.pageDidCommit()
+            onNavigationCommitted?()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -763,27 +775,25 @@ struct WebViewRepresentable: UIViewRepresentable {
                     return
                 }
             }
-            // Already retried (or nothing to reload): for the native, content-sized slot, collapse to
-            // zero height (parity with a load failure) instead of holding a blank provisional block.
-            // Gated to the native path — the full-screen creatives don't size to content.
-            if reportsContentHeight {
-                onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
-            }
+            // Already retried (or nothing to reload): surface terminal failure to any consumer. The
+            // retained native slot collapses through this callback; fullscreen surfaces keep their
+            // native black failure shield and stop showing a loading spinner.
+            onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
         }
 
         // An HTTP error status on the creative's main-frame load (e.g. the iframe URL 404s/500s) still
         // reports as a successful navigation on WKWebView — it renders the error body and never hits
-        // didFail. Mirror Android's onReceivedHttpError: for the native path, treat a main-frame
-        // 4xx/5xx as a load failure so the slot collapses instead of holding a blank reserved block.
-        // Allow the response (the slot tears the WebView down on collapse); gated to the native path
-        // so full-screen creatives are unaffected.
+        // didFail. Mirror Android's onReceivedHttpError: treat every main-frame 4xx/5xx as a load
+        // failure. Native slots collapse; fullscreen consumers keep their native black shield and
+        // stop loading. The response remains allowed, but didFinish is suppressed below so WebKit's
+        // error document can never be marked ready.
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationResponse: WKNavigationResponse,
             decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
         ) {
             decisionHandler(.allow)
-            guard reportsContentHeight, navigationResponse.isForMainFrame,
+            guard navigationResponse.isForMainFrame,
                   let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 else {
                 return
             }
@@ -901,7 +911,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             // SFSafariViewController (other).
             if navigationAction.navigationType == .linkActivated,
                scheme == "http" || scheme == "https" {
-                let currentHost = currentURL?.host?.lowercased() ?? ""
+                let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
                 if !targetHost.isEmpty && currentHost != targetHost {
                     fireAdClickOnce() // CLICKED (HTML creative); nil for the game iframe.
@@ -936,7 +946,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                     return nil
                 }
                 if scheme == "http" || scheme == "https" {
-                    let currentHost = currentURL?.host?.lowercased() ?? ""
+                    let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
                     let targetHost = url.host?.lowercased() ?? ""
                     if !targetHost.isEmpty && currentHost != targetHost {
                         // Cross-domain → deterministic store route when the serve supplied its raw
@@ -1160,6 +1170,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     let url: URL?
     let htmlString: String?
     var baseURL: URL?
+    var onNavigationCommitted: (() -> Void)?
     var onNavigationFinished: (() -> Void)?
     var onNavigationFailed: ((Error) -> Void)?
     var onMessageReceived: ((String) -> Void)?
@@ -1175,6 +1186,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         url: URL? = nil,
         htmlString: String? = nil,
         baseURL: URL? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
@@ -1187,6 +1199,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.url = url
         self.htmlString = htmlString
         self.baseURL = baseURL
+        self.onNavigationCommitted = onNavigationCommitted
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
@@ -1243,6 +1256,7 @@ struct WebViewRepresentable: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
+            onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived
@@ -1250,26 +1264,53 @@ struct WebViewRepresentable: NSViewRepresentable {
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+        var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var currentURL: URL?
         var currentHTML: String?
+        private var mainFrameHTTPFailed = false
 
         private let internalSchemes: Set<String> = ["about", "data", "blob"]
 
         init(
+            onNavigationCommitted: (() -> Void)?,
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?
         ) {
+            self.onNavigationCommitted = onNavigationCommitted
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
         }
 
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            mainFrameHTTPFailed = false
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard !mainFrameHTTPFailed else { return }
             onNavigationFinished?()
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            guard !mainFrameHTTPFailed else { return }
+            onNavigationCommitted?()
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            decisionHandler(.allow)
+            guard navigationResponse.isForMainFrame,
+                  let http = navigationResponse.response as? HTTPURLResponse,
+                  http.statusCode >= 400 else { return }
+            mainFrameHTTPFailed = true
+            onNavigationFailed?(NSError(domain: "SimulaWebView", code: http.statusCode))
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

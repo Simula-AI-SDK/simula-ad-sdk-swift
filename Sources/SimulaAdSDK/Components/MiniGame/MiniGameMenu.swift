@@ -175,7 +175,7 @@ public struct MiniGameMenu: View {
             // Ad loading screen (shown while fetching post-game ad)
             if adLoading {
                 ZStack {
-                    Color.black.opacity(0.8).ignoresSafeArea()
+                    Color.black.opacity(lastGameWasBottomSheet ? 0.8 : 1.0).ignoresSafeArea()
 
                     GeometryReader { geo in
                         let sheetHeight = lastGameWasBottomSheet ? (lastGameHeightDp ?? geo.size.height) : geo.size.height
@@ -566,7 +566,15 @@ public struct MiniGameMenu: View {
         guard compatibilityPlan.loadsGame else { return }
         guard !adLoading else { return }
         if compatibilityPlan.fetchesFallbacks, !adFetched, let serveId = currentServeId {
-            adLoading = true
+            // GameIframeView reports its final dimensions before this callback. Replace its active
+            // WKWebView with the identity loading cover in the same update, without an opacity exit.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                adLoading = true
+                showGameIframe = false
+                selectedGameId = nil
+            }
             // Single-call task closure — see the task-shape note in TelemetryManager.
             Task { await loadFallbacksAfterIframeClose(serveId: serveId) }
         } else {
@@ -589,10 +597,6 @@ public struct MiniGameMenu: View {
             adFetched = true
             showAdOverlay = true
         }
-        // Match Kotlin: keep the outgoing game mounted until fallback resolution, then replace it
-        // with the already-opaque end-screen shell in the same main-actor update.
-        showGameIframe = false
-        selectedGameId = nil
         adLoading = false
     }
 

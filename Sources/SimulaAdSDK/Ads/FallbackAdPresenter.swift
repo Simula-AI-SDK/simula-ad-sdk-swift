@@ -15,6 +15,7 @@ import UIKit
 /// window is torn down.
 @MainActor
 final class FallbackAdPresenter {
+    private static let loadingDeadlineNanos: UInt64 = 2_000_000_000
     private var window: UIWindow?
     /// One opaque host survives loading and every screen swap. Replacing its root view lets SwiftUI
     /// dismantle the previous representable before creating the next one, so only one fallback
@@ -50,12 +51,16 @@ final class FallbackAdPresenter {
     private var ctaDestination: AdDestination = .appstore
     private var ctaStoreUrl: String?
     private var attribution: AdAttribution?
+    private var loadingDeadlineTask: Task<Void, Never>?
+    private var onLoadingTimeout: (() -> Void)?
+    private var isLoading = false
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onClose` is then never called).
     @discardableResult
     func present(
         ads: [FallbackAd],
+        originalKeyWindow: UIWindow?,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
         ctaStoreUrl: String? = nil,
@@ -70,6 +75,7 @@ final class FallbackAdPresenter {
         return beginPresentation(
             ads: ads,
             startsLoading: false,
+            originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
@@ -87,6 +93,7 @@ final class FallbackAdPresenter {
     /// the screens, preventing the primary presenter from exposing the host app during handoff.
     @discardableResult
     func presentLoading(
+        originalKeyWindow: UIWindow?,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
         ctaStoreUrl: String? = nil,
@@ -94,12 +101,14 @@ final class FallbackAdPresenter {
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAutoStoreRedirect: (@MainActor () -> Void)? = nil,
         onAdClick: (() -> Void)? = nil,
+        onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
-        beginPresentation(
+        let didPresent = beginPresentation(
             ads: [],
             startsLoading: true,
+            originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
@@ -110,11 +119,20 @@ final class FallbackAdPresenter {
             presentationLease: presentationLease,
             onClose: onClose
         )
+        guard didPresent else { return false }
+        self.onLoadingTimeout = onLoadingTimeout
+        loadingDeadlineTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: Self.loadingDeadlineNanos) } catch { return }
+            guard !Task.isCancelled else { return }
+            self?.loadingDidTimeout()
+        }
+        return true
     }
 
     private func beginPresentation(
         ads: [FallbackAd],
         startsLoading: Bool,
+        originalKeyWindow: UIWindow?,
         ctaTrackingUrl: String?,
         ctaDestination: AdDestination,
         ctaStoreUrl: String?,
@@ -125,7 +143,8 @@ final class FallbackAdPresenter {
         presentationLease: FullscreenPresentationLease,
         onClose: @escaping () -> Void
     ) -> Bool {
-        guard window == nil, let scene = Self.activeWindowScene() else { return false }
+        guard window == nil,
+              let scene = originalKeyWindow?.windowScene ?? Self.activeWindowScene() else { return false }
         self.ads = ads
         self.index = 0
         self.onClose = onClose
@@ -137,8 +156,9 @@ final class FallbackAdPresenter {
         self.onAutoStoreRedirect = onAutoStoreRedirect
         self.onAdClick = onAdClick
         self.presentationLease = presentationLease
+        isLoading = startsLoading
 
-        originalKeyWindow = scene.keyWindow
+        self.originalKeyWindow = originalKeyWindow
 
         let rootView = startsLoading ? loadingView() : adView(at: 0)
         let hosting = UIHostingController(rootView: rootView)
@@ -158,16 +178,17 @@ final class FallbackAdPresenter {
         // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
         // where `.hideStatusBar` in the end-screen view is a no-op. No-op in native hosts.
         SimulaAppStatusBar.hide()
-        if !startsLoading {
-            fireAutoStoreRedirectIfMatching(index: 0)
-        }
         return true
     }
 
     /// Replaces the native loading surface with End Screen 1, or safely tears down when the
     /// best-effort prefetch returned no usable screens. The presenter self-retains across the await.
     func resolveLoading(with ads: [FallbackAd]) {
-        guard window != nil else { return }
+        guard window != nil, isLoading else { return }
+        isLoading = false
+        loadingDeadlineTask?.cancel()
+        loadingDeadlineTask = nil
+        onLoadingTimeout = nil
         guard !ads.isEmpty else {
             dismiss()
             return
@@ -175,7 +196,16 @@ final class FallbackAdPresenter {
         self.ads = ads
         index = 0
         hostingController?.rootView = adView(at: index)
-        fireAutoStoreRedirectIfMatching(index: index)
+    }
+
+    private func loadingDidTimeout() {
+        guard window != nil, isLoading else { return }
+        isLoading = false
+        loadingDeadlineTask = nil
+        let timeout = onLoadingTimeout
+        onLoadingTimeout = nil
+        timeout?()
+        dismiss()
     }
 
     /// END_SCREEN_N: open the primary ad's store once, when the fallback screen whose index matches
@@ -194,14 +224,18 @@ final class FallbackAdPresenter {
         let ad = ads[index]
         return AnyView(AdOverlayView(
             iframeUrl: ad.iframeUrl,
-            onClose: { [weak self] in self?.advance() },
+            onClose: { [weak self] in self?.advance(from: index) },
             adId: ad.adId,
             html: ad.html,
             onAdClick: { [weak self] in self?.onAdClick?() },
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
-            attribution: attribution
+            attribution: attribution,
+            onPresented: { [weak self] in
+                guard let self, self.index == index else { return }
+                self.fireAutoStoreRedirectIfMatching(index: index)
+            }
         ).id(index))
     }
 
@@ -217,11 +251,11 @@ final class FallbackAdPresenter {
     }
 
     /// Reveal the next screen on each close tap; tear down after the last one.
-    private func advance() {
+    private func advance(from renderedIndex: Int) {
+        guard window != nil, index == renderedIndex else { return }
         index += 1
         if index < ads.count {
             hostingController?.rootView = adView(at: index)
-            fireAutoStoreRedirectIfMatching(index: index)
         } else {
             dismiss()
         }
@@ -235,6 +269,11 @@ final class FallbackAdPresenter {
         // reference keeps `self` alive through this method itself.
         let win = window
         let hostKeyWindow = originalKeyWindow
+        let shouldRestoreHostKeyWindow = win?.isKeyWindow == true
+        loadingDeadlineTask?.cancel()
+        loadingDeadlineTask = nil
+        onLoadingTimeout = nil
+        isLoading = false
         window = nil
         hostingController = nil
         originalKeyWindow = nil
@@ -245,7 +284,9 @@ final class FallbackAdPresenter {
         retainedWhilePresenting = nil
         win?.isHidden = true
         win?.rootViewController = nil
-        hostKeyWindow?.makeKey()
+        if shouldRestoreHostKeyWindow {
+            hostKeyWindow?.makeKey()
+        }
         callback?()
         // Balanced with the present-time hide(); ref count keeps the bar hidden if the close
         // callback opens another presenter, restoring the host only when the last one ends.
