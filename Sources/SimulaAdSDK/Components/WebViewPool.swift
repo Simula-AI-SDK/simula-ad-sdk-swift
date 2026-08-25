@@ -226,19 +226,40 @@ private func waitForNativeAdDisplayFrame() async {
 /// handler is before the web view is created) and simply repoint its `onMessage`
 /// closure when the view is handed out. The closure captures the coordinator
 /// weakly, so it introduces no retain cycle through the content controller.
+enum WebViewForwardedMessage {
+    case page(String)
+    case userActivatedCTA(URL)
+}
+
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
-    var onMessage: ((String) -> Void)?
+    private(set) var userActivationNonce = UUID().uuidString
+    var onMessage: ((WebViewForwardedMessage) -> Void)?
+
+    func rotateUserActivationNonce() {
+        userActivationNonce = UUID().uuidString
+    }
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        if let body = message.body as? String {
-            onMessage?(body)
+        let body: String?
+        if let value = message.body as? String {
+            body = value
         } else if let dict = message.body as? [String: Any],
-                  let data = try? JSONSerialization.data(withJSONObject: dict),
-                  let str = String(data: data, encoding: .utf8) {
-            onMessage?(str)
+                  let data = try? JSONSerialization.data(withJSONObject: dict) {
+            body = String(data: data, encoding: .utf8)
+        } else {
+            body = nil
+        }
+        guard let body else { return }
+        switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
+        case .accepted(let url):
+            onMessage?(.userActivatedCTA(url))
+        case .rejected:
+            return
+        case .notMessage:
+            onMessage?(.page(body))
         }
     }
 }
@@ -368,18 +389,46 @@ final class WebViewPool {
     /// Handles popup CTAs before WebKit can race `createWebViewWith` ahead of an asynchronous script
     /// message. During active user activation, `window.open` and trusted target=_blank clicks are
     /// suppressed synchronously and forwarded as a structured message over the existing bridge.
-    /// Outside activation, native WebKit delegates still see the original navigation and reject
-    /// programmatic `.other` popups. `navigator.userActivation` is task-scoped: code running in the
-    /// same genuine gesture can share it, and page-world code can replace this wrapper or address the
-    /// existing handler directly, so this is best-effort admission for trusted creatives rather than
-    /// cryptographic attestation. The explicit `.linkActivated` delegate fallback remains authoritative.
-    private static let userActivationScript = WKUserScript(
-        source: """
+    /// The per-WebView nonce and bound native handler are captured before creative code runs. Direct
+    /// page calls to the public handler therefore cannot forge a billable activation message.
+    private static func userActivationScript(nonce: String) -> WKUserScript {
+        WKUserScript(
+            source: """
         (function() {
           var originalOpen = window.open;
+          var nativeHandler = window.webkit && window.webkit.messageHandlers
+            ? window.webkit.messageHandlers.simulaSDK
+            : null;
+          var postNative = nativeHandler && typeof nativeHandler.postMessage === 'function'
+            ? nativeHandler.postMessage.bind(nativeHandler)
+            : null;
+          var capturedUserActivation = navigator.userActivation;
+          var nativeQueueMicrotask = typeof queueMicrotask === 'function'
+            ? queueMicrotask.bind(window)
+            : null;
+          var resolvedPromise = Promise.resolve();
+          var nativePromiseThen = Promise.prototype.then;
+          var trustedEventDispatch = false;
+
+          function clearTrustedDispatchLater() {
+            var clear = function() { trustedEventDispatch = false; };
+            if (nativeQueueMicrotask) { nativeQueueMicrotask(clear); }
+            else { nativePromiseThen.call(resolvedPromise, clear); }
+          }
+
+          function markTrustedDispatch(event) {
+            if (!event || event.isTrusted !== true) { return; }
+            trustedEventDispatch = true;
+            clearTrustedDispatchLater();
+          }
+
+          ['click', 'pointerdown', 'pointerup', 'mousedown', 'touchend', 'keydown'].forEach(function(name) {
+            window.addEventListener(name, markTrustedDispatch, true);
+          });
 
           function hasActiveUserGesture() {
-            return !!(navigator.userActivation && navigator.userActivation.isActive === true);
+            return trustedEventDispatch ||
+              !!(capturedUserActivation && capturedUserActivation.isActive === true);
           }
 
           function resolvedURL(value) {
@@ -389,13 +438,14 @@ final class WebViewPool {
           }
 
           function forwardCTA(value) {
-            if (!hasActiveUserGesture()) { return false; }
+            if (!postNative || !hasActiveUserGesture()) { return false; }
             var url = resolvedURL(value);
             if (!url) { return false; }
             try {
-              window.webkit.messageHandlers.simulaSDK.postMessage({
+              postNative({
                 type: 'SIMULA_CTA_OPEN',
-                url: url
+                url: url,
+                activation_nonce: '\(nonce)'
               });
               return true;
             } catch (_) {
@@ -416,9 +466,17 @@ final class WebViewPool {
           }, true);
         })();
         """,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-    )
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
+
+    static func installUserScripts(on controller: WKUserContentController, nonce: String) {
+        controller.removeAllUserScripts()
+        controller.addUserScript(postMessageScript)
+        controller.addUserScript(errorCaptureScript)
+        controller.addUserScript(userActivationScript(nonce: nonce))
+    }
 
     private func makePooled() -> Pooled {
         let interval = signposter.beginInterval("WebViewCreate")
@@ -427,9 +485,7 @@ final class WebViewPool {
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
-        controller.addUserScript(WebViewPool.postMessageScript)
-        controller.addUserScript(WebViewPool.errorCaptureScript)
-        controller.addUserScript(WebViewPool.userActivationScript)
+        WebViewPool.installUserScripts(on: controller, nonce: forwarder.userActivationNonce)
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
@@ -511,7 +567,7 @@ final class WebViewPool {
     /// Acquiring never refills speculatively; only explicit demand or gated fullscreen-ready work may prewarm.
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
-        onMessage: @escaping (String) -> Void,
+        onMessage: @escaping (WebViewForwardedMessage) -> Void,
         surface: String? = nil
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
@@ -525,6 +581,11 @@ final class WebViewPool {
         let reusedWarm = idle.last != nil
         let pooled = idle.popLast() ?? makePooled()
 
+        pooled.forwarder.rotateUserActivationNonce()
+        Self.installUserScripts(
+            on: pooled.webView.configuration.userContentController,
+            nonce: pooled.forwarder.userActivationNonce
+        )
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate
         pooled.webView.uiDelegate = delegate

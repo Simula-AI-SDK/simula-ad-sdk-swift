@@ -39,11 +39,7 @@ struct AdOverlayLoadCoordinator {
     }
 
     mutating func finishCurrentLoad() -> Bool {
-        let owner: Int
-        switch phase {
-        case .loading(let generation), .timedOut(let generation): owner = generation
-        case .idle, .finished, .failed: return false
-        }
+        guard case .loading(let owner) = phase else { return false }
         phase = .finished(owner)
         return true
     }

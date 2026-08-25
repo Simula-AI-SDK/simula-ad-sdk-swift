@@ -229,6 +229,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptScheduled = false
     @State private var storePromptTask: Task<Void, Never>?
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
+    @State private var clickHandoffPending = false
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -292,7 +293,10 @@ private struct CreativeInterstitialView: View {
                 position: closeConfig.position,
                 progressBarColor: closeConfig.progressBarColor,
                 isRewardCopy: isRewardCopy,
-                enabled: closeEnabled,
+                enabled: canDismissFullscreen(
+                    dismissUnlocked: closeEnabled,
+                    clickHandoffPending: clickHandoffPending
+                ),
                 remaining: closeRemaining,
                 progress: closeProgress,
                 onClose: { handleClose() }
@@ -354,6 +358,7 @@ private struct CreativeInterstitialView: View {
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
+            clickHandoffPending = false
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -449,6 +454,10 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleClose() {
+        guard canDismissFullscreen(
+            dismissUnlocked: closeEnabled,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
@@ -628,6 +637,7 @@ private struct CreativeInterstitialView: View {
 
     private func handleStorePromptClick() {
         guard storePromptGestureGuard.claim() else { return }
+        clickHandoffPending = true
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
@@ -637,11 +647,13 @@ private struct CreativeInterstitialView: View {
         ) {
             DispatchQueue.main.async {
                 guard visible else {
+                    clickHandoffPending = false
                     gestureGuard.release()
                     return
                 }
                 let routed = handleStorePromptTap()
                 if routed { storeExit?.recordStoreOpen("store_prompt") }
+                clickHandoffPending = false
                 if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout

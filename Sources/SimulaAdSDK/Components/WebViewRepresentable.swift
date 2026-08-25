@@ -256,7 +256,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         // sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
         // WKWebView handles these by default; scripts and forms are always allowed.
         let coordinator = context.coordinator
-        let onMessage: (String) -> Void = { [weak coordinator] body in coordinator?.handleMessage(body) }
+        let onMessage: (WebViewForwardedMessage) -> Void = { [weak coordinator] message in
+            coordinator?.handleMessage(message)
+        }
         let webView: WKWebView
         if let impressionId = retainedImpressionId, !impressionId.isEmpty {
             // Native-ad retained path: reattach this serve's already-rendered view when the store
@@ -458,7 +460,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     // MARK: - Coordinator
 
     @preconcurrency
-    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
@@ -656,29 +658,25 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
         /// when one is attached — which posts `GET_*` replies back via this web view — else to
         /// the legacy `onMessageReceived` callback (game iframe).
-        func handleMessage(_ body: String) {
-            switch CreativeCTAOpenMessage.admission(
-                for: body,
-                destination: ctaDestination,
-                externalClickOnly: externalClickOnly
-            ) {
-            case .accepted(let url):
+        func handleMessage(_ message: WebViewForwardedMessage) {
+            switch message {
+            case .userActivatedCTA(let url):
+                guard CreativeCTAOpenMessage.isAllowed(
+                    url,
+                    destination: ctaDestination,
+                    externalClickOnly: externalClickOnly
+                ) else { return }
                 let route = externalClickOnly
                     ? nativeCTARoute(fallback: url)
                     : creativeCTARoute(fallback: url, fallbackStoreAppID: appStoreID(from: url))
-                // Page-world code can address this message handler directly, so the envelope cannot
-                // attest a user gesture. Preserve popup routing without emitting a billable click;
-                // native `.linkActivated` delegate callbacks remain the authoritative click path.
-                Task { @MainActor [weak self] in
-                    guard self?.webView != nil else { return }
-                    route()
-                }
+                _ = routeClaimedClick(userActivated: true, route: route)
                 return
-            case .rejected:
-                return
-            case .notMessage:
-                break
+            case .page(let body):
+                handlePageMessage(body)
             }
+        }
+
+        private func handlePageMessage(_ body: String) {
             // Intercept creative JS errors (window.onerror → simulaSDK) before normal routing, so they
             // are captured for ALL modes (bridge + native). Recorded as deduped, redacted telemetry.
             if body.contains("SIMULA_JS_ERROR"),
@@ -1128,21 +1126,6 @@ struct WebViewRepresentable: UIViewRepresentable {
                 }
             }
             return nil
-        }
-
-        // MARK: - WKScriptMessageHandler
-
-        func userContentController(
-            _ userContentController: WKUserContentController,
-            didReceive message: WKScriptMessage
-        ) {
-            if let body = message.body as? String {
-                handleMessage(body)
-            } else if let dict = message.body as? [String: Any],
-                      let data = try? JSONSerialization.data(withJSONObject: dict),
-                      let str = String(data: data, encoding: .utf8) {
-                handleMessage(str)
-            }
         }
 
         /// Injected (via `evaluateJavaScript`) after a native-ad creative loads: posts the content

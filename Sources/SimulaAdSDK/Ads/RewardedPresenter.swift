@@ -264,6 +264,7 @@ private struct RewardedGameView: View {
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
+    @State private var clickHandoffPending = false
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     /// auto_store_redirect routes once per presentation and is never a user click.
@@ -319,7 +320,10 @@ private struct RewardedGameView: View {
                 position: (close ?? CloseBehavior()).position,
                 progressBarColor: (close ?? CloseBehavior()).progressBarColor,
                 isRewardCopy: true,
-                enabled: rewardEarned,
+                enabled: canDismissFullscreen(
+                    dismissUnlocked: rewardEarned,
+                    clickHandoffPending: clickHandoffPending
+                ),
                 remaining: secondsLeft,
                 progress: closeProgressAnim,
                 onClose: { finish(earned: true) }
@@ -364,6 +368,7 @@ private struct RewardedGameView: View {
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
+            clickHandoffPending = false
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -528,6 +533,7 @@ private struct RewardedGameView: View {
 
     private func handleStorePromptClick() {
         guard storePromptGestureGuard.claim() else { return }
+        clickHandoffPending = true
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
@@ -537,11 +543,13 @@ private struct RewardedGameView: View {
         ) {
             DispatchQueue.main.async {
                 guard visible else {
+                    clickHandoffPending = false
                     gestureGuard.release()
                     return
                 }
                 let routed = handleStorePromptTap()
                 if routed { storeExit?.recordStoreOpen("store_prompt") }
+                clickHandoffPending = false
                 if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
@@ -556,6 +564,10 @@ private struct RewardedGameView: View {
     // MARK: Close
 
     private func finish(earned: Bool) {
+        guard canDismissFullscreen(
+            dismissUnlocked: earned,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
         let elapsed = elapsedPlayTime
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

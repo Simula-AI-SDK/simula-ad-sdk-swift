@@ -178,7 +178,17 @@ final class StorePromptGestureGuard {
     }
 }
 
+func canDismissFullscreen(dismissUnlocked: Bool, clickHandoffPending: Bool) -> Bool {
+    dismissUnlocked && !clickHandoffPending
+}
+
 enum CreativeCTAOpenAdmission: Equatable {
+    case notMessage
+    case rejected
+    case accepted(URL)
+}
+
+enum CreativeCTAOpenAuthentication: Equatable {
     case notMessage
     case rejected
     case accepted(URL)
@@ -196,19 +206,38 @@ enum CreativeCTAOpenMessage {
     /// rewritten, so attribution URLs reach the router byte-for-byte as received from JavaScript.
     static func admission(
         for body: String,
+        expectedNonce: String,
         destination: AdDestination,
         externalClickOnly: Bool
     ) -> CreativeCTAOpenAdmission {
+        switch authenticate(body, expectedNonce: expectedNonce) {
+        case .accepted(let url):
+            return isAllowed(url, destination: destination, externalClickOnly: externalClickOnly)
+                ? .accepted(url)
+                : .rejected
+        case .rejected:
+            return .rejected
+        case .notMessage:
+            return .notMessage
+        }
+    }
+
+    static func authenticate(
+        _ body: String,
+        expectedNonce: String
+    ) -> CreativeCTAOpenAuthentication {
         guard let data = body.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let messageType = object["type"] as? String else {
             return .notMessage
         }
         guard messageType == type else { return .notMessage }
-        guard let value = object["url"] as? String,
+        guard !expectedNonce.isEmpty,
+              object["activation_nonce"] as? String == expectedNonce,
+              let value = object["url"] as? String,
               !value.isEmpty,
               let url = URL(string: value),
-              isAllowed(url, destination: destination, externalClickOnly: externalClickOnly) else {
+              url.scheme?.isEmpty == false else {
             return .rejected
         }
         return .accepted(url)

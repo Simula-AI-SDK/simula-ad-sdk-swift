@@ -3,6 +3,14 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class CreativeClickURLTests: XCTestCase {
+    private let activationNonce = "activation-nonce"
+
+    private func ctaBody(url: String, nonce: String? = "activation-nonce") -> String {
+        var object: [String: Any] = ["type": CreativeCTAOpenMessage.type, "url": url]
+        if let nonce { object["activation_nonce"] = nonce }
+        let data = try? JSONSerialization.data(withJSONObject: object)
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
     func testTopLevelTrackerWinsOverHTMLEscapedURL() {
         let fallback = URL(string: "https://tracker.example/click?a=1&amp;b=2")!
 
@@ -62,10 +70,11 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
-    func testStructuredCTAOpenPreservesURLAndFragmentWithoutAttestingGesture() {
-        let body = #"{"type":"SIMULA_CTA_OPEN","url":"https://tracker.example/click?a=1#campaign&step=2"}"#
+    func testAuthenticatedCTAOpenPreservesURLAndFragment() {
+        let body = ctaBody(url: "https://tracker.example/click?a=1#campaign&step=2")
         guard case .accepted(let url) = CreativeCTAOpenMessage.admission(
             for: body,
+            expectedNonce: activationNonce,
             destination: .appstore,
             externalClickOnly: false
         ) else { return XCTFail("expected CTA admission") }
@@ -82,10 +91,11 @@ final class CreativeClickURLTests: XCTestCase {
         ]
 
         for value in values {
-            let body = #"{"type":"SIMULA_CTA_OPEN","url":"\#(value)"}"#
+            let body = ctaBody(url: value)
             XCTAssertEqual(
                 CreativeCTAOpenMessage.admission(
                     for: body,
+                    expectedNonce: activationNonce,
                     destination: .appstore,
                     externalClickOnly: false
                 ),
@@ -95,19 +105,25 @@ final class CreativeClickURLTests: XCTestCase {
     }
 
     func testStructuredCTAOpenCustomSchemeFollowsDestinationPolicy() {
-        let body = #"{"type":"SIMULA_CTA_OPEN","url":"advertiser-app://offer/42#details"}"#
+        let body = ctaBody(url: "advertiser-app://offer/42#details")
         let url = URL(string: "advertiser-app://offer/42#details")!
 
         XCTAssertEqual(
-            CreativeCTAOpenMessage.admission(for: body, destination: .web, externalClickOnly: false),
+            CreativeCTAOpenMessage.admission(
+                for: body, expectedNonce: activationNonce, destination: .web, externalClickOnly: false
+            ),
             .accepted(url)
         )
         XCTAssertEqual(
-            CreativeCTAOpenMessage.admission(for: body, destination: .appstore, externalClickOnly: true),
+            CreativeCTAOpenMessage.admission(
+                for: body, expectedNonce: activationNonce, destination: .appstore, externalClickOnly: true
+            ),
             .accepted(url)
         )
         XCTAssertEqual(
-            CreativeCTAOpenMessage.admission(for: body, destination: .appstore, externalClickOnly: false),
+            CreativeCTAOpenMessage.admission(
+                for: body, expectedNonce: activationNonce, destination: .appstore, externalClickOnly: false
+            ),
             .rejected
         )
     }
@@ -115,7 +131,8 @@ final class CreativeClickURLTests: XCTestCase {
     func testStructuredCTAOpenRejectsMalformedUnsafeAndRelativeDestinations() {
         XCTAssertEqual(
             CreativeCTAOpenMessage.admission(
-                for: #"{"type":"SIMULA_CTA_OPEN","url":"javascript:alert(1)"}"#,
+                for: ctaBody(url: "javascript:alert(1)"),
+                expectedNonce: activationNonce,
                 destination: .web,
                 externalClickOnly: true
             ),
@@ -123,7 +140,8 @@ final class CreativeClickURLTests: XCTestCase {
         )
         XCTAssertEqual(
             CreativeCTAOpenMessage.admission(
-                for: #"{"type":"SIMULA_CTA_OPEN","url":"/relative"}"#,
+                for: ctaBody(url: "/relative"),
+                expectedNonce: activationNonce,
                 destination: .web,
                 externalClickOnly: true
             ),
@@ -131,7 +149,8 @@ final class CreativeClickURLTests: XCTestCase {
         )
         XCTAssertEqual(
             CreativeCTAOpenMessage.admission(
-                for: #"{"type":"SIMULA_CTA_OPEN"}"#,
+                for: #"{"type":"SIMULA_CTA_OPEN","activation_nonce":"activation-nonce"}"#,
+                expectedNonce: activationNonce,
                 destination: .appstore,
                 externalClickOnly: false
             ),
@@ -140,6 +159,7 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertEqual(
             CreativeCTAOpenMessage.admission(
                 for: #"{"type":"OTHER","url":"https://example.com"}"#,
+                expectedNonce: activationNonce,
                 destination: .appstore,
                 externalClickOnly: false
             ),
@@ -148,6 +168,7 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertEqual(
             CreativeCTAOpenMessage.admission(
                 for: "not-json",
+                expectedNonce: activationNonce,
                 destination: .appstore,
                 externalClickOnly: false
             ),
@@ -155,11 +176,32 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
-    func testStructuredMessageCannotClaimBeforeAuthoritativeDelegateGesture() {
+    func testMissingAndWrongActivationNonceAreRejected() {
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: ctaBody(url: "https://example.com", nonce: nil),
+                expectedNonce: activationNonce,
+                destination: .web,
+                externalClickOnly: false
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: ctaBody(url: "https://example.com", nonce: "other-webview"),
+                expectedNonce: activationNonce,
+                destination: .web,
+                externalClickOnly: false
+            ),
+            .rejected
+        )
+    }
+
+    func testAuthenticatedMessageAndDelegateStillClaimExactlyOnce() {
         var claim = CreativeClickClaim()
 
         let scriptMessage = claim.claim(
-            userActivated: false,
+            userActivated: true,
             source: .primaryCTA,
             now: 10,
             interactionId: "script"
@@ -171,8 +213,8 @@ final class CreativeClickURLTests: XCTestCase {
             interactionId: "delegate"
         )
 
-        XCTAssertNil(scriptMessage)
-        XCTAssertEqual(lateDelegate, ClickInteraction(id: "delegate", source: .primaryCTA))
+        XCTAssertEqual(scriptMessage, ClickInteraction(id: "script", source: .primaryCTA))
+        XCTAssertNil(lateDelegate)
     }
 
     func testStorePromptGuardRejectsDuplicatesAndKeepsFailedBilledRouteClaimed() {
@@ -221,6 +263,13 @@ final class CreativeClickURLTests: XCTestCase {
 
         XCTAssertTrue(guardState.claim())
         XCTAssertFalse(guardState.claim(), "a failed external open must not loop automatic redirects")
+    }
+
+    func testFullscreenDismissRequiresUnlockedGateAndNoPendingClick() {
+        XCTAssertFalse(canDismissFullscreen(dismissUnlocked: false, clickHandoffPending: false))
+        XCTAssertFalse(canDismissFullscreen(dismissUnlocked: false, clickHandoffPending: true))
+        XCTAssertFalse(canDismissFullscreen(dismissUnlocked: true, clickHandoffPending: true))
+        XCTAssertTrue(canDismissFullscreen(dismissUnlocked: true, clickHandoffPending: false))
     }
 
     func testDeferredRouteRejectsStaleCompletionAfterReplacement() {
