@@ -38,6 +38,14 @@ final class TelemetryEnrichmentTests: XCTestCase {
         }
     }
 
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func set() { lock.lock(); value = true; lock.unlock() }
+    }
+
     private func build(
         store: TelemetryStoring,
         sender: TelemetrySending,
@@ -180,11 +188,13 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let store = FakeStore()
         let sender = FakeSender()
         let gate = ControllableLaunchSettledGate()
+        let timedSleep = ControllablePersistenceSleep()
         let m = build(
             store: store,
             sender: sender,
             clock: clock,
-            launchGate: gate
+            launchGate: gate,
+            timedFlushSleep: { await timedSleep.sleep($0) }
         )
         await m.waitForRecoveryForTests()
 
@@ -205,14 +215,25 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertEqual(persisted.first { $0.interactionId == "before" }?.sampleRate, 1)
         XCTAssertEqual(persisted.first { $0.interactionId == "after" }?.sampleRate, 1)
 
+        _ = await timedSleep.waitForRequest()
+        await waitUntil { await gate.waitCount > 0 }
         await gate.open()
-        await waitUntil { !sender.batches.isEmpty }
-        let envelope = sender.batches.first
+        let expectedIds: Set<String> = ["before", "after"]
+        await waitUntil {
+            Set(self.allEvents(sender.batches).compactMap(\.interactionId)).isSuperset(of: expectedIds)
+        }
+        let envelope = sender.batches.first { batch in
+            Set(batch.events.compactMap(\.interactionId)) == expectedIds
+        }
         XCTAssertEqual(envelope?.sampleRate, 1)
         XCTAssertEqual(
             Set(envelope?.events.filter { $0.name == "click" }.compactMap(\.sampleRate) ?? []),
             Set([1.0])
         )
+
+        timedSleep.release()
+        await timedSleep.waitForCompletion()
+        await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
     }
 
     func testCriticalClickSurvivesOrdinaryBufferPressure() async {
@@ -268,22 +289,22 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertTrue(store.load().contains { $0.name == "pending_before_background" })
     }
 
-    func testBackgroundObserverDoesNotFlushInlineOnPostingThread() {
+    func testBackgroundObserverDoesNotFlushInlineOnPostingThread() async {
         let center = NotificationCenter()
         let name = Notification.Name("telemetry-background-async-test")
         let queue = DispatchQueue(label: "telemetry-background-async-test")
         queue.suspend()
-        let flushed = DispatchSemaphore(value: 0)
+        let flushed = LockedFlag()
         let observer = TelemetryBackgroundFlushObserver(center: center, name: name, queue: queue) {
-            flushed.signal()
+            flushed.set()
         }
         _ = observer
 
         center.post(name: name, object: nil)
-        XCTAssertEqual(flushed.wait(timeout: .now()), .timedOut)
+        XCTAssertFalse(flushed.isSet)
         queue.resume()
 
-        XCTAssertEqual(flushed.wait(timeout: .now() + 1), .success)
+        await waitUntil { flushed.isSet }
     }
 
     func testOldPersistedEventDecodesWithoutTimeSinceInit() throws {

@@ -269,6 +269,8 @@ final class AdBeaconManagerTests: XCTestCase {
     }
 
     func testClickRequestUsesContractHeadersAndShownDoesNot() async throws {
+        BeaconHeaderURLProtocol.reset()
+        defer { BeaconHeaderURLProtocol.reset() }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [BeaconHeaderURLProtocol.self]
         let api = SimulaAPI(session: URLSession(configuration: configuration))
@@ -365,7 +367,6 @@ final class AdBeaconManagerTests: XCTestCase {
             timeout: 1
         ) { persisted.signal() }
 
-        try? await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertFalse(persisted.isSignaled)
         store.release()
         await persisted.wait()
@@ -897,6 +898,10 @@ private final class BeaconHeaderURLProtocol: URLProtocol {
 
     static var requests: [URLRequest] {
         lock.lock(); defer { lock.unlock() }; return captured
+    }
+
+    static func reset() {
+        lock.lock(); captured.removeAll(); lock.unlock()
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }

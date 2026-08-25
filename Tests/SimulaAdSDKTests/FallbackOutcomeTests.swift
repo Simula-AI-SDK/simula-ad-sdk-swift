@@ -2,6 +2,13 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class FallbackOutcomeTests: XCTestCase {
+    func testFallbackAdvanceRequiresCurrentScreenWithoutPendingClickRoute() {
+        XCTAssertTrue(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: nil))
+        XCTAssertFalse(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: 0))
+        XCTAssertFalse(canAdvanceFallback(renderedIndex: 0, currentIndex: 1, clickHandoffIndex: nil))
+        XCTAssertTrue(canAdvanceFallback(renderedIndex: 1, currentIndex: 1, clickHandoffIndex: 0))
+    }
+
     func testLoadingTimeoutProducesUnavailableOutcomeOnce() {
         var coordinator = FallbackPresentationCoordinator()
         let generation = coordinator.beginLoading()

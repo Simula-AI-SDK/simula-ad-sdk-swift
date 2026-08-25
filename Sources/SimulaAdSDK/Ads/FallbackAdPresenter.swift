@@ -63,6 +63,10 @@ enum FallbackLoadingResolution: Equatable, Sendable {
     case stale
 }
 
+func canAdvanceFallback(renderedIndex: Int, currentIndex: Int, clickHandoffIndex: Int?) -> Bool {
+    renderedIndex == currentIndex && clickHandoffIndex != renderedIndex
+}
+
 /// Pure one-presentation state machine. Generation ownership makes a timeout and a late fetch
 /// mutually exclusive, while terminal transitions return an outcome only once.
 struct FallbackPresentationCoordinator: Sendable {
@@ -183,6 +187,7 @@ final class FallbackAdPresenter {
     private var isLoading = false
     private var presentationCoordinator = FallbackPresentationCoordinator()
     private var loadingGeneration: Int?
+    private var clickHandoffIndex: Int?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onFinish` is then never called).
@@ -384,6 +389,14 @@ final class FallbackAdPresenter {
             adId: ad.adId,
             html: ad.html,
             onAdClick: { [weak self] interaction in self?.onAdClick?(interaction) },
+            onClickHandoffPendingChanged: { [weak self] pending in
+                guard let self, self.index == index else { return }
+                if pending {
+                    self.clickHandoffIndex = index
+                } else if self.clickHandoffIndex == index {
+                    self.clickHandoffIndex = nil
+                }
+            },
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
             ctaStoreUrl: ctaStoreUrl,
@@ -408,7 +421,13 @@ final class FallbackAdPresenter {
 
     /// Reveal the next screen on each close tap; tear down after the last one.
     private func advance(from renderedIndex: Int) {
-        guard window != nil, index == renderedIndex else { return }
+        guard window != nil,
+              canAdvanceFallback(
+                renderedIndex: renderedIndex,
+                currentIndex: index,
+                clickHandoffIndex: clickHandoffIndex
+              ) else { return }
+        clickHandoffIndex = nil
         index += 1
         if index < ads.count {
             hostingController?.rootView = adView(at: index)
@@ -432,6 +451,7 @@ final class FallbackAdPresenter {
         onLoadingTimeout = nil
         isLoading = false
         loadingGeneration = nil
+        clickHandoffIndex = nil
         window = nil
         hostingController = nil
         originalKeyWindow = nil

@@ -92,6 +92,8 @@ public struct AdOverlayView: View {
     var html: String? = nil
     /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
     var onAdClick: ((ClickInteraction) -> Void)? = nil
+    /// Mirrors deferred route ownership to imperative fallback presenters for a defensive close guard.
+    var onClickHandoffPendingChanged: ((Bool) -> Void)? = nil
     /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
     /// the in-app store sheet deterministically (tracker fired in the background) instead of
     /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
@@ -119,6 +121,7 @@ public struct AdOverlayView: View {
     @State private var loadedCreativeIdentity: String?
     @State private var loadCoordinator = AdOverlayLoadCoordinator()
     @State private var loadWatchdogTask: Task<Void, Never>?
+    @State private var clickHandoffPending = false
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -168,7 +171,7 @@ public struct AdOverlayView: View {
             Color.black.opacity(isBottomSheet ? 0.8 : 1.0)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    if adCountdown <= 0 { onClose() }
+                    requestClose()
                 }
 
             // Content: bottom sheet or fullscreen (GeometryReader layout matches GameIframeView)
@@ -201,24 +204,28 @@ public struct AdOverlayView: View {
                                 onNavigationFinished: { markPageFinished() },
                                 onNavigationFailed: { _ in markPageFailed() },
                                 onAdClick: onAdClick,
+                                onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
                                 clickSource: .fallbackCTA,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
                                 ctaStoreUrl: ctaStoreUrl
                             )
+                            .allowsHitTesting(!clickHandoffPending)
                         } else if let url = URL(string: iframeUrl) {
                             WebViewRepresentable(
                                 url: url,
                                 onNavigationFinished: { markPageFinished() },
                                 onNavigationFailed: { _ in markPageFailed() },
                                 onAdClick: onAdClick,
+                                onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
                                 clickSource: .fallbackCTA,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
                                 ctaStoreUrl: ctaStoreUrl
                             )
+                            .allowsHitTesting(!clickHandoffPending)
                         }
 
                         if !adPageReady {
@@ -239,7 +246,7 @@ public struct AdOverlayView: View {
                                     // Compact close button, matching the interstitial/rewarded default
                                     // (a ~16pt dark-translucent circle with a white X). Visible glyph
                                     // stays small; the hit area is a full 44pt touch target.
-                                    Button(action: onClose) {
+                                    Button(action: requestClose) {
                                         Image(systemName: "xmark")
                                             .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.white)
@@ -252,6 +259,7 @@ public struct AdOverlayView: View {
                                             .contentShape(Rectangle())
                                     }
                                     .buttonStyle(CloseButtonStyle())
+                                    .disabled(clickHandoffPending)
                                     .padding(.top, 8)
                                     .padding(.trailing, 8)
                                     .accessibilityLabel("Close ad")
@@ -330,6 +338,7 @@ public struct AdOverlayView: View {
             loadCoordinator.cancel()
             countdownTask?.cancel()
             countdownTask = nil
+            updateClickHandoffPending(false)
         }
         .onChange(of: creativeIdentity) { _ in
             startCurrentCreativeLoadIfNeeded()
@@ -345,6 +354,19 @@ public struct AdOverlayView: View {
     }
 
     // MARK: - Countdown
+
+    private func updateClickHandoffPending(_ pending: Bool) {
+        clickHandoffPending = pending
+        onClickHandoffPendingChanged?(pending)
+    }
+
+    private func requestClose() {
+        guard canDismissFullscreen(
+            dismissUnlocked: adCountdown <= 0,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
+        onClose()
+    }
 
     private var hasLoadableCreative: Bool {
         if let html, !html.isEmpty { return true }

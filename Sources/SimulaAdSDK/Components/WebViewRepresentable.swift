@@ -108,6 +108,9 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// routing (App Store / cross-domain click-through). Lets the imperative HTML
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
     var onAdClick: ((ClickInteraction) -> Void)?
+    /// Reports ownership of a deferred click route so fullscreen containers cannot dismantle this
+    /// WebView after recording the click but before its destination opens.
+    var onClickHandoffPendingChanged: ((Bool) -> Void)?
     var clickSource: ClickSource
     /// Non-nil only when the SDK owns this surface's backend click beacon. Native/fallback HTML
     /// self-report and deliberately leave this nil.
@@ -168,6 +171,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         clickSource: ClickSource = .primaryCTA,
         clickBeaconImpressionId: String? = nil,
         bridge: CreativeBridge? = nil,
@@ -189,6 +193,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
         self.clickSource = clickSource
         self.clickBeaconImpressionId = clickBeaconImpressionId
         self.bridge = bridge
@@ -212,6 +217,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
+        onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
@@ -232,6 +238,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
+            onClickHandoffPendingChanged: onClickHandoffPendingChanged,
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
@@ -308,6 +315,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onNavigationFailed = onNavigationFailed
         coordinator.onMessageReceived = onMessageReceived
         coordinator.onAdClick = onAdClick
+        coordinator.onClickHandoffPendingChanged = onClickHandoffPendingChanged
         coordinator.clickSource = clickSource
         coordinator.clickBeaconImpressionId = clickBeaconImpressionId
         if coordinator.bridge !== bridge {
@@ -443,6 +451,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
+            onClickHandoffPendingChanged: onClickHandoffPendingChanged,
             clickSource: clickSource,
             clickBeaconImpressionId: clickBeaconImpressionId,
             bridge: bridge,
@@ -466,6 +475,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationFailed: ((Error) -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: ((ClickInteraction) -> Void)?
+        var onClickHandoffPendingChanged: ((Bool) -> Void)?
         var clickSource: ClickSource
         var clickBeaconImpressionId: String?
         /// The WebView ↔ SDK bridge (PRD §3); `nil` for non-ad web views.
@@ -543,6 +553,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// reports one target=_blank gesture through both delegate methods.
         private var clickClaim = CreativeClickClaim()
         private let clickRouteGuard = DeferredRouteGuard()
+        private var clickHandoffPending = false
 
         /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
         /// use KVO instead of becoming the scroll delegate.
@@ -558,15 +569,21 @@ struct WebViewRepresentable: UIViewRepresentable {
                 now: now
             ) else { return false }
             let routeGeneration = clickRouteGuard.begin()
+            setClickHandoffPending(true)
             onAdClick?(interaction)
             ClickHandoffPersistence.wait(
                 interaction: interaction,
                 beaconImpressionId: clickBeaconImpressionId
             ) {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.webView != nil,
-                          self.clickRouteGuard.consume(routeGeneration) else { return }
+                    guard let self else { return }
+                    guard self.webView != nil,
+                          self.clickRouteGuard.consume(routeGeneration) else {
+                        self.setClickHandoffPending(false)
+                        return
+                    }
                     route()
+                    self.setClickHandoffPending(false)
                 }
             }
             return true
@@ -574,6 +591,13 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         func cancelPendingClickRoutes() {
             clickRouteGuard.cancel()
+            setClickHandoffPending(false)
+        }
+
+        private func setClickHandoffPending(_ pending: Bool) {
+            guard clickHandoffPending != pending else { return }
+            clickHandoffPending = pending
+            onClickHandoffPendingChanged?(pending)
         }
 
         /// Continuously cancel any WebKit-driven offset nudge (sub-pt content overflow).
@@ -625,6 +649,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationFailed: ((Error) -> Void)?,
             onMessageReceived: ((String) -> Void)?,
             onAdClick: ((ClickInteraction) -> Void)? = nil,
+            onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
             clickSource: ClickSource = .primaryCTA,
             clickBeaconImpressionId: String? = nil,
             bridge: CreativeBridge? = nil,
@@ -642,6 +667,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onNavigationFailed = onNavigationFailed
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
+            self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
             self.clickSource = clickSource
             self.clickBeaconImpressionId = clickBeaconImpressionId
             self.bridge = bridge
@@ -1324,6 +1350,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     /// Accepted for signature parity with the iOS variant (the imperative HTML
     /// creative is iOS-only, so these are unused on macOS).
     var onAdClick: ((ClickInteraction) -> Void)?
+    var onClickHandoffPendingChanged: ((Bool) -> Void)?
     var clickSource: ClickSource
     var attribution: AdAttribution?
     var ctaTrackingUrl: String?
@@ -1339,6 +1366,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         clickSource: ClickSource = .primaryCTA,
         attribution: AdAttribution? = nil,
         ctaTrackingUrl: String? = nil,
@@ -1353,6 +1381,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationFailed = onNavigationFailed
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
+        self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
         self.clickSource = clickSource
         self.attribution = attribution
         self.ctaTrackingUrl = ctaTrackingUrl
@@ -1369,6 +1398,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationFailed: ((Error) -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
+        onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         attribution: AdAttribution? = nil,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
@@ -1383,6 +1413,7 @@ struct WebViewRepresentable: NSViewRepresentable {
             onNavigationFailed: onNavigationFailed,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
+            onClickHandoffPendingChanged: onClickHandoffPendingChanged,
             attribution: attribution,
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
