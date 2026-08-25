@@ -904,7 +904,6 @@ public final class SimulaInterstitialAd {
             ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
-            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
@@ -912,13 +911,6 @@ public final class SimulaInterstitialAd {
                     adId: response.impressionId, serveId: response.impressionId,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
-                if interaction.source == .autoRedirect {
-                    AdBeaconManager.shared.enqueue(
-                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
-                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
-                        clickSource: interaction.source.rawValue
-                    )
-                }
                 if let self { self.delegate?.interstitialDidClick(self) }
             },
             onLoadingTimeout: { prefetch.cancel() },
@@ -976,7 +968,6 @@ public final class SimulaInterstitialAd {
             ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
-            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
@@ -984,13 +975,6 @@ public final class SimulaInterstitialAd {
                     adId: response.impressionId, serveId: response.impressionId,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
-                if interaction.source == .autoRedirect {
-                    AdBeaconManager.shared.enqueue(
-                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
-                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
-                        clickSource: interaction.source.rawValue
-                    )
-                }
                 if let self { self.delegate?.interstitialDidClick(self) }
             },
             presentationLease: presentationLease

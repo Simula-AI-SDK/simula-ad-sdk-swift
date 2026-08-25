@@ -235,8 +235,8 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
-    // auto_store_redirect — exactly-once click emission with a cancellable persistence handoff.
-    @State private var autoRedirectHandoff = AutomaticClickHandoffGuard()
+    // auto_store_redirect — one route per presentation, never a user click.
+    @State private var autoRedirectGuard = AutomaticRouteGuard()
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
@@ -354,7 +354,6 @@ private struct CreativeInterstitialView: View {
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
-            autoRedirectHandoff.cancelPendingRoute()
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -398,19 +397,9 @@ private struct CreativeInterstitialView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard let generation = autoRedirectHandoff.claim() else { return }
-        storeExit?.recordStoreOpen("auto_redirect")
-        let interaction = ClickInteraction(source: .autoRedirect)
-        onClick(interaction)
-        ClickHandoffPersistence.wait(
-            interaction: interaction,
-            beaconImpressionId: response.impressionId
-        ) {
-            DispatchQueue.main.async {
-                guard visible,
-                      autoRedirectHandoff.persistenceCompleted(generation: generation) else { return }
-                _ = handleStorePromptTap()
-            }
+        guard autoRedirectGuard.claim(), visible else { return }
+        if handleStorePromptTap() {
+            storeExit?.recordStoreOpen("auto_redirect")
         }
     }
 
@@ -642,7 +631,6 @@ private struct CreativeInterstitialView: View {
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
-        storeExit?.recordStoreOpen("store_prompt")
         ClickHandoffPersistence.wait(
             interaction: interaction,
             beaconImpressionId: response.impressionId
@@ -652,7 +640,9 @@ private struct CreativeInterstitialView: View {
                     gestureGuard.release()
                     return
                 }
-                if let generation = gestureGuard.complete(routed: handleStorePromptTap()) {
+                let routed = handleStorePromptTap()
+                if routed { storeExit?.recordStoreOpen("store_prompt") }
+                if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
                     ) {

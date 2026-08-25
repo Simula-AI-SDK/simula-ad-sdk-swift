@@ -666,7 +666,13 @@ struct WebViewRepresentable: UIViewRepresentable {
                 let route = externalClickOnly
                     ? nativeCTARoute(fallback: url)
                     : creativeCTARoute(fallback: url, fallbackStoreAppID: appStoreID(from: url))
-                _ = routeClaimedClick(userActivated: true, route: route)
+                // Page-world code can address this message handler directly, so the envelope cannot
+                // attest a user gesture. Preserve popup routing without emitting a billable click;
+                // native `.linkActivated` delegate callbacks remain the authoritative click path.
+                Task { @MainActor [weak self] in
+                    guard self?.webView != nil else { return }
+                    route()
+                }
                 return
             case .rejected:
                 return

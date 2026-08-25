@@ -932,7 +932,6 @@ public final class SimulaRewardedAd {
             ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
-            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
@@ -940,13 +939,6 @@ public final class SimulaRewardedAd {
                     adId: response.impressionId, serveId: nil,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
-                if interaction.source == .autoRedirect {
-                    AdBeaconManager.shared.enqueue(
-                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
-                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
-                        clickSource: interaction.source.rawValue
-                    )
-                }
                 if let self { self.delegate?.rewardedDidClick(self) }
             },
             onLoadingTimeout: { prefetch.cancel() },
@@ -1003,7 +995,6 @@ public final class SimulaRewardedAd {
             ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
-            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
@@ -1011,13 +1002,6 @@ public final class SimulaRewardedAd {
                     adId: response.impressionId, serveId: nil,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
-                if interaction.source == .autoRedirect {
-                    AdBeaconManager.shared.enqueue(
-                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
-                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
-                        clickSource: interaction.source.rawValue
-                    )
-                }
                 if let self { self.delegate?.rewardedDidClick(self) }
             },
             presentationLease: presentationLease

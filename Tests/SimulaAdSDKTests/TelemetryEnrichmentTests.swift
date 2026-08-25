@@ -48,6 +48,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
         carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
         ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
         flushThreshold: Int = 20,
+        maxBuffer: Int = 200,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil
     ) -> TelemetryManager {
@@ -68,6 +69,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             timedFlushSleep: timedFlushSleep,
             launchGate: launchGate,
             flushThreshold: flushThreshold,
+            maxBuffer: maxBuffer,
             flushInterval: 0.05
         )
         manager.start()
@@ -201,16 +203,43 @@ final class TelemetryEnrichmentTests: XCTestCase {
         await waitUntil { store.load().filter { $0.name == "click" }.count == 2 }
         let persisted = store.load().filter { $0.name == "click" }
         XCTAssertEqual(persisted.first { $0.interactionId == "before" }?.sampleRate, 1)
-        XCTAssertEqual(persisted.first { $0.interactionId == "after" }?.sampleRate, 0.25)
+        XCTAssertEqual(persisted.first { $0.interactionId == "after" }?.sampleRate, 1)
 
         await gate.open()
         await waitUntil { !sender.batches.isEmpty }
         let envelope = sender.batches.first
-        XCTAssertNil(envelope?.sampleRate, "a mixed-rate envelope must not claim one batch-wide rate")
+        XCTAssertEqual(envelope?.sampleRate, 1)
         XCTAssertEqual(
             Set(envelope?.events.filter { $0.name == "click" }.compactMap(\.sampleRate) ?? []),
-            Set([1.0, 0.25])
+            Set([1.0])
         )
+    }
+
+    func testCriticalClickSurvivesOrdinaryBufferPressure() async {
+        let store = FakeStore()
+        let gate = ControllableLaunchSettledGate()
+        let m = build(
+            store: store,
+            sender: FakeSender(),
+            clock: Clock(1_000),
+            flushThreshold: 100,
+            maxBuffer: 3,
+            launchGate: gate
+        )
+        await m.waitForRecoveryForTests()
+
+        m.recordLifecycle(
+            stage: "click", adFormat: "interstitial", adUnitId: "unit", adId: "imp",
+            serveId: "imp", durationMs: nil, errorCode: nil,
+            interactionId: "critical", clickSource: "primary_cta"
+        )
+        for index in 0..<4 {
+            m.recordOperation(name: "ordinary_\(index)", durationMs: 1, success: true)
+        }
+        m.flushNow()
+
+        await waitUntil { store.load().count == 3 }
+        XCTAssertTrue(store.load().contains { $0.interactionId == "critical" })
     }
 
     func testBackgroundObserverPersistsBeforeFlushAttempt() async {
@@ -237,6 +266,24 @@ final class TelemetryEnrichmentTests: XCTestCase {
 
         await waitUntil { store.load().contains { $0.name == "pending_before_background" } }
         XCTAssertTrue(store.load().contains { $0.name == "pending_before_background" })
+    }
+
+    func testBackgroundObserverDoesNotFlushInlineOnPostingThread() {
+        let center = NotificationCenter()
+        let name = Notification.Name("telemetry-background-async-test")
+        let queue = DispatchQueue(label: "telemetry-background-async-test")
+        queue.suspend()
+        let flushed = DispatchSemaphore(value: 0)
+        let observer = TelemetryBackgroundFlushObserver(center: center, name: name, queue: queue) {
+            flushed.signal()
+        }
+        _ = observer
+
+        center.post(name: name, object: nil)
+        XCTAssertEqual(flushed.wait(timeout: .now()), .timedOut)
+        queue.resume()
+
+        XCTAssertEqual(flushed.wait(timeout: .now() + 1), .success)
     }
 
     func testOldPersistedEventDecodesWithoutTimeSinceInit() throws {

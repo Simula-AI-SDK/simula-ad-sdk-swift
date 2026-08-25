@@ -33,11 +33,20 @@ struct TelemetryInitialization: Equatable, Sendable {
 
 final class TelemetryBackgroundFlushObserver: @unchecked Sendable {
     private let center: NotificationCenter
+    private let queue: DispatchQueue
     private var token: NSObjectProtocol?
 
-    init(center: NotificationCenter = .default, name: Notification.Name, flush: @escaping @Sendable () -> Void) {
+    init(
+        center: NotificationCenter = .default,
+        name: Notification.Name,
+        queue: DispatchQueue = DispatchQueue.global(qos: .utility),
+        flush: @escaping @Sendable () -> Void
+    ) {
         self.center = center
-        token = center.addObserver(forName: name, object: nil, queue: nil) { _ in flush() }
+        self.queue = queue
+        token = center.addObserver(forName: name, object: nil, queue: nil) { _ in
+            queue.async { flush() }
+        }
     }
 
     deinit {

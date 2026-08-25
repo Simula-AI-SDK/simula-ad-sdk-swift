@@ -61,8 +61,8 @@ struct CarrierInfo: Sendable {
 ///   (most likely to precede process death), perf events on each flush. Recovered on `start`.
 /// - **Batched**: flushes at `flushThreshold` events, every `flushInterval`, or eagerly on an
 ///   error. Failed batches retry with exponential backoff.
-/// - **Bounded**: the buffer caps at `maxBuffer` (oldest dropped) and distinct error signatures
-///   at `maxErrorSignatures`; both surface a `dropped` meta event rather than silently truncating.
+/// - **Bounded**: the buffer caps at `maxBuffer` (oldest non-critical event dropped) and distinct
+///   error signatures at `maxErrorSignatures`; both surface a `dropped` meta event.
 /// - **Sampled / killable**: perf is sampled per session at `sampleRate`; the whole pipeline
 ///   honors `isEnabled` (host opt-out always wins; the server can additionally disable it).
 ///
@@ -641,11 +641,14 @@ final class TelemetryManager: @unchecked Sendable {
         guard isEnabled, perfSampledIn else { lock.unlock(); return }
         var event = event
         event.sampleRate = sampleRate
-        buffer.append(event)
-        while buffer.count > maxBuffer { buffer.removeFirst(); droppedCount += 1 }
+        let admitted = admitBufferedEventLocked(event)
         let shouldFlush = buffer.count >= flushThreshold
         lock.unlock()
         debugLog?(formatForLog(event))
+        if !admitted {
+            if triggersFlush { requestImmediateFlush() }
+            return
+        }
         if triggersFlush {
             if shouldFlush {
                 requestImmediateFlush()
@@ -661,13 +664,33 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         guard isEnabled else { lock.unlock(); return }
         var event = event
-        event.sampleRate = sampleRate
-        buffer.append(event)
-        while buffer.count > maxBuffer { buffer.removeFirst(); droppedCount += 1 }
-        if recoveryCompleted { persistAsync(snapshotLocked()) }
+        // Critical clicks bypass sampling, so their actual inclusion probability is always 1.0.
+        event.sampleRate = 1
+        let admitted = admitBufferedEventLocked(event)
+        if admitted, recoveryCompleted { persistAsync(snapshotLocked()) }
         lock.unlock()
         debugLog?(formatForLog(event))
         requestImmediateFlush()
+    }
+
+    /// Caller holds `lock`. Preserve conversion-critical rows when the shared FIFO is full.
+    private func admitBufferedEventLocked(_ event: TelemetryEvent) -> Bool {
+        if buffer.count < maxBuffer {
+            buffer.append(event)
+            return true
+        }
+        guard let evictable = buffer.firstIndex(where: { !isCriticalClickLifecycle($0) }) else {
+            droppedCount += 1
+            return false
+        }
+        buffer.remove(at: evictable)
+        droppedCount += 1
+        buffer.append(event)
+        return true
+    }
+
+    private func isCriticalClickLifecycle(_ event: TelemetryEvent) -> Bool {
+        event.type == TelemetryType.lifecycle && (event.name == "click" || event.name == "click_fired")
     }
 
     /// Runs after every persistence item currently queued. A click caller records synchronously,

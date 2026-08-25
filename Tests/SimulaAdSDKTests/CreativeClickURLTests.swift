@@ -62,8 +62,7 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
-    func testStructuredCTAOpenPreservesURLAndFragmentBeforeClaiming() {
-        var clickClaim = CreativeClickClaim()
+    func testStructuredCTAOpenPreservesURLAndFragmentWithoutAttestingGesture() {
         let body = #"{"type":"SIMULA_CTA_OPEN","url":"https://tracker.example/click?a=1#campaign&step=2"}"#
         guard case .accepted(let url) = CreativeCTAOpenMessage.admission(
             for: body,
@@ -71,18 +70,7 @@ final class CreativeClickURLTests: XCTestCase {
             externalClickOnly: false
         ) else { return XCTFail("expected CTA admission") }
 
-        let interaction = clickClaim.claim(
-            userActivated: true,
-            source: .primaryCTA,
-            now: 10.1,
-            interactionId: "script-window-open"
-        )
-
         XCTAssertEqual(url.absoluteString, "https://tracker.example/click?a=1#campaign&step=2")
-        XCTAssertEqual(
-            interaction,
-            ClickInteraction(id: "script-window-open", source: .primaryCTA)
-        )
     }
 
     func testStructuredCTAOpenAcceptsEveryNativeStoreAndWebScheme() {
@@ -167,11 +155,11 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
-    func testStructuredAndDelegateCallbacksStillClaimExactlyOnce() {
+    func testStructuredMessageCannotClaimBeforeAuthoritativeDelegateGesture() {
         var claim = CreativeClickClaim()
 
         let scriptMessage = claim.claim(
-            userActivated: true,
+            userActivated: false,
             source: .primaryCTA,
             now: 10,
             interactionId: "script"
@@ -183,16 +171,20 @@ final class CreativeClickURLTests: XCTestCase {
             interactionId: "delegate"
         )
 
-        XCTAssertEqual(scriptMessage, ClickInteraction(id: "script", source: .primaryCTA))
-        XCTAssertNil(lateDelegate)
+        XCTAssertNil(scriptMessage)
+        XCTAssertEqual(lateDelegate, ClickInteraction(id: "delegate", source: .primaryCTA))
     }
 
-    func testStorePromptGuardRejectsDuplicatesAndReleasesFailedRoute() {
+    func testStorePromptGuardRejectsDuplicatesAndKeepsFailedBilledRouteClaimed() {
         let guardState = StorePromptGestureGuard()
 
         XCTAssertTrue(guardState.claim())
         XCTAssertFalse(guardState.claim())
-        guardState.complete(routed: false)
+        guard let generation = guardState.complete() else {
+            return XCTFail("persisted click needs bounded release ownership")
+        }
+        XCTAssertFalse(guardState.claim())
+        guardState.releaseRoutedFallback(generation: generation)
         XCTAssertTrue(guardState.claim())
     }
 
@@ -202,7 +194,7 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertTrue(guardState.claim())
         guardState.releaseAfterExternalReturn()
         XCTAssertFalse(guardState.claim(), "a foreground notification must not release pending persistence")
-        let generation = guardState.complete(routed: true)
+        let generation = guardState.complete()
         XCTAssertFalse(guardState.claim())
         guardState.releaseAfterExternalReturn()
         XCTAssertTrue(guardState.claim())
@@ -216,7 +208,7 @@ final class CreativeClickURLTests: XCTestCase {
         let guardState = StorePromptGestureGuard()
 
         XCTAssertTrue(guardState.claim())
-        guard let generation = guardState.complete(routed: true) else {
+        guard let generation = guardState.complete() else {
             return XCTFail("successful route needs a bounded release generation")
         }
         XCTAssertFalse(guardState.claim())
@@ -224,46 +216,11 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertTrue(guardState.claim())
     }
 
-    func testAutomaticClickWaitsForPersistenceAndClaimsExactlyOnce() {
-        let guardState = AutomaticClickHandoffGuard()
-        let interaction = ClickInteraction(id: "auto", source: .autoRedirect)
-        var events = ["emit:\(interaction.source.rawValue)"]
-        guard let generation = guardState.claim() else {
-            return XCTFail("first auto redirect must claim")
-        }
+    func testAutomaticRouteClaimsExactlyOnceWithoutCreatingClickInteraction() {
+        let guardState = AutomaticRouteGuard()
 
-        XCTAssertNil(guardState.claim())
-        XCTAssertEqual(events, ["emit:auto_redirect"], "routing must not happen before persistence completion")
-        if guardState.persistenceCompleted(generation: generation) {
-            events.append("route")
-        }
-        XCTAssertEqual(events, ["emit:auto_redirect", "route"])
-        XCTAssertFalse(guardState.persistenceCompleted(generation: generation))
-    }
-
-    func testAutomaticClickRouteFailureDoesNotResetExactlyOnceAdmission() {
-        let guardState = AutomaticClickHandoffGuard()
-        guard let generation = guardState.claim() else {
-            return XCTFail("first auto redirect must claim")
-        }
-        XCTAssertTrue(guardState.persistenceCompleted(generation: generation))
-
-        let routed = false
-
-        XCTAssertFalse(routed)
-        XCTAssertNil(guardState.claim(), "a failed external open must not loop automatic redirects")
-    }
-
-    func testAutomaticClickTeardownSuppressesDelayedRoute() {
-        let guardState = AutomaticClickHandoffGuard()
-        guard let generation = guardState.claim() else {
-            return XCTFail("first auto redirect must claim")
-        }
-
-        guardState.cancelPendingRoute()
-
-        XCTAssertFalse(guardState.persistenceCompleted(generation: generation))
-        XCTAssertNil(guardState.claim(), "teardown must not reset exactly-once admission")
+        XCTAssertTrue(guardState.claim())
+        XCTAssertFalse(guardState.claim(), "a failed external open must not loop automatic redirects")
     }
 
     func testDeferredRouteRejectsStaleCompletionAfterReplacement() {

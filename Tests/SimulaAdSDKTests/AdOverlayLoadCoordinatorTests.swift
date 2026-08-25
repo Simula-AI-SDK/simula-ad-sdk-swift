@@ -2,13 +2,16 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class AdOverlayLoadCoordinatorTests: XCTestCase {
-    func testHungCurrentLoadTimesOutIntoTerminalFailure() {
+    func testHungCurrentLoadTimesOutButLateFinishCanRecover() {
         var coordinator = AdOverlayLoadCoordinator()
         let generation = coordinator.beginLoad()
 
         XCTAssertTrue(coordinator.timeout(generation: generation))
-        XCTAssertEqual(coordinator.phase, .failed(generation))
+        XCTAssertEqual(coordinator.phase, .timedOut(generation))
         XCTAssertFalse(coordinator.isLoading)
+        XCTAssertTrue(coordinator.isTimedOut)
+        XCTAssertTrue(coordinator.finishCurrentLoad())
+        XCTAssertEqual(coordinator.phase, .finished(generation))
     }
 
     func testStaleTimeoutCannotFailReplacementLoad() {

@@ -266,8 +266,8 @@ private struct RewardedGameView: View {
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
-    /// auto_store_redirect exactly-once click + cancellable persistence handoff.
-    @State private var autoRedirectHandoff = AutomaticClickHandoffGuard()
+    /// auto_store_redirect routes once per presentation and is never a user click.
+    @State private var autoRedirectGuard = AutomaticRouteGuard()
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
@@ -364,7 +364,6 @@ private struct RewardedGameView: View {
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
-            autoRedirectHandoff.cancelPendingRoute()
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -412,19 +411,9 @@ private struct RewardedGameView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard let generation = autoRedirectHandoff.claim() else { return }
-        storeExit?.recordStoreOpen("auto_redirect")
-        let interaction = ClickInteraction(source: .autoRedirect)
-        onClick(interaction)
-        ClickHandoffPersistence.wait(
-            interaction: interaction,
-            beaconImpressionId: impressionId
-        ) {
-            DispatchQueue.main.async {
-                guard visible,
-                      autoRedirectHandoff.persistenceCompleted(generation: generation) else { return }
-                _ = handleStorePromptTap()
-            }
+        guard autoRedirectGuard.claim(), visible else { return }
+        if handleStorePromptTap() {
+            storeExit?.recordStoreOpen("auto_redirect")
         }
     }
 
@@ -542,7 +531,6 @@ private struct RewardedGameView: View {
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
-        storeExit?.recordStoreOpen("store_prompt")
         ClickHandoffPersistence.wait(
             interaction: interaction,
             beaconImpressionId: impressionId
@@ -552,7 +540,9 @@ private struct RewardedGameView: View {
                     gestureGuard.release()
                     return
                 }
-                if let generation = gestureGuard.complete(routed: handleStorePromptTap()) {
+                let routed = handleStorePromptTap()
+                if routed { storeExit?.recordStoreOpen("store_prompt") }
+                if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
                     ) {

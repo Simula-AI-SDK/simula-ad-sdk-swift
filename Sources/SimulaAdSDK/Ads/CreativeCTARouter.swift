@@ -121,31 +121,21 @@ final class DeferredRouteGuard {
     }
 }
 
-/// Exactly-once automatic-click admission plus a cancellable persistence boundary. `claim()` can
-/// succeed only once for the lifetime of an ad surface; teardown invalidates only the pending route,
-/// not the one-shot claim, so a SwiftUI reappearance cannot manufacture another auto redirect.
-final class AutomaticClickHandoffGuard {
+/// Exactly-once automatic-route admission for one ad surface. Automatic store redirects are not
+/// clicks: they route once without publisher notification, click telemetry, or a click beacon.
+final class AutomaticRouteGuard {
     private var claimed = false
-    private let deferredRoute = DeferredRouteGuard()
 
-    func claim() -> Int? {
-        guard !claimed else { return nil }
+    func claim() -> Bool {
+        guard !claimed else { return false }
         claimed = true
-        return deferredRoute.begin()
-    }
-
-    func persistenceCompleted(generation: Int) -> Bool {
-        deferredRoute.consume(generation)
-    }
-
-    func cancelPendingRoute() {
-        deferredRoute.cancel()
+        return true
     }
 }
 
 /// One-in-flight admission used by store-prompt badges while click persistence and routing run.
-/// A successful route remains claimed until its external surface dismisses/returns; a failed route
-/// releases immediately so a transient presentation failure can be retried.
+/// Once persisted, the interaction stays claimed for a bounded window even if routing fails so a
+/// dead store button cannot mint a fresh billable click on every tap.
 final class StorePromptGestureGuard {
     static let routedReleaseTimeout: TimeInterval = 2
 
@@ -166,14 +156,9 @@ final class StorePromptGestureGuard {
         return true
     }
 
-    /// Returns the current generation when an optimistic route needs a bounded release fallback.
-    /// A known failure releases synchronously and needs no scheduled work.
-    @discardableResult
-    func complete(routed: Bool) -> Int? {
-        guard routed else {
-            state = .idle
-            return nil
-        }
+    /// Returns the generation used for a bounded release if no external-return signal arrives.
+    func complete() -> Int? {
+        guard state == .pending else { return nil }
         state = .routed
         return generation
     }

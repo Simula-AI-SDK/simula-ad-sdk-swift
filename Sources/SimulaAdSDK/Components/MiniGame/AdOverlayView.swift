@@ -12,6 +12,7 @@ struct AdOverlayLoadCoordinator {
     enum Phase: Equatable {
         case idle
         case loading(Int)
+        case timedOut(Int)
         case finished(Int)
         case failed(Int)
     }
@@ -26,6 +27,11 @@ struct AdOverlayLoadCoordinator {
 
     var isIdle: Bool { phase == .idle }
 
+    var isTimedOut: Bool {
+        if case .timedOut = phase { return true }
+        return false
+    }
+
     mutating func beginLoad() -> Int {
         generation += 1
         phase = .loading(generation)
@@ -33,14 +39,18 @@ struct AdOverlayLoadCoordinator {
     }
 
     mutating func finishCurrentLoad() -> Bool {
-        guard case .loading(let owner) = phase else { return false }
+        let owner: Int
+        switch phase {
+        case .loading(let generation), .timedOut(let generation): owner = generation
+        case .idle, .finished, .failed: return false
+        }
         phase = .finished(owner)
         return true
     }
 
     mutating func failCurrentLoad() -> Bool {
         switch phase {
-        case .loading(let owner), .finished(let owner):
+        case .loading(let owner), .timedOut(let owner), .finished(let owner):
             phase = .failed(owner)
             return true
         case .idle, .failed:
@@ -50,7 +60,7 @@ struct AdOverlayLoadCoordinator {
 
     mutating func timeout(generation expectedGeneration: Int) -> Bool {
         guard phase == .loading(expectedGeneration) else { return false }
-        phase = .failed(expectedGeneration)
+        phase = .timedOut(expectedGeneration)
         return true
     }
 
@@ -106,6 +116,8 @@ public struct AdOverlayView: View {
     /// A committed document can still fail while loading subresources. Presentation timing starts
     /// only after `didFinish`, once the creative has passed the stronger readiness boundary.
     @State private var pageFinished = false
+    /// A watchdog timeout fails open: close remains available even if the same load finishes later.
+    @State private var loadTimedOut = false
     @State private var presentationStarted = false
     @State private var hasAppeared = false
     @State private var loadedCreativeIdentity: String?
@@ -356,7 +368,8 @@ public struct AdOverlayView: View {
     private func startCurrentCreativeLoadIfNeeded() {
         let identityChanged = loadedCreativeIdentity != creativeIdentity
         guard identityChanged || loadCoordinator.isIdle
-                || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading) else {
+                || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading
+                    && !loadCoordinator.isTimedOut) else {
             return
         }
 
@@ -367,6 +380,7 @@ public struct AdOverlayView: View {
         adPageReady = false
         adPageFailed = false
         pageFinished = false
+        loadTimedOut = false
         presentationStarted = false
         adCountdown = 5
         ringProgress = 0
@@ -383,7 +397,13 @@ public struct AdOverlayView: View {
         do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
         if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
         loadWatchdogTask = nil
-        applyTerminalPageFailure()
+        loadTimedOut = true
+        adPageReady = true
+        adPageFailed = false
+        countdownTask?.cancel()
+        countdownTask = nil
+        adCountdown = 0
+        ringProgress = 1
     }
 
     private func markPageFinished() {
@@ -430,7 +450,8 @@ public struct AdOverlayView: View {
 
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
     private func reconcileCountdown() {
-        if hasAppeared && presentationStarted && !adPageFailed && appForegrounded && !storeSheetPresented {
+        if hasAppeared && presentationStarted && !adPageFailed && !loadTimedOut
+            && appForegrounded && !storeSheetPresented {
             startCountdown()
         } else {
             countdownTask?.cancel()

@@ -165,10 +165,9 @@ final class FallbackAdPresenter {
     /// Set on a successful `present`, released in `dismiss` (the only teardown path).
     private var retainedWhilePresenting: FallbackAdPresenter?
 
-    /// auto_store_redirect END_SCREEN_N: emitted and durably persisted once when the matching
-    /// fallback screen is actually presented.
+    /// auto_store_redirect END_SCREEN_N: routed once when the matching fallback screen is presented.
     private var autoStoreRedirect: AutoStoreRedirect?
-    private let autoRedirectHandoff = AutomaticClickHandoffGuard()
+    private let autoRedirectGuard = AutomaticRouteGuard()
     /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
     private var onAdClick: ((ClickInteraction) -> Void)?
     /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
@@ -179,7 +178,6 @@ final class FallbackAdPresenter {
     private var ctaStoreOpen: StoreOpen = .skstoreproduct
     private var ctaStoreUrl: String?
     private var attribution: AdAttribution?
-    private var clickBeaconImpressionId: String?
     private var loadingDeadlineTask: Task<Void, Never>?
     private var onLoadingTimeout: (() -> Void)?
     private var isLoading = false
@@ -197,7 +195,6 @@ final class FallbackAdPresenter {
         ctaStoreOpen: StoreOpen = .skstoreproduct,
         ctaStoreUrl: String? = nil,
         attribution: AdAttribution? = nil,
-        clickBeaconImpressionId: String? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         presentationLease: FullscreenPresentationLease,
@@ -214,7 +211,6 @@ final class FallbackAdPresenter {
             ctaStoreOpen: ctaStoreOpen,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution,
-            clickBeaconImpressionId: clickBeaconImpressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
             presentationLease: presentationLease,
@@ -232,7 +228,6 @@ final class FallbackAdPresenter {
         ctaStoreOpen: StoreOpen = .skstoreproduct,
         ctaStoreUrl: String? = nil,
         attribution: AdAttribution? = nil,
-        clickBeaconImpressionId: String? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onLoadingTimeout: @escaping () -> Void,
@@ -250,7 +245,6 @@ final class FallbackAdPresenter {
             ctaStoreOpen: ctaStoreOpen,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution,
-            clickBeaconImpressionId: clickBeaconImpressionId,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
             presentationLease: presentationLease,
@@ -278,7 +272,6 @@ final class FallbackAdPresenter {
         ctaStoreOpen: StoreOpen,
         ctaStoreUrl: String?,
         attribution: AdAttribution?,
-        clickBeaconImpressionId: String?,
         autoStoreRedirect: AutoStoreRedirect?,
         onAdClick: ((ClickInteraction) -> Void)?,
         presentationLease: FullscreenPresentationLease,
@@ -294,7 +287,6 @@ final class FallbackAdPresenter {
         self.ctaStoreOpen = ctaStoreOpen
         self.ctaStoreUrl = ctaStoreUrl
         self.attribution = attribution
-        self.clickBeaconImpressionId = clickBeaconImpressionId
         self.autoStoreRedirect = autoStoreRedirect
         self.onAdClick = onAdClick
         self.presentationLease = presentationLease
@@ -372,25 +364,14 @@ final class FallbackAdPresenter {
         guard let redirect = autoStoreRedirect, redirect.enabled,
               let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: index),
               redirect.trigger == trigger,
-              let generation = autoRedirectHandoff.claim() else { return }
-        let interaction = ClickInteraction(source: .autoRedirect)
-        onAdClick?(interaction)
-        ClickHandoffPersistence.wait(
-            interaction: interaction,
-            beaconImpressionId: clickBeaconImpressionId
-        ) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self, self.window != nil, self.index == index,
-                      self.autoRedirectHandoff.persistenceCompleted(generation: generation) else { return }
-                _ = CreativeCTARouter.open(
-                    trackingUrl: self.ctaTrackingUrl,
-                    destination: self.ctaDestination,
-                    storeOpen: self.ctaStoreOpen,
-                    storeUrl: self.ctaStoreUrl,
-                    attribution: self.attribution
-                )
-            }
-        }
+              autoRedirectGuard.claim(), window != nil, self.index == index else { return }
+        _ = CreativeCTARouter.open(
+            trackingUrl: ctaTrackingUrl,
+            destination: ctaDestination,
+            storeOpen: ctaStoreOpen,
+            storeUrl: ctaStoreUrl,
+            attribution: attribution
+        )
     }
 
     /// `.id` gives each screen fresh overlay state while the opaque host itself stays installed.
@@ -448,7 +429,6 @@ final class FallbackAdPresenter {
         let shouldRestoreHostKeyWindow = win?.isKeyWindow == true
         loadingDeadlineTask?.cancel()
         loadingDeadlineTask = nil
-        autoRedirectHandoff.cancelPendingRoute()
         onLoadingTimeout = nil
         isLoading = false
         loadingGeneration = nil
