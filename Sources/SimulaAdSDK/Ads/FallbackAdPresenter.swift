@@ -1,3 +1,132 @@
+import Foundation
+
+enum FallbackOutcome: Equatable, Sendable {
+    case completed
+    case noContent
+    case loadingTimeout
+    case fetchFailure
+    case presentationUnavailable
+    case hostUnavailable
+
+    var unavailableReason: String? {
+        switch self {
+        case .completed: return nil
+        case .noContent: return "no_content"
+        case .loadingTimeout: return "loading_timeout"
+        case .fetchFailure: return "fetch_failure"
+        case .presentationUnavailable: return "presentation_unavailable"
+        case .hostUnavailable: return "host_unavailable"
+        }
+    }
+
+    /// Fallback delivery is best-effort. Once the playable earned a reward, infrastructure/content
+    /// unavailability must not revoke it; this keeps that policy explicit at the decision point.
+    func shouldVerifyEarnedReward(_ earned: Bool) -> Bool { earned }
+}
+
+struct FallbackTelemetryIdentifiers: Equatable, Sendable {
+    let adId: String
+    let serveId: String?
+
+    static func rewarded(impressionId: String) -> FallbackTelemetryIdentifiers {
+        FallbackTelemetryIdentifiers(adId: impressionId, serveId: nil)
+    }
+
+    static func interstitial(impressionId: String) -> FallbackTelemetryIdentifiers {
+        FallbackTelemetryIdentifiers(adId: impressionId, serveId: impressionId)
+    }
+}
+
+enum FallbackFetchStatus: Equatable, Sendable {
+    case content
+    case noContent
+    case failure
+}
+
+enum FallbackFetchResult: Sendable {
+    case content([FallbackAd])
+    case noContent
+    case failure
+
+    var status: FallbackFetchStatus {
+        switch self {
+        case .content: return .content
+        case .noContent: return .noContent
+        case .failure: return .failure
+        }
+    }
+}
+
+enum FallbackLoadingResolution: Equatable, Sendable {
+    case presentContent
+    case finish(FallbackOutcome)
+    case stale
+}
+
+/// Pure one-presentation state machine. Generation ownership makes a timeout and a late fetch
+/// mutually exclusive, while terminal transitions return an outcome only once.
+struct FallbackPresentationCoordinator: Sendable {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case loading(Int)
+        case presenting(Int)
+        case terminal(FallbackOutcome)
+    }
+
+    private(set) var generation = 0
+    private(set) var phase = Phase.idle
+
+    mutating func beginLoading() -> Int {
+        generation += 1
+        phase = .loading(generation)
+        return generation
+    }
+
+    mutating func beginPresenting() -> Int {
+        generation += 1
+        phase = .presenting(generation)
+        return generation
+    }
+
+    mutating func resolveLoading(
+        generation expectedGeneration: Int,
+        status: FallbackFetchStatus
+    ) -> FallbackLoadingResolution {
+        guard phase == .loading(expectedGeneration) else { return .stale }
+        switch status {
+        case .content:
+            phase = .presenting(expectedGeneration)
+            return .presentContent
+        case .noContent:
+            phase = .terminal(.noContent)
+            return .finish(.noContent)
+        case .failure:
+            phase = .terminal(.fetchFailure)
+            return .finish(.fetchFailure)
+        }
+    }
+
+    mutating func loadingTimedOut(generation expectedGeneration: Int) -> FallbackOutcome? {
+        guard phase == .loading(expectedGeneration) else { return nil }
+        phase = .terminal(.loadingTimeout)
+        return .loadingTimeout
+    }
+
+    mutating func completedPresentedContent() -> FallbackOutcome? {
+        guard case .presenting = phase else { return nil }
+        phase = .terminal(.completed)
+        return .completed
+    }
+
+    mutating func presentationUnavailable() -> FallbackOutcome? {
+        guard case .terminal = phase else {
+            phase = .terminal(.presentationUnavailable)
+            return .presentationUnavailable
+        }
+        return nil
+    }
+}
+
 #if os(iOS)
 import SwiftUI
 import UIKit
@@ -11,8 +140,7 @@ import UIKit
 /// one per close tap, in reveal order.
 ///
 /// The window is hosted above `.normal` (independent of the host's view-controller stack), the
-/// same pattern as `InterstitialPresenter`. `onClose` fires once the last screen closes and the
-/// window is torn down.
+/// same pattern as `InterstitialPresenter`. `onFinish` reports exactly why the window ended.
 @MainActor
 final class FallbackAdPresenter {
     private static let loadingDeadlineNanos: UInt64 = 2_000_000_000
@@ -21,7 +149,7 @@ final class FallbackAdPresenter {
     /// dismantle the previous representable before creating the next one, so only one fallback
     /// WebView is owned at a time.
     private var hostingController: UIHostingController<AnyView>?
-    private var onClose: (() -> Void)?
+    private var onFinish: ((FallbackOutcome) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     private var ads: [FallbackAd] = []
     private var index = 0
@@ -55,9 +183,11 @@ final class FallbackAdPresenter {
     private var loadingDeadlineTask: Task<Void, Never>?
     private var onLoadingTimeout: (() -> Void)?
     private var isLoading = false
+    private var presentationCoordinator = FallbackPresentationCoordinator()
+    private var loadingGeneration: Int?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
-    /// when `ads` is empty or no window scene was available (`onClose` is then never called).
+    /// when `ads` is empty or no window scene was available (`onFinish` is then never called).
     @discardableResult
     func present(
         ads: [FallbackAd],
@@ -71,9 +201,10 @@ final class FallbackAdPresenter {
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         presentationLease: FullscreenPresentationLease,
-        onClose: @escaping () -> Void
+        onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
         guard !ads.isEmpty else { return false }
+        presentationCoordinator.beginPresenting()
         return beginPresentation(
             ads: ads,
             startsLoading: false,
@@ -87,14 +218,13 @@ final class FallbackAdPresenter {
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
             presentationLease: presentationLease,
-            onClose: onClose
+            onFinish: onFinish
         )
     }
 
     /// Installs an SDK-owned opaque fallback window synchronously while fallback prefetch is still
     /// in flight. The same window and hosting controller are reused when `resolveLoading` supplies
     /// the screens, preventing the primary presenter from exposing the host app during handoff.
-    @discardableResult
     func presentLoading(
         originalKeyWindow: UIWindow?,
         ctaTrackingUrl: String? = nil,
@@ -107,8 +237,10 @@ final class FallbackAdPresenter {
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
-        onClose: @escaping () -> Void
-    ) -> Bool {
+        onFinish: @escaping (FallbackOutcome) -> Void
+    ) -> Int? {
+        let generation = presentationCoordinator.beginLoading()
+        loadingGeneration = generation
         let didPresent = beginPresentation(
             ads: [],
             startsLoading: true,
@@ -122,16 +254,19 @@ final class FallbackAdPresenter {
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
             presentationLease: presentationLease,
-            onClose: onClose
+            onFinish: onFinish
         )
-        guard didPresent else { return false }
+        guard didPresent else {
+            loadingGeneration = nil
+            return nil
+        }
         self.onLoadingTimeout = onLoadingTimeout
         loadingDeadlineTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: Self.loadingDeadlineNanos) } catch { return }
             guard !Task.isCancelled else { return }
-            self?.loadingDidTimeout()
+            self?.loadingDidTimeout(generation: generation)
         }
-        return true
+        return generation
     }
 
     private func beginPresentation(
@@ -147,13 +282,13 @@ final class FallbackAdPresenter {
         autoStoreRedirect: AutoStoreRedirect?,
         onAdClick: ((ClickInteraction) -> Void)?,
         presentationLease: FullscreenPresentationLease,
-        onClose: @escaping () -> Void
+        onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
         guard window == nil,
               let scene = originalKeyWindow?.windowScene ?? Self.activeWindowScene() else { return false }
         self.ads = ads
         self.index = 0
-        self.onClose = onClose
+        self.onFinish = onFinish
         self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
         self.ctaStoreOpen = ctaStoreOpen
@@ -164,6 +299,7 @@ final class FallbackAdPresenter {
         self.onAdClick = onAdClick
         self.presentationLease = presentationLease
         isLoading = startsLoading
+        if !startsLoading { loadingGeneration = nil }
 
         self.originalKeyWindow = originalKeyWindow
 
@@ -190,29 +326,44 @@ final class FallbackAdPresenter {
 
     /// Replaces the native loading surface with End Screen 1, or safely tears down when the
     /// best-effort prefetch returned no usable screens. The presenter self-retains across the await.
-    func resolveLoading(with ads: [FallbackAd]) {
+    func resolveLoading(with result: FallbackFetchResult, generation: Int) {
         guard window != nil, isLoading else { return }
-        isLoading = false
+        let resolution = presentationCoordinator.resolveLoading(
+            generation: generation,
+            status: result.status
+        )
+        guard resolution != .stale else { return }
         loadingDeadlineTask?.cancel()
         loadingDeadlineTask = nil
         onLoadingTimeout = nil
-        guard !ads.isEmpty else {
-            dismiss()
-            return
+        loadingGeneration = nil
+        isLoading = false
+        switch resolution {
+        case .presentContent:
+            guard case .content(let ads) = result, !ads.isEmpty else {
+                dismiss(outcome: .noContent)
+                return
+            }
+            self.ads = ads
+            index = 0
+            hostingController?.rootView = adView(at: index)
+        case .finish(let outcome):
+            dismiss(outcome: outcome)
+        case .stale:
+            break
         }
-        self.ads = ads
-        index = 0
-        hostingController?.rootView = adView(at: index)
     }
 
-    private func loadingDidTimeout() {
-        guard window != nil, isLoading else { return }
+    private func loadingDidTimeout(generation: Int) {
+        guard window != nil, isLoading,
+              let outcome = presentationCoordinator.loadingTimedOut(generation: generation) else { return }
         isLoading = false
+        loadingGeneration = nil
         loadingDeadlineTask = nil
         let timeout = onLoadingTimeout
         onLoadingTimeout = nil
         timeout?()
-        dismiss()
+        dismiss(outcome: outcome)
     }
 
     /// END_SCREEN_N: open the primary ad's store once, when the fallback screen whose index matches
@@ -281,12 +432,13 @@ final class FallbackAdPresenter {
         if index < ads.count {
             hostingController?.rootView = adView(at: index)
         } else {
-            dismiss()
+            guard let outcome = presentationCoordinator.completedPresentedContent() else { return }
+            dismiss(outcome: outcome)
         }
     }
 
     /// Tears down the presentation window and fires the close callback once.
-    private func dismiss() {
+    private func dismiss(outcome: FallbackOutcome) {
         // Capture locals and clear `self`'s references before invoking the callback: releasing
         // the self-retention below may leave the callback's owner as the last reference to this
         // presenter, so `self` can be deallocated by the time the callback returns. The caller's
@@ -299,11 +451,12 @@ final class FallbackAdPresenter {
         autoRedirectHandoff.cancelPendingRoute()
         onLoadingTimeout = nil
         isLoading = false
+        loadingGeneration = nil
         window = nil
         hostingController = nil
         originalKeyWindow = nil
-        let callback = onClose
-        onClose = nil
+        let callback = onFinish
+        onFinish = nil
         let presentationLease = presentationLease
         self.presentationLease = nil
         retainedWhilePresenting = nil
@@ -312,7 +465,7 @@ final class FallbackAdPresenter {
         if shouldRestoreHostKeyWindow {
             hostKeyWindow?.makeKey()
         }
-        callback?()
+        callback?(outcome)
         // Balanced with the present-time hide(); ref count keeps the bar hidden if the close
         // callback opens another presenter, restoring the host only when the last one ends.
         SimulaAppStatusBar.restore()

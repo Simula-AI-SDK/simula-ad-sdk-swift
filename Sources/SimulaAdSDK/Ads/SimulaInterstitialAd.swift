@@ -237,11 +237,11 @@ public final class SimulaInterstitialAd {
     /// Background prefetch of the post-close fallback screens, kicked off while the primary ad is
     /// on screen so they present instantly on close (no fetch-after-close flash). Consumed once in
     /// `presentFallbackAds`.
-    private var fallbackPrefetch: Task<[FallbackAd], Never>?
+    private var fallbackPrefetch: Task<FallbackFetchResult, Never>?
     private var fallbackPrefetchToken: UUID?
     /// The prefetch result once it lands, so the close path can present the fallback window
     /// synchronously (before the primary window is torn down) rather than awaiting.
-    private var prefetchedFallbacks: [FallbackAd]?
+    private var prefetchedFallbacks: FallbackFetchResult?
     #endif
 
     // MARK: - Init
@@ -502,6 +502,11 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
+                    SimulaInterstitialAd.recordFallbackOutcome(
+                        .hostUnavailable,
+                        adUnitId: clickAdUnitId,
+                        impressionId: response.impressionId
+                    )
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
@@ -511,13 +516,19 @@ public final class SimulaInterstitialAd {
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
-                // CLOSED fires from onAllClosed — after the LAST fallback screen, not the playable close.
+                // CLOSED fires after fallback delivery terminates. Normal completion still means the
+                // final screen closed; unavailable outcomes are separately identified in telemetry.
                 self.presentFallbackAds(
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
-                    onAllClosed: { [weak self] in
+                    onFallbackFinished: { [weak self] outcome in
+                        SimulaInterstitialAd.recordFallbackOutcome(
+                            outcome,
+                            adUnitId: clickAdUnitId,
+                            impressionId: response.impressionId
+                        )
                         guard let self else { return }
                         self.delegate?.interstitialDidClose(self)
                         // Auto-preload the next ad only now that the WHOLE unit is closed (Android
@@ -726,6 +737,23 @@ public final class SimulaInterstitialAd {
         delegate?.interstitialDidFailToDisplay(self, error: error)
     }
 
+    private static func recordFallbackOutcome(
+        _ outcome: FallbackOutcome,
+        adUnitId: String,
+        impressionId: String
+    ) {
+        guard let reason = outcome.unavailableReason else { return }
+        let identifiers = FallbackTelemetryIdentifiers.interstitial(impressionId: impressionId)
+        Telemetry.shared.recordLifecycle(
+            stage: "fallback_unavailable",
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            adId: identifiers.adId,
+            serveId: identifiers.serveId,
+            errorCode: reason
+        )
+    }
+
     /// Monotonic ms since the given marker (nil if not started).
     private func msSince(_ startNanos: UInt64) -> Int? {
         guard startNanos != 0 else { return nil }
@@ -736,8 +764,8 @@ public final class SimulaInterstitialAd {
 
     /// Starts a background prefetch of the serve's fallback ad screens
     /// (`GET /load/fallbacks/{impressionId}`) while the primary ad is on screen, so they're ready
-    /// the instant the user closes. Best-effort: a missing id / network error / empty response
-    /// resolves to an empty list (nothing shown). The fetch is side-effect-free server-side.
+    /// the instant the user closes. Missing content and fetch failure remain distinct unavailable
+    /// outcomes for telemetry. The fetch is side-effect-free server-side.
     private func startFallbackPrefetch(impressionId: String) {
         #if os(iOS)
         fallbackPrefetch?.cancel()
@@ -751,9 +779,9 @@ public final class SimulaInterstitialAd {
         // screens — even if this ad object is released before the task starts (parity with the
         // pre-refactor closure); `self` stays weak and only gates the state write.
         fallbackPrefetch = Task { [weak self, api] in
-            await Self.runFallbackPrefetch(api: api, impressionId: impressionId) { [weak self] ads in
+            await Self.runFallbackPrefetch(api: api, impressionId: impressionId) { [weak self] result in
                 guard self?.fallbackPrefetchToken == token else { return }
-                self?.prefetchedFallbacks = ads
+                self?.prefetchedFallbacks = result
             }
         }
         #endif
@@ -768,13 +796,18 @@ public final class SimulaInterstitialAd {
     private static func runFallbackPrefetch(
         api: SimulaAPI,
         impressionId: String,
-        publish: @escaping @MainActor ([FallbackAd]) -> Void
-    ) async -> [FallbackAd] {
-        let ads: [FallbackAd]
-        do { ads = try await api.fetchFallbacks(impressionId: impressionId) } catch { ads = [] }
-        guard !Task.isCancelled else { return [] }
-        publish(ads)
-        return ads
+        publish: @escaping @MainActor (FallbackFetchResult) -> Void
+    ) async -> FallbackFetchResult {
+        let result: FallbackFetchResult
+        do {
+            let ads = try await api.fetchFallbacks(impressionId: impressionId)
+            result = ads.isEmpty ? .noContent : .content(ads)
+        } catch {
+            result = .failure
+        }
+        guard !Task.isCancelled else { return .failure }
+        publish(result)
+        return result
     }
     #endif
 
@@ -784,13 +817,13 @@ public final class SimulaInterstitialAd {
     /// fallback window is on screen before the primary window is torn down (see the presenter's
     /// `dismiss`) — no fetch-after-close gap and no handoff flash. If the user closed before the
     /// prefetch finished (rare), it installs an opaque loading window synchronously, then resolves
-    /// that same window after the await. Empty → nothing shown.
+    /// that same window after the await. Empty/failed results report an explicit outcome.
     private func presentFallbackAds(
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
-        onAllClosed: @escaping @MainActor () -> Void
+        onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         let ready = prefetchedFallbacks
         let prefetch = fallbackPrefetch
@@ -798,7 +831,14 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, originalKeyWindow: originalKeyWindow, presentationLease: presentationLease, onAllClosed: onAllClosed)
+            resolveReadyFallback(
+                ready,
+                response: response,
+                autoStoreRedirect: autoStoreRedirect,
+                originalKeyWindow: originalKeyWindow,
+                presentationLease: presentationLease,
+                onFallbackFinished: onFallbackFinished
+            )
         } else if let prefetch {
             presentFallbackLoadingWindow(
                 prefetch: prefetch,
@@ -806,10 +846,39 @@ public final class SimulaInterstitialAd {
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
-                onAllClosed: onAllClosed
+                onFallbackFinished: onFallbackFinished
             )
         } else {
-            onAllClosed()
+            onFallbackFinished(.noContent)
+            presentationLease.finishPostCloseTeardown()
+        }
+    }
+    #endif
+
+    #if os(iOS)
+    private func resolveReadyFallback(
+        _ result: FallbackFetchResult,
+        response: AdLoadResponse,
+        autoStoreRedirect: AutoStoreRedirect?,
+        originalKeyWindow: UIWindow?,
+        presentationLease: FullscreenPresentationLease,
+        onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
+    ) {
+        switch result {
+        case .content(let ads):
+            presentFallbackWindow(
+                ads,
+                response: response,
+                autoStoreRedirect: autoStoreRedirect,
+                originalKeyWindow: originalKeyWindow,
+                presentationLease: presentationLease,
+                onFallbackFinished: onFallbackFinished
+            )
+        case .noContent:
+            onFallbackFinished(.noContent)
+            presentationLease.finishPostCloseTeardown()
+        case .failure:
+            onFallbackFinished(.fetchFailure)
             presentationLease.finishPostCloseTeardown()
         }
     }
@@ -819,16 +888,16 @@ public final class SimulaInterstitialAd {
     /// Installs the pending-prefetch safety window before returning to the primary presenter, then
     /// resolves it asynchronously. The fallback presenter self-retains if the ad object is released.
     private func presentFallbackLoadingWindow(
-        prefetch: Task<[FallbackAd], Never>,
+        prefetch: Task<FallbackFetchResult, Never>,
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
-        onAllClosed: @escaping @MainActor () -> Void
+        onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         let presenter = FallbackAdPresenter()
         let fallbackAdUnitId = adUnitId
-        let didPresent = presenter.presentLoading(
+        let generation = presenter.presentLoading(
             originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
@@ -854,33 +923,34 @@ public final class SimulaInterstitialAd {
             },
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
-        ) { [weak self] in
+        ) { [weak self] outcome in
             self?.fallbackPresenter = nil
-            onAllClosed()
+            onFallbackFinished(outcome)
         }
-        guard didPresent else {
-            onAllClosed()
+        guard let generation else {
+            onFallbackFinished(.presentationUnavailable)
             presentationLease.finishPostCloseTeardown()
             return
         }
         fallbackPresenter = presenter
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch) }
+        Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch, generation: generation) }
     }
 
     /// Prefetch-await task body (named method — see the task-shape note in TelemetryManager).
     @MainActor
     private static func awaitPrefetchAndResolve(
         presenter: FallbackAdPresenter,
-        prefetch: Task<[FallbackAd], Never>
+        prefetch: Task<FallbackFetchResult, Never>,
+        generation: Int
     ) async {
-        let ads = await prefetch.value
-        presenter.resolveLoading(with: ads)
+        let result = await prefetch.value
+        presenter.resolveLoading(with: result, generation: generation)
     }
     #endif
 
     #if os(iOS)
-    /// Presents the fallback ad window for `ads` (fires `onAllClosed` immediately if empty). Best-effort.
+    /// Presents the fallback ad window for `ads` (reports `.noContent` immediately if empty).
     /// `response` threads the serve's CTA routing context (destination / raw store link /
     /// attribution) into the end-screen WebViews for the deterministic store route.
     private func presentFallbackWindow(
@@ -889,10 +959,10 @@ public final class SimulaInterstitialAd {
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
-        onAllClosed: @escaping @MainActor () -> Void
+        onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         guard !ads.isEmpty else {
-            onAllClosed()
+            onFallbackFinished(.noContent)
             presentationLease.finishPostCloseTeardown()
             return
         }
@@ -924,14 +994,14 @@ public final class SimulaInterstitialAd {
                 if let self { self.delegate?.interstitialDidClick(self) }
             },
             presentationLease: presentationLease
-        ) { [weak self] in
+        ) { [weak self] outcome in
             self?.fallbackPresenter = nil
-            onAllClosed()
+            onFallbackFinished(outcome)
         }
         if didPresent {
             self.fallbackPresenter = presenter
         } else {
-            onAllClosed()
+            onFallbackFinished(.presentationUnavailable)
             presentationLease.finishPostCloseTeardown()
         }
     }
