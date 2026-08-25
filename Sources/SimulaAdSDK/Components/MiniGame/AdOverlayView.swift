@@ -47,6 +47,11 @@ public struct AdOverlayView: View {
     @State private var adPageReady = false
     /// Terminal load failure keeps the native black shield but removes the indefinite spinner.
     @State private var adPageFailed = false
+    /// A committed document can still fail while loading subresources. Presentation timing starts
+    /// only after `didFinish`, once the creative has passed the stronger readiness boundary.
+    @State private var pageFinished = false
+    @State private var presentationStarted = false
+    @State private var hasAppeared = false
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -126,9 +131,8 @@ public struct AdOverlayView: View {
                             WebViewRepresentable(
                                 htmlString: html,
                                 baseURL: URL(string: iframeUrl),
-                                onNavigationCommitted: { adPageReady = true; adPageFailed = false },
-                                onNavigationFinished: { adPageReady = true; adPageFailed = false },
-                                onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
+                                onNavigationFinished: { markPageFinished() },
+                                onNavigationFailed: { _ in markPageFailed() },
                                 onAdClick: onAdClick,
                                 clickSource: .fallbackCTA,
                                 attribution: attribution,
@@ -139,9 +143,8 @@ public struct AdOverlayView: View {
                         } else if let url = URL(string: iframeUrl) {
                             WebViewRepresentable(
                                 url: url,
-                                onNavigationCommitted: { adPageReady = true; adPageFailed = false },
-                                onNavigationFinished: { adPageReady = true; adPageFailed = false },
-                                onNavigationFailed: { _ in adPageReady = false; adPageFailed = true },
+                                onNavigationFinished: { markPageFinished() },
+                                onNavigationFailed: { _ in markPageFailed() },
                                 onAdClick: onAdClick,
                                 clickSource: .fallbackCTA,
                                 attribution: attribution,
@@ -240,14 +243,19 @@ public struct AdOverlayView: View {
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)
         .onAppear {
+            hasAppeared = true
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
-            reconcileCountdown()
-            onPresented?()
+            if !hasLoadableCreative {
+                markPageFailed()
+            } else {
+                beginPresentationIfReady()
+            }
         }
         .onDisappear {
+            hasAppeared = false
             countdownTask?.cancel()
             countdownTask = nil
         }
@@ -263,9 +271,45 @@ public struct AdOverlayView: View {
 
     // MARK: - Countdown
 
+    private var hasLoadableCreative: Bool {
+        if let html, !html.isEmpty { return true }
+        return URL(string: iframeUrl) != nil
+    }
+
+    private func markPageFinished() {
+        guard !adPageFailed else { return }
+        adPageReady = true
+        pageFinished = true
+        beginPresentationIfReady()
+    }
+
+    /// `didFinish` can race SwiftUI's `onAppear` for a newly-installed hosting controller. Keep the
+    /// readiness bit and reconcile from both boundaries; callbacks/timing start exactly once only
+    /// after the view is mounted and lifecycle observers can pause any immediate store presentation.
+    private func beginPresentationIfReady() {
+        guard hasAppeared, pageFinished, !adPageFailed else { return }
+        if !presentationStarted {
+            presentationStarted = true
+            onPresented?()
+        }
+        reconcileCountdown()
+    }
+
+    /// A terminal/no-content failure must not strand the user behind a spinner and a close gate for
+    /// content that was never viewable. It also deliberately does not call `onPresented`, preventing
+    /// presentation-timed auto redirects from firing for a failed end screen.
+    private func markPageFailed() {
+        adPageReady = false
+        adPageFailed = true
+        countdownTask?.cancel()
+        countdownTask = nil
+        adCountdown = 0
+        ringProgress = 1
+    }
+
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
     private func reconcileCountdown() {
-        if appForegrounded && !storeSheetPresented {
+        if hasAppeared && presentationStarted && !adPageFailed && appForegrounded && !storeSheetPresented {
             startCountdown()
         } else {
             countdownTask?.cancel()

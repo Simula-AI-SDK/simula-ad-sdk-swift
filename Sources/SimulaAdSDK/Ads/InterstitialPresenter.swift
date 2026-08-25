@@ -228,6 +228,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptVisible = false
     @State private var storePromptScheduled = false
     @State private var storePromptTask: Task<Void, Never>?
+    @State private var storePromptGestureGuard = StorePromptGestureGuard()
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -353,6 +354,7 @@ private struct CreativeInterstitialView: View {
                 SKOverlayPresenter.dismiss()
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
+            storePromptGestureGuard.release()
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -364,6 +366,7 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
             storeExit?.onReturn() // returned from an .external store/browser jump
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
@@ -374,6 +377,7 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
             storeExit?.onReturn() // the in-app sheet was dismissed
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
@@ -619,9 +623,10 @@ private struct CreativeInterstitialView: View {
     }
 
     /// Routes a store-prompt tap to the same destination as the CTA (shared router).
-    private func handleStorePromptTap() {
+    @discardableResult
+    private func handleStorePromptTap() -> Bool {
         let storeOpen = response.adBehavior?.storeOpen ?? .skstoreproduct
-        CreativeCTARouter.open(
+        return CreativeCTARouter.open(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeOpen: storeOpen,
@@ -631,6 +636,8 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleStorePromptClick() {
+        guard storePromptGestureGuard.claim() else { return }
+        let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
         storeExit?.recordStoreOpen("store_prompt")
@@ -638,7 +645,19 @@ private struct CreativeInterstitialView: View {
             interaction: interaction,
             beaconImpressionId: response.impressionId
         ) {
-            DispatchQueue.main.async { handleStorePromptTap() }
+            DispatchQueue.main.async {
+                guard visible else {
+                    gestureGuard.release()
+                    return
+                }
+                if let generation = gestureGuard.complete(routed: handleStorePromptTap()) {
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                    ) {
+                        gestureGuard.releaseRoutedFallback(generation: generation)
+                    }
+                }
+            }
         }
     }
 

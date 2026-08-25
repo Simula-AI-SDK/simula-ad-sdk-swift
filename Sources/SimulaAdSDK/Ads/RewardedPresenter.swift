@@ -263,6 +263,7 @@ private struct RewardedGameView: View {
     @State private var closeProgressAnim: Double = 0
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
+    @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     /// auto_store_redirect one-shot guard.
@@ -362,6 +363,7 @@ private struct RewardedGameView: View {
             impressionTask?.cancel()
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
+            storePromptGestureGuard.release()
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -373,6 +375,7 @@ private struct RewardedGameView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
             storeExit?.onReturn()
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
@@ -386,6 +389,7 @@ private struct RewardedGameView: View {
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
             storeExit?.onReturn()
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
@@ -517,11 +521,14 @@ private struct RewardedGameView: View {
     }
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
-    private func handleStorePromptTap() {
+    @discardableResult
+    private func handleStorePromptTap() -> Bool {
         CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
     }
 
     private func handleStorePromptClick() {
+        guard storePromptGestureGuard.claim() else { return }
+        let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
         storeExit?.recordStoreOpen("store_prompt")
@@ -529,7 +536,19 @@ private struct RewardedGameView: View {
             interaction: interaction,
             beaconImpressionId: impressionId
         ) {
-            DispatchQueue.main.async { handleStorePromptTap() }
+            DispatchQueue.main.async {
+                guard visible else {
+                    gestureGuard.release()
+                    return
+                }
+                if let generation = gestureGuard.complete(routed: handleStorePromptTap()) {
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                    ) {
+                        gestureGuard.releaseRoutedFallback(generation: generation)
+                    }
+                }
+            }
         }
     }
 

@@ -538,7 +538,6 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// One atomic claim guards both publisher notification and destination routing when WebKit
         /// reports one target=_blank gesture through both delegate methods.
         private var clickClaim = CreativeClickClaim()
-        private var userActivation = CreativeUserActivation()
 
         /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
         /// use KVO instead of becoming the scroll delegate.
@@ -549,7 +548,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         private func routeClaimedClick(userActivated: Bool, route: @escaping @MainActor () -> Void) -> Bool {
             let now = ProcessInfo.processInfo.systemUptime
             guard let interaction = clickClaim.claim(
-                userActivated: userActivation.consume(explicitLinkActivation: userActivated, now: now),
+                userActivated: userActivated,
                 source: clickSource,
                 now: now
             ) else { return false }
@@ -646,9 +645,21 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// when one is attached — which posts `GET_*` replies back via this web view — else to
         /// the legacy `onMessageReceived` callback (game iframe).
         func handleMessage(_ body: String) {
-            if body == WebViewMessageForwarder.trustedActivationMessage {
-                userActivation.noteTrustedActivation(now: ProcessInfo.processInfo.systemUptime)
+            switch CreativeCTAOpenMessage.admission(
+                for: body,
+                destination: ctaDestination,
+                externalClickOnly: externalClickOnly
+            ) {
+            case .accepted(let url):
+                let route = externalClickOnly
+                    ? nativeCTARoute(fallback: url)
+                    : creativeCTARoute(fallback: url, fallbackStoreAppID: appStoreID(from: url))
+                _ = routeClaimedClick(userActivated: true, route: route)
                 return
+            case .rejected:
+                return
+            case .notMessage:
+                break
             }
             // Intercept creative JS errors (window.onerror → simulaSDK) before normal routing, so they
             // are captured for ALL modes (bridge + native). Recorded as deduped, redacted telemetry.
@@ -919,6 +930,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
+            let isPopup = navigationAction.targetFrame == nil
+            let userActivated = navigationAction.navigationType == .linkActivated
             let scheme = url.scheme?.lowercased() ?? ""
 
             // Allow internal schemes (about:blank, about:srcdoc, data:, blob:)
@@ -937,8 +950,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             // system browser (PRD) — never the in-app store/SFSafari sheet. Subresource and
             // server-redirect navigations (.other) pass through so the creative loads normally.
             if externalClickOnly {
-                if navigationAction.navigationType == .linkActivated,
-                   scheme == "http" || scheme == "https" || scheme == "itms-apps" || scheme == "itms" {
+                if userActivated, CreativeCTAOpenMessage.isAllowed(
+                    url,
+                    destination: ctaDestination,
+                    externalClickOnly: true
+                ) {
                     // Prefer the server tracking URL (attribution-preserving); fall back to the tapped URL.
                     _ = routeClaimedClick(
                         userActivated: true,
@@ -961,11 +977,15 @@ struct WebViewRepresentable: UIViewRepresentable {
                 // cross-domain branch below and Android's `hasGesture()` guard — so a
                 // programmatic redirect to the store can't fake a click. Routing is
                 // unconditional (the game iframe's post-game auto-redirect still opens).
-                if navigationAction.navigationType == .linkActivated {
+                if userActivated {
                     _ = routeClaimedClick(
                         userActivated: true,
                         route: creativeCTARoute(fallback: url, fallbackStoreAppID: appID)
                     )
+                    decisionHandler(.cancel)
+                    return
+                }
+                if isPopup {
                     decisionHandler(.cancel)
                     return
                 }
@@ -977,11 +997,15 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
-                if navigationAction.navigationType == .linkActivated {
+                if userActivated {
                     _ = routeClaimedClick(
                         userActivated: true,
                         route: creativeCTARoute(fallback: url)
                     )
+                    decisionHandler(.cancel)
+                    return
+                }
+                if isPopup {
                     decisionHandler(.cancel)
                     return
                 }
@@ -996,11 +1020,26 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
+            if userActivated,
+               scheme != "http", scheme != "https",
+               CreativeCTAOpenMessage.isAllowed(
+                   url,
+                   destination: ctaDestination,
+                   externalClickOnly: false
+               ) {
+                _ = routeClaimedClick(
+                    userActivated: true,
+                    route: creativeCTARoute(fallback: url, fallbackStoreAppID: appStoreID(from: url))
+                )
+                decisionHandler(.cancel)
+                return
+            }
+
             // User-initiated cross-domain clicks → deterministic store route when the serve
             // supplied its raw store link (in-app sheet + background tracker fire), else resolve
             // the redirect chain, then SKStoreProductViewController (App Store) or
             // SFSafariViewController (other).
-            if navigationAction.navigationType == .linkActivated,
+            if userActivated,
                scheme == "http" || scheme == "https" {
                 let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
                 let targetHost = url.host?.lowercased() ?? ""
@@ -1028,18 +1067,22 @@ struct WebViewRepresentable: UIViewRepresentable {
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
             if let url = navigationAction.request.url {
-                let scheme = url.scheme?.lowercased() ?? ""
+                let userActivated = navigationAction.navigationType == .linkActivated
+                guard CreativeCTAOpenMessage.isAllowed(
+                    url,
+                    destination: ctaDestination,
+                    externalClickOnly: externalClickOnly
+                ) else { return nil }
                 // Native ad: target="_blank" / window.open → external browser (PRD).
                 if externalClickOnly {
-                    if scheme == "http" || scheme == "https" {
-                        // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
-                        _ = routeClaimedClick(
-                            userActivated: navigationAction.navigationType == .linkActivated,
-                            route: nativeCTARoute(fallback: url)
-                        )
-                    }
+                    // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
+                    _ = routeClaimedClick(
+                        userActivated: userActivated,
+                        route: nativeCTARoute(fallback: url)
+                    )
                     return nil
                 }
+                let scheme = url.scheme?.lowercased() ?? ""
                 if scheme == "http" || scheme == "https" {
                     let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
                     let targetHost = url.host?.lowercased() ?? ""
@@ -1048,15 +1091,22 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // store link, else resolve redirects then route. Router entry point is
                         // `@MainActor`; this delegate runs on main, so hop explicitly rather than
                         // asserting isolation. WebKit can also invoke this for programmatic
-                        // `window.open`; the claim below therefore requires `.linkActivated`.
+                        // `window.open`; the document-start bridge suppresses genuine gesture
+                        // popups first, while this fallback admits only explicit link activation.
                         _ = routeClaimedClick(
-                            userActivated: navigationAction.navigationType == .linkActivated,
+                            userActivated: userActivated,
                             route: creativeCTARoute(fallback: url)
                         )
-                    } else {
-                        // Same-origin → load in webview
+                    } else if userActivated {
+                        // Explicit same-origin target=_blank links stay in this web view. A
+                        // programmatic `.other` popup is suppressed without navigating or routing.
                         webView.load(URLRequest(url: url))
                     }
+                } else {
+                    _ = routeClaimedClick(
+                        userActivated: userActivated,
+                        route: creativeCTARoute(fallback: url, fallbackStoreAppID: appStoreID(from: url))
+                    )
                 }
             }
             return nil

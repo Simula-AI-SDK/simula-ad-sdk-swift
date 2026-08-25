@@ -227,19 +227,13 @@ private func waitForNativeAdDisplayFrame() async {
 /// closure when the view is handed out. The closure captures the coordinator
 /// weakly, so it introduces no retain cycle through the content controller.
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
-    static let trustedActivationMessage = "__simula_trusted_user_activation__"
     var onMessage: ((String) -> Void)?
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        if message.name == WebViewPool.userActivationHandlerName {
-            onMessage?(Self.trustedActivationMessage)
-            return
-        }
         if let body = message.body as? String {
-            guard body != Self.trustedActivationMessage else { return }
             onMessage?(body)
         } else if let dict = message.body as? [String: Any],
                   let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -267,7 +261,6 @@ final class WebViewPool {
 
     /// JS → native channel name. Must match the injected script below.
     static let messageHandlerName = "simulaSDK"
-    static let userActivationHandlerName = "simulaUserActivation"
 
     private struct Pooled {
         let webView: WKWebView
@@ -372,20 +365,59 @@ final class WebViewPool {
         forMainFrameOnly: false
     )
 
-    /// Isolated-world listener for a genuine pointer activation. Creative JavaScript cannot access
-    /// this message handler or forge `Event.isTrusted`; the short-lived native marker lets
-    /// user-triggered `window.open()` through even when WebKit labels its navigation type `.other`.
+    /// Handles popup CTAs before WebKit can race `createWebViewWith` ahead of an asynchronous script
+    /// message. During active user activation, `window.open` and trusted target=_blank clicks are
+    /// suppressed synchronously and forwarded as a structured message over the existing bridge.
+    /// Outside activation, native WebKit delegates still see the original navigation and reject
+    /// programmatic `.other` popups. `navigator.userActivation` is task-scoped: code running in the
+    /// same genuine gesture can share it, and page-world code can replace this wrapper or address the
+    /// existing handler directly, so this is best-effort admission for trusted creatives rather than
+    /// cryptographic attestation. The explicit `.linkActivated` delegate fallback remains authoritative.
     private static let userActivationScript = WKUserScript(
         source: """
-        window.addEventListener('pointerdown', function(event) {
-            if (!event.isTrusted) { return; }
-            if (navigator.userActivation && !navigator.userActivation.isActive) { return; }
-            window.webkit.messageHandlers.simulaUserActivation.postMessage('active');
-        }, true);
+        (function() {
+          var originalOpen = window.open;
+
+          function hasActiveUserGesture() {
+            return !!(navigator.userActivation && navigator.userActivation.isActive === true);
+          }
+
+          function resolvedURL(value) {
+            if (value === undefined || value === null) { return null; }
+            try { return new URL(String(value), document.baseURI).href; }
+            catch (_) { return null; }
+          }
+
+          function forwardCTA(value) {
+            if (!hasActiveUserGesture()) { return false; }
+            var url = resolvedURL(value);
+            if (!url) { return false; }
+            try {
+              window.webkit.messageHandlers.simulaSDK.postMessage({
+                type: 'SIMULA_CTA_OPEN',
+                url: url
+              });
+              return true;
+            } catch (_) {
+              return false;
+            }
+          }
+
+          window.open = function() {
+            if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
+            return originalOpen.apply(window, arguments);
+          };
+
+          window.addEventListener('click', function(event) {
+            if (!event.isTrusted || !hasActiveUserGesture()) { return; }
+            var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+            if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
+            if (forwardCTA(anchor.href)) { event.preventDefault(); }
+          }, true);
+        })();
         """,
         injectionTime: .atDocumentStart,
-        forMainFrameOnly: false,
-        in: .defaultClient
+        forMainFrameOnly: false
     )
 
     private func makePooled() -> Pooled {
@@ -395,11 +427,6 @@ final class WebViewPool {
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
-        controller.add(
-            forwarder,
-            contentWorld: .defaultClient,
-            name: WebViewPool.userActivationHandlerName
-        )
         controller.addUserScript(WebViewPool.postMessageScript)
         controller.addUserScript(WebViewPool.errorCaptureScript)
         controller.addUserScript(WebViewPool.userActivationScript)

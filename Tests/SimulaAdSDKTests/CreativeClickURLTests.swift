@@ -62,34 +62,166 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
-    func testTrustedActivationAllowsWindowOpenOtherButIsSingleUseAndExpires() {
-        var activation = CreativeUserActivation()
-        activation.noteTrustedActivation(now: 5)
-
-        XCTAssertTrue(activation.consume(explicitLinkActivation: false, now: 5.1))
-        XCTAssertFalse(activation.consume(explicitLinkActivation: false, now: 5.2))
-
-        activation.noteTrustedActivation(now: 10)
-        XCTAssertFalse(activation.consume(explicitLinkActivation: false, now: 11.1))
-        XCTAssertTrue(activation.consume(explicitLinkActivation: true, now: 20))
-    }
-
-    func testExternalWindowOpenOtherClaimsWhenTrustedMarkerProvesGesture() {
-        var activation = CreativeUserActivation()
+    func testStructuredCTAOpenPreservesURLAndFragmentBeforeClaiming() {
         var clickClaim = CreativeClickClaim()
-        activation.noteTrustedActivation(now: 10)
+        let body = #"{"type":"SIMULA_CTA_OPEN","url":"https://tracker.example/click?a=1#campaign&step=2"}"#
+        guard case .accepted(let url) = CreativeCTAOpenMessage.admission(
+            for: body,
+            destination: .appstore,
+            externalClickOnly: false
+        ) else { return XCTFail("expected CTA admission") }
 
         let interaction = clickClaim.claim(
-            userActivated: activation.consume(explicitLinkActivation: false, now: 10.1),
+            userActivated: true,
             source: .primaryCTA,
             now: 10.1,
-            interactionId: "trusted-window-open"
+            interactionId: "script-window-open"
         )
 
+        XCTAssertEqual(url.absoluteString, "https://tracker.example/click?a=1#campaign&step=2")
         XCTAssertEqual(
             interaction,
-            ClickInteraction(id: "trusted-window-open", source: .primaryCTA)
+            ClickInteraction(id: "script-window-open", source: .primaryCTA)
         )
+    }
+
+    func testStructuredCTAOpenAcceptsEveryNativeStoreAndWebScheme() {
+        let values = [
+            "https://example.com/path",
+            "http://example.com/path",
+            "itms-apps://apps.apple.com/app/id123",
+            "itms://itunes.apple.com/app/id123",
+        ]
+
+        for value in values {
+            let body = #"{"type":"SIMULA_CTA_OPEN","url":"\#(value)"}"#
+            XCTAssertEqual(
+                CreativeCTAOpenMessage.admission(
+                    for: body,
+                    destination: .appstore,
+                    externalClickOnly: false
+                ),
+                .accepted(URL(string: value)!)
+            )
+        }
+    }
+
+    func testStructuredCTAOpenCustomSchemeFollowsDestinationPolicy() {
+        let body = #"{"type":"SIMULA_CTA_OPEN","url":"advertiser-app://offer/42#details"}"#
+        let url = URL(string: "advertiser-app://offer/42#details")!
+
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(for: body, destination: .web, externalClickOnly: false),
+            .accepted(url)
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(for: body, destination: .appstore, externalClickOnly: true),
+            .accepted(url)
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(for: body, destination: .appstore, externalClickOnly: false),
+            .rejected
+        )
+    }
+
+    func testStructuredCTAOpenRejectsMalformedUnsafeAndRelativeDestinations() {
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: #"{"type":"SIMULA_CTA_OPEN","url":"javascript:alert(1)"}"#,
+                destination: .web,
+                externalClickOnly: true
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: #"{"type":"SIMULA_CTA_OPEN","url":"/relative"}"#,
+                destination: .web,
+                externalClickOnly: true
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: #"{"type":"SIMULA_CTA_OPEN"}"#,
+                destination: .appstore,
+                externalClickOnly: false
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: #"{"type":"OTHER","url":"https://example.com"}"#,
+                destination: .appstore,
+                externalClickOnly: false
+            ),
+            .notMessage
+        )
+        XCTAssertEqual(
+            CreativeCTAOpenMessage.admission(
+                for: "not-json",
+                destination: .appstore,
+                externalClickOnly: false
+            ),
+            .notMessage
+        )
+    }
+
+    func testStructuredAndDelegateCallbacksStillClaimExactlyOnce() {
+        var claim = CreativeClickClaim()
+
+        let scriptMessage = claim.claim(
+            userActivated: true,
+            source: .primaryCTA,
+            now: 10,
+            interactionId: "script"
+        )
+        let lateDelegate = claim.claim(
+            userActivated: true,
+            source: .primaryCTA,
+            now: 10.01,
+            interactionId: "delegate"
+        )
+
+        XCTAssertEqual(scriptMessage, ClickInteraction(id: "script", source: .primaryCTA))
+        XCTAssertNil(lateDelegate)
+    }
+
+    func testStorePromptGuardRejectsDuplicatesAndReleasesFailedRoute() {
+        let guardState = StorePromptGestureGuard()
+
+        XCTAssertTrue(guardState.claim())
+        XCTAssertFalse(guardState.claim())
+        guardState.complete(routed: false)
+        XCTAssertTrue(guardState.claim())
+    }
+
+    func testStorePromptGuardHoldsSuccessfulRouteUntilExternalReturn() {
+        let guardState = StorePromptGestureGuard()
+
+        XCTAssertTrue(guardState.claim())
+        guardState.releaseAfterExternalReturn()
+        XCTAssertFalse(guardState.claim(), "a foreground notification must not release pending persistence")
+        let generation = guardState.complete(routed: true)
+        XCTAssertFalse(guardState.claim())
+        guardState.releaseAfterExternalReturn()
+        XCTAssertTrue(guardState.claim())
+        if let generation {
+            guardState.releaseRoutedFallback(generation: generation)
+        }
+        XCTAssertFalse(guardState.claim(), "a stale fallback cannot release the next pending gesture")
+    }
+
+    func testStorePromptGuardBoundedFallbackReleasesOptimisticRoute() {
+        let guardState = StorePromptGestureGuard()
+
+        XCTAssertTrue(guardState.claim())
+        guard let generation = guardState.complete(routed: true) else {
+            return XCTFail("successful route needs a bounded release generation")
+        }
+        XCTAssertFalse(guardState.claim())
+        guardState.releaseRoutedFallback(generation: generation)
+        XCTAssertTrue(guardState.claim())
     }
 
     func testBoundedCompletionFiresRouteOnlyOnceAfterOwnerRelease() {

@@ -100,18 +100,100 @@ struct CreativeClickClaim {
     }
 }
 
-struct CreativeUserActivation {
-    private var trustedActivationUptime: TimeInterval?
+/// One-in-flight admission used by store-prompt badges while click persistence and routing run.
+/// A successful route remains claimed until its external surface dismisses/returns; a failed route
+/// releases immediately so a transient presentation failure can be retried.
+final class StorePromptGestureGuard {
+    static let routedReleaseTimeout: TimeInterval = 2
 
-    mutating func noteTrustedActivation(now: TimeInterval) {
-        trustedActivationUptime = now
+    private enum State {
+        case idle
+        case pending
+        case routed
     }
 
-    mutating func consume(explicitLinkActivation: Bool, now: TimeInterval) -> Bool {
-        defer { trustedActivationUptime = nil }
-        if explicitLinkActivation { return true }
-        guard let trustedActivationUptime else { return false }
-        return now - trustedActivationUptime >= 0 && now - trustedActivationUptime <= 1
+    private var state = State.idle
+    private var generation = 0
+    var isInFlight: Bool { state != .idle }
+
+    func claim() -> Bool {
+        guard state == .idle else { return false }
+        generation += 1
+        state = .pending
+        return true
+    }
+
+    /// Returns the current generation when an optimistic route needs a bounded release fallback.
+    /// A known failure releases synchronously and needs no scheduled work.
+    @discardableResult
+    func complete(routed: Bool) -> Int? {
+        guard routed else {
+            state = .idle
+            return nil
+        }
+        state = .routed
+        return generation
+    }
+
+    func releaseRoutedFallback(generation expectedGeneration: Int) {
+        guard state == .routed, generation == expectedGeneration else { return }
+        release()
+    }
+
+    func releaseAfterExternalReturn() {
+        if state == .routed { release() }
+    }
+
+    func release() {
+        generation += 1
+        state = .idle
+    }
+}
+
+enum CreativeCTAOpenAdmission: Equatable {
+    case notMessage
+    case rejected
+    case accepted(URL)
+}
+
+enum CreativeCTAOpenMessage {
+    static let type = "SIMULA_CTA_OPEN"
+    private static let alwaysAllowedSchemes: Set<String> = ["http", "https", "itms", "itms-apps"]
+    private static let blockedSchemes: Set<String> = ["about", "blob", "data", "file", "javascript"]
+
+    /// Parses only the SDK's structured popup envelope, then applies the current serve's routing
+    /// policy. HTTP(S) and App Store schemes work on every surface. Other absolute custom schemes
+    /// are admitted only where the existing native router opens them directly (native external or
+    /// `.web` destinations); internal/executable schemes always fail closed. URL fragments are never
+    /// rewritten, so attribution URLs reach the router byte-for-byte as received from JavaScript.
+    static func admission(
+        for body: String,
+        destination: AdDestination,
+        externalClickOnly: Bool
+    ) -> CreativeCTAOpenAdmission {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messageType = object["type"] as? String else {
+            return .notMessage
+        }
+        guard messageType == type else { return .notMessage }
+        guard let value = object["url"] as? String,
+              !value.isEmpty,
+              let url = URL(string: value),
+              isAllowed(url, destination: destination, externalClickOnly: externalClickOnly) else {
+            return .rejected
+        }
+        return .accepted(url)
+    }
+
+    static func isAllowed(_ url: URL, destination: AdDestination, externalClickOnly: Bool) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              !scheme.isEmpty,
+              !blockedSchemes.contains(scheme) else { return false }
+        if alwaysAllowedSchemes.contains(scheme) {
+            return true
+        }
+        return externalClickOnly || destination == .web
     }
 }
 
@@ -178,31 +260,33 @@ enum CreativeCTARouter {
     /// from that id and the MMP tracker (`trackingUrl`) is fired in the background — no dependency
     /// on the tracker's redirect chain (the same pattern `resolveAppStoreID` uses for SKOverlay).
     /// `nil`/id-less falls back to redirect-chain resolution.
+    @discardableResult
     static func open(
         trackingUrl: String?,
         destination: AdDestination,
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
         attribution: AdAttribution? = nil
-    ) {
+    ) -> Bool {
         guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
             // No tracker on the serve — a raw store link still gives the CTA somewhere to go
             // (previously a silent no-op). No tracker means no background click to fire.
             if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
                 if storeOpen == .external, let storeURL = storeUrl.flatMap(URL.init(string:)) {
                     UIApplication.shared.open(storeURL)
+                    return true
                 } else {
-                    presentStoreProduct(appID: appID, attribution: attribution)
+                    return presentStoreProduct(appID: appID, attribution: attribution)
                 }
             }
-            return
+            return false
         }
 
         if storeOpen == .external {
             // `.external` leaves the app to the App Store / browser, which StoreKit attribution tokens
             // can't ride on — they apply only to the in-app store sheet below.
             openExternally(initialURL: url, destination: destination, storeUrl: storeUrl)
-            return
+            return true
         }
 
         switch destination {
@@ -211,19 +295,21 @@ enum CreativeCTARouter {
             // Otherwise prefer the deterministic route (store id from the raw `ios_store_url`,
             // tracker fired in the background); only without one resolve the redirect chain.
             if let appID = appStoreID(from: url) {
-                presentStoreProduct(appID: appID, attribution: attribution)
+                return presentStoreProduct(appID: appID, attribution: attribution)
             } else if let appID = appStoreID(fromString: storeUrl) {
                 fireClickTracker(url)
-                presentStoreProduct(appID: appID, attribution: attribution)
+                return presentStoreProduct(appID: appID, attribution: attribution)
             } else {
                 resolveAndRoute(url: url, attribution: attribution)
+                return true
             }
         case .web:
             let scheme = url.scheme?.lowercased() ?? ""
             if scheme == "http" || scheme == "https" {
-                presentSafari(url: url)
+                return presentSafari(url: url)
             } else {
                 UIApplication.shared.open(url)
+                return true
             }
         }
     }
@@ -258,6 +344,11 @@ enum CreativeCTARouter {
         if let fallbackStoreAppID, !fallbackStoreAppID.isEmpty {
             fireClickTracker(url)
             presentStoreProduct(appID: fallbackStoreAppID, attribution: attribution)
+            return
+        }
+        let scheme = url.scheme?.lowercased() ?? ""
+        if destination == .web, scheme != "http", scheme != "https" {
+            UIApplication.shared.open(url)
             return
         }
         resolveAndRoute(url: url, attribution: attribution)
@@ -384,8 +475,9 @@ enum CreativeCTARouter {
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
     /// campaign/provider/SKAN [attribution] tokens so the install it drives is credited to the campaign.
-    static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) {
-        guard !isPresentingExternal else { return }
+    @discardableResult
+    static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) -> Bool {
+        guard !isPresentingExternal else { return false }
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
             isPresentingExternal = false
@@ -405,7 +497,9 @@ enum CreativeCTARouter {
         if presentViewController(storeVC) {
             isPresentingExternal = true
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
+            return true
         }
+        return false
     }
 
     // MARK: - Attribution token mapping
@@ -453,8 +547,9 @@ enum CreativeCTARouter {
     }
 
     /// Presents `SFSafariViewController` for external links.
-    static func presentSafari(url: URL) {
-        guard !isPresentingExternal else { return }
+    @discardableResult
+    static func presentSafari(url: URL) -> Bool {
+        guard !isPresentingExternal else { return false }
         let safariVC = SFSafariViewController(url: url)
         let delegate = SafariDelegate {
             isPresentingExternal = false
@@ -469,7 +564,9 @@ enum CreativeCTARouter {
         if presentViewController(safariVC) {
             isPresentingExternal = true
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
+            return true
         }
+        return false
     }
 
     /// Presents `vc` on top of the active window. Returns `true` if a host
