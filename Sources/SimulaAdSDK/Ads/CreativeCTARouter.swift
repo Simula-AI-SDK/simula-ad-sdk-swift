@@ -100,8 +100,9 @@ struct CreativeClickClaim {
     }
 }
 
-/// Generation guard for work that may complete after a view/presenter has been torn down or rebound.
-/// Completing consumes the generation; cancelling invalidates every outstanding completion.
+/// Generation guard for pending-UI ownership after a view has been torn down or rebound. The
+/// accepted immutable route executes independently; this guard only prevents an old completion
+/// from clearing a newer surface's pending state.
 final class DeferredRouteGuard {
     private var generation = 0
 
@@ -180,6 +181,29 @@ final class StorePromptGestureGuard {
 
 func canDismissFullscreen(dismissUnlocked: Bool, clickHandoffPending: Bool) -> Bool {
     dismissUnlocked && !clickHandoffPending
+}
+
+enum FullscreenClickHandoffOwner: Hashable, Sendable {
+    case creative
+    case storePrompt
+}
+
+struct FullscreenClickHandoffState: Equatable, Sendable {
+    private var owners: Set<FullscreenClickHandoffOwner> = []
+
+    var isPending: Bool { !owners.isEmpty }
+
+    func isPending(_ owner: FullscreenClickHandoffOwner) -> Bool {
+        owners.contains(owner)
+    }
+
+    mutating func set(_ owner: FullscreenClickHandoffOwner, pending: Bool) {
+        if pending { owners.insert(owner) } else { owners.remove(owner) }
+    }
+
+    mutating func reset() {
+        owners.removeAll()
+    }
 }
 
 enum CreativeCTAOpenAdmission: Equatable {

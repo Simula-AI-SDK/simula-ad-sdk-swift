@@ -422,7 +422,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         coordinator.unlockContentOffset()
-        coordinator.cancelPendingClickRoutes()
+        coordinator.detachPendingClickState()
         stopBeforeRecycling(stop: { coordinator.bridge?.stop() }) {
             coordinator.bridge = nil
             coordinator.webView = nil
@@ -515,7 +515,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// old-document verdict before issuing the new load and disarm bridge audio immediately;
         /// stale callbacks remain explicitly rejected by the navigation tracker.
         func prepareForRetainedServeRebind() {
-            clickRouteGuard.cancel()
+            detachPendingClickState()
             navigationTracker.resetForRebind()
             pageStartUptime = nil
             mainFrameHTTPFailed = false
@@ -576,20 +576,17 @@ struct WebViewRepresentable: UIViewRepresentable {
                 beaconImpressionId: clickBeaconImpressionId
             ) {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    guard self.webView != nil,
-                          self.clickRouteGuard.consume(routeGeneration) else {
-                        self.setClickHandoffPending(false)
-                        return
-                    }
+                    // Immutable accepted routing survives host recycle/rebind. Generation ownership
+                    // only decides whether this completion still owns the visible pending state.
                     route()
+                    guard let self, self.clickRouteGuard.consume(routeGeneration) else { return }
                     self.setClickHandoffPending(false)
                 }
             }
             return true
         }
 
-        func cancelPendingClickRoutes() {
+        func detachPendingClickState() {
             clickRouteGuard.cancel()
             setClickHandoffPending(false)
         }

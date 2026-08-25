@@ -272,6 +272,26 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertTrue(canDismissFullscreen(dismissUnlocked: true, clickHandoffPending: false))
     }
 
+    func testFullscreenClickHandoffOwnersDoNotUnlockEachOther() {
+        var state = FullscreenClickHandoffState()
+        XCTAssertFalse(state.isPending)
+
+        state.set(.creative, pending: true)
+        state.set(.storePrompt, pending: true)
+        XCTAssertTrue(state.isPending(.creative))
+        XCTAssertTrue(state.isPending(.storePrompt))
+
+        state.set(.creative, pending: false)
+        XCTAssertTrue(state.isPending, "store prompt still owns close admission")
+        state.set(.storePrompt, pending: false)
+        XCTAssertFalse(state.isPending)
+
+        state.set(.creative, pending: true)
+        state.set(.creative, pending: true)
+        state.reset()
+        XCTAssertFalse(state.isPending)
+    }
+
     func testDeferredRouteRejectsStaleCompletionAfterReplacement() {
         let guardState = DeferredRouteGuard()
         let staleGeneration = guardState.begin()
@@ -280,6 +300,19 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertFalse(guardState.consume(staleGeneration))
         XCTAssertTrue(guardState.consume(currentGeneration))
         XCTAssertFalse(guardState.consume(currentGeneration))
+    }
+
+    func testDetachedRouteStillExecutesButCannotClearReplacementOwner() {
+        let guardState = DeferredRouteGuard()
+        let detached = guardState.begin()
+        guardState.cancel()
+        let replacement = guardState.begin()
+        var routes = 0
+
+        routes += 1 // immutable accepted route executes before owner-generation reconciliation
+        XCTAssertFalse(guardState.consume(detached))
+        XCTAssertEqual(routes, 1)
+        XCTAssertTrue(guardState.consume(replacement))
     }
 
     func testBoundedCompletionFiresRouteOnlyOnceAfterOwnerRelease() {

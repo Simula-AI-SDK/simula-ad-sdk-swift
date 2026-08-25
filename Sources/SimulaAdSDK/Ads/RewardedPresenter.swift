@@ -264,7 +264,7 @@ private struct RewardedGameView: View {
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
-    @State private var clickHandoffPending = false
+    @State private var clickHandoffs = FullscreenClickHandoffState()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     /// auto_store_redirect routes once per presentation and is never a user click.
@@ -293,6 +293,8 @@ private struct RewardedGameView: View {
         gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
     }
 
+    private var clickHandoffPending: Bool { clickHandoffs.isPending }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -302,14 +304,14 @@ private struct RewardedGameView: View {
             // an in-playable CTA opens the store deterministically (in-app sheet + background
             // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(html: previewHTML)
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(html: renderedHtml)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick($0) }, clickBeaconImpressionId: impressionId, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(url: url)
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -368,7 +370,7 @@ private struct RewardedGameView: View {
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
-            clickHandoffPending = false
+            clickHandoffs.reset()
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -525,6 +527,25 @@ private struct RewardedGameView: View {
         storeExit?.recordStoreOpen("cta")
     }
 
+    private func creativeWebView(url: URL? = nil, html: String? = nil) -> some View {
+        WebViewRepresentable(
+            url: url,
+            htmlString: html,
+            onAdClick: { handleHtmlClick($0) },
+            onClickHandoffPendingChanged: {
+                clickHandoffs.set(.creative, pending: $0)
+            },
+            clickBeaconImpressionId: impressionId,
+            bridge: bridge,
+            attribution: attribution,
+            ctaTrackingUrl: trackingUrl,
+            ctaDestination: destination,
+            ctaStoreUrl: storeUrl,
+            telemetryAdFormat: "rewarded"
+        )
+        .allowsHitTesting(!clickHandoffPending)
+    }
+
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
     @discardableResult
     private func handleStorePromptTap() -> Bool {
@@ -532,8 +553,8 @@ private struct RewardedGameView: View {
     }
 
     private func handleStorePromptClick() {
-        guard storePromptGestureGuard.claim() else { return }
-        clickHandoffPending = true
+        guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        clickHandoffs.set(.storePrompt, pending: true)
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
@@ -543,13 +564,13 @@ private struct RewardedGameView: View {
         ) {
             DispatchQueue.main.async {
                 guard visible else {
-                    clickHandoffPending = false
+                    clickHandoffs.set(.storePrompt, pending: false)
                     gestureGuard.release()
                     return
                 }
                 let routed = handleStorePromptTap()
                 if routed { storeExit?.recordStoreOpen("store_prompt") }
-                clickHandoffPending = false
+                clickHandoffs.set(.storePrompt, pending: false)
                 if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout

@@ -229,7 +229,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptScheduled = false
     @State private var storePromptTask: Task<Void, Never>?
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
-    @State private var clickHandoffPending = false
+    @State private var clickHandoffs = FullscreenClickHandoffState()
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -275,6 +275,7 @@ private struct CreativeInterstitialView: View {
     /// The close config to render: the server's `ad_behavior.close` when present, else a default
     /// (compact, always-available top-right X) so ads without `ad_behavior` still get a small close.
     private var closeConfig: CloseBehavior { response.adBehavior?.close ?? CloseBehavior() }
+    private var clickHandoffPending: Bool { clickHandoffs.isPending }
 
     var body: some View {
         ZStack {
@@ -358,7 +359,7 @@ private struct CreativeInterstitialView: View {
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
-            clickHandoffPending = false
+            clickHandoffs.reset()
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -425,6 +426,9 @@ private struct CreativeInterstitialView: View {
         WebViewRepresentable(
             htmlString: html,
             onAdClick: { handleHtmlClick($0) },
+            onClickHandoffPendingChanged: {
+                clickHandoffs.set(.creative, pending: $0)
+            },
             clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
             attribution: response.skanAttribution,
@@ -435,6 +439,7 @@ private struct CreativeInterstitialView: View {
             ctaStoreUrl: response.iosStoreUrl,
             telemetryAdFormat: "interstitial"
         )
+        .allowsHitTesting(!clickHandoffPending)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
@@ -636,8 +641,8 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleStorePromptClick() {
-        guard storePromptGestureGuard.claim() else { return }
-        clickHandoffPending = true
+        guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        clickHandoffs.set(.storePrompt, pending: true)
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
         onClick(interaction)
@@ -647,13 +652,13 @@ private struct CreativeInterstitialView: View {
         ) {
             DispatchQueue.main.async {
                 guard visible else {
-                    clickHandoffPending = false
+                    clickHandoffs.set(.storePrompt, pending: false)
                     gestureGuard.release()
                     return
                 }
                 let routed = handleStorePromptTap()
                 if routed { storeExit?.recordStoreOpen("store_prompt") }
-                clickHandoffPending = false
+                clickHandoffs.set(.storePrompt, pending: false)
                 if let generation = gestureGuard.complete() {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
