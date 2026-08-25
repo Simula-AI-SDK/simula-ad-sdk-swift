@@ -1,5 +1,17 @@
 import Foundation
 
+protocol TelemetryTimeoutScheduling: Sendable {
+    func schedule(after timeout: TimeInterval, completion: @escaping @Sendable () -> Void)
+}
+
+struct DispatchTelemetryTimeoutScheduler: TelemetryTimeoutScheduling {
+    func schedule(after timeout: TimeInterval, completion: @escaping @Sendable () -> Void) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0, timeout)) {
+            completion()
+        }
+    }
+}
+
 /// Static per-process/device context attached to every telemetry batch.
 struct TelemetryContext {
     let sdkVersion: String
@@ -74,6 +86,7 @@ final class TelemetryManager: @unchecked Sendable {
     private let backoff: @Sendable (Int) -> TimeInterval
     private let timedFlushSleep: @Sendable (TimeInterval) async -> Void
     private let retrySleep: @Sendable (TimeInterval) async -> Void
+    private let timeoutScheduler: any TelemetryTimeoutScheduling
     private let launchGate: LaunchSettling
     // Dev-only sink: when set (devMode), each recorded event is logged here (already redacted).
     private let debugLog: (@Sendable (String) -> Void)?
@@ -133,6 +146,7 @@ final class TelemetryManager: @unchecked Sendable {
         backoff: @escaping @Sendable (Int) -> TimeInterval = { telemetryBackoff(retryCount: $0) },
         timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
         retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        timeoutScheduler: any TelemetryTimeoutScheduling = DispatchTelemetryTimeoutScheduler(),
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
         debugLog: (@Sendable (String) -> Void)? = nil,
         flushThreshold: Int = 20,
@@ -155,6 +169,7 @@ final class TelemetryManager: @unchecked Sendable {
         self.backoff = backoff
         self.timedFlushSleep = timedFlushSleep ?? Self.defaultSleep
         self.retrySleep = retrySleep ?? Self.defaultSleep
+        self.timeoutScheduler = timeoutScheduler
         self.launchGate = launchGate
         self.debugLog = debugLog
         self.flushThreshold = flushThreshold
@@ -663,9 +678,7 @@ final class TelemetryManager: @unchecked Sendable {
     ) {
         let gate = BoundedCompletion(completion)
         persistQueue.async { gate.complete() }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0, timeout)) {
-            gate.complete()
-        }
+        timeoutScheduler.schedule(after: timeout) { gate.complete() }
     }
 
     func afterPendingPersistence(_ completion: @escaping @Sendable () -> Void) {

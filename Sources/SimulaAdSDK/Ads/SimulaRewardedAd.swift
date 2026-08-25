@@ -396,19 +396,18 @@ public final class SimulaRewardedAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onClick: { [weak self] interaction in
-                guard let self else { return }
-                // CLICKED — a user-gesture CTA / store-prompt tap (parity with the interstitial).
+                // CLICKED — CTA, store prompt, or configured automatic redirect.
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: salvageAdUnitId,
                     adId: response.impressionId, serveId: nil,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
                 AdBeaconManager.shared.enqueue(
                     impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId, interactionId: interaction.id,
+                    adUnitId: salvageAdUnitId, interactionId: interaction.id,
                     clickSource: interaction.source.rawValue
                 )
-                self.delegate?.rewardedDidClick(self)
+                if let self { self.delegate?.rewardedDidClick(self) }
             },
             onImpression: { [weak self] in
                 guard let self else { return }
@@ -457,15 +456,6 @@ public final class SimulaRewardedAd {
                 self.presentFallbackAds(
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
-                    onAutoStoreRedirect: {
-                        CreativeCTARouter.open(
-                            trackingUrl: response.trackingUrl,
-                            destination: response.destinationKind,
-                            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            storeUrl: response.iosStoreUrl,
-                            attribution: response.skanAttribution
-                        )
-                    },
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onAllClosed: { [weak self] in
@@ -824,7 +814,6 @@ public final class SimulaRewardedAd {
     private func presentFallbackAds(
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
@@ -835,13 +824,12 @@ public final class SimulaRewardedAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, originalKeyWindow: originalKeyWindow, presentationLease: presentationLease, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, originalKeyWindow: originalKeyWindow, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
             presentFallbackLoadingWindow(
                 prefetch: prefetch,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                onAutoStoreRedirect: onAutoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onAllClosed: onAllClosed
@@ -862,28 +850,35 @@ public final class SimulaRewardedAd {
         prefetch: Task<[FallbackAd], Never>,
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         let presenter = FallbackAdPresenter()
+        let fallbackAdUnitId = adUnitId
         let didPresent = presenter.presentLoading(
             originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] interaction in
-                guard let self else { return }
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
                     adId: response.impressionId, serveId: nil,
-                    interactionId: interaction.id, clickSource: .fallbackCTA
+                    interactionId: interaction.id, clickSource: interaction.source
                 )
-                self.delegate?.rewardedDidClick(self)
+                if interaction.source == .autoRedirect {
+                    AdBeaconManager.shared.enqueue(
+                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
+                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
+                        clickSource: interaction.source.rawValue
+                    )
+                }
+                if let self { self.delegate?.rewardedDidClick(self) }
             },
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
@@ -918,7 +913,6 @@ public final class SimulaRewardedAd {
         _ ads: [FallbackAd],
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
@@ -930,23 +924,31 @@ public final class SimulaRewardedAd {
             return
         }
         let presenter = FallbackAdPresenter()
+        let fallbackAdUnitId = adUnitId
         let didPresent = presenter.present(
             ads: ads,
             originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] interaction in
-                guard let self else { return }
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
                     adId: response.impressionId, serveId: nil,
-                    interactionId: interaction.id, clickSource: .fallbackCTA
+                    interactionId: interaction.id, clickSource: interaction.source
                 )
-                self.delegate?.rewardedDidClick(self)
+                if interaction.source == .autoRedirect {
+                    AdBeaconManager.shared.enqueue(
+                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
+                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
+                        clickSource: interaction.source.rawValue
+                    )
+                }
+                if let self { self.delegate?.rewardedDidClick(self) }
             },
             presentationLease: presentationLease
         ) { [weak self] in

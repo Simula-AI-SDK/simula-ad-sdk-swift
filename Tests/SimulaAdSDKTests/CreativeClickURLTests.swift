@@ -224,6 +224,58 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertTrue(guardState.claim())
     }
 
+    func testAutomaticClickWaitsForPersistenceAndClaimsExactlyOnce() {
+        let guardState = AutomaticClickHandoffGuard()
+        let interaction = ClickInteraction(id: "auto", source: .autoRedirect)
+        var events = ["emit:\(interaction.source.rawValue)"]
+        guard let generation = guardState.claim() else {
+            return XCTFail("first auto redirect must claim")
+        }
+
+        XCTAssertNil(guardState.claim())
+        XCTAssertEqual(events, ["emit:auto_redirect"], "routing must not happen before persistence completion")
+        if guardState.persistenceCompleted(generation: generation) {
+            events.append("route")
+        }
+        XCTAssertEqual(events, ["emit:auto_redirect", "route"])
+        XCTAssertFalse(guardState.persistenceCompleted(generation: generation))
+    }
+
+    func testAutomaticClickRouteFailureDoesNotResetExactlyOnceAdmission() {
+        let guardState = AutomaticClickHandoffGuard()
+        guard let generation = guardState.claim() else {
+            return XCTFail("first auto redirect must claim")
+        }
+        XCTAssertTrue(guardState.persistenceCompleted(generation: generation))
+
+        let routed = false
+
+        XCTAssertFalse(routed)
+        XCTAssertNil(guardState.claim(), "a failed external open must not loop automatic redirects")
+    }
+
+    func testAutomaticClickTeardownSuppressesDelayedRoute() {
+        let guardState = AutomaticClickHandoffGuard()
+        guard let generation = guardState.claim() else {
+            return XCTFail("first auto redirect must claim")
+        }
+
+        guardState.cancelPendingRoute()
+
+        XCTAssertFalse(guardState.persistenceCompleted(generation: generation))
+        XCTAssertNil(guardState.claim(), "teardown must not reset exactly-once admission")
+    }
+
+    func testDeferredRouteRejectsStaleCompletionAfterReplacement() {
+        let guardState = DeferredRouteGuard()
+        let staleGeneration = guardState.begin()
+        let currentGeneration = guardState.begin()
+
+        XCTAssertFalse(guardState.consume(staleGeneration))
+        XCTAssertTrue(guardState.consume(currentGeneration))
+        XCTAssertFalse(guardState.consume(currentGeneration))
+    }
+
     func testBoundedCompletionFiresRouteOnlyOnceAfterOwnerRelease() {
         let routed = expectation(description: "route")
         routed.expectedFulfillmentCount = 1

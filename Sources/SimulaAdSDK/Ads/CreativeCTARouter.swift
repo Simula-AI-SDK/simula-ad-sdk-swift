@@ -100,6 +100,49 @@ struct CreativeClickClaim {
     }
 }
 
+/// Generation guard for work that may complete after a view/presenter has been torn down or rebound.
+/// Completing consumes the generation; cancelling invalidates every outstanding completion.
+final class DeferredRouteGuard {
+    private var generation = 0
+
+    func begin() -> Int {
+        generation += 1
+        return generation
+    }
+
+    func consume(_ expectedGeneration: Int) -> Bool {
+        guard generation == expectedGeneration else { return false }
+        generation += 1
+        return true
+    }
+
+    func cancel() {
+        generation += 1
+    }
+}
+
+/// Exactly-once automatic-click admission plus a cancellable persistence boundary. `claim()` can
+/// succeed only once for the lifetime of an ad surface; teardown invalidates only the pending route,
+/// not the one-shot claim, so a SwiftUI reappearance cannot manufacture another auto redirect.
+final class AutomaticClickHandoffGuard {
+    private var claimed = false
+    private let deferredRoute = DeferredRouteGuard()
+
+    func claim() -> Int? {
+        guard !claimed else { return nil }
+        claimed = true
+        return deferredRoute.begin()
+    }
+
+    func persistenceCompleted(generation: Int) -> Bool {
+        deferredRoute.consume(generation)
+    }
+
+    func cancelPendingRoute() {
+        deferredRoute.cancel()
+    }
+}
+
 /// One-in-flight admission used by store-prompt badges while click persistence and routing run.
 /// A successful route remains claimed until its external surface dismisses/returns; a failed route
 /// releases immediately so a transient presentation failure can be retried.

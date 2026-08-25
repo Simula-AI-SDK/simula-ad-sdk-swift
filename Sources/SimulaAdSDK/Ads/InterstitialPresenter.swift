@@ -235,9 +235,8 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
-    // auto_store_redirect — fires the store open once, the first time the creative reports the
-    // configured moment.
-    @State private var autoRedirectFired = false
+    // auto_store_redirect — exactly-once click emission with a cancellable persistence handoff.
+    @State private var autoRedirectHandoff = AutomaticClickHandoffGuard()
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
@@ -355,6 +354,7 @@ private struct CreativeInterstitialView: View {
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
+            autoRedirectHandoff.cancelPendingRoute()
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -398,17 +398,19 @@ private struct CreativeInterstitialView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard !autoRedirectFired else { return }
-        autoRedirectFired = true
+        guard let generation = autoRedirectHandoff.claim() else { return }
         storeExit?.recordStoreOpen("auto_redirect")
         let interaction = ClickInteraction(source: .autoRedirect)
-        Telemetry.shared.recordLifecycle(
-            stage: "click", adFormat: "interstitial", adUnitId: response.adUnitId,
-            adId: response.impressionId, serveId: response.impressionId,
-            interactionId: interaction.id, clickSource: interaction.source
-        )
-        ClickHandoffPersistence.wait(interaction: interaction, beaconImpressionId: nil) {
-            DispatchQueue.main.async { handleStorePromptTap() }
+        onClick(interaction)
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: response.impressionId
+        ) {
+            DispatchQueue.main.async {
+                guard visible,
+                      autoRedirectHandoff.persistenceCompleted(generation: generation) else { return }
+                _ = handleStorePromptTap()
+            }
         }
     }
 

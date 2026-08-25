@@ -412,6 +412,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// remount of the same serve.
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         coordinator.unlockContentOffset()
+        coordinator.cancelPendingClickRoutes()
         stopBeforeRecycling(stop: { coordinator.bridge?.stop() }) {
             coordinator.bridge = nil
             coordinator.webView = nil
@@ -502,6 +503,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// old-document verdict before issuing the new load and disarm bridge audio immediately;
         /// stale callbacks remain explicitly rejected by the navigation tracker.
         func prepareForRetainedServeRebind() {
+            clickRouteGuard.cancel()
             navigationTracker.resetForRebind()
             pageStartUptime = nil
             mainFrameHTTPFailed = false
@@ -538,6 +540,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// One atomic claim guards both publisher notification and destination routing when WebKit
         /// reports one target=_blank gesture through both delegate methods.
         private var clickClaim = CreativeClickClaim()
+        private let clickRouteGuard = DeferredRouteGuard()
 
         /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
         /// use KVO instead of becoming the scroll delegate.
@@ -552,14 +555,23 @@ struct WebViewRepresentable: UIViewRepresentable {
                 source: clickSource,
                 now: now
             ) else { return false }
+            let routeGeneration = clickRouteGuard.begin()
             onAdClick?(interaction)
             ClickHandoffPersistence.wait(
                 interaction: interaction,
                 beaconImpressionId: clickBeaconImpressionId
             ) {
-                DispatchQueue.main.async { route() }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.webView != nil,
+                          self.clickRouteGuard.consume(routeGeneration) else { return }
+                    route()
+                }
             }
             return true
+        }
+
+        func cancelPendingClickRoutes() {
+            clickRouteGuard.cancel()
         }
 
         /// Continuously cancel any WebKit-driven offset nudge (sub-pt content overflow).

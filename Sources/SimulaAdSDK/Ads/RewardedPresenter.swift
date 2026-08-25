@@ -266,8 +266,8 @@ private struct RewardedGameView: View {
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
-    /// auto_store_redirect one-shot guard.
-    @State private var autoRedirectFired = false
+    /// auto_store_redirect exactly-once click + cancellable persistence handoff.
+    @State private var autoRedirectHandoff = AutomaticClickHandoffGuard()
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
@@ -364,6 +364,7 @@ private struct RewardedGameView: View {
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
+            autoRedirectHandoff.cancelPendingRoute()
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -411,10 +412,20 @@ private struct RewardedGameView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard !autoRedirectFired else { return }
-        autoRedirectFired = true
+        guard let generation = autoRedirectHandoff.claim() else { return }
         storeExit?.recordStoreOpen("auto_redirect")
-        handleStorePromptTap()
+        let interaction = ClickInteraction(source: .autoRedirect)
+        onClick(interaction)
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: impressionId
+        ) {
+            DispatchQueue.main.async {
+                guard visible,
+                      autoRedirectHandoff.persistenceCompleted(generation: generation) else { return }
+                _ = handleStorePromptTap()
+            }
+        }
     }
 
     /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.

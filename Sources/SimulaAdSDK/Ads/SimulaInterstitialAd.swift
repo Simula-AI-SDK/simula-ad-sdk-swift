@@ -460,15 +460,15 @@ public final class SimulaInterstitialAd {
         }
 
         let presenter = InterstitialPresenter()
+        let clickAdUnitId = adUnitId
         showStartNanos = DispatchTime.now().uptimeNanoseconds
 
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
             onClick: { [weak self] interaction in
-                guard let self else { return }
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: clickAdUnitId,
                     adId: response.impressionId, serveId: response.impressionId,
                     interactionId: interaction.id, clickSource: interaction.source
                 )
@@ -476,11 +476,11 @@ public final class SimulaInterstitialAd {
                     impressionId: response.impressionId,
                     action: "click",
                     adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId,
+                    adUnitId: clickAdUnitId,
                     interactionId: interaction.id,
                     clickSource: interaction.source.rawValue
                 )
-                self.delegate?.interstitialDidClick(self)
+                if let self { self.delegate?.interstitialDidClick(self) }
             },
             onImpression: { [weak self] in
                 guard let self else { return }
@@ -515,15 +515,6 @@ public final class SimulaInterstitialAd {
                 self.presentFallbackAds(
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
-                    onAutoStoreRedirect: {
-                        CreativeCTARouter.open(
-                            trackingUrl: response.trackingUrl,
-                            destination: response.destinationKind,
-                            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                            storeUrl: response.iosStoreUrl,
-                            attribution: response.skanAttribution
-                        )
-                    },
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onAllClosed: { [weak self] in
@@ -797,7 +788,6 @@ public final class SimulaInterstitialAd {
     private func presentFallbackAds(
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
@@ -808,13 +798,12 @@ public final class SimulaInterstitialAd {
         prefetchedFallbacks = nil
         fallbackPrefetch = nil
         if let ready {
-            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, onAutoStoreRedirect: onAutoStoreRedirect, originalKeyWindow: originalKeyWindow, presentationLease: presentationLease, onAllClosed: onAllClosed)
+            presentFallbackWindow(ready, response: response, autoStoreRedirect: autoStoreRedirect, originalKeyWindow: originalKeyWindow, presentationLease: presentationLease, onAllClosed: onAllClosed)
         } else if let prefetch {
             presentFallbackLoadingWindow(
                 prefetch: prefetch,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                onAutoStoreRedirect: onAutoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onAllClosed: onAllClosed
@@ -833,28 +822,35 @@ public final class SimulaInterstitialAd {
         prefetch: Task<[FallbackAd], Never>,
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
     ) {
         let presenter = FallbackAdPresenter()
+        let fallbackAdUnitId = adUnitId
         let didPresent = presenter.presentLoading(
             originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] interaction in
-                guard let self else { return }
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
                     adId: response.impressionId, serveId: response.impressionId,
-                    interactionId: interaction.id, clickSource: .fallbackCTA
+                    interactionId: interaction.id, clickSource: interaction.source
                 )
-                self.delegate?.interstitialDidClick(self)
+                if interaction.source == .autoRedirect {
+                    AdBeaconManager.shared.enqueue(
+                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
+                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
+                        clickSource: interaction.source.rawValue
+                    )
+                }
+                if let self { self.delegate?.interstitialDidClick(self) }
             },
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
@@ -891,7 +887,6 @@ public final class SimulaInterstitialAd {
         _ ads: [FallbackAd],
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        onAutoStoreRedirect: @escaping @MainActor () -> Void,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onAllClosed: @escaping @MainActor () -> Void
@@ -902,23 +897,31 @@ public final class SimulaInterstitialAd {
             return
         }
         let presenter = FallbackAdPresenter()
+        let fallbackAdUnitId = adUnitId
         let didPresent = presenter.present(
             ads: ads,
             originalKeyWindow: originalKeyWindow,
             ctaTrackingUrl: response.trackingUrl,
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            clickBeaconImpressionId: response.impressionId,
             autoStoreRedirect: autoStoreRedirect,
-            onAutoStoreRedirect: onAutoStoreRedirect,
             onAdClick: { [weak self] interaction in
-                guard let self else { return }
                 Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: self.adUnitId,
+                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
                     adId: response.impressionId, serveId: response.impressionId,
-                    interactionId: interaction.id, clickSource: .fallbackCTA
+                    interactionId: interaction.id, clickSource: interaction.source
                 )
-                self.delegate?.interstitialDidClick(self)
+                if interaction.source == .autoRedirect {
+                    AdBeaconManager.shared.enqueue(
+                        impressionId: response.impressionId, action: "click", adFormat: Self.adFormat,
+                        adUnitId: fallbackAdUnitId, interactionId: interaction.id,
+                        clickSource: interaction.source.rawValue
+                    )
+                }
+                if let self { self.delegate?.interstitialDidClick(self) }
             },
             presentationLease: presentationLease
         ) { [weak self] in

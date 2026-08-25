@@ -179,6 +179,34 @@ final class TelemetryManagerTests: XCTestCase {
         }
     }
 
+    private final class ManualTimeoutScheduler: TelemetryTimeoutScheduling, @unchecked Sendable {
+        private struct Scheduled {
+            let timeout: TimeInterval
+            let completion: @Sendable () -> Void
+        }
+
+        private let lock = NSLock()
+        private var scheduled: [Scheduled] = []
+
+        var requestedTimeouts: [TimeInterval] {
+            lock.lock(); defer { lock.unlock() }
+            return scheduled.map(\.timeout)
+        }
+
+        func schedule(after timeout: TimeInterval, completion: @escaping @Sendable () -> Void) {
+            lock.lock()
+            scheduled.append(Scheduled(timeout: timeout, completion: completion))
+            lock.unlock()
+        }
+
+        func fireNext() {
+            lock.lock()
+            let next = scheduled.isEmpty ? nil : scheduled.removeFirst()
+            lock.unlock()
+            next?.completion()
+        }
+    }
+
     private final class BlockingManagerFactory: @unchecked Sendable {
         private let lock = NSLock()
         private let gate: LaunchSettling
@@ -225,7 +253,8 @@ final class TelemetryManagerTests: XCTestCase {
         now: @escaping @Sendable () -> TimeInterval = { 1_000 },
         backoff: @escaping @Sendable (Int) -> TimeInterval = { _ in 0 },
         timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
-        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil
+        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        timeoutScheduler: any TelemetryTimeoutScheduling = DispatchTelemetryTimeoutScheduler()
     ) -> TelemetryManager {
         let manager = TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -241,6 +270,7 @@ final class TelemetryManagerTests: XCTestCase {
             backoff: backoff,
             timedFlushSleep: timedFlushSleep,
             retrySleep: retrySleep,
+            timeoutScheduler: timeoutScheduler,
             launchGate: launchGate,
             debugLog: debugLog,
             flushThreshold: 20,
@@ -341,14 +371,18 @@ final class TelemetryManagerTests: XCTestCase {
     func testHandoffPersistenceBarrierFallsBackWhenStoreStalls() async {
         let store = SlowStore()
         let sender = FakeSender()
-        let mgr = build(store: store, sender: sender)
+        let timeoutScheduler = ManualTimeoutScheduler()
+        let mgr = build(store: store, sender: sender, timeoutScheduler: timeoutScheduler)
         defer { store.release() }
         await store.waitForSaveStarted()
-        let released = expectation(description: "bounded telemetry persistence fallback")
+        let released = TestSignal()
 
-        mgr.afterPendingPersistence(timeout: 0.02) { released.fulfill() }
+        mgr.afterPendingPersistence(timeout: 0.02) { released.signal() }
+        XCTAssertEqual(timeoutScheduler.requestedTimeouts, [0.02])
+        XCTAssertFalse(released.isSignaled)
 
-        await fulfillment(of: [released], timeout: 0.5)
+        timeoutScheduler.fireNext()
+        XCTAssertTrue(released.isSignaled)
     }
 
     func testEnvelopeCarriesContextAndSessionId() async {
@@ -852,6 +886,11 @@ private final class TestSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var signaled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isSignaled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return signaled
+    }
 
     func signal() {
         lock.lock()

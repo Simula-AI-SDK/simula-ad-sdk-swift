@@ -4,6 +4,62 @@ import Combine
 import UIKit
 #endif
 
+/// Pure navigation-generation state for `AdOverlayView`'s load watchdog. Late timeout/completion
+/// callbacks can mutate state only while they still own the current loading generation.
+struct AdOverlayLoadCoordinator {
+    static let watchdogTimeout: TimeInterval = 10
+
+    enum Phase: Equatable {
+        case idle
+        case loading(Int)
+        case finished(Int)
+        case failed(Int)
+    }
+
+    private(set) var generation = 0
+    private(set) var phase = Phase.idle
+
+    var isLoading: Bool {
+        if case .loading = phase { return true }
+        return false
+    }
+
+    var isIdle: Bool { phase == .idle }
+
+    mutating func beginLoad() -> Int {
+        generation += 1
+        phase = .loading(generation)
+        return generation
+    }
+
+    mutating func finishCurrentLoad() -> Bool {
+        guard case .loading(let owner) = phase else { return false }
+        phase = .finished(owner)
+        return true
+    }
+
+    mutating func failCurrentLoad() -> Bool {
+        switch phase {
+        case .loading(let owner), .finished(let owner):
+            phase = .failed(owner)
+            return true
+        case .idle, .failed:
+            return false
+        }
+    }
+
+    mutating func timeout(generation expectedGeneration: Int) -> Bool {
+        guard phase == .loading(expectedGeneration) else { return false }
+        phase = .failed(expectedGeneration)
+        return true
+    }
+
+    mutating func cancel() {
+        generation += 1
+        phase = .idle
+    }
+}
+
 // MARK: - AdOverlayView
 
 /// Full-screen overlay that displays an ad iframe after a minigame session.
@@ -52,6 +108,9 @@ public struct AdOverlayView: View {
     @State private var pageFinished = false
     @State private var presentationStarted = false
     @State private var hasAppeared = false
+    @State private var loadedCreativeIdentity: String?
+    @State private var loadCoordinator = AdOverlayLoadCoordinator()
+    @State private var loadWatchdogTask: Task<Void, Never>?
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -249,15 +308,23 @@ public struct AdOverlayView: View {
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
             if !hasLoadableCreative {
+                startCurrentCreativeLoadIfNeeded()
                 markPageFailed()
             } else {
+                startCurrentCreativeLoadIfNeeded()
                 beginPresentationIfReady()
             }
         }
         .onDisappear {
             hasAppeared = false
+            loadWatchdogTask?.cancel()
+            loadWatchdogTask = nil
+            loadCoordinator.cancel()
             countdownTask?.cancel()
             countdownTask = nil
+        }
+        .onChange(of: creativeIdentity) { _ in
+            startCurrentCreativeLoadIfNeeded()
         }
         // Pause the countdown while the app is backgrounded OR an in-app store/Safari sheet covers the
         // ad; resume only when both clear, so it can't elapse off-screen. (iOS-only; no-op elsewhere.)
@@ -276,8 +343,54 @@ public struct AdOverlayView: View {
         return URL(string: iframeUrl) != nil
     }
 
+    private var creativeIdentity: String {
+        if let html, !html.isEmpty {
+            return "html:\(iframeUrl):\(html.hashValue)"
+        }
+        return "url:\(iframeUrl)"
+    }
+
+    /// Starts one watchdog for the current creative. Ten seconds is deliberately longer than the
+    /// ordinary fallback page load but short enough that a wedged Web Content process cannot trap a
+    /// user indefinitely. Identity + generation checks make every cancelled/replaced timer harmless.
+    private func startCurrentCreativeLoadIfNeeded() {
+        let identityChanged = loadedCreativeIdentity != creativeIdentity
+        guard identityChanged || loadCoordinator.isIdle
+                || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading) else {
+            return
+        }
+
+        loadWatchdogTask?.cancel()
+        countdownTask?.cancel()
+        countdownTask = nil
+        loadedCreativeIdentity = creativeIdentity
+        adPageReady = false
+        adPageFailed = false
+        pageFinished = false
+        presentationStarted = false
+        adCountdown = 5
+        ringProgress = 0
+        accumulatedMs = 0
+
+        let generation = loadCoordinator.beginLoad()
+        loadWatchdogTask = Task { await runLoadWatchdog(generation: generation) }
+    }
+
+    @MainActor
+    private func runLoadWatchdog(generation: Int) async {
+        let nanos = AdOverlayLoadCoordinator.watchdogTimeout * 1_000_000_000
+        guard nanos.isFinite, nanos > 0, nanos < Double(UInt64.max) else { return }
+        do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
+        if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
+        loadWatchdogTask = nil
+        applyTerminalPageFailure()
+    }
+
     private func markPageFinished() {
-        guard !adPageFailed else { return }
+        startCurrentCreativeLoadIfNeeded()
+        guard !adPageFailed, loadCoordinator.finishCurrentLoad() else { return }
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
         adPageReady = true
         pageFinished = true
         beginPresentationIfReady()
@@ -299,6 +412,14 @@ public struct AdOverlayView: View {
     /// content that was never viewable. It also deliberately does not call `onPresented`, preventing
     /// presentation-timed auto redirects from firing for a failed end screen.
     private func markPageFailed() {
+        startCurrentCreativeLoadIfNeeded()
+        guard loadCoordinator.failCurrentLoad() else { return }
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        applyTerminalPageFailure()
+    }
+
+    private func applyTerminalPageFailure() {
         adPageReady = false
         adPageFailed = true
         countdownTask?.cancel()
