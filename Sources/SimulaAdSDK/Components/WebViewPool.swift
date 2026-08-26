@@ -409,6 +409,9 @@ final class WebViewPool {
           var resolvedPromise = Promise.resolve();
           var nativePromiseThen = Promise.prototype.then;
           var trustedEventDispatch = false;
+          var gestureSequence = 0;
+          var claimedGesture = -1;
+          var awaitingClick = false;
 
           function clearTrustedDispatchLater() {
             var clear = function() { trustedEventDispatch = false; };
@@ -416,14 +419,29 @@ final class WebViewPool {
             else { nativePromiseThen.call(resolvedPromise, clear); }
           }
 
-          function markTrustedDispatch(event) {
+          function beginGesture() {
+            gestureSequence += 1;
+            awaitingClick = true;
+          }
+
+          function observeTrustedEvent(event) {
             if (!event || event.isTrusted !== true) { return; }
             trustedEventDispatch = true;
             clearTrustedDispatchLater();
+            if (event.type === 'pointerdown' ||
+                (event.type === 'keydown' && event.repeat !== true)) {
+              beginGesture();
+            } else if (event.type === 'click') {
+              // Keyboard/accessibility activation can deliver a trusted click without pointerdown.
+              if (!awaitingClick) { beginGesture(); }
+              awaitingClick = false;
+            } else if (event.type === 'pointercancel') {
+              awaitingClick = false;
+            }
           }
 
-          ['click', 'pointerdown', 'pointerup', 'mousedown', 'touchend', 'keydown'].forEach(function(name) {
-            window.addEventListener(name, markTrustedDispatch, true);
+          ['click', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'touchend', 'keydown'].forEach(function(name) {
+            window.addEventListener(name, observeTrustedEvent, true);
           });
 
           function hasActiveUserGesture() {
@@ -438,9 +456,13 @@ final class WebViewPool {
           }
 
           function forwardCTA(value) {
-            if (!postNative || !hasActiveUserGesture()) { return false; }
+            if (!postNative || gestureSequence === 0 || !hasActiveUserGesture()) { return false; }
             var url = resolvedURL(value);
             if (!url) { return false; }
+            // Returning true suppresses duplicate window.open/default navigation too. Falling
+            // through after the first claim would move the duplicate into WebKit's delegate path.
+            if (claimedGesture === gestureSequence) { return true; }
+            claimedGesture = gestureSequence;
             try {
               postNative({
                 type: 'SIMULA_CTA_OPEN',
@@ -449,6 +471,7 @@ final class WebViewPool {
               });
               return true;
             } catch (_) {
+              if (claimedGesture === gestureSequence) { claimedGesture = -1; }
               return false;
             }
           }

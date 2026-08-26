@@ -302,16 +302,15 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertFalse(guardState.consume(currentGeneration))
     }
 
-    func testDetachedRouteStillExecutesButCannotClearReplacementOwner() {
+    func testDetachedRouteIsSuppressedAndCannotConsumeReplacementOwner() {
         let guardState = DeferredRouteGuard()
         let detached = guardState.begin()
         guardState.cancel()
         let replacement = guardState.begin()
         var routes = 0
 
-        routes += 1 // immutable accepted route executes before owner-generation reconciliation
-        XCTAssertFalse(guardState.consume(detached))
-        XCTAssertEqual(routes, 1)
+        if guardState.consume(detached) { routes += 1 }
+        XCTAssertEqual(routes, 0)
         XCTAssertTrue(guardState.consume(replacement))
     }
 

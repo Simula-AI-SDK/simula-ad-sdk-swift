@@ -100,9 +100,8 @@ struct CreativeClickClaim {
     }
 }
 
-/// Generation guard for pending-UI ownership after a view has been torn down or rebound. The
-/// accepted immutable route executes independently; this guard only prevents an old completion
-/// from clearing a newer surface's pending state.
+/// Generation guard for deferred-route ownership after a view has been torn down or rebound.
+/// A stale completion must neither route nor clear a newer surface's pending state.
 final class DeferredRouteGuard {
     private var generation = 0
 

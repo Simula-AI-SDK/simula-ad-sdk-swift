@@ -576,10 +576,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                 beaconImpressionId: clickBeaconImpressionId
             ) {
                 DispatchQueue.main.async { [weak self] in
-                    // Immutable accepted routing survives host recycle/rebind. Generation ownership
-                    // only decides whether this completion still owns the visible pending state.
+                    guard let self, self.webView != nil,
+                          self.clickRouteGuard.consume(routeGeneration) else { return }
                     route()
-                    guard let self, self.clickRouteGuard.consume(routeGeneration) else { return }
                     self.setClickHandoffPending(false)
                 }
             }
@@ -758,7 +757,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// interaction; the separately decoded tracker remains the attribution source of truth.
         private func creativeCTARoute(
             fallback: URL,
-            fallbackStoreAppID: String? = nil
+            fallbackStoreAppID: String?
         ) -> @MainActor () -> Void {
             let target = preferredCreativeClickURL(trackingUrl: ctaTrackingUrl, fallback: fallback)
             let destination = ctaDestination
@@ -1039,7 +1038,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if userActivated {
                     _ = routeClaimedClick(
                         userActivated: true,
-                        route: creativeCTARoute(fallback: url)
+                        route: creativeCTARoute(
+                            fallback: url,
+                            fallbackStoreAppID: appStoreID(from: url)
+                        )
                     )
                     decisionHandler(.cancel)
                     return
@@ -1085,7 +1087,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                 if !targetHost.isEmpty && currentHost != targetHost {
                     _ = routeClaimedClick(
                         userActivated: true,
-                        route: creativeCTARoute(fallback: url)
+                        route: creativeCTARoute(
+                            fallback: url,
+                            fallbackStoreAppID: appStoreID(from: url)
+                        )
                     )
                     decisionHandler(.cancel)
                     return
@@ -1134,7 +1139,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                         // popups first, while this fallback admits only explicit link activation.
                         _ = routeClaimedClick(
                             userActivated: userActivated,
-                            route: creativeCTARoute(fallback: url)
+                            route: creativeCTARoute(
+                                fallback: url,
+                                fallbackStoreAppID: appStoreID(from: url)
+                            )
                         )
                     } else if userActivated {
                         // Explicit same-origin target=_blank links stay in this web view. A
