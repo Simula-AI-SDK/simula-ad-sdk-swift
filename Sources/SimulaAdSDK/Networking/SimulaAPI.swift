@@ -98,19 +98,44 @@ public struct DeviceCapabilities: Encodable, Sendable {
     public let storekitAvailable: Bool
     public let skanVersion: String
     public let adAttributionKitAvailable: Bool
+    /// Client support declaration only. Per-fallback server ownership is decoded separately.
+    public let nativeClickBeaconV1: Bool
 
     enum CodingKeys: String, CodingKey {
         case osVersion = "os_version"
         case storekitAvailable = "storekit_available"
         case skanVersion = "skan_version"
         case adAttributionKitAvailable = "adattributionkit_available"
+        case nativeClickBeaconV1 = "native_click_beacon_v1"
     }
 
-    public init(osVersion: String, storekitAvailable: Bool, skanVersion: String, adAttributionKitAvailable: Bool) {
+    public init(
+        osVersion: String,
+        storekitAvailable: Bool,
+        skanVersion: String,
+        adAttributionKitAvailable: Bool
+    ) {
+        self.init(
+            osVersion: osVersion,
+            storekitAvailable: storekitAvailable,
+            skanVersion: skanVersion,
+            adAttributionKitAvailable: adAttributionKitAvailable,
+            nativeClickBeaconV1: false
+        )
+    }
+
+    public init(
+        osVersion: String,
+        storekitAvailable: Bool,
+        skanVersion: String,
+        adAttributionKitAvailable: Bool,
+        nativeClickBeaconV1: Bool
+    ) {
         self.osVersion = osVersion
         self.storekitAvailable = storekitAvailable
         self.skanVersion = skanVersion
         self.adAttributionKitAvailable = adAttributionKitAvailable
+        self.nativeClickBeaconV1 = nativeClickBeaconV1
     }
 
     /// The running device's capabilities, evaluated once. `storekit_available` mirrors SKOverlay
@@ -121,6 +146,7 @@ public struct DeviceCapabilities: Encodable, Sendable {
         var storekitAvailable = false
         var skanVersion = "0"
         var adAttributionKitAvailable = false
+        var nativeClickBeaconV1 = false
         if #available(iOS 14.0, *) {
             storekitAvailable = true
             skanVersion = "4.0"
@@ -128,11 +154,15 @@ public struct DeviceCapabilities: Encodable, Sendable {
         if #available(iOS 17.4, *) {
             adAttributionKitAvailable = true
         }
+        #if os(iOS)
+        nativeClickBeaconV1 = true
+        #endif
         return DeviceCapabilities(
             osVersion: osVersion,
             storekitAvailable: storekitAvailable,
             skanVersion: skanVersion,
-            adAttributionKitAvailable: adAttributionKitAvailable
+            adAttributionKitAvailable: adAttributionKitAvailable,
+            nativeClickBeaconV1: nativeClickBeaconV1
         )
     }()
 
@@ -144,6 +174,7 @@ public struct DeviceCapabilities: Encodable, Sendable {
             "storekit_available": storekitAvailable,
             "skan_version": skanVersion,
             "adattributionkit_available": adAttributionKitAvailable,
+            "native_click_beacon_v1": nativeClickBeaconV1,
         ]
     }
 }
@@ -850,11 +881,33 @@ public struct FallbackAd: Sendable {
     public let adId: String
     public let iframeUrl: String
     public let html: String?
+    /// Whether the server removed this fallback HTML's legacy click beacon and assigned click
+    /// counting to the SDK. Client support is checked separately at the point of use.
+    public let nativeClickBeaconV1Enabled: Bool
 
-    public init(adId: String, iframeUrl: String, html: String? = nil) {
+    public init(
+        adId: String,
+        iframeUrl: String,
+        html: String? = nil
+    ) {
+        self.init(
+            adId: adId,
+            iframeUrl: iframeUrl,
+            html: html,
+            nativeClickBeaconV1Enabled: false
+        )
+    }
+
+    public init(
+        adId: String,
+        iframeUrl: String,
+        html: String? = nil,
+        nativeClickBeaconV1Enabled: Bool
+    ) {
         self.adId = adId
         self.iframeUrl = iframeUrl
         self.html = html
+        self.nativeClickBeaconV1Enabled = nativeClickBeaconV1Enabled
     }
 }
 
@@ -863,16 +916,35 @@ public struct FallbackAd: Sendable {
 struct FallbackAdsAPIResponse: Decodable {
     let impressionId: String?
     let ads: [FallbackAdItem]
+    let nativeClickBeaconV1Enabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case ads
+        case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.impressionId = try? c.decode(String.self, forKey: .impressionId)
         self.ads = (try? c.decode([FallbackAdItem].self, forKey: .ads)) ?? []
+        self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
+    }
+
+    var resolvedAds: [FallbackAd] {
+        ads.compactMap { item in
+            let html = (item.html?.isEmpty == false) ? item.html : nil
+            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
+            guard html != nil || url != nil else { return nil }
+            return FallbackAd(
+                adId: item.adId ?? "",
+                iframeUrl: url ?? "",
+                html: html,
+                nativeClickBeaconV1Enabled: item.nativeClickBeaconV1Enabled
+                    ?? nativeClickBeaconV1Enabled
+                    ?? false
+            )
+        }
     }
 }
 
@@ -880,11 +952,21 @@ struct FallbackAdItem: Decodable {
     let adId: String?
     let html: String?
     let iframeUrl: String?
+    let nativeClickBeaconV1Enabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case html
         case iframeUrl = "iframe_url"
+        case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.adId = try? c.decode(String.self, forKey: .adId)
+        self.html = try? c.decode(String.self, forKey: .html)
+        self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
+        self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
     }
 }
 
@@ -1535,14 +1617,7 @@ public final class SimulaAPI: @unchecked Sendable {
         }
 
         let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
-        return apiResponse.ads.compactMap { item in
-            // Prefer the inline html (rendered in AdOverlayView); keep the iframe url as the same-origin
-            // base + url fallback. Drop only when neither is present.
-            let html = (item.html?.isEmpty == false) ? item.html : nil
-            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
-            guard html != nil || url != nil else { return nil }
-            return FallbackAd(adId: item.adId ?? "", iframeUrl: url ?? "", html: html)
-        }
+        return apiResponse.resolvedAds
     }
 
     // MARK: - Track Menu Game Click
@@ -1615,12 +1690,29 @@ public final class SimulaAPI: @unchecked Sendable {
     /// tapped. `adId` is the serve handle for rewarded/interstitial and the ad id for native; the
     /// backend resolves either. Best-effort, silent-fail.
     public func trackClick(adId: String, apiKey: String) async {
+        await trackClick(
+            adId: adId,
+            apiKey: apiKey,
+            interactionId: UUID().uuidString,
+            clickSource: ClickSource.primaryCTA.rawValue
+        )
+    }
+
+    public func trackClick(
+        adId: String,
+        apiKey: String,
+        interactionId: String,
+        clickSource: String
+    ) async {
         guard !adId.isEmpty else { return }
         guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/click") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        let normalizedSource = ClickSource(rawValue: clickSource)?.rawValue ?? ClickSource.primaryCTA.rawValue
+        request.setValue(interactionId, forHTTPHeaderField: "X-Simula-Click-Event-Id")
+        request.setValue(normalizedSource, forHTTPHeaderField: "X-Simula-Click-Source")
 
         // do/catch, not `try?` around an await — see the task-shape note in TelemetryManager.
         do { _ = try await session.data(for: request) } catch { /* best-effort beacon — silent-fail by design */ }
@@ -1680,12 +1772,36 @@ public final class SimulaAPI: @unchecked Sendable {
         apiKey: String,
         metadata: [String: String]? = nil
     ) async throws -> Int {
+        try await sendImpressionBeacon(
+            adId: adId,
+            action: action,
+            apiKey: apiKey,
+            metadata: metadata,
+            interactionId: nil,
+            clickSource: nil
+        )
+    }
+
+    func sendImpressionBeacon(
+        adId: String,
+        action: String,
+        apiKey: String,
+        metadata: [String: String]? = nil,
+        interactionId: String?,
+        clickSource: String?
+    ) async throws -> Int {
         guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/\(action)") else {
             throw SimulaAPIError.invalidURL
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
+        if action == "click",
+           let interactionId, !interactionId.isEmpty,
+           let clickSource, !clickSource.isEmpty {
+            request.setValue(interactionId, forHTTPHeaderField: "X-Simula-Click-Event-Id")
+            request.setValue(clickSource, forHTTPHeaderField: "X-Simula-Click-Source")
+        }
         if action == "seen", let metadata, !metadata.isEmpty {
             request.httpBody = try JSONEncoder().encode(["metadata": metadata])
         }

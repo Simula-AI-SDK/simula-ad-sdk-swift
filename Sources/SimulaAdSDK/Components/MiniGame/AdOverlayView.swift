@@ -4,6 +4,92 @@ import Combine
 import UIKit
 #endif
 
+/// Pure navigation-generation state for `AdOverlayView`'s load watchdog. Late timeout/completion
+/// callbacks can mutate state only while they still own the current loading generation.
+struct AdOverlayLoadCoordinator {
+    static let watchdogTimeout: TimeInterval = 10
+
+    enum Phase: Equatable {
+        case idle
+        case loading(Int)
+        case timedOut(Int)
+        case finished(Int)
+        case failed(Int)
+    }
+
+    private(set) var generation = 0
+    private(set) var phase = Phase.idle
+
+    var isLoading: Bool {
+        if case .loading = phase { return true }
+        return false
+    }
+
+    var isIdle: Bool { phase == .idle }
+
+    var isTimedOut: Bool {
+        if case .timedOut = phase { return true }
+        return false
+    }
+
+    mutating func beginLoad() -> Int {
+        generation += 1
+        phase = .loading(generation)
+        return generation
+    }
+
+    mutating func finishCurrentLoad() -> Bool {
+        guard case .loading(let owner) = phase else { return false }
+        phase = .finished(owner)
+        return true
+    }
+
+    mutating func failCurrentLoad() -> Bool {
+        switch phase {
+        case .loading(let owner), .timedOut(let owner), .finished(let owner):
+            phase = .failed(owner)
+            return true
+        case .idle, .failed:
+            return false
+        }
+    }
+
+    mutating func timeout(generation expectedGeneration: Int) -> Bool {
+        guard phase == .loading(expectedGeneration) else { return false }
+        phase = .timedOut(expectedGeneration)
+        return true
+    }
+
+    mutating func cancel() {
+        generation += 1
+        phase = .idle
+    }
+}
+
+/// One-shot ownership for the screen-installed event. A SwiftUI re-appearance or a late WebView
+/// callback cannot manufacture another END_SCREEN_N_OPEN trigger for the same overlay identity.
+struct AdOverlayScreenMountCoordinator {
+    private enum Phase { case idle, scheduled, delivered }
+    private var phase: Phase = .idle
+    var isMounted: Bool { phase == .delivered }
+
+    mutating func scheduleIfNeeded() -> Bool {
+        guard phase == .idle else { return false }
+        phase = .scheduled
+        return true
+    }
+
+    mutating func markDelivered() -> Bool {
+        guard phase == .scheduled else { return false }
+        phase = .delivered
+        return true
+    }
+
+    mutating func cancelScheduled() {
+        if phase == .scheduled { phase = .idle }
+    }
+}
+
 // MARK: - AdOverlayView
 
 /// Full-screen overlay that displays an ad iframe after a minigame session.
@@ -26,20 +112,51 @@ public struct AdOverlayView: View {
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
     /// Inline end-screen html (preferred over `iframeUrl` when present): the `<iframe srcdoc>` blob from
-    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin so its click beacon stays same-origin.
+    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin for creative resources.
     var html: String? = nil
-    /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
-    var onAdClick: (() -> Void)? = nil
+    /// Server-owned assignment for this fallback. False means the HTML retains click counting.
+    var nativeClickBeaconV1Enabled: Bool = false
+    /// Measurement context for this fallback surface. The fallback ad id remains the event identity;
+    /// the parent serve is deliberately not reused for fallback click accounting.
+    var telemetryAdFormat: String = "interstitial"
+    var telemetryAdUnitId: String? = nil
+    var telemetryServeId: String? = nil
+    /// Fired once for an admitted user CTA tap. Route success is reported separately.
+    var onAdClick: ((ClickInteraction) -> Void)? = nil
+    /// Mirrors deferred route ownership to imperative fallback presenters for a defensive close guard.
+    var onClickHandoffPendingChanged: ((Bool) -> Void)? = nil
     /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
     /// the in-app store sheet deterministically (tracker fired in the background) instead of
     /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
     var ctaTrackingUrl: String? = nil
     var ctaDestination: AdDestination = .appstore
+    var ctaStoreOpen: StoreOpen = .skstoreproduct
     var ctaStoreUrl: String? = nil
     /// Attribution tokens carried into the store sheet the end-screen CTA opens.
     var attribution: AdAttribution? = nil
+    /// Presentation-owned routing state shared with configured and in-WebView automatic routes.
+    var routeLifecycle: AttributionRouteLifecycle? = nil
+    /// Fires once after this screen's route lifecycle and lifecycle observers are mounted. This is
+    /// deliberately independent of WebView readiness: END_SCREEN_N_OPEN means screen installation.
+    var onScreenMounted: (() -> Bool)? = nil
 
-    @State private var appeared = false
+    /// The pooled WebView is transparent, so keep native black above it until the current page is
+    /// actually ready. A failed navigation deliberately leaves the safe surface in place.
+    @State private var adPageReady = false
+    /// Terminal load failure keeps the native black shield but removes the indefinite spinner.
+    @State private var adPageFailed = false
+    /// A committed document can still fail while loading subresources. Presentation timing starts
+    /// only after `didFinish`, once the creative has passed the stronger readiness boundary.
+    @State private var pageFinished = false
+    /// A watchdog timeout fails open: close remains available even if the same load finishes later.
+    @State private var loadTimedOut = false
+    @State private var hasAppeared = false
+    @State private var loadedCreativeIdentity: String?
+    @State private var loadCoordinator = AdOverlayLoadCoordinator()
+    @State private var loadWatchdogTask: Task<Void, Never>?
+    @State private var screenMountCoordinator = AdOverlayScreenMountCoordinator()
+    @State private var clickHandoffPending = false
+    @State private var localRouteLifecycle = AttributionRouteLifecycle()
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -89,7 +206,7 @@ public struct AdOverlayView: View {
             Color.black.opacity(isBottomSheet ? 0.8 : 1.0)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    if adCountdown <= 0 { onClose() }
+                    requestClose()
                 }
 
             // Content: bottom sheet or fullscreen (GeometryReader layout matches GameIframeView)
@@ -110,13 +227,56 @@ public struct AdOverlayView: View {
 
                     // Main content area
                     ZStack {
-                        // Ad creative: prefer the inline html (rendered with the iframe origin as base
-                        // so the end screen's own click beacon stays same-origin), else load the url.
+                        Color.black
+
+                        // Ad creative: prefer inline HTML, retaining the iframe origin for its resources;
+                        // otherwise load the URL directly. Server ownership separately controls beacons.
                         // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
                         if let html, !html.isEmpty {
-                            WebViewRepresentable(htmlString: html, baseURL: URL(string: iframeUrl), onAdClick: onAdClick, attribution: attribution, ctaTrackingUrl: ctaTrackingUrl, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
+                            WebViewRepresentable(
+                                htmlString: html,
+                                baseURL: URL(string: iframeUrl),
+                                onNavigationFinished: { markPageFinished() },
+                                onNavigationFailed: { _ in markPageFailed() },
+                                onAdClick: { handleAdClick($0) },
+                                onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
+                                attributionRouteLifecycle: activeRouteLifecycle,
+                                clickSource: .fallbackCTA,
+                                clickBeaconImpressionId: nativeClickBeaconImpressionId,
+                                attribution: attribution,
+                                ctaTrackingUrl: ctaTrackingUrl,
+                                ctaDestination: ctaDestination,
+                                ctaStoreOpen: ctaStoreOpen,
+                                ctaStoreUrl: ctaStoreUrl
+                            )
+                            .allowsHitTesting(!clickHandoffPending)
                         } else if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(url: url, onAdClick: onAdClick, attribution: attribution, ctaTrackingUrl: ctaTrackingUrl, ctaDestination: ctaDestination, ctaStoreUrl: ctaStoreUrl)
+                            WebViewRepresentable(
+                                url: url,
+                                onNavigationFinished: { markPageFinished() },
+                                onNavigationFailed: { _ in markPageFailed() },
+                                onAdClick: { handleAdClick($0) },
+                                onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
+                                attributionRouteLifecycle: activeRouteLifecycle,
+                                clickSource: .fallbackCTA,
+                                clickBeaconImpressionId: nativeClickBeaconImpressionId,
+                                attribution: attribution,
+                                ctaTrackingUrl: ctaTrackingUrl,
+                                ctaDestination: ctaDestination,
+                                ctaStoreOpen: ctaStoreOpen,
+                                ctaStoreUrl: ctaStoreUrl
+                            )
+                            .allowsHitTesting(!clickHandoffPending)
+                        }
+
+                        if !adPageReady {
+                            ZStack {
+                                Color.black
+                                if !adPageFailed {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                }
+                            }
                         }
 
                         // Close button / countdown ring — top right
@@ -127,7 +287,7 @@ public struct AdOverlayView: View {
                                     // Compact close button, matching the interstitial/rewarded default
                                     // (a ~16pt dark-translucent circle with a white X). Visible glyph
                                     // stays small; the hit area is a full 44pt touch target.
-                                    Button(action: onClose) {
+                                    Button(action: requestClose) {
                                         Image(systemName: "xmark")
                                             .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.white)
@@ -140,6 +300,7 @@ public struct AdOverlayView: View {
                                             .contentShape(Rectangle())
                                     }
                                     .buttonStyle(CloseButtonStyle())
+                                    .disabled(clickHandoffPending)
                                     .padding(.top, 8)
                                     .padding(.trailing, 8)
                                     .accessibilityLabel("Close ad")
@@ -197,16 +358,51 @@ public struct AdOverlayView: View {
         }
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)
-        .opacity(appeared ? 1 : 0)
-        .animation(.easeIn(duration: 0.2), value: appeared)
         .onAppear {
-            appeared = true
+            activeRouteLifecycle.activate()
+            hasAppeared = true
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
-            startCountdown()
+            #if os(iOS)
+            appForegrounded = UIApplication.shared.applicationState == .active
+            #endif
+            if screenMountCoordinator.scheduleIfNeeded() {
+                // Let the outer lifecycle modifier finish installing its notification subscriptions
+                // before an automatic store sheet can synchronously publish will-present.
+                let mounted = onScreenMounted
+                DispatchQueue.main.async {
+                    guard hasAppeared, activeRouteLifecycle.isActive else {
+                        screenMountCoordinator.cancelScheduled()
+                        return
+                    }
+                    let accepted = mounted?() ?? true
+                    if accepted {
+                        _ = screenMountCoordinator.markDelivered()
+                    } else {
+                        screenMountCoordinator.cancelScheduled()
+                    }
+                }
+            }
+            if !hasLoadableCreative {
+                startCurrentCreativeLoadIfNeeded()
+                markPageFailed()
+            } else {
+                startCurrentCreativeLoadIfNeeded()
+                beginPresentationIfReady()
+            }
         }
         .onDisappear {
+            screenMountCoordinator.cancelScheduled()
+            activeRouteLifecycle.deactivate()
+            hasAppeared = false
+            loadWatchdogTask?.cancel()
+            loadWatchdogTask = nil
+            loadCoordinator.cancel()
             countdownTask?.cancel()
             countdownTask = nil
+            updateClickHandoffPending(false)
+        }
+        .onChange(of: creativeIdentity) { _ in
+            startCurrentCreativeLoadIfNeeded()
         }
         // Pause the countdown while the app is backgrounded OR an in-app store/Safari sheet covers the
         // ad; resume only when both clear, so it can't elapse off-screen. (iOS-only; no-op elsewhere.)
@@ -220,9 +416,162 @@ public struct AdOverlayView: View {
 
     // MARK: - Countdown
 
+    private var nativeClickBeaconImpressionId: String? {
+        fallbackNativeClickBeaconImpressionId(
+            adId: adId,
+            capabilities: .current,
+            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
+        )
+    }
+
+    private var activeRouteLifecycle: AttributionRouteLifecycle {
+        routeLifecycle ?? localRouteLifecycle
+    }
+
+    private func handleAdClick(_ interaction: ClickInteraction) {
+        accountFallbackClick(
+            adId: adId,
+            interaction: interaction,
+            capabilities: .current,
+            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled,
+            adFormat: telemetryAdFormat,
+            adUnitId: telemetryAdUnitId,
+            serveId: telemetryServeId,
+            recordTelemetry: { context, interaction in
+                Telemetry.shared.recordLifecycle(
+                    stage: "click",
+                    adFormat: context.adFormat,
+                    adUnitId: context.adUnitId,
+                    adId: context.adId,
+                    serveId: context.serveId,
+                    interactionId: interaction.id,
+                    clickSource: interaction.source
+                )
+            },
+            enqueueBeacon: { claim, context in
+                AdBeaconManager.shared.enqueue(
+                    impressionId: claim.impressionId,
+                    action: "click",
+                    adFormat: context.adFormat,
+                    adUnitId: context.adUnitId,
+                    telemetryServeId: context.serveId ?? "",
+                    interactionId: claim.interactionId,
+                    clickSource: claim.clickSource
+                )
+            },
+            notifyPublisher: { interaction in onAdClick?(interaction) }
+        )
+    }
+
+    private func updateClickHandoffPending(_ pending: Bool) {
+        clickHandoffPending = pending
+        onClickHandoffPendingChanged?(pending)
+    }
+
+    private func requestClose() {
+        guard canDismissFullscreen(
+            dismissUnlocked: adCountdown <= 0,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
+        onClose()
+    }
+
+    private var hasLoadableCreative: Bool {
+        if let html, !html.isEmpty { return true }
+        return URL(string: iframeUrl) != nil
+    }
+
+    private var creativeIdentity: String {
+        if let html, !html.isEmpty {
+            return "html:\(iframeUrl):\(html.hashValue)"
+        }
+        return "url:\(iframeUrl)"
+    }
+
+    /// Starts one watchdog for the current creative. Ten seconds is deliberately longer than the
+    /// ordinary fallback page load but short enough that a wedged Web Content process cannot trap a
+    /// user indefinitely. Identity + generation checks make every cancelled/replaced timer harmless.
+    private func startCurrentCreativeLoadIfNeeded() {
+        let identityChanged = loadedCreativeIdentity != creativeIdentity
+        guard identityChanged || loadCoordinator.isIdle
+                || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading
+                    && !loadCoordinator.isTimedOut) else {
+            return
+        }
+
+        loadWatchdogTask?.cancel()
+        countdownTask?.cancel()
+        countdownTask = nil
+        loadedCreativeIdentity = creativeIdentity
+        adPageReady = false
+        adPageFailed = false
+        pageFinished = false
+        loadTimedOut = false
+        adCountdown = 5
+        ringProgress = 0
+        accumulatedMs = 0
+
+        let generation = loadCoordinator.beginLoad()
+        loadWatchdogTask = Task { await runLoadWatchdog(generation: generation) }
+    }
+
+    @MainActor
+    private func runLoadWatchdog(generation: Int) async {
+        let nanos = AdOverlayLoadCoordinator.watchdogTimeout * 1_000_000_000
+        guard nanos.isFinite, nanos > 0, nanos < Double(UInt64.max) else { return }
+        do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
+        if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
+        loadWatchdogTask = nil
+        loadTimedOut = true
+        adPageReady = true
+        adPageFailed = false
+        countdownTask?.cancel()
+        countdownTask = nil
+        adCountdown = 0
+        ringProgress = 1
+    }
+
+    private func markPageFinished() {
+        startCurrentCreativeLoadIfNeeded()
+        guard !adPageFailed, loadCoordinator.finishCurrentLoad() else { return }
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        adPageReady = true
+        pageFinished = true
+        beginPresentationIfReady()
+    }
+
+    /// `didFinish` can race SwiftUI's `onAppear` for a newly-installed hosting controller. Keep the
+    /// readiness bit and reconcile from both boundaries; callbacks/timing start exactly once only
+    /// after the view is mounted and lifecycle observers can pause any immediate store presentation.
+    private func beginPresentationIfReady() {
+        guard hasAppeared, pageFinished, !adPageFailed else { return }
+        reconcileCountdown()
+    }
+
+    /// A terminal/no-content failure must not strand the user behind a spinner and a close gate for
+    /// content that was never viewable. Screen-mounted behavior has already been delivered separately.
+    private func markPageFailed() {
+        startCurrentCreativeLoadIfNeeded()
+        guard loadCoordinator.failCurrentLoad() else { return }
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        applyTerminalPageFailure()
+    }
+
+    private func applyTerminalPageFailure() {
+        adPageReady = false
+        adPageFailed = true
+        countdownTask?.cancel()
+        countdownTask = nil
+        adCountdown = 0
+        ringProgress = 1
+    }
+
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
     private func reconcileCountdown() {
-        if appForegrounded && !storeSheetPresented {
+        if hasAppeared && pageFinished && !adPageFailed && !loadTimedOut
+            && appForegrounded && !storeSheetPresented {
             startCountdown()
         } else {
             countdownTask?.cancel()
@@ -268,6 +617,78 @@ public struct AdOverlayView: View {
     }
 }
 
+func fallbackNativeClickBeaconImpressionId(
+    adId: String,
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool
+) -> String? {
+    guard capabilities.nativeClickBeaconV1, nativeClickBeaconV1Enabled, !adId.isEmpty else {
+        return nil
+    }
+    return adId
+}
+
+struct FallbackNativeClickBeaconClaim: Equatable {
+    let impressionId: String
+    let interactionId: String
+    let clickSource: String
+}
+
+struct FallbackClickTelemetryContext: Equatable {
+    let adFormat: String
+    let adUnitId: String?
+    let adId: String?
+    let serveId: String?
+}
+
+func accountFallbackClick(
+    adId: String,
+    interaction: ClickInteraction,
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool,
+    adFormat: String,
+    adUnitId: String?,
+    serveId: String?,
+    recordTelemetry: (FallbackClickTelemetryContext, ClickInteraction) -> Void,
+    enqueueBeacon: (FallbackNativeClickBeaconClaim, FallbackClickTelemetryContext) -> Void,
+    notifyPublisher: (ClickInteraction) -> Void
+) {
+    let context = FallbackClickTelemetryContext(
+        adFormat: adFormat,
+        adUnitId: adUnitId,
+        adId: adId.isEmpty ? nil : adId,
+        serveId: serveId?.isEmpty == false ? serveId : nil
+    )
+    recordTelemetry(context, interaction)
+    if let claim = fallbackNativeClickBeaconClaim(
+        adId: adId,
+        interaction: interaction,
+        capabilities: capabilities,
+        nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
+    ) {
+        enqueueBeacon(claim, context)
+    }
+    notifyPublisher(interaction)
+}
+
+func fallbackNativeClickBeaconClaim(
+    adId: String,
+    interaction: ClickInteraction,
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool
+) -> FallbackNativeClickBeaconClaim? {
+    guard let impressionId = fallbackNativeClickBeaconImpressionId(
+        adId: adId,
+        capabilities: capabilities,
+        nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
+    ) else { return nil }
+    return FallbackNativeClickBeaconClaim(
+        impressionId: impressionId,
+        interactionId: interaction.id,
+        clickSource: interaction.source.rawValue
+    )
+}
+
 // MARK: - AdCountdownLifecycle
 
 /// Pauses an ad overlay's countdown while the app is backgrounded or an in-app store/Safari sheet
@@ -292,4 +713,3 @@ private struct AdCountdownLifecycle: ViewModifier {
         #endif
     }
 }
-

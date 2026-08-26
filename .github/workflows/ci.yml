@@ -39,6 +39,10 @@ jobs:
             echo '::error::`async let` is banned in SDK code — use sequential await or a task group (see .cursor/skills/swift-concurrency-task-shape/SKILL.md)'
             fail=1
           fi
+          if ! grep -qF 'loadingDeadlineTask = Task { [weak self] in await self?.runLoadingDeadline(generation: generation) }' Sources/SimulaAdSDK/Ads/FallbackAdPresenter.swift; then
+            echo '::error::Fallback loading deadline must keep its Task closure to one named async call'
+            fail=1
+          fi
           exit $fail
 
       - name: Select Xcode

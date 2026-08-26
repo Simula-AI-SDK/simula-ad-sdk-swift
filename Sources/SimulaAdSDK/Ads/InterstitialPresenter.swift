@@ -25,7 +25,7 @@ let impressionTickNanos: UInt64 = 200_000_000
 final class InterstitialPresenter {
     private var window: UIWindow?
     private var creativeBridge: CreativeBridge?
-    private var onClose: ((FullscreenPresentationLease) -> Void)?
+    private var onClose: ((FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so
     /// the host regains touch/keyboard focus (a new key window doesn't auto-revert).
@@ -48,13 +48,13 @@ final class InterstitialPresenter {
     func present(
         apiKey: String,
         response: AdLoadResponse,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
-        onClose: @escaping (FullscreenPresentationLease) -> Void
+        onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
-        guard let scene = Self.activeWindowScene() else {
+        guard let scene = preferredForegroundActiveWindowScene() else {
             // No scene to present in — caller decides how to surface this.
             presentationLease.releaseAfterPresentationFailure()
             return false
@@ -70,6 +70,7 @@ final class InterstitialPresenter {
         let root = CreativeInterstitialView(
             apiKey: apiKey,
             response: response,
+            originatingScene: scene,
             bridge: bridge,
             onClick: onClick,
             onImpression: onImpression,
@@ -100,6 +101,23 @@ final class InterstitialPresenter {
         return true
     }
 
+    @discardableResult
+    func present(
+        apiKey: String,
+        response: AdLoadResponse,
+        onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
+        onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
+    ) -> Bool {
+        present(
+            apiKey: apiKey,
+            response: response,
+            onClick: { _ in onClick() },
+            onImpression: onImpression,
+            onClose: onClose
+        )
+    }
+
     /// Fires the CLOSED callback, then tears down the presentation window — in that order.
     /// The callback brings up the post-close fallback ad window (from a background prefetch, so
     /// it's ready synchronously) on top of this still-visible window; only then do we hide it.
@@ -125,30 +143,25 @@ final class InterstitialPresenter {
         retainedWhilePresenting = nil
         if let presentationLease {
             if let callback {
-                callback(presentationLease)
+                callback(presentationLease, hostKeyWindow)
             } else {
                 presentationLease.finishPostCloseTeardown()
             }
         }
+        let shouldRestoreHostKeyWindow = win?.isKeyWindow == true
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).
         SimulaAppStatusBar.restore()
         win?.isHidden = true
         win?.rootViewController = nil
-        // Restore the host's key window so it regains focus. A fallback window presented in the
-        // callback stays visible on top and still receives touches via hit-testing.
-        hostKeyWindow?.makeKey()
+        // Restore the host only when the primary still owns key status. A successor fallback or
+        // loading window made key by the callback owns the handoff until its final dismiss.
+        if shouldRestoreHostKeyWindow {
+            hostKeyWindow?.makeKey()
+        }
         presentationLease?.finishPrimaryTeardown()
     }
 
-    /// Finds a foreground window scene to attach the overlay window to.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 
 // MARK: - CreativeInterstitialView
@@ -166,9 +179,10 @@ final class InterstitialPresenter {
 private struct CreativeInterstitialView: View {
     let apiKey: String
     let response: AdLoadResponse
+    let originatingScene: UIWindowScene
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
-    let onClick: () -> Void
+    let onClick: (ClickInteraction) -> Void
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onRequestDismiss: () -> Void
@@ -208,15 +222,14 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptVisible = false
     @State private var storePromptScheduled = false
     @State private var storePromptTask: Task<Void, Never>?
+    @State private var storePromptGestureGuard = StorePromptGestureGuard()
+    @State private var clickHandoffs = FullscreenClickHandoffState()
+    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
-    @State private var skOverlayPresented = false
+    @State private var skOverlayOwnership: SKOverlayOwnershipToken?
     @State private var skOverlayTask: Task<Void, Never>?
-
-    // auto_store_redirect — fires the store open once, the first time the creative reports the
-    // configured moment.
-    @State private var autoRedirectFired = false
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
@@ -229,13 +242,15 @@ private struct CreativeInterstitialView: View {
     init(
         apiKey: String,
         response: AdLoadResponse,
+        originatingScene: UIWindowScene,
         bridge: CreativeBridge,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
         self.apiKey = apiKey
         self.response = response
+        self.originatingScene = originatingScene
         self.bridge = bridge
         self.onClick = onClick
         self.onImpression = onImpression
@@ -254,6 +269,7 @@ private struct CreativeInterstitialView: View {
     /// The close config to render: the server's `ad_behavior.close` when present, else a default
     /// (compact, always-available top-right X) so ads without `ad_behavior` still get a small close.
     private var closeConfig: CloseBehavior { response.adBehavior?.close ?? CloseBehavior() }
+    private var clickHandoffPending: Bool { clickHandoffs.isPending }
 
     var body: some View {
         ZStack {
@@ -272,7 +288,10 @@ private struct CreativeInterstitialView: View {
                 position: closeConfig.position,
                 progressBarColor: closeConfig.progressBarColor,
                 isRewardCopy: isRewardCopy,
-                enabled: closeEnabled,
+                enabled: canDismissFullscreen(
+                    dismissUnlocked: closeEnabled,
+                    clickHandoffPending: clickHandoffPending
+                ),
                 remaining: closeRemaining,
                 progress: closeProgress,
                 onClose: { handleClose() }
@@ -284,7 +303,7 @@ private struct CreativeInterstitialView: View {
             // the real close button appears.
             if let prompt = response.adBehavior?.storePrompt, prompt.enabled, storePromptVisible, !closeEnabled {
                 // Center the badge in the same 44pt touch-target band as the close button (so they line up).
-                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { onClick(); trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: closeConfig.position, rowHeight: 44, onTap: { handleStorePromptClick() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last in the ZStack so the
@@ -305,7 +324,14 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
-            if storeExit == nil { storeExit = StoreExitTracker(adId: response.impressionId, adFormat: "interstitial") }
+            attributionRouteLifecycle.activate()
+            if storeExit == nil {
+                storeExit = StoreExitTracker(
+                    adId: response.impressionId,
+                    adFormat: "interstitial",
+                    adUnitId: response.adUnitId
+                )
+            }
             startGate()
             startImpressionTimer()
             startStorePromptTrigger()
@@ -314,6 +340,7 @@ private struct CreativeInterstitialView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
             gateTask = nil
             impressionTask?.cancel()
@@ -323,10 +350,13 @@ private struct CreativeInterstitialView: View {
             skOverlayTask?.cancel()
             skOverlayTask = nil
             // Tear the install banner down with the ad so it doesn't leak into the host app.
-            if skOverlayPresented, #available(iOS 14.0, *) {
-                SKOverlayPresenter.dismiss()
+            if let skOverlayOwnership, #available(iOS 14.0, *) {
+                SKOverlayPresenter.dismiss(ownershipToken: skOverlayOwnership)
+                self.skOverlayOwnership = nil
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
+            storePromptGestureGuard.release()
+            clickHandoffs.reset()
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
@@ -338,6 +368,7 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
             storeExit?.onReturn() // returned from an .external store/browser jump
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
@@ -348,6 +379,7 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
             storeExit?.onReturn() // the in-app sheet was dismissed
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
@@ -368,10 +400,24 @@ private struct CreativeInterstitialView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard !autoRedirectFired else { return }
-        autoRedirectFired = true
-        storeExit?.recordStoreOpen("auto_redirect")
-        handleStorePromptTap()
+        guard visible else { return }
+        attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) {
+            let execution = AttributionRouteExecution(
+                originatingScene: originatingScene,
+                isActive: {
+                    attributionRouteLifecycle.isActive
+                        && visible
+                        && UIApplication.shared.applicationState == .active
+                },
+                onOutcome: { outcome in
+                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                }
+            )
+            handleStorePromptTap(execution: execution)
+        }
     }
 
     /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
@@ -390,16 +436,26 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onAdClick: { handleHtmlClick() },
+            onAdClick: { handleHtmlClick($0) },
+            onClickHandoffPendingChanged: {
+                clickHandoffs.set(.creative, pending: $0)
+            },
+            onAttributionRouteOutcome: { outcome in
+                if outcome.success { storeExit?.recordStoreOpen("cta") }
+            },
+            attributionRouteLifecycle: attributionRouteLifecycle,
+            clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
             attribution: response.skanAttribution,
             ctaTrackingUrl: response.trackingUrl,
             // The serve's routing context: an in-creative CTA opens the store deterministically
             // (in-app sheet from the raw ios_store_url + background tracker fire) when available.
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             telemetryAdFormat: "interstitial"
         )
+        .allowsHitTesting(!clickHandoffPending)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
@@ -412,13 +468,16 @@ private struct CreativeInterstitialView: View {
     /// still-live interstitial window), so here we only emit CLICKED and, when configured, present
     /// an `on_click`-timed SKOverlay. We intentionally do NOT auto-dismiss: tearing the window down
     /// would destroy the just-presented sheet. Dismissal is driven by the close button.
-    private func handleHtmlClick() {
-        onClick() // CLICKED
-        storeExit?.recordStoreOpen("cta") // the creative CTA opens the advertiser store
+    private func handleHtmlClick(_ interaction: ClickInteraction) {
+        onClick(interaction) // CLICKED
         presentSKOverlayOnClickIfNeeded()
     }
 
     private func handleClose() {
+        guard canDismissFullscreen(
+            dismissUnlocked: closeEnabled,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
@@ -584,22 +643,72 @@ private struct CreativeInterstitialView: View {
     }
 
     /// Routes a store-prompt tap to the same destination as the CTA (shared router).
-    private func handleStorePromptTap() {
-        let storeOpen = response.adBehavior?.storeOpen ?? .skstoreproduct
+    private func handleStorePromptTap(execution: AttributionRouteExecution) {
         CreativeCTARouter.open(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
-            storeOpen: storeOpen,
+            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             storeUrl: response.iosStoreUrl,
-            attribution: response.skanAttribution
+            attribution: response.skanAttribution,
+            execution: execution
         )
     }
 
-    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
-    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
-    private func trackStorePromptClick() {
-        // Durable click beacon (was a fire-and-forget trackClick).
-        AdBeaconManager.shared.enqueue(impressionId: response.impressionId, action: "click", adFormat: "interstitial")
+    private func handleStorePromptClick() {
+        guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) else {
+            storePromptGestureGuard.release()
+            return
+        }
+        clickHandoffs.set(.storePrompt, pending: true)
+        let gestureGuard = storePromptGestureGuard
+        let interaction = ClickInteraction(source: .storePrompt)
+        onClick(interaction)
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: response.impressionId
+        ) {
+            DispatchQueue.main.async {
+                let execution = AttributionRouteExecution(
+                    originatingScene: originatingScene,
+                    isActive: {
+                        attributionRouteLifecycle.isActive
+                            && visible
+                            && UIApplication.shared.applicationState == .active
+                    },
+                    allowsDetachedDeterministicAttribution: true,
+                    survivesPresentationTeardownAfterBegin: true,
+                    canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
+                        originatingScene: originatingScene
+                    ),
+                    onUIHandoffReleased: {
+                        clickHandoffs.set(.storePrompt, pending: false)
+                    },
+                    onOutcome: { outcome in
+                        recordAttributionRoute(outcome: outcome, source: .storePrompt)
+                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let generation = gestureGuard.complete() {
+                            DispatchQueue.main.asyncAfter(
+                                deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                            ) {
+                                gestureGuard.releaseRoutedFallback(generation: generation)
+                            }
+                        } else {
+                            gestureGuard.release()
+                        }
+                    }
+                )
+                routeCommittedUserHandoff(
+                    coordinator: attributionRouteLifecycle.automaticRoutes,
+                    handoff: automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope,
+                    execution: execution,
+                    route: handleStorePromptTap
+                )
+            }
+        }
     }
 
     // MARK: SKOverlay (install banner)
@@ -623,7 +732,7 @@ private struct CreativeInterstitialView: View {
     }
 
     private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
-        guard !skOverlayPresented, resolvedAppID != nil else { return }
+        guard skOverlayOwnership == nil, resolvedAppID != nil else { return }
         skOverlayTask?.cancel()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         skOverlayTask = Task { await runSKOverlayPresent(config: config) }
@@ -643,7 +752,7 @@ private struct CreativeInterstitialView: View {
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
     /// link) safely no-ops with sampled telemetry.
     private func presentSKOverlay(config: SKOverlayConfig) {
-        guard !skOverlayPresented, let appID = resolvedAppID, !appID.isEmpty else {
+        guard skOverlayOwnership == nil, let appID = resolvedAppID, !appID.isEmpty else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
                 Telemetry.shared.recordOperation(
                     name: "skoverlay_skipped",
@@ -654,9 +763,16 @@ private struct CreativeInterstitialView: View {
             }
             return
         }
+        guard visible, attributionRouteLifecycle.isActive,
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
-        skOverlayPresented = true
-        SKOverlayPresenter.present(appID: appID, config: config, attribution: response.skanAttribution)
+        skOverlayOwnership = SKOverlayPresenter.present(
+            appID: appID,
+            config: config,
+            attribution: response.skanAttribution,
+            originatingScene: originatingScene
+        )
     }
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).

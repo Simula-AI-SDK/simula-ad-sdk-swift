@@ -79,6 +79,280 @@ enum SimulaWebViewPrewarmDecision: String, Hashable {
     case inactive
 }
 
+enum CreativeActivationClaim: Equatable {
+    case none
+    case newGesture
+    case duplicateGesture
+}
+
+enum CreativeActivationEvent: Equatable {
+    case pointerDown(type: String, trusted: Bool)
+    case pointerUp(type: String, trusted: Bool)
+    case pointerCancel(trusted: Bool)
+    case mouseDown(trusted: Bool)
+    case touchStart(trusted: Bool)
+    case touchEnd(trusted: Bool)
+    case touchCancel(trusted: Bool)
+    case keyDown(key: String, repeatKey: Bool, trusted: Bool)
+    case click(trusted: Bool)
+}
+
+/// Cross-platform model of the document-start activation fallback used when
+/// `navigator.userActivation` is unavailable on older WebKit versions.
+struct CreativeUserActivationState: Equatable {
+    private(set) var gestureSequence = 0
+    private(set) var claimedGesture = -1
+    private(set) var trustedEventDispatch = false
+    private var awaitingClick = false
+    private var contactPending = false
+    private var cancelledContact = false
+
+    mutating func observe(_ event: CreativeActivationEvent) {
+        switch event {
+        case .pointerDown(let type, let trusted):
+            guard trusted else { return }
+            if type.lowercased() == "touch" || type.lowercased() == "pen" {
+                disarmForPendingContact()
+            } else {
+                beginGesture()
+            }
+        case .pointerUp(let type, let trusted):
+            guard trusted else { return }
+            if type.lowercased() == "touch" || type.lowercased() == "pen" {
+                guard contactPending else { return }
+                contactPending = false
+            }
+            beginGesture()
+        case .pointerCancel(let trusted), .touchCancel(let trusted):
+            guard trusted else { return }
+            contactPending = false
+            awaitingClick = false
+            trustedEventDispatch = false
+            cancelledContact = true
+        case .mouseDown(let trusted):
+            guard trusted, !contactPending else { return }
+            beginGesture()
+        case .touchStart(let trusted):
+            guard trusted else { return }
+            disarmForPendingContact()
+        case .touchEnd(let trusted):
+            guard trusted, contactPending else { return }
+            contactPending = false
+            beginGesture()
+        case .keyDown(let key, let repeatKey, let trusted):
+            guard trusted, !repeatKey, qualifiesKeyboardKey(key) else { return }
+            beginKeyboardGesture()
+        case .click(let trusted):
+            guard trusted, !cancelledContact, !contactPending else { return }
+            if !awaitingClick { beginGesture() } else { trustedEventDispatch = true }
+            awaitingClick = false
+        }
+    }
+
+    mutating func claim(navigatorIsActive: Bool) -> CreativeActivationClaim {
+        guard gestureSequence > 0 else { return .none }
+        if claimedGesture == gestureSequence { return .duplicateGesture }
+        guard !contactPending, !cancelledContact,
+              navigatorIsActive || trustedEventDispatch else { return .none }
+        claimedGesture = gestureSequence
+        return .newGesture
+    }
+
+    mutating func expireMacrotask() {
+        trustedEventDispatch = false
+        cancelledContact = false
+    }
+
+    private mutating func disarmForPendingContact() {
+        contactPending = true
+        awaitingClick = false
+        trustedEventDispatch = false
+        cancelledContact = false
+    }
+
+    private mutating func beginGesture() {
+        cancelledContact = false
+        if !awaitingClick { gestureSequence += 1 }
+        awaitingClick = true
+        trustedEventDispatch = true
+    }
+
+    private mutating func beginKeyboardGesture() {
+        cancelledContact = false
+        gestureSequence += 1
+        awaitingClick = true
+        trustedEventDispatch = true
+    }
+
+    private func qualifiesKeyboardKey(_ key: String) -> Bool {
+        let normalized = key.lowercased()
+        if normalized == "escape" || normalized == "esc" { return false }
+        return !["alt", "altgraph", "capslock", "control", "ctrl", "fn", "fnlock",
+                  "hyper", "meta", "numlock", "scrolllock", "shift", "super", "symbol",
+                  "symbollock"].contains(normalized)
+    }
+}
+
+func creativeUserActivationScriptSource(nonce: String) -> String {
+    """
+    (function() {
+      var originalOpen = window.open;
+      var nativeHandler = window.webkit && window.webkit.messageHandlers
+        ? window.webkit.messageHandlers.simulaSDK
+        : null;
+      var postNative = nativeHandler && typeof nativeHandler.postMessage === 'function'
+        ? nativeHandler.postMessage.bind(nativeHandler)
+        : null;
+      var capturedUserActivation = navigator.userActivation;
+      var nativeSetTimeout = window.setTimeout.bind(window);
+      var trustedEventDispatch = false;
+      var trustedEventEpoch = 0;
+      var trustedEventTimestamp = -1;
+      var gestureSequence = 0;
+      var claimedGesture = -1;
+      var awaitingClick = false;
+      var contactPending = false;
+      var cancelledContact = false;
+
+      function clearTrustedDispatchLater(epoch) {
+        nativeSetTimeout(function() {
+          if (trustedEventEpoch === epoch) { trustedEventDispatch = false; }
+        }, 0);
+      }
+
+      function markTrustedDispatch(event) {
+        trustedEventEpoch += 1;
+        trustedEventTimestamp = Number(event.timeStamp || 0);
+        trustedEventDispatch = true;
+        clearTrustedDispatchLater(trustedEventEpoch);
+      }
+
+      function beginGesture(event) {
+        cancelledContact = false;
+        if (!awaitingClick) { gestureSequence += 1; }
+        awaitingClick = true;
+        markTrustedDispatch(event);
+      }
+
+      function beginKeyboardGesture(event) {
+        cancelledContact = false;
+        gestureSequence += 1;
+        awaitingClick = true;
+        markTrustedDispatch(event);
+      }
+
+      function disarmPendingContact() {
+        contactPending = true;
+        awaitingClick = false;
+        trustedEventDispatch = false;
+        trustedEventEpoch += 1;
+        cancelledContact = false;
+      }
+
+      function cancelContact() {
+        contactPending = false;
+        awaitingClick = false;
+        trustedEventDispatch = false;
+        trustedEventEpoch += 1;
+        cancelledContact = true;
+        var epoch = trustedEventEpoch;
+        nativeSetTimeout(function() {
+          if (trustedEventEpoch === epoch) { cancelledContact = false; }
+        }, 0);
+      }
+
+      function isModifierOnlyKey(key) {
+        return ['alt','altgraph','capslock','control','ctrl','fn','fnlock','hyper','meta',
+          'numlock','scrolllock','shift','super','symbol','symbollock'].indexOf(key) !== -1;
+      }
+
+      function observeTrustedEvent(event) {
+        if (!event || event.isTrusted !== true) { return; }
+        var type = event.type;
+        var pointerType = String(event.pointerType || '').toLowerCase();
+        if (type === 'pointerdown') {
+          if (pointerType === 'touch' || pointerType === 'pen') { disarmPendingContact(); }
+          else { beginGesture(event); }
+        } else if (type === 'pointerup') {
+          if (pointerType === 'touch' || pointerType === 'pen') {
+            if (!contactPending) { return; }
+            contactPending = false;
+          }
+          beginGesture(event);
+        } else if (type === 'pointercancel' || type === 'touchcancel') {
+          cancelContact();
+        } else if (type === 'touchstart') {
+          disarmPendingContact();
+        } else if (type === 'touchend') {
+          if (!contactPending) { return; }
+          contactPending = false;
+          beginGesture(event);
+        } else if (type === 'mousedown') {
+          if (!contactPending) { beginGesture(event); }
+        } else if (type === 'keydown') {
+          var key = String(event.key || '').toLowerCase();
+          if (event.repeat === true || key === 'escape' || key === 'esc' || isModifierOnlyKey(key)) { return; }
+          beginKeyboardGesture(event);
+        } else if (type === 'click') {
+          if (cancelledContact || contactPending) { return; }
+          if (!awaitingClick) { beginGesture(event); }
+          else { markTrustedDispatch(event); }
+          awaitingClick = false;
+        }
+      }
+
+      ['click', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown',
+       'touchstart', 'touchend', 'touchcancel', 'keydown'].forEach(function(name) {
+        window.addEventListener(name, observeTrustedEvent, true);
+      });
+
+      function hasActiveUserGesture() {
+        if (contactPending || cancelledContact) { return false; }
+        if (capturedUserActivation && capturedUserActivation.isActive === true) { return true; }
+        return trustedEventDispatch && trustedEventTimestamp >= 0;
+      }
+
+      function resolvedURL(value) {
+        if (value === undefined || value === null) { return null; }
+        try { return new URL(String(value), document.baseURI).href; }
+        catch (_) { return null; }
+      }
+
+      function forwardCTA(value) {
+        if (!postNative || gestureSequence === 0) { return false; }
+        if (claimedGesture === gestureSequence) { return true; }
+        if (!hasActiveUserGesture()) { return false; }
+        var url = resolvedURL(value);
+        if (!url) { return false; }
+        claimedGesture = gestureSequence;
+        try {
+          postNative({
+            type: 'SIMULA_CTA_OPEN',
+            url: url,
+            activation_nonce: '\(nonce)'
+          });
+          return true;
+        } catch (_) {
+          if (claimedGesture === gestureSequence) { claimedGesture = -1; }
+          return false;
+        }
+      }
+
+      window.open = function() {
+        if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
+        return originalOpen.apply(window, arguments);
+      };
+
+      window.addEventListener('click', function(event) {
+        if (!event.isTrusted || !hasActiveUserGesture()) { return; }
+        var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+        if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
+        if (forwardCTA(anchor.href)) { event.preventDefault(); }
+      }, true);
+    })();
+    """
+}
+
 struct SimulaWebViewPrewarmSkipGate {
     private var reported: Set<SimulaWebViewPrewarmDecision> = []
 
@@ -226,19 +500,40 @@ private func waitForNativeAdDisplayFrame() async {
 /// handler is before the web view is created) and simply repoint its `onMessage`
 /// closure when the view is handed out. The closure captures the coordinator
 /// weakly, so it introduces no retain cycle through the content controller.
+enum WebViewForwardedMessage {
+    case page(String)
+    case userActivatedCTA(URL)
+}
+
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
-    var onMessage: ((String) -> Void)?
+    private(set) var userActivationNonce = UUID().uuidString
+    var onMessage: ((WebViewForwardedMessage) -> Void)?
+
+    func rotateUserActivationNonce() {
+        userActivationNonce = UUID().uuidString
+    }
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        if let body = message.body as? String {
-            onMessage?(body)
+        let body: String?
+        if let value = message.body as? String {
+            body = value
         } else if let dict = message.body as? [String: Any],
-                  let data = try? JSONSerialization.data(withJSONObject: dict),
-                  let str = String(data: data, encoding: .utf8) {
-            onMessage?(str)
+                  let data = try? JSONSerialization.data(withJSONObject: dict) {
+            body = String(data: data, encoding: .utf8)
+        } else {
+            body = nil
+        }
+        guard let body else { return }
+        switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
+        case .accepted(let url):
+            onMessage?(.userActivatedCTA(url))
+        case .rejected:
+            return
+        case .notMessage:
+            onMessage?(.page(body))
         }
     }
 }
@@ -365,6 +660,26 @@ final class WebViewPool {
         forMainFrameOnly: false
     )
 
+    /// Handles popup CTAs before WebKit can race `createWebViewWith` ahead of an asynchronous script
+    /// message. During active user activation, `window.open` and trusted target=_blank clicks are
+    /// suppressed synchronously and forwarded as a structured message over the existing bridge.
+    /// The per-WebView nonce and bound native handler are captured before creative code runs. Direct
+    /// page calls to the public handler therefore cannot forge a billable activation message.
+    private static func userActivationScript(nonce: String) -> WKUserScript {
+        WKUserScript(
+            source: creativeUserActivationScriptSource(nonce: nonce),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
+
+    static func installUserScripts(on controller: WKUserContentController, nonce: String) {
+        controller.removeAllUserScripts()
+        controller.addUserScript(postMessageScript)
+        controller.addUserScript(errorCaptureScript)
+        controller.addUserScript(userActivationScript(nonce: nonce))
+    }
+
     private func makePooled() -> Pooled {
         let interval = signposter.beginInterval("WebViewCreate")
         defer { signposter.endInterval("WebViewCreate", interval) }
@@ -372,8 +687,7 @@ final class WebViewPool {
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
-        controller.addUserScript(WebViewPool.postMessageScript)
-        controller.addUserScript(WebViewPool.errorCaptureScript)
+        WebViewPool.installUserScripts(on: controller, nonce: forwarder.userActivationNonce)
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
@@ -455,7 +769,7 @@ final class WebViewPool {
     /// Acquiring never refills speculatively; only explicit demand or gated fullscreen-ready work may prewarm.
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
-        onMessage: @escaping (String) -> Void,
+        onMessage: @escaping (WebViewForwardedMessage) -> Void,
         surface: String? = nil
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
@@ -469,6 +783,11 @@ final class WebViewPool {
         let reusedWarm = idle.last != nil
         let pooled = idle.popLast() ?? makePooled()
 
+        pooled.forwarder.rotateUserActivationNonce()
+        Self.installUserScripts(
+            on: pooled.webView.configuration.userContentController,
+            nonce: pooled.forwarder.userActivationNonce
+        )
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate
         pooled.webView.uiDelegate = delegate

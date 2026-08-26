@@ -179,6 +179,34 @@ final class TelemetryManagerTests: XCTestCase {
         }
     }
 
+    private final class ManualTimeoutScheduler: TelemetryTimeoutScheduling, @unchecked Sendable {
+        private struct Scheduled {
+            let timeout: TimeInterval
+            let completion: @Sendable () -> Void
+        }
+
+        private let lock = NSLock()
+        private var scheduled: [Scheduled] = []
+
+        var requestedTimeouts: [TimeInterval] {
+            lock.lock(); defer { lock.unlock() }
+            return scheduled.map(\.timeout)
+        }
+
+        func schedule(after timeout: TimeInterval, completion: @escaping @Sendable () -> Void) {
+            lock.lock()
+            scheduled.append(Scheduled(timeout: timeout, completion: completion))
+            lock.unlock()
+        }
+
+        func fireNext() {
+            lock.lock()
+            let next = scheduled.isEmpty ? nil : scheduled.removeFirst()
+            lock.unlock()
+            next?.completion()
+        }
+    }
+
     private final class BlockingManagerFactory: @unchecked Sendable {
         private let lock = NSLock()
         private let gate: LaunchSettling
@@ -225,7 +253,8 @@ final class TelemetryManagerTests: XCTestCase {
         now: @escaping @Sendable () -> TimeInterval = { 1_000 },
         backoff: @escaping @Sendable (Int) -> TimeInterval = { _ in 0 },
         timedFlushSleep: (@Sendable (TimeInterval) async -> Void)? = nil,
-        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil
+        retrySleep: (@Sendable (TimeInterval) async -> Void)? = nil,
+        timeoutScheduler: any TelemetryTimeoutScheduling = DispatchTelemetryTimeoutScheduler()
     ) -> TelemetryManager {
         let manager = TelemetryManager(
             ctx: TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "TestPhone", hostAppId: "com.test", devMode: true),
@@ -241,6 +270,7 @@ final class TelemetryManagerTests: XCTestCase {
             backoff: backoff,
             timedFlushSleep: timedFlushSleep,
             retrySleep: retrySleep,
+            timeoutScheduler: timeoutScheduler,
             launchGate: launchGate,
             debugLog: debugLog,
             flushThreshold: 20,
@@ -316,6 +346,65 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertTrue(savedNames.last?.isEmpty == true)
     }
 
+    func testCriticalClickRedrainsWhenImmediateRequestCollidesWithPeriodicFlush() async {
+        for iteration in 0..<10 {
+            let sender = FakeSender()
+            sender.gateFirst()
+            let sleep = ControllablePersistenceSleep()
+            let mgr = build(
+                store: FakeStore(),
+                sender: sender,
+                timedFlushSleep: { await sleep.sleep($0) }
+            )
+            await mgr.waitForRecoveryForTests()
+            await mgr.waitForImmediateFlushIdleForTests()
+
+            mgr.recordNetwork(
+                path: "/load/interstitial",
+                method: "POST",
+                statusCode: 200,
+                durationMs: 1,
+                requestBytes: 0,
+                responseBytes: 1,
+                failureClass: nil
+            )
+            _ = await sleep.waitForRequest()
+            sleep.release()
+            await waitUntil { sender.attemptCount == 1 }
+
+            let interactionId = "critical-inflight-\(iteration)"
+            mgr.recordLifecycle(
+                stage: "click_fired",
+                adFormat: "interstitial",
+                adUnitId: "unit",
+                adId: "serve",
+                serveId: "serve",
+                durationMs: nil,
+                errorCode: nil,
+                interactionId: interactionId,
+                clickSource: "primary_cta"
+            )
+
+            let settled = TestSignal()
+            Task { await mgr.waitForImmediateFlushIdleForTests(); settled.signal() }
+            await Task.yield()
+            XCTAssertFalse(
+                settled.isSignaled,
+                "in-flight send must not report reconciliation at iteration \(iteration)"
+            )
+
+            sender.release()
+            await settled.wait()
+
+            XCTAssertEqual(sender.attemptCount, 2, "iteration \(iteration)")
+            XCTAssertEqual(
+                allEvents(sender.batches).filter { $0.interactionId == interactionId }.count,
+                1,
+                "iteration \(iteration)"
+            )
+        }
+    }
+
     func testFlushNowDoesNotWaitIndefinitelyForBlockedPersistence() async {
         let store = SlowStore()
         let mgr = build(
@@ -336,6 +425,23 @@ final class TelemetryManagerTests: XCTestCase {
         await completion.wait()
 
         XCTAssertEqual(store.saveCount, 0, "flush returns while the first persistence write remains blocked")
+    }
+
+    func testHandoffPersistenceBarrierFallsBackWhenStoreStalls() async {
+        let store = SlowStore()
+        let sender = FakeSender()
+        let timeoutScheduler = ManualTimeoutScheduler()
+        let mgr = build(store: store, sender: sender, timeoutScheduler: timeoutScheduler)
+        defer { store.release() }
+        await store.waitForSaveStarted()
+        let released = TestSignal()
+
+        mgr.afterPendingPersistence(timeout: 0.02) { released.signal() }
+        XCTAssertEqual(timeoutScheduler.requestedTimeouts, [0.02])
+        XCTAssertFalse(released.isSignaled)
+
+        timeoutScheduler.fireNext()
+        XCTAssertTrue(released.isSignaled)
     }
 
     func testEnvelopeCarriesContextAndSessionId() async {
@@ -457,6 +563,7 @@ final class TelemetryManagerTests: XCTestCase {
         let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
         XCTAssertEqual(duplicates.map { $0.count ?? 0 }, [2, 3])
         XCTAssertEqual(Set(duplicates.map(\.eventId)).count, 2)
+        XCTAssertEqual(duplicates.compactMap(\.sampleRate), [1, 1])
         sleep.release()
         await sleep.waitForCompletion()
     }
@@ -839,6 +946,11 @@ private final class TestSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var signaled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isSignaled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return signaled
+    }
 
     func signal() {
         lock.lock()

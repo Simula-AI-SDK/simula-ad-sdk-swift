@@ -1,3 +1,40 @@
+import Foundation
+
+struct SKOverlayOwnershipState<Owner: Hashable, Scene: Hashable> {
+    private var ownerByScene: [Scene: Owner] = [:]
+    private var sceneByOwner: [Owner: Scene] = [:]
+
+    mutating func install(owner: Owner, scene: Scene) {
+        if let replacedOwner = ownerByScene[scene] {
+            sceneByOwner[replacedOwner] = nil
+        }
+        if let previousScene = sceneByOwner[owner] {
+            ownerByScene[previousScene] = nil
+        }
+        ownerByScene[scene] = owner
+        sceneByOwner[owner] = scene
+    }
+
+    mutating func takeSceneForDismiss(owner: Owner) -> Scene? {
+        guard let scene = sceneByOwner.removeValue(forKey: owner),
+              ownerByScene[scene] == owner else { return nil }
+        ownerByScene[scene] = nil
+        return scene
+    }
+
+    func owns(owner: Owner, scene: Scene) -> Bool {
+        ownerByScene[scene] == owner && sceneByOwner[owner] == scene
+    }
+}
+
+struct SKOverlayOwnershipToken: Hashable, Sendable {
+    fileprivate let id: UUID
+
+    init(id: UUID = UUID()) {
+        self.id = id
+    }
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit
@@ -5,6 +42,8 @@ import StoreKit
 // MARK: - SKOverlayPresenter
 
 /// Presents the native `SKOverlay` install banner for the `skoverlay` experiment (PRD Section 5).
+/// StoreKit exposes no overlay-tap callback, so this surface remains StoreKit/SKAN-attributed and
+/// never manufactures an SDK click or an MMP tracker request merely to observe engagement.
 ///
 /// This is purely the persistent bottom banner — `SKStoreProductViewController` stays available in
 /// the background via `CreativeCTARouter`, independent of this overlay. Presentation is gated to
@@ -16,11 +55,27 @@ import StoreKit
 @available(iOS 14.0, *)
 @MainActor
 enum SKOverlayPresenter {
+    private static var ownership = SKOverlayOwnershipState<SKOverlayOwnershipToken, ObjectIdentifier>()
+    private static var presentedScenes: [ObjectIdentifier: WeakObjectReference<UIWindowScene>] = [:]
+
     /// Presents an SKOverlay for `appID` (numeric App Store id) honoring position + dismissibility, and
     /// carrying any [attribution] tokens so the install the overlay drives is credited to the campaign.
     /// Best-effort: a disabled config or a missing scene simply no-ops (the impression is unaffected).
-    static func present(appID: String, config: SKOverlayConfig, attribution: AdAttribution? = nil) {
-        guard config.enabled, !appID.isEmpty, let scene = activeWindowScene() else { return }
+    static func present(
+        appID: String,
+        config: SKOverlayConfig,
+        attribution: AdAttribution? = nil,
+        originatingScene: UIWindowScene? = nil
+    ) -> SKOverlayOwnershipToken? {
+        guard config.enabled, !appID.isEmpty,
+              UIApplication.shared.applicationState == .active else { return nil }
+        let scene: UIWindowScene?
+        if let originatingScene {
+            scene = originatingScene.activationState == .foregroundActive ? originatingScene : nil
+        } else {
+            scene = preferredForegroundActiveWindowScene()
+        }
+        guard let scene else { return nil }
 
         let position: SKOverlay.Position = config.position == .bottomRaised ? .bottomRaised : .bottom
         let appConfig = SKOverlay.AppConfiguration(appIdentifier: appID, position: position)
@@ -34,8 +89,8 @@ enum SKOverlayPresenter {
         // postback when the overlay drives the install. The SKAdImpression initializer is iOS
         // 16+, and older servers omit the view signature; both cases fall back to the
         // undocumented `setAdditionalValue` conveyance with the shared
-        // `SKStoreProductParameterAdNetwork*` keys. The MMP click for this engagement is fired
-        // separately when the app id is resolved (`is_skoverlay=true`).
+        // `SKStoreProductParameterAdNetwork*` keys. App-id resolution is side-effect free; StoreKit
+        // owns any later user engagement with the install banner.
         if let campaign = attribution?.campaignToken, !campaign.isEmpty { appConfig.campaignToken = campaign }
         if let provider = attribution?.providerToken, !provider.isEmpty { appConfig.providerToken = provider }
         if #available(iOS 16.0, *), let impression = Self.adImpression(appID: appID, attribution: attribution) {
@@ -48,6 +103,11 @@ enum SKOverlayPresenter {
 
         let overlay = SKOverlay(configuration: appConfig)
         overlay.present(in: scene)
+        let token = SKOverlayOwnershipToken()
+        let sceneID = ObjectIdentifier(scene)
+        ownership.install(owner: token, scene: sceneID)
+        presentedScenes[sceneID] = WeakObjectReference(scene)
+        return token
     }
 
     /// Builds the documented view-through impression for the overlay from the server's signed
@@ -79,21 +139,14 @@ enum SKOverlayPresenter {
         return impression
     }
 
-    /// Dismisses any SKOverlay currently shown in the active scene (called on creative teardown so
-    /// the banner doesn't outlive the ad).
-    static func dismiss() {
-        guard let scene = activeWindowScene() else { return }
+    /// Dismisses in the exact scene used for presentation, so multi-window hosts cannot leak an
+    /// overlay into one scene while teardown targets another.
+    static func dismiss(ownershipToken: SKOverlayOwnershipToken) {
+        guard let sceneID = ownership.takeSceneForDismiss(owner: ownershipToken) else { return }
+        let scene = presentedScenes.removeValue(forKey: sceneID)?.value
+        guard let scene, ObjectIdentifier(scene) == sceneID else { return }
         SKOverlay.dismiss(in: scene)
     }
 
-    /// Picks a window scene the same way `InterstitialPresenter` / `CreativeCTARouter` do —
-    /// preferring a foreground-active scene — so the overlay lands on the same surface as the ad.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 #endif

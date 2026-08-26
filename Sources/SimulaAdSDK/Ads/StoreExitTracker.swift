@@ -18,6 +18,7 @@ final class StoreExitTracker {
     private let adId: String?
     private let adFormat: String?
     private let adUnitId: String?
+    private var serveId: String? { adFormat == "interstitial" ? adId : nil }
 
     private var foregroundMs: Double = 0
     private var resumedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -41,17 +42,8 @@ final class StoreExitTracker {
         pendingTrigger = trigger
         Telemetry.shared.recordLifecycle(
             stage: "store_opened", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: Int(dwellMs), errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: Int(dwellMs), errorCode: nil, trigger: trigger
         )
-    }
-
-    /// Record a `store_opened` only if no visit is already pending — for paths where the trigger
-    /// isn't known at the call site (e.g. a playable CTA whose tap is handled inside the web view,
-    /// surfaced only by the in-app store sheet appearing). A no-op when an explicit
-    /// ``recordStoreOpen(_:)`` already set the trigger for this visit.
-    func recordStoreOpenIfUntracked(_ trigger: String) {
-        guard pendingTrigger == nil else { return }
-        recordStoreOpen(trigger)
     }
 
     /// App backgrounded, or an in-app sheet covered the ad — bank the foreground time accrued so far.
@@ -73,7 +65,7 @@ final class StoreExitTracker {
         pendingTrigger = nil
         Telemetry.shared.recordLifecycle(
             stage: "store_returned", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: Int(max(0, now - openedAt) * 1000), errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: Int(max(0, now - openedAt) * 1000), errorCode: nil, trigger: trigger
         )
     }
 
@@ -83,7 +75,7 @@ final class StoreExitTracker {
         pendingTrigger = nil
         Telemetry.shared.recordLifecycle(
             stage: "store_abandoned", adFormat: adFormat, adUnitId: adUnitId, adId: adId,
-            serveId: nil, durationMs: nil, errorCode: nil, trigger: trigger
+            serveId: serveId, durationMs: nil, errorCode: nil, trigger: trigger
         )
     }
 }

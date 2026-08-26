@@ -307,19 +307,21 @@ public struct NativeAdSlot: View {
                         htmlString: response.renderedHTML,
                         onNavigationFailed: { _ in handleLoadFailure() },
                         onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
-                        onAdClick: {
+                        onAdClick: { interaction in
                             // Surface the click to the publisher (parity with the interstitial's
                             // interstitialDidClick; CAI consumes this) BEFORE recording telemetry.
                             onClick()
                             // click lifecycle parity with interstitial/rewarded (was a reserved no-op).
                             Telemetry.shared.recordLifecycle(
                                 stage: "click", adFormat: response.adFormat, adUnitId: adUnitId,
-                                adId: impressionId.isEmpty ? nil : impressionId, serveId: nil, durationMs: nil, errorCode: nil
+                                adId: impressionId.isEmpty ? nil : impressionId, serveId: nil,
+                                durationMs: nil, errorCode: nil,
+                                interactionId: interaction.id, clickSource: interaction.source
                             )
                         },
-                        // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an
-                        // App Store CTA routes through the in-app store sheet so the tokens ride it; absent
-                        // tokens keep today's external open (see `openNativeCTA`).
+                        // SKAN/App-Analytics tokens (parity with interstitial/rewarded). Native serves
+                        // have no store_open field, so App Store CTAs use the default in-app StoreKit
+                        // sheet and carry these tokens.
                         attribution: response.skanAttribution,
                         externalClickOnly: true,
                         // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).

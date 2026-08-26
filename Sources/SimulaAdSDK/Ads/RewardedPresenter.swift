@@ -16,7 +16,7 @@ final class RewardedPresenter {
     private var creativeBridge: CreativeBridge?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
-    private var onClose: ((Bool, Double, FullscreenPresentationLease) -> Void)?
+    private var onClose: ((Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so the
     /// host regains touch/keyboard focus (a new key window doesn't auto-revert).
@@ -49,13 +49,13 @@ final class RewardedPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
-        onClick: @escaping () -> Void,
+        onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
-        onClose: @escaping (Bool, Double, FullscreenPresentationLease) -> Void
+        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
-        guard let scene = Self.activeWindowScene() else {
+        guard let scene = preferredForegroundActiveWindowScene() else {
             presentationLease.releaseAfterPresentationFailure()
             return false
         }
@@ -71,6 +71,7 @@ final class RewardedPresenter {
         let root = RewardedGameView(
             impressionId: impressionId,
             apiKey: apiKey,
+            originatingScene: scene,
             iframeUrl: iframeUrl,
             renderedHtml: renderedHtml,
             close: close,
@@ -113,6 +114,45 @@ final class RewardedPresenter {
         return true
     }
 
+    @discardableResult
+    func present(
+        impressionId: String,
+        apiKey: String,
+        iframeUrl: String,
+        renderedHtml: String = "",
+        close: CloseBehavior? = nil,
+        storePrompt: StorePrompt? = nil,
+        trackingUrl: String? = nil,
+        destination: AdDestination = .appstore,
+        storeOpen: StoreOpen = .skstoreproduct,
+        storeUrl: String? = nil,
+        attribution: AdAttribution? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        previewHTML: String? = nil,
+        onClick: @escaping () -> Void,
+        onImpression: @escaping () -> Void,
+        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
+    ) -> Bool {
+        present(
+            impressionId: impressionId,
+            apiKey: apiKey,
+            iframeUrl: iframeUrl,
+            renderedHtml: renderedHtml,
+            close: close,
+            storePrompt: storePrompt,
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeOpen: storeOpen,
+            storeUrl: storeUrl,
+            attribution: attribution,
+            autoStoreRedirect: autoStoreRedirect,
+            previewHTML: previewHTML,
+            onClick: { _ in onClick() },
+            onImpression: onImpression,
+            onClose: onClose
+        )
+    }
+
     /// Fires the close callback, then tears down the presentation window — in that order, so the
     /// callback can bring up the post-close fallback ad window (from a background prefetch, ready
     /// synchronously) on top of this still-visible window before it's hidden. Tearing down first
@@ -137,30 +177,25 @@ final class RewardedPresenter {
         retainedWhilePresenting = nil
         if let presentationLease {
             if let callback {
-                callback(earned, elapsedPlayTime, presentationLease)
+                callback(earned, elapsedPlayTime, presentationLease, hostKeyWindow)
             } else {
                 presentationLease.finishPostCloseTeardown()
             }
         }
+        let shouldRestoreHostKeyWindow = win?.isKeyWindow == true
         // Balanced with the present-time hide() (after the callback so a fallback presented in it
         // keeps the bar hidden across the handoff via the ref count).
         SimulaAppStatusBar.restore()
         win?.isHidden = true
         win?.rootViewController = nil
-        // Restore the host's key window so it regains focus. A fallback window presented in the
-        // callback stays visible on top and still receives touches via hit-testing.
-        hostKeyWindow?.makeKey()
+        // Restore the host only when the primary still owns key status. A successor fallback or
+        // loading window made key by the callback owns the handoff until its final dismiss.
+        if shouldRestoreHostKeyWindow {
+            hostKeyWindow?.makeKey()
+        }
         presentationLease?.finishPrimaryTeardown()
     }
 
-    /// Finds a foreground window scene to attach the overlay window to.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 
 // MARK: - RewardedGameView
@@ -175,6 +210,7 @@ private struct RewardedGameView: View {
     /// The impression id from /load/rewarded — drives the ad-info report overlay.
     let impressionId: String
     let apiKey: String
+    let originatingScene: UIWindowScene
     let iframeUrl: String
     /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty.
     let renderedHtml: String
@@ -200,7 +236,7 @@ private struct RewardedGameView: View {
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
     /// Fired on a user-gesture CTA / store-prompt tap (the CLICKED signal); parity with the interstitial.
-    let onClick: () -> Void
+    let onClick: (ClickInteraction) -> Void
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onFinish: (Bool, Double) -> Void
@@ -221,11 +257,11 @@ private struct RewardedGameView: View {
     @State private var closeProgressAnim: Double = 0
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
+    @State private var storePromptGestureGuard = StorePromptGestureGuard()
+    @State private var clickHandoffs = FullscreenClickHandoffState()
+    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
-    /// auto_store_redirect one-shot guard.
-    @State private var autoRedirectFired = false
-
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
     @State private var impressionFired = false
@@ -249,6 +285,8 @@ private struct RewardedGameView: View {
         gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
     }
 
+    private var clickHandoffPending: Bool { clickHandoffs.isPending }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -258,14 +296,14 @@ private struct RewardedGameView: View {
             // an in-playable CTA opens the store deterministically (in-app sheet + background
             // tracker fire) instead of sniffing the tracker's redirect chain.
             if let previewHTML {
-                WebViewRepresentable(htmlString: previewHTML, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(html: previewHTML)
             } else if !renderedHtml.isEmpty {
                 // Prefer the server-rendered HTML (parity with the interstitial, which fills the
                 // surface); fall back to the iframe URL. A user-gesture CTA tap fires CLICKED via
                 // onAdClick and routes through the store sheet carrying any SKAN attribution.
-                WebViewRepresentable(htmlString: renderedHtml, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(html: renderedHtml)
             } else if let url = URL(string: iframeUrl) {
-                WebViewRepresentable(url: url, onAdClick: { handleHtmlClick() }, bridge: bridge, attribution: attribution, ctaTrackingUrl: trackingUrl, ctaDestination: destination, ctaStoreUrl: storeUrl, telemetryAdFormat: "rewarded")
+                creativeWebView(url: url)
             }
 
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
@@ -276,7 +314,10 @@ private struct RewardedGameView: View {
                 position: (close ?? CloseBehavior()).position,
                 progressBarColor: (close ?? CloseBehavior()).progressBarColor,
                 isRewardCopy: true,
-                enabled: rewardEarned,
+                enabled: canDismissFullscreen(
+                    dismissUnlocked: rewardEarned,
+                    clickHandoffPending: clickHandoffPending
+                ),
                 remaining: secondsLeft,
                 progress: closeProgressAnim,
                 onClose: { finish(earned: true) }
@@ -289,7 +330,7 @@ private struct RewardedGameView: View {
             if let prompt = storePrompt, prompt.enabled, storePromptVisible, !rewardEarned {
                 // Match the reward/close pill's 8pt inset and center the badge in the same 44pt
                 // touch-target band so the two share one centerline (parity with the interstitial).
-                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { onClick(); trackStorePromptClick(); storeExit?.recordStoreOpen("store_prompt"); handleStorePromptTap() })
+                StorePromptBadge(prompt: prompt, closePosition: (close ?? CloseBehavior()).position, edgePadding: 8, rowHeight: 44, onTap: { handleStorePromptClick() })
             }
 
             // Persistent ad-info "i" + report sheet (required disclosure). Last so its sheet overlays.
@@ -308,6 +349,7 @@ private struct RewardedGameView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            attributionRouteLifecycle.activate()
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             startTimer()
             startImpressionTimer()
@@ -315,11 +357,14 @@ private struct RewardedGameView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
             impressionTask?.cancel()
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
+            storePromptGestureGuard.release()
+            clickHandoffs.reset()
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
@@ -331,19 +376,18 @@ private struct RewardedGameView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             appForegrounded = true
             storeExit?.onReturn()
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
-            // A store/Safari sheet only appears from a CTA tap — handled inside the playable's web
-            // view, so the trigger isn't known here. Tag it as a CTA open if nothing else claimed it.
-            storeExit?.recordStoreOpenIfUntracked("cta")
             storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
             storeExit?.onReturn()
+            storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
@@ -365,10 +409,24 @@ private struct RewardedGameView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard !autoRedirectFired else { return }
-        autoRedirectFired = true
-        storeExit?.recordStoreOpen("auto_redirect")
-        handleStorePromptTap()
+        guard visible else { return }
+        attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) {
+            let execution = AttributionRouteExecution(
+                originatingScene: originatingScene,
+                isActive: {
+                    attributionRouteLifecycle.isActive
+                        && visible
+                        && UIApplication.shared.applicationState == .active
+                },
+                onOutcome: { outcome in
+                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                }
+            )
+            handleStorePromptTap(execution: execution)
+        }
     }
 
     /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
@@ -465,30 +523,113 @@ private struct RewardedGameView: View {
         }
     }
 
-    /// A user-gesture CTA tap inside the playable: surface CLICKED to the publisher, then mark the
-    /// store-exit funnel (the creative's CTA opens the advertiser store). Mirrors the interstitial's
-    /// `handleHtmlClick` (minus SKOverlay — the rewarded uses post-close fallback ads instead). The
-    /// WebView coordinator does the actual store routing.
-    private func handleHtmlClick() {
-        onClick()
-        storeExit?.recordStoreOpen("cta")
+    /// A user-gesture CTA tap inside the playable surfaces CLICKED to the publisher. The WebView
+    /// coordinator reports the terminal route outcome separately, and only a successful route marks
+    /// the store-exit funnel.
+    private func handleHtmlClick(_ interaction: ClickInteraction) {
+        onClick(interaction)
+    }
+
+    private func creativeWebView(url: URL? = nil, html: String? = nil) -> some View {
+        WebViewRepresentable(
+            url: url,
+            htmlString: html,
+            onAdClick: { handleHtmlClick($0) },
+            onClickHandoffPendingChanged: {
+                clickHandoffs.set(.creative, pending: $0)
+            },
+            onAttributionRouteOutcome: { outcome in
+                if outcome.success { storeExit?.recordStoreOpen("cta") }
+            },
+            attributionRouteLifecycle: attributionRouteLifecycle,
+            clickBeaconImpressionId: impressionId,
+            bridge: bridge,
+            attribution: attribution,
+            ctaTrackingUrl: trackingUrl,
+            ctaDestination: destination,
+            ctaStoreOpen: storeOpen,
+            ctaStoreUrl: storeUrl,
+            telemetryAdFormat: "rewarded"
+        )
+        .allowsHitTesting(!clickHandoffPending)
     }
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
-    private func handleStorePromptTap() {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
+    private func handleStorePromptTap(execution: AttributionRouteExecution) {
+        CreativeCTARouter.open(
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeOpen: storeOpen,
+            storeUrl: storeUrl,
+            attribution: attribution,
+            execution: execution
+        )
     }
 
-    /// Mid-store-prompt click beacon. Wired only to the badge's `onTap` — `handleStorePromptTap` is
-    /// also reused by `fireAutoStoreRedirect` (no user tap), which must NOT count as a click.
-    private func trackStorePromptClick() {
-        // Durable click beacon (was a fire-and-forget trackClick).
-        AdBeaconManager.shared.enqueue(impressionId: impressionId, action: "click", adFormat: "rewarded")
+    private func handleStorePromptClick() {
+        guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) else {
+            storePromptGestureGuard.release()
+            return
+        }
+        clickHandoffs.set(.storePrompt, pending: true)
+        let gestureGuard = storePromptGestureGuard
+        let interaction = ClickInteraction(source: .storePrompt)
+        onClick(interaction)
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: impressionId
+        ) {
+            DispatchQueue.main.async {
+                let execution = AttributionRouteExecution(
+                    originatingScene: originatingScene,
+                    isActive: {
+                        attributionRouteLifecycle.isActive
+                            && visible
+                            && UIApplication.shared.applicationState == .active
+                    },
+                    allowsDetachedDeterministicAttribution: true,
+                    survivesPresentationTeardownAfterBegin: true,
+                    canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
+                        originatingScene: originatingScene
+                    ),
+                    onUIHandoffReleased: {
+                        clickHandoffs.set(.storePrompt, pending: false)
+                    },
+                    onOutcome: { outcome in
+                        recordAttributionRoute(outcome: outcome, source: .storePrompt)
+                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let generation = gestureGuard.complete() {
+                            DispatchQueue.main.asyncAfter(
+                                deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                            ) {
+                                gestureGuard.releaseRoutedFallback(generation: generation)
+                            }
+                        } else {
+                            gestureGuard.release()
+                        }
+                    }
+                )
+                routeCommittedUserHandoff(
+                    coordinator: attributionRouteLifecycle.automaticRoutes,
+                    handoff: automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope,
+                    execution: execution,
+                    route: handleStorePromptTap
+                )
+            }
+        }
     }
 
     // MARK: Close
 
     private func finish(earned: Bool) {
+        guard canDismissFullscreen(
+            dismissUnlocked: earned,
+            clickHandoffPending: clickHandoffPending
+        ) else { return }
         let elapsed = elapsedPlayTime
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

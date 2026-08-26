@@ -12,6 +12,28 @@ import StoreKit
 /// return nil exactly then.
 final class SKOverlayAttributionTests: XCTestCase {
 
+    func testOverlayOwnershipDismissesOnlyMatchingOwnerAndScene() {
+        var ownership = SKOverlayOwnershipState<String, String>()
+        ownership.install(owner: "first", scene: "scene-a")
+        ownership.install(owner: "second", scene: "scene-b")
+
+        XCTAssertTrue(ownership.owns(owner: "first", scene: "scene-a"))
+        XCTAssertNil(ownership.takeSceneForDismiss(owner: "stale"))
+        XCTAssertEqual(ownership.takeSceneForDismiss(owner: "first"), "scene-a")
+        XCTAssertTrue(ownership.owns(owner: "second", scene: "scene-b"))
+        XCTAssertEqual(ownership.takeSceneForDismiss(owner: "second"), "scene-b")
+    }
+
+    func testNewOverlayInSameSceneInvalidatesPreviousOwner() {
+        var ownership = SKOverlayOwnershipState<String, String>()
+        ownership.install(owner: "first", scene: "scene-a")
+        ownership.install(owner: "second", scene: "scene-a")
+
+        XCTAssertFalse(ownership.owns(owner: "first", scene: "scene-a"))
+        XCTAssertNil(ownership.takeSceneForDismiss(owner: "first"))
+        XCTAssertEqual(ownership.takeSceneForDismiss(owner: "second"), "scene-a")
+    }
+
     private func attribution(_ skanFields: String) throws -> AdAttribution {
         let json = """
         {"campaign_token":"camp_tok","provider_token":"prov_tok","skan":{\(skanFields)}}
@@ -84,6 +106,30 @@ final class SKOverlayAttributionTests: XCTestCase {
     func testAdImpressionNilWithoutSkanBlock() async throws {
         let result = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: nil)
         XCTAssertNil(result)
+    }
+
+    @MainActor
+    func testTrackerOnlyOverlayResolutionDoesNotCreateMMPClick() {
+        var resolved: String? = "not-called"
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: "https://tracker.example/click",
+            destination: .appstore,
+            storeUrl: nil
+        ) { resolved = $0 }
+
+        XCTAssertNil(resolved, "tracker-only overlay setup must stay side-effect-free")
+    }
+
+    @MainActor
+    func testDirectItmsOverlayResolutionUsesStoreIdWithoutMMPRequest() {
+        var resolved: String? = nil
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: "itms-apps://apps.apple.com/app/id1575412509",
+            destination: .appstore,
+            storeUrl: nil
+        ) { resolved = $0 }
+
+        XCTAssertEqual(resolved, "1575412509")
     }
 
     @available(iOS 16.0, *)

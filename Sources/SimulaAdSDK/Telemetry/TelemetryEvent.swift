@@ -40,6 +40,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var adUnitId: String?
     var adId: String?
     var serveId: String?
+    var interactionId: String?
+    var clickSource: String?
     var errorCode: String?
     var message: String?
     var breadcrumb: String?
@@ -55,6 +57,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var eventAgeMs: Int?
     /// Occurrence count for a deduped error signature (mutable so repeats aggregate in place).
     var count: Int?
+    /// Effective performance sampling rate when this event entered the buffer.
+    var sampleRate: Double?
 
     enum CodingKeys: String, CodingKey {
         case type, name
@@ -71,6 +75,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case adUnitId = "ad_unit_id"
         case adId = "ad_id"
         case serveId = "serve_id"
+        case interactionId = "interaction_id"
+        case clickSource = "click_source"
         case errorCode = "error_code"
         case message, breadcrumb, stack
         case cacheHit = "cache_hit"
@@ -79,6 +85,7 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case cacheSource = "cache_source"
         case eventAgeMs = "event_age_ms"
         case count
+        case sampleRate = "sample_rate"
     }
 
     init(type: String, name: String, eventId: String, timestamp: Double) {
@@ -119,6 +126,9 @@ struct TelemetryEnvelope: Codable {
     var carrier: String?
     var radio: String?
     var buildType: String?
+    /// Effective server-controlled performance sampling rate when every event in this batch shares
+    /// one rate. Nil for mixed-rate batches; each event remains individually stamped.
+    var sampleRate: Double?
     let events: [TelemetryEvent]
 
     enum CodingKeys: String, CodingKey {
@@ -140,6 +150,7 @@ struct TelemetryEnvelope: Codable {
         case batteryCharging = "battery_charging"
         case carrier, radio
         case buildType = "build_type"
+        case sampleRate = "sample_rate"
         case events
     }
 }
