@@ -504,6 +504,7 @@ final class TelemetryManagerTests: XCTestCase {
         let duplicates = allEvents(sender.batches).filter { $0.name == "duplicate_initialize" }
         XCTAssertEqual(duplicates.map { $0.count ?? 0 }, [2, 3])
         XCTAssertEqual(Set(duplicates.map(\.eventId)).count, 2)
+        XCTAssertEqual(duplicates.compactMap(\.sampleRate), [1, 1])
         sleep.release()
         await sleep.waitForCompletion()
     }

@@ -22,7 +22,8 @@ enum SKOverlayPresenter {
     /// carrying any [attribution] tokens so the install the overlay drives is credited to the campaign.
     /// Best-effort: a disabled config or a missing scene simply no-ops (the impression is unaffected).
     static func present(appID: String, config: SKOverlayConfig, attribution: AdAttribution? = nil) {
-        guard config.enabled, !appID.isEmpty, let scene = activeWindowScene() else { return }
+        guard config.enabled, !appID.isEmpty,
+              let scene = preferredForegroundActiveWindowScene() else { return }
 
         let position: SKOverlay.Position = config.position == .bottomRaised ? .bottomRaised : .bottom
         let appConfig = SKOverlay.AppConfiguration(appIdentifier: appID, position: position)
@@ -84,18 +85,9 @@ enum SKOverlayPresenter {
     /// Dismisses any SKOverlay currently shown in the active scene (called on creative teardown so
     /// the banner doesn't outlive the ad).
     static func dismiss() {
-        guard let scene = activeWindowScene() else { return }
+        guard let scene = preferredForegroundActiveWindowScene() else { return }
         SKOverlay.dismiss(in: scene)
     }
 
-    /// Picks a window scene the same way `InterstitialPresenter` / `CreativeCTARouter` do —
-    /// preferring a foreground-active scene — so the overlay lands on the same surface as the ad.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 #endif

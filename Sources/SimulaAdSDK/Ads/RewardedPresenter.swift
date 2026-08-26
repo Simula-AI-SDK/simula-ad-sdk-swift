@@ -55,7 +55,7 @@ final class RewardedPresenter {
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
-        guard let scene = Self.activeWindowScene() else {
+        guard let scene = preferredForegroundActiveWindowScene() else {
             presentationLease.releaseAfterPresentationFailure()
             return false
         }
@@ -71,6 +71,7 @@ final class RewardedPresenter {
         let root = RewardedGameView(
             impressionId: impressionId,
             apiKey: apiKey,
+            originatingScene: scene,
             iframeUrl: iframeUrl,
             renderedHtml: renderedHtml,
             close: close,
@@ -195,14 +196,6 @@ final class RewardedPresenter {
         presentationLease?.finishPrimaryTeardown()
     }
 
-    /// Finds a foreground window scene to attach the overlay window to.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 
 // MARK: - RewardedGameView
@@ -217,6 +210,7 @@ private struct RewardedGameView: View {
     /// The impression id from /load/rewarded — drives the ad-info report overlay.
     let impressionId: String
     let apiKey: String
+    let originatingScene: UIWindowScene
     let iframeUrl: String
     /// Server-rendered HTML creative; preferred over `iframeUrl` when non-empty.
     let renderedHtml: String
@@ -268,9 +262,6 @@ private struct RewardedGameView: View {
     @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
-    /// auto_store_redirect routes once per presentation and is never a user click.
-    @State private var autoRedirectGuard = AutomaticRouteGuard()
-
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
     @State private var impressionFired = false
@@ -418,19 +409,24 @@ private struct RewardedGameView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard autoRedirectGuard.claim(), visible else { return }
-        let execution = AttributionRouteExecution(
-            isActive: {
-                attributionRouteLifecycle.isActive
-                    && visible
-                    && UIApplication.shared.applicationState == .active
-            },
-            onOutcome: { outcome in
-                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-                if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
-            }
-        )
-        handleStorePromptTap(execution: execution)
+        guard visible else { return }
+        attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) {
+            let execution = AttributionRouteExecution(
+                originatingScene: originatingScene,
+                isActive: {
+                    attributionRouteLifecycle.isActive
+                        && visible
+                        && UIApplication.shared.applicationState == .active
+                },
+                onOutcome: { outcome in
+                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                }
+            )
+            handleStorePromptTap(execution: execution)
+        }
     }
 
     /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
@@ -572,6 +568,12 @@ private struct RewardedGameView: View {
 
     private func handleStorePromptClick() {
         guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) else {
+            storePromptGestureGuard.release()
+            return
+        }
         clickHandoffs.set(.storePrompt, pending: true)
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
@@ -582,6 +584,7 @@ private struct RewardedGameView: View {
         ) {
             DispatchQueue.main.async {
                 let execution = AttributionRouteExecution(
+                    originatingScene: originatingScene,
                     isActive: {
                         attributionRouteLifecycle.isActive
                             && visible
@@ -605,6 +608,17 @@ private struct RewardedGameView: View {
                     }
                 )
                 guard visible else {
+                    attributionRouteLifecycle.automaticRoutes.cancelUserHandoff(
+                        automaticUserHandoff,
+                        scope: attributionRouteLifecycle.automaticRouteScope
+                    )
+                    execution.cancel()
+                    return
+                }
+                guard attributionRouteLifecycle.automaticRoutes.commitUserHandoff(
+                    automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope
+                ) else {
                     execution.cancel()
                     return
                 }

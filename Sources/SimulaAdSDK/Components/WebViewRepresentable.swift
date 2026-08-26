@@ -538,6 +538,10 @@ struct WebViewRepresentable: UIViewRepresentable {
         func prepareForRetainedServeRebind() {
             detachPendingClickState()
             automaticPopupGuard.reset()
+            if attributionRouteLifecycle == nil {
+                ownedAutomaticRouteScope = AnyHashable(UUID())
+                ownedAutomaticRoutes.reset(scope: ownedAutomaticRouteScope)
+            }
             navigationTracker.resetForRebind()
             pageStartUptime = nil
             mainFrameHTTPFailed = false
@@ -575,6 +579,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// reports one target=_blank gesture through both delegate methods.
         private var clickClaim = CreativeClickClaim()
         let automaticPopupGuard = AutomaticRouteGuard()
+        private let ownedAutomaticRoutes = AutomaticRouteCoordinator()
+        private var ownedAutomaticRouteScope = AnyHashable(UUID())
+        private var pendingAutomaticUserHandoff: AutomaticRouteUserHandoff?
         private var clickHandoffPending = false
         private var pendingAttributionRoute: AttributionRouteExecution?
 
@@ -595,12 +602,18 @@ struct WebViewRepresentable: UIViewRepresentable {
                 now: now
             ) else { return false }
             let lifecycle = attributionRouteLifecycle
+            let automaticRoutes = lifecycle?.automaticRoutes ?? ownedAutomaticRoutes
+            let automaticRouteScope = lifecycle?.automaticRouteScope ?? ownedAutomaticRouteScope
+            guard let automaticUserHandoff = automaticRoutes.beginUserHandoff(
+                scope: automaticRouteScope
+            ) else { return false }
             let source = clickSource
             let routeID = UUID()
             let terminalOutcome = onAttributionRouteOutcome
             let execution = makeCreativeAttributionRouteExecution(
                 id: routeID,
                 source: source,
+                originatingScene: webView?.window?.windowScene,
                 isActive: { [weak self] in
                     let presentationActive = lifecycle?.isActive ?? (self?.webView != nil)
                     return presentationActive && UIApplication.shared.applicationState == .active
@@ -616,6 +629,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                     }
                 }
             )
+            pendingAutomaticUserHandoff = automaticUserHandoff
             pendingAttributionRoute = execution
             setClickHandoffPending(true)
             onAdClick?(interaction)
@@ -625,8 +639,22 @@ struct WebViewRepresentable: UIViewRepresentable {
             ) {
                 DispatchQueue.main.async { [weak self] in
                     guard self?.pendingAttributionRoute === execution || lifecycle != nil else {
+                        automaticRoutes.cancelUserHandoff(
+                            automaticUserHandoff,
+                            scope: automaticRouteScope
+                        )
                         execution.cancel()
                         return
+                    }
+                    guard automaticRoutes.commitUserHandoff(
+                        automaticUserHandoff,
+                        scope: automaticRouteScope
+                    ) else {
+                        execution.cancel()
+                        return
+                    }
+                    if self?.pendingAutomaticUserHandoff == automaticUserHandoff {
+                        self?.pendingAutomaticUserHandoff = nil
                     }
                     route(execution)
                 }
@@ -636,22 +664,27 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         private func routeAutomaticNavigation(_ url: URL) {
             let lifecycle = attributionRouteLifecycle
+            let automaticRoutes = lifecycle?.automaticRoutes ?? ownedAutomaticRoutes
+            let automaticRouteScope = lifecycle?.automaticRouteScope ?? ownedAutomaticRouteScope
             let route = externalClickOnly
                 ? nativeCTARoute(fallback: url)
                 : creativeCTARoute(
                     fallback: url,
                     fallbackStoreURL: validatedDirectAppStoreURL(url.absoluteString)
                 )
-            let execution = AttributionRouteExecution(
-                isActive: { [weak self] in
-                    let presentationActive = lifecycle?.isActive ?? (self?.webView != nil)
-                    return presentationActive && UIApplication.shared.applicationState == .active
-                },
-                onOutcome: { outcome in
-                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-                }
-            )
-            route(execution)
+            automaticRoutes.requestAutomaticRoute(scope: automaticRouteScope) { [weak self] in
+                let execution = AttributionRouteExecution(
+                    originatingScene: self?.webView?.window?.windowScene,
+                    isActive: { [weak self] in
+                        let presentationActive = lifecycle?.isActive ?? (self?.webView != nil)
+                        return presentationActive && UIApplication.shared.applicationState == .active
+                    },
+                    onOutcome: { outcome in
+                        recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    }
+                )
+                route(execution)
+            }
         }
 
         private func popupAdmission(
@@ -678,6 +711,13 @@ struct WebViewRepresentable: UIViewRepresentable {
             // Fullscreen/fallback containers own a presentation lifecycle and keep accepted routes
             // alive across WebView replacement. Lifecycle-less native-ad rows cancel on rebind.
             if attributionRouteLifecycle == nil {
+                if let pendingAutomaticUserHandoff {
+                    ownedAutomaticRoutes.cancelUserHandoff(
+                        pendingAutomaticUserHandoff,
+                        scope: ownedAutomaticRouteScope
+                    )
+                    self.pendingAutomaticUserHandoff = nil
+                }
                 pendingAttributionRoute?.cancel()
                 pendingAttributionRoute = nil
             }
@@ -775,6 +815,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.reportsContentHeight = reportsContentHeight
             self.retainedImpressionId = retainedImpressionId
             self.telemetryAdFormat = telemetryAdFormat
+            ownedAutomaticRoutes.activate(scope: ownedAutomaticRouteScope)
         }
 
         /// Routes a `window.postMessage` envelope from the creative: to the bridge (PRD §3)
@@ -1168,7 +1209,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                     return
                 }
                 let attribution = self.attribution
-                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                let originatingScene = webView.window?.windowScene
+                Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution, originatingScene: originatingScene) }
                 decisionHandler(.cancel)
                 return
             }
@@ -1196,7 +1238,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 }
                 if let appID = appStoreID(from: url) {
                     let attribution = self.attribution
-                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution) }
+                    let originatingScene = webView.window?.windowScene
+                    Task { @MainActor in CreativeCTARouter.presentStoreProduct(appID: appID, attribution: attribution, originatingScene: originatingScene) }
                 } else {
                     // Couldn't extract app ID — let the system handle it
                     Task { @MainActor in UIApplication.shared.open(url) }

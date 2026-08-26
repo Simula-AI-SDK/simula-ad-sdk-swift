@@ -55,6 +55,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
         battery: @escaping @Sendable () -> BatteryInfo? = { nil },
         carrier: @escaping @Sendable () -> CarrierInfo? = { nil },
         ctx: TelemetryContext = TelemetryContext(sdkVersion: "9.9", osVersion: "14", deviceModel: "Test", hostAppId: "com.test", devMode: true),
+        sampleRate: Double = 1.0,
         flushThreshold: Int = 20,
         maxBuffer: Int = 200,
         launchGate: LaunchSettling = ImmediateLaunchSettledGate.shared,
@@ -70,7 +71,7 @@ final class TelemetryEnrichmentTests: XCTestCase {
             batteryProvider: battery,
             carrierProvider: carrier,
             enabled: true,
-            sampleRate: 1.0,
+            sampleRate: sampleRate,
             now: { clock.now },
             random: { 0.0 },
             backoff: { _ in 0 },
@@ -263,6 +264,31 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertTrue(store.load().contains { $0.interactionId == "critical" })
     }
 
+    func testClickFiredBypassesZeroSampleRateAsCriticalTelemetry() async {
+        let store = FakeStore()
+        let sender = FakeSender()
+        let m = build(
+            store: store,
+            sender: sender,
+            clock: Clock(1_000),
+            sampleRate: 0
+        )
+        await m.waitForRecoveryForTests()
+
+        m.recordLifecycle(
+            stage: "click_fired", adFormat: "interstitial", adUnitId: "unit", adId: "imp",
+            serveId: "imp", durationMs: nil, errorCode: nil,
+            interactionId: "interaction", clickSource: "primary_cta"
+        )
+
+        await waitUntil {
+            self.allEvents(sender.batches).contains { $0.name == "click_fired" }
+        }
+        let event = allEvents(sender.batches).first { $0.name == "click_fired" }
+        XCTAssertEqual(event?.sampleRate, 1)
+        XCTAssertEqual(event?.interactionId, "interaction")
+    }
+
     func testBackgroundObserverPersistsBeforeFlushAttempt() async {
         let clock = Clock(1_000)
         let store = FakeStore()
@@ -393,11 +419,14 @@ final class TelemetryEnrichmentTests: XCTestCase {
         _ = await sleep.waitForRequest()
         sleep.release()
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "funnel_summary" } }
+        await m.waitForImmediateFlushIdleForTests()
         m.flushNow()
-        await waitUntil { self.allEvents(sender.batches).filter { $0.name == "diagnostics" }.count == 2 }
+        await m.waitForImmediateFlushIdleForTests()
 
         let summaries = allEvents(sender.batches).filter { $0.name == "funnel_summary" }
+        let diagnostics = allEvents(sender.batches).filter { $0.name == "diagnostics" }
         XCTAssertEqual(summaries.count, 1)
+        XCTAssertEqual(diagnostics.count, 2)
         XCTAssertEqual(summaries.first?.breadcrumb, "fmt=native;req=0;fill=0;nofill=0;fail=0;imp=0;clk=1")
     }
 

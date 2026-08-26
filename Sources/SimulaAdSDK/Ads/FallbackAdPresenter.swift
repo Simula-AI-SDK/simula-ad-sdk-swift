@@ -169,9 +169,9 @@ final class FallbackAdPresenter {
     /// Set on a successful `present`, released in `dismiss` (the only teardown path).
     private var retainedWhilePresenting: FallbackAdPresenter?
 
-    /// auto_store_redirect END_SCREEN_N: routed once when the matching fallback screen is presented.
+    /// auto_store_redirect END_SCREEN_N shares one route lifecycle with the current fallback WebView.
     private var autoStoreRedirect: AutoStoreRedirect?
-    private let autoRedirectGuard = AutomaticRouteGuard()
+    private var currentRouteLifecycle: AttributionRouteLifecycle?
     /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
     private var onAdClick: ((ClickInteraction) -> Void)?
     /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
@@ -260,12 +260,14 @@ final class FallbackAdPresenter {
             return nil
         }
         self.onLoadingTimeout = onLoadingTimeout
-        loadingDeadlineTask = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: Self.loadingDeadlineNanos) } catch { return }
-            guard !Task.isCancelled else { return }
-            self?.loadingDidTimeout(generation: generation)
-        }
+        loadingDeadlineTask = Task { [weak self] in await self?.runLoadingDeadline(generation: generation) }
         return generation
+    }
+
+    private func runLoadingDeadline(generation: Int) async {
+        do { try await Task.sleep(nanoseconds: Self.loadingDeadlineNanos) } catch { return }
+        guard !Task.isCancelled else { return }
+        loadingDidTimeout(generation: generation)
     }
 
     private func beginPresentation(
@@ -283,7 +285,9 @@ final class FallbackAdPresenter {
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
         guard window == nil,
-              let scene = originalKeyWindow?.windowScene ?? Self.activeWindowScene() else { return false }
+              let scene = preferredForegroundActiveWindowScene(
+                  originating: originalKeyWindow?.windowScene
+              ) else { return false }
         self.ads = ads
         self.index = 0
         self.onFinish = onFinish
@@ -365,35 +369,43 @@ final class FallbackAdPresenter {
 
     /// END_SCREEN_N: open the primary ad's store once, when the fallback screen whose index matches
     /// the configured trigger is presented (index 0 = END SCREEN 1, index 1 = END SCREEN 2).
-    private func fireAutoStoreRedirectIfMatching(index: Int) {
+    private func fireAutoStoreRedirectIfMatching(
+        index: Int,
+        lifecycle: AttributionRouteLifecycle
+    ) {
         guard let redirect = autoStoreRedirect, redirect.enabled,
               let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: index),
-              redirect.trigger == trigger,
-              autoRedirectGuard.claim(), window != nil, self.index == index else { return }
-        let execution = AttributionRouteExecution(
-            isActive: {
-                self.window != nil
-                    && self.index == index
-                    && UIApplication.shared.applicationState == .active
-            },
-            onOutcome: { outcome in
-                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-            }
-        )
-        CreativeCTARouter.open(
-            trackingUrl: ctaTrackingUrl,
-            destination: ctaDestination,
-            storeOpen: ctaStoreOpen,
-            storeUrl: ctaStoreUrl,
-            attribution: attribution,
-            execution: execution
-        )
+              redirect.trigger == trigger, window != nil, self.index == index else { return }
+        lifecycle.automaticRoutes.requestAutomaticRoute(scope: lifecycle.automaticRouteScope) {
+            let execution = AttributionRouteExecution(
+                originatingScene: self.window?.windowScene,
+                isActive: {
+                    self.window != nil
+                        && self.index == index
+                        && UIApplication.shared.applicationState == .active
+                },
+                onOutcome: { outcome in
+                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                }
+            )
+            CreativeCTARouter.open(
+                trackingUrl: self.ctaTrackingUrl,
+                destination: self.ctaDestination,
+                storeOpen: self.ctaStoreOpen,
+                storeUrl: self.ctaStoreUrl,
+                attribution: self.attribution,
+                execution: execution
+            )
+        }
     }
 
     /// `.id` gives each screen fresh overlay state while the opaque host itself stays installed.
     private func adView(at index: Int) -> AnyView {
         guard ads.indices.contains(index) else { return loadingView() }
         let ad = ads[index]
+        currentRouteLifecycle?.deactivate()
+        let routeLifecycle = AttributionRouteLifecycle()
+        currentRouteLifecycle = routeLifecycle
         return AnyView(AdOverlayView(
             iframeUrl: ad.iframeUrl,
             onClose: { [weak self] in self?.advance(from: index) },
@@ -413,9 +425,10 @@ final class FallbackAdPresenter {
             ctaStoreOpen: ctaStoreOpen,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution,
+            routeLifecycle: routeLifecycle,
             onPresented: { [weak self] in
                 guard let self, self.index == index else { return }
-                self.fireAutoStoreRedirectIfMatching(index: index)
+                self.fireAutoStoreRedirectIfMatching(index: index, lifecycle: routeLifecycle)
             }
         ).id(index))
     }
@@ -464,6 +477,8 @@ final class FallbackAdPresenter {
         isLoading = false
         loadingGeneration = nil
         clickHandoffIndex = nil
+        currentRouteLifecycle?.deactivate()
+        currentRouteLifecycle = nil
         window = nil
         hostingController = nil
         originalKeyWindow = nil
@@ -484,12 +499,5 @@ final class FallbackAdPresenter {
         presentationLease?.finishPostCloseTeardown()
     }
 
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 #endif

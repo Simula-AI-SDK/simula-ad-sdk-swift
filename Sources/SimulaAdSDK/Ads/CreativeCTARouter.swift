@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 final class BoundedCompletion: @unchecked Sendable {
     private let lock = NSLock()
@@ -103,9 +106,18 @@ struct CreativeClickClaim {
 final class AttributionRouteLifecycle: @unchecked Sendable {
     private let lock = NSLock()
     private var active = false
+    let automaticRoutes = AutomaticRouteCoordinator()
+    let automaticRouteScope = AnyHashable(UUID())
 
-    func activate() { lock.lock(); active = true; lock.unlock() }
-    func deactivate() { lock.lock(); active = false; lock.unlock() }
+    func activate() {
+        lock.lock(); active = true; lock.unlock()
+        automaticRoutes.activate(scope: automaticRouteScope)
+    }
+
+    func deactivate() {
+        lock.lock(); active = false; lock.unlock()
+        automaticRoutes.deactivate(scope: automaticRouteScope)
+    }
     var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
 }
 
@@ -124,6 +136,30 @@ struct AttributionRouteOutcome: Equatable {
     let failureClass: String?
 }
 
+func preferredActiveScene<Scene: AnyObject>(
+    originating: Scene?,
+    scenes: [Scene],
+    isActive: (Scene) -> Bool,
+    hasKeyWindow: (Scene) -> Bool
+) -> Scene? {
+    if let originating, isActive(originating) { return originating }
+    return scenes.first { isActive($0) && hasKeyWindow($0) }
+        ?? scenes.first { isActive($0) }
+}
+
+#if os(iOS)
+@MainActor
+func preferredForegroundActiveWindowScene(originating: UIWindowScene? = nil) -> UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    return preferredActiveScene(
+        originating: originating,
+        scenes: scenes,
+        isActive: { $0.activationState == .foregroundActive },
+        hasKeyWindow: { $0.windows.contains(where: \.isKeyWindow) }
+    )
+}
+#endif
+
 @MainActor
 final class AttributionRouteExecution {
     private enum State {
@@ -135,17 +171,23 @@ final class AttributionRouteExecution {
     private var state = State.pending
     private var uiHandoffReleased = false
     let id: UUID
+    private weak var originatingSceneObject: AnyObject?
+#if os(iOS)
+    var originatingScene: UIWindowScene? { originatingSceneObject as? UIWindowScene }
+#endif
     private let isActive: () -> Bool
     private let onUIHandoffReleased: () -> Void
     private let onOutcome: (AttributionRouteOutcome) -> Void
 
     init(
         id: UUID = UUID(),
+        originatingScene: AnyObject? = nil,
         isActive: @escaping () -> Bool,
         onUIHandoffReleased: @escaping () -> Void = {},
         onOutcome: @escaping (AttributionRouteOutcome) -> Void
     ) {
         self.id = id
+        self.originatingSceneObject = originatingScene
         self.isActive = isActive
         self.onUIHandoffReleased = onUIHandoffReleased
         self.onOutcome = onOutcome
@@ -244,6 +286,7 @@ func recordAttributionRoute(
 func makeCreativeAttributionRouteExecution(
     id: UUID,
     source: ClickSource,
+    originatingScene: AnyObject? = nil,
     isActive: @escaping () -> Bool,
     onUIHandoffReleased: @escaping () -> Void,
     onTerminalOutcome: ((AttributionRouteOutcome) -> Void)?,
@@ -251,6 +294,7 @@ func makeCreativeAttributionRouteExecution(
 ) -> AttributionRouteExecution {
     AttributionRouteExecution(
         id: id,
+        originatingScene: originatingScene,
         isActive: isActive,
         onUIHandoffReleased: onUIHandoffReleased,
         onOutcome: { outcome in
@@ -259,6 +303,101 @@ func makeCreativeAttributionRouteExecution(
             onFinished(id)
         }
     )
+}
+
+enum AutomaticRouteRequestResult: Equatable {
+    case started
+    case deferred
+    case suppressed
+    case stale
+}
+
+struct AutomaticRouteUserHandoff: Equatable {
+    fileprivate let id: Int
+}
+
+/// Presentation-scoped arbitration between billable user routes and non-billable automatic routes.
+/// Callers are main-thread confined; the value remains Foundation-only so its policy is pure-testable.
+final class AutomaticRouteCoordinator {
+    private struct DeferredRoute {
+        let scope: AnyHashable
+        let start: () -> Void
+    }
+
+    private var activeScope: AnyHashable?
+    private var pendingUserHandoff: AutomaticRouteUserHandoff?
+    private var nextHandoffId = 0
+    private var userRouteCommitted = false
+    private var automaticRouteStarted = false
+    private var deferredRoute: DeferredRoute?
+
+    func activate(scope: AnyHashable) {
+        guard activeScope != scope else { return }
+        activeScope = scope
+        pendingUserHandoff = nil
+        deferredRoute = nil
+    }
+
+    func deactivate(scope: AnyHashable) {
+        guard activeScope == scope else { return }
+        activeScope = nil
+        pendingUserHandoff = nil
+        deferredRoute = nil
+    }
+
+    func reset(scope: AnyHashable) {
+        activeScope = scope
+        pendingUserHandoff = nil
+        nextHandoffId = 0
+        userRouteCommitted = false
+        automaticRouteStarted = false
+        deferredRoute = nil
+    }
+
+    func beginUserHandoff(scope: AnyHashable) -> AutomaticRouteUserHandoff? {
+        guard activeScope == scope, pendingUserHandoff == nil else { return nil }
+        nextHandoffId += 1
+        let handoff = AutomaticRouteUserHandoff(id: nextHandoffId)
+        pendingUserHandoff = handoff
+        return handoff
+    }
+
+    @discardableResult
+    func commitUserHandoff(_ handoff: AutomaticRouteUserHandoff, scope: AnyHashable) -> Bool {
+        guard activeScope == scope, pendingUserHandoff == handoff else { return false }
+        pendingUserHandoff = nil
+        userRouteCommitted = true
+        deferredRoute = nil
+        return true
+    }
+
+    @discardableResult
+    func cancelUserHandoff(_ handoff: AutomaticRouteUserHandoff, scope: AnyHashable) -> Bool {
+        guard activeScope == scope, pendingUserHandoff == handoff else { return false }
+        pendingUserHandoff = nil
+        guard !userRouteCommitted, !automaticRouteStarted,
+              let deferredRoute, deferredRoute.scope == scope else { return true }
+        self.deferredRoute = nil
+        automaticRouteStarted = true
+        deferredRoute.start()
+        return true
+    }
+
+    @discardableResult
+    func requestAutomaticRoute(
+        scope: AnyHashable,
+        start: @escaping () -> Void
+    ) -> AutomaticRouteRequestResult {
+        guard activeScope == scope else { return .stale }
+        guard !userRouteCommitted, !automaticRouteStarted else { return .suppressed }
+        if pendingUserHandoff != nil {
+            if deferredRoute == nil { deferredRoute = DeferredRoute(scope: scope, start: start) }
+            return .deferred
+        }
+        automaticRouteStarted = true
+        start()
+        return .started
+    }
 }
 
 /// Exactly-once automatic-route admission for one ad surface. Automatic store redirects are not
@@ -601,7 +740,6 @@ func preferredCreativeClickURL(
 }
 
 #if os(iOS)
-import UIKit
 import StoreKit
 import SafariServices
 import ObjectiveC.runtime
@@ -668,7 +806,11 @@ enum CreativeCTARouter {
                     UIApplication.shared.open(directStoreURL)
                     return true
                 }
-                return presentStoreProduct(appID: appID, attribution: attribution)
+                return presentStoreProduct(
+                    appID: appID,
+                    attribution: attribution,
+                    originatingScene: execution.originatingScene
+                )
             }
             return
         }
@@ -683,7 +825,11 @@ enum CreativeCTARouter {
                         UIApplication.shared.open(storeURL)
                         return true
                     }
-                    return presentStoreProduct(appID: appID, attribution: attribution)
+                    return presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene
+                    )
                 }
                 return
             }
@@ -711,19 +857,31 @@ enum CreativeCTARouter {
             // tracker fired in the background); only without one resolve the redirect chain.
             if let appID = appStoreID(from: url) {
                 guard execution.begin(path: .directStore) else { return }
-                execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
+                execution.complete {
+                    presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene
+                    )
+                }
             } else if let appID = appStoreID(fromString: storeUrl) {
                 guard execution.begin(path: .rawStoreFallback) else { return }
                 execution.complete {
                     fireClickTracker(url)
-                    return presentStoreProduct(appID: appID, attribution: attribution)
+                    return presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene
+                    )
                 }
             } else {
                 resolveAndRoute(url: url, attribution: attribution, execution: execution)
             }
         case .web:
             guard execution.begin(path: .web) else { return }
-            execution.complete { presentSafari(url: url) }
+            execution.complete {
+                presentSafari(url: url, originatingScene: execution.originatingScene)
+            }
         }
     }
 
@@ -763,7 +921,8 @@ enum CreativeCTARouter {
                     storeURL: storeURL,
                     appID: appID,
                     storeOpen: mode,
-                    attribution: attribution
+                    attribution: attribution,
+                    originatingScene: execution.originatingScene
                 )
             }
         case .trackerWithStore(let tracker, let storeURL, let appID, let mode):
@@ -774,7 +933,8 @@ enum CreativeCTARouter {
                     storeURL: storeURL,
                     appID: appID,
                     storeOpen: mode,
-                    attribution: attribution
+                    attribution: attribution,
+                    originatingScene: execution.originatingScene
                 )
             }
         case .resolveTracker(let tracker, let mode):
@@ -796,7 +956,9 @@ enum CreativeCTARouter {
                 )
             } else {
                 guard execution.begin(path: .web) else { return }
-                execution.complete { presentSafari(url: webURL) }
+                execution.complete {
+                    presentSafari(url: webURL, originatingScene: execution.originatingScene)
+                }
             }
         case .customScheme(let customURL):
             guard execution.begin(path: .customScheme) else { return }
@@ -811,13 +973,18 @@ enum CreativeCTARouter {
         storeURL: URL,
         appID: String,
         storeOpen: StoreOpen,
-        attribution: AdAttribution?
+        attribution: AdAttribution?,
+        originatingScene: UIWindowScene?
     ) -> Bool {
         if storeOpen == .external {
             UIApplication.shared.open(storeURL)
             return true
         }
-        return presentStoreProduct(appID: appID, attribution: attribution)
+        return presentStoreProduct(
+            appID: appID,
+            attribution: attribution,
+            originatingScene: originatingScene
+        )
     }
 
     /// Fires the MMP click tracker in the background (fire-and-forget GET), used when the store
@@ -849,7 +1016,7 @@ enum CreativeCTARouter {
     /// String-flavored variant of `appStoreID(from:)` for optional raw links (e.g. the serve's
     /// `ios_store_url`). `nil`/empty/unparseable → nil.
     nonisolated static func appStoreID(fromString urlString: String?) -> String? {
-        guard let urlString, !urlString.isEmpty, let url = URL(string: urlString) else { return nil }
+        guard let url = validatedDirectAppStoreURL(urlString) else { return nil }
         return appStoreID(from: url)
     }
 
@@ -927,7 +1094,11 @@ enum CreativeCTARouter {
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
     /// campaign/provider/SKAN [attribution] tokens so the install it drives is credited to the campaign.
     @discardableResult
-    static func presentStoreProduct(appID: String, attribution: AdAttribution? = nil) -> Bool {
+    static func presentStoreProduct(
+        appID: String,
+        attribution: AdAttribution? = nil,
+        originatingScene: UIWindowScene? = nil
+    ) -> Bool {
         guard !isPresentingExternal else { return false }
         let storeVC = SKStoreProductViewController()
         let delegate = StoreProductDelegate {
@@ -945,7 +1116,7 @@ enum CreativeCTARouter {
         storeVC.loadProduct(withParameters: storeProductParameters(appID: appID, attribution: attribution))
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick true forever on a no-window early-return.
-        if presentViewController(storeVC) {
+        if presentViewController(storeVC, originatingScene: originatingScene) {
             isPresentingExternal = true
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
             return true
@@ -999,7 +1170,7 @@ enum CreativeCTARouter {
 
     /// Presents `SFSafariViewController` for external links.
     @discardableResult
-    static func presentSafari(url: URL) -> Bool {
+    static func presentSafari(url: URL, originatingScene: UIWindowScene? = nil) -> Bool {
         guard !isPresentingExternal else { return false }
         let safariVC = SFSafariViewController(url: url)
         let delegate = SafariDelegate {
@@ -1012,7 +1183,7 @@ enum CreativeCTARouter {
             safariVC, &safariDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
         // Only mark "presenting" once the present actually succeeds.
-        if presentViewController(safariVC) {
+        if presentViewController(safariVC, originatingScene: originatingScene) {
             isPresentingExternal = true
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
             return true
@@ -1023,11 +1194,14 @@ enum CreativeCTARouter {
     /// Presents `vc` on top of the active window. Returns `true` if a host
     /// view-controller was found and `present` was invoked, `false` otherwise.
     @discardableResult
-    static func presentViewController(_ vc: UIViewController) -> Bool {
+    static func presentViewController(
+        _ vc: UIViewController,
+        originatingScene: UIWindowScene? = nil
+    ) -> Bool {
         let rootVC: UIViewController?
         if let override = presentationRootOverrideForTesting {
             rootVC = override()
-        } else if let scene = activeWindowScene() {
+        } else if let scene = preferredForegroundActiveWindowScene(originating: originatingScene) {
             rootVC = (scene.windows.first(where: \.isKeyWindow)
                       ?? scene.windows.first)?.rootViewController
         } else {
@@ -1040,15 +1214,6 @@ enum CreativeCTARouter {
         }
         topVC.present(vc, animated: true)
         return true
-    }
-
-    /// Picks a window scene the same way `InterstitialPresenter` does — preferring a
-    /// foreground-active scene — so both present on the same surface (matters on
-    /// multi-window iPad).
-    private static func activeWindowScene() -> UIWindowScene? {
-        UIApplication.shared.connectedScenes.first {
-            $0.activationState == .foregroundActive
-        } as? UIWindowScene
     }
 
     /// In-flight redirect resolvers. A Set (rather than a single static slot) lets
@@ -1095,7 +1260,7 @@ enum CreativeCTARouter {
 
         // Deterministic external store open: fire the tracker in the background and jump straight
         // to the App Store from the raw store link — no redirect-chain dependency.
-        if appStoreID(fromString: storeUrl) != nil, let storeURL = storeUrl.flatMap(URL.init(string:)) {
+        if let storeURL = validatedDirectAppStoreURL(storeUrl) {
             guard execution.begin(path: .rawStoreFallback) else { return }
             execution.complete {
                 fireClickTracker(initialURL)
@@ -1142,7 +1307,13 @@ enum CreativeCTARouter {
         // Quick check — already an App Store URL?
         if let appID = appStoreID(from: url) {
             guard execution.begin(path: .directStore) else { return }
-            execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
+            execution.complete {
+                presentStoreProduct(
+                    appID: appID,
+                    attribution: attribution,
+                    originatingScene: execution.originatingScene
+                )
+            }
             return
         }
 
@@ -1165,9 +1336,16 @@ enum CreativeCTARouter {
                     ) else { return }
                     execution.complete {
                         if let appID = appStoreID(from: finalURL) {
-                            return presentStoreProduct(appID: appID, attribution: attribution)
+                            return presentStoreProduct(
+                                appID: appID,
+                                attribution: attribution,
+                                originatingScene: execution.originatingScene
+                            )
                         } else {
-                            return presentSafari(url: finalURL)
+                            return presentSafari(
+                                url: finalURL,
+                                originatingScene: execution.originatingScene
+                            )
                         }
                     }
                 }

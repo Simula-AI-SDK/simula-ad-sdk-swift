@@ -367,7 +367,7 @@ final class TelemetryManager: @unchecked Sendable {
         e.cacheSource = cacheSource
         e.breadcrumb = breadcrumb
         let accumulatedFunnel = accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
-        if stage == "click" {
+        if stage == "click" || stage == "click_fired" {
             enqueueCritical(e)
         } else {
             enqueuePerf(e)
@@ -869,6 +869,7 @@ final class TelemetryManager: @unchecked Sendable {
                     else if event.eventId == claim.eventId {
                         var remainder = newEvent(type: TelemetryType.meta, name: event.name)
                         remainder.count = remaining
+                        remainder.sampleRate = event.sampleRate
                         metaAgg[key] = remainder
                     } else {
                         event.count = remaining

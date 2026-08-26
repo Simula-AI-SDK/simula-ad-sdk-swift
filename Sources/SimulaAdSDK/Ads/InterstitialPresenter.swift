@@ -54,7 +54,7 @@ final class InterstitialPresenter {
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
-        guard let scene = Self.activeWindowScene() else {
+        guard let scene = preferredForegroundActiveWindowScene() else {
             // No scene to present in — caller decides how to surface this.
             presentationLease.releaseAfterPresentationFailure()
             return false
@@ -70,6 +70,7 @@ final class InterstitialPresenter {
         let root = CreativeInterstitialView(
             apiKey: apiKey,
             response: response,
+            originatingScene: scene,
             bridge: bridge,
             onClick: onClick,
             onImpression: onImpression,
@@ -161,14 +162,6 @@ final class InterstitialPresenter {
         presentationLease?.finishPrimaryTeardown()
     }
 
-    /// Finds a foreground window scene to attach the overlay window to.
-    private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
-    }
 }
 
 // MARK: - CreativeInterstitialView
@@ -186,6 +179,7 @@ final class InterstitialPresenter {
 private struct CreativeInterstitialView: View {
     let apiKey: String
     let response: AdLoadResponse
+    let originatingScene: UIWindowScene
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
     let onClick: (ClickInteraction) -> Void
@@ -237,9 +231,6 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayPresented = false
     @State private var skOverlayTask: Task<Void, Never>?
 
-    // auto_store_redirect — one route per presentation, never a user click.
-    @State private var autoRedirectGuard = AutomaticRouteGuard()
-
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
     @State private var impressionFired = false
@@ -251,6 +242,7 @@ private struct CreativeInterstitialView: View {
     init(
         apiKey: String,
         response: AdLoadResponse,
+        originatingScene: UIWindowScene,
         bridge: CreativeBridge,
         onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
@@ -258,6 +250,7 @@ private struct CreativeInterstitialView: View {
     ) {
         self.apiKey = apiKey
         self.response = response
+        self.originatingScene = originatingScene
         self.bridge = bridge
         self.onClick = onClick
         self.onImpression = onImpression
@@ -406,19 +399,24 @@ private struct CreativeInterstitialView: View {
 
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
-        guard autoRedirectGuard.claim(), visible else { return }
-        let execution = AttributionRouteExecution(
-            isActive: {
-                attributionRouteLifecycle.isActive
-                    && visible
-                    && UIApplication.shared.applicationState == .active
-            },
-            onOutcome: { outcome in
-                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-                if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
-            }
-        )
-        handleStorePromptTap(execution: execution)
+        guard visible else { return }
+        attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) {
+            let execution = AttributionRouteExecution(
+                originatingScene: originatingScene,
+                isActive: {
+                    attributionRouteLifecycle.isActive
+                        && visible
+                        && UIApplication.shared.applicationState == .active
+                },
+                onOutcome: { outcome in
+                    recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                }
+            )
+            handleStorePromptTap(execution: execution)
+        }
     }
 
     /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
@@ -657,6 +655,12 @@ private struct CreativeInterstitialView: View {
 
     private func handleStorePromptClick() {
         guard !clickHandoffs.isPending(.creative), storePromptGestureGuard.claim() else { return }
+        guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
+            scope: attributionRouteLifecycle.automaticRouteScope
+        ) else {
+            storePromptGestureGuard.release()
+            return
+        }
         clickHandoffs.set(.storePrompt, pending: true)
         let gestureGuard = storePromptGestureGuard
         let interaction = ClickInteraction(source: .storePrompt)
@@ -667,6 +671,7 @@ private struct CreativeInterstitialView: View {
         ) {
             DispatchQueue.main.async {
                 let execution = AttributionRouteExecution(
+                    originatingScene: originatingScene,
                     isActive: {
                         attributionRouteLifecycle.isActive
                             && visible
@@ -690,6 +695,17 @@ private struct CreativeInterstitialView: View {
                     }
                 )
                 guard visible else {
+                    attributionRouteLifecycle.automaticRoutes.cancelUserHandoff(
+                        automaticUserHandoff,
+                        scope: attributionRouteLifecycle.automaticRouteScope
+                    )
+                    execution.cancel()
+                    return
+                }
+                guard attributionRouteLifecycle.automaticRoutes.commitUserHandoff(
+                    automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope
+                ) else {
                     execution.cancel()
                     return
                 }

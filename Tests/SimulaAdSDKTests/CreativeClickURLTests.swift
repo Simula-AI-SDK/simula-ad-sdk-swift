@@ -122,6 +122,92 @@ final class CreativeClickURLTests: XCTestCase {
         )
     }
 
+    func testDirectStoreNormalizationTrimsWhitespaceAcrossHelpersAndExternalPlans() {
+        let raw = "  itms-apps://apps.apple.com/app/id123456789  "
+        XCTAssertEqual(
+            validatedDirectAppStoreURL(raw)?.absoluteString,
+            "itms-apps://apps.apple.com/app/id123456789"
+        )
+        #if os(iOS)
+        XCTAssertEqual(CreativeCTARouter.appStoreID(fromString: raw), "123456789")
+        #endif
+
+        let tracker = URL(string: "https://tracker.example/click")!
+        XCTAssertEqual(
+            creativeRoutePlan(
+                selectedURL: tracker,
+                destination: .appstore,
+                storeOpen: .external,
+                campaignStoreURL: "  https://apps.apple.com/app/id987654321  ",
+                fallbackStoreURL: nil,
+                externalClickOnly: false
+            ),
+            .trackerWithStore(
+                tracker: tracker,
+                storeURL: URL(string: "https://apps.apple.com/app/id987654321")!,
+                appID: "987654321",
+                storeOpen: .external
+            )
+        )
+    }
+
+    func testDirectStoreNormalizationRejectsMalformedHostsPathsAndSchemes() {
+        for value in [
+            "https://apps.apple.com.evil.example/app/id123",
+            "itms-apps://evil.example/app/id123",
+            "itms-apps://apps.apple.com/app/no-id",
+            "javascript://apps.apple.com/app/id123",
+            "ftp://apps.apple.com/app/id123",
+        ] {
+            XCTAssertNil(validatedDirectAppStoreURL(value), "unexpected store URL: \(value)")
+            #if os(iOS)
+            XCTAssertNil(CreativeCTARouter.appStoreID(fromString: value))
+            #endif
+        }
+    }
+
+    func testSceneSelectionPrefersOriginThenActiveKeyThenAnyActive() {
+        final class Scene {
+            let name: String
+            let active: Bool
+            let key: Bool
+            init(_ name: String, active: Bool, key: Bool) {
+                self.name = name
+                self.active = active
+                self.key = key
+            }
+        }
+        let inactiveOrigin = Scene("inactive", active: false, key: true)
+        let activeNoKey = Scene("active-no-key", active: true, key: false)
+        let activeKey = Scene("active-key", active: true, key: true)
+        let activeOrigin = Scene("origin", active: true, key: false)
+
+        XCTAssertTrue(preferredActiveScene(
+            originating: activeOrigin,
+            scenes: [activeKey, activeNoKey],
+            isActive: { $0.active },
+            hasKeyWindow: { $0.key }
+        ) === activeOrigin)
+        XCTAssertTrue(preferredActiveScene(
+            originating: inactiveOrigin,
+            scenes: [activeNoKey, activeKey],
+            isActive: { $0.active },
+            hasKeyWindow: { $0.key }
+        ) === activeKey)
+        XCTAssertTrue(preferredActiveScene(
+            originating: nil,
+            scenes: [inactiveOrigin, activeNoKey],
+            isActive: { $0.active },
+            hasKeyWindow: { $0.key }
+        ) === activeNoKey)
+        XCTAssertNil(preferredActiveScene(
+            originating: inactiveOrigin,
+            scenes: [inactiveOrigin],
+            isActive: { $0.active },
+            hasKeyWindow: { $0.key }
+        ))
+    }
+
     func testSelectedCreativeFallbackRequiresSafeDestinationURL() {
         let safe = URL(string: "https://advertiser.example/landing")!
         XCTAssertEqual(
