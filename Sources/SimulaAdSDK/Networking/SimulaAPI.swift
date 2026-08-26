@@ -98,19 +98,28 @@ public struct DeviceCapabilities: Encodable, Sendable {
     public let storekitAvailable: Bool
     public let skanVersion: String
     public let adAttributionKitAvailable: Bool
+    public let nativeClickBeaconV1: Bool
 
     enum CodingKeys: String, CodingKey {
         case osVersion = "os_version"
         case storekitAvailable = "storekit_available"
         case skanVersion = "skan_version"
         case adAttributionKitAvailable = "adattributionkit_available"
+        case nativeClickBeaconV1 = "native_click_beacon_v1"
     }
 
-    public init(osVersion: String, storekitAvailable: Bool, skanVersion: String, adAttributionKitAvailable: Bool) {
+    public init(
+        osVersion: String,
+        storekitAvailable: Bool,
+        skanVersion: String,
+        adAttributionKitAvailable: Bool,
+        nativeClickBeaconV1: Bool = false
+    ) {
         self.osVersion = osVersion
         self.storekitAvailable = storekitAvailable
         self.skanVersion = skanVersion
         self.adAttributionKitAvailable = adAttributionKitAvailable
+        self.nativeClickBeaconV1 = nativeClickBeaconV1
     }
 
     /// The running device's capabilities, evaluated once. `storekit_available` mirrors SKOverlay
@@ -121,6 +130,7 @@ public struct DeviceCapabilities: Encodable, Sendable {
         var storekitAvailable = false
         var skanVersion = "0"
         var adAttributionKitAvailable = false
+        var nativeClickBeaconV1 = false
         if #available(iOS 14.0, *) {
             storekitAvailable = true
             skanVersion = "4.0"
@@ -128,11 +138,15 @@ public struct DeviceCapabilities: Encodable, Sendable {
         if #available(iOS 17.4, *) {
             adAttributionKitAvailable = true
         }
+        #if os(iOS)
+        nativeClickBeaconV1 = true
+        #endif
         return DeviceCapabilities(
             osVersion: osVersion,
             storekitAvailable: storekitAvailable,
             skanVersion: skanVersion,
-            adAttributionKitAvailable: adAttributionKitAvailable
+            adAttributionKitAvailable: adAttributionKitAvailable,
+            nativeClickBeaconV1: nativeClickBeaconV1
         )
     }()
 
@@ -144,6 +158,7 @@ public struct DeviceCapabilities: Encodable, Sendable {
             "storekit_available": storekitAvailable,
             "skan_version": skanVersion,
             "adattributionkit_available": adAttributionKitAvailable,
+            "native_click_beacon_v1": nativeClickBeaconV1,
         ]
     }
 }

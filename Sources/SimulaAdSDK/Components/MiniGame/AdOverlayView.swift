@@ -88,7 +88,7 @@ public struct AdOverlayView: View {
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
     /// Inline end-screen html (preferred over `iframeUrl` when present): the `<iframe srcdoc>` blob from
-    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin so its click beacon stays same-origin.
+    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin for creative resources.
     var html: String? = nil
     /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
     var onAdClick: ((ClickInteraction) -> Void)? = nil
@@ -122,6 +122,7 @@ public struct AdOverlayView: View {
     @State private var loadCoordinator = AdOverlayLoadCoordinator()
     @State private var loadWatchdogTask: Task<Void, Never>?
     @State private var clickHandoffPending = false
+    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
     /// Countdown seconds remaining (starts at 5)
     @State private var adCountdown: Int = 5
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
@@ -203,9 +204,11 @@ public struct AdOverlayView: View {
                                 baseURL: URL(string: iframeUrl),
                                 onNavigationFinished: { markPageFinished() },
                                 onNavigationFailed: { _ in markPageFailed() },
-                                onAdClick: onAdClick,
+                                onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
+                                attributionRouteLifecycle: attributionRouteLifecycle,
                                 clickSource: .fallbackCTA,
+                                clickBeaconImpressionId: nativeClickBeaconImpressionId,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
@@ -217,9 +220,11 @@ public struct AdOverlayView: View {
                                 url: url,
                                 onNavigationFinished: { markPageFinished() },
                                 onNavigationFailed: { _ in markPageFailed() },
-                                onAdClick: onAdClick,
+                                onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
+                                attributionRouteLifecycle: attributionRouteLifecycle,
                                 clickSource: .fallbackCTA,
+                                clickBeaconImpressionId: nativeClickBeaconImpressionId,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
@@ -318,6 +323,7 @@ public struct AdOverlayView: View {
         .ignoresSafeArea()
         .hideStatusBar(shouldHideStatusBar)
         .onAppear {
+            attributionRouteLifecycle.activate()
             hasAppeared = true
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
@@ -332,6 +338,7 @@ public struct AdOverlayView: View {
             }
         }
         .onDisappear {
+            attributionRouteLifecycle.deactivate()
             hasAppeared = false
             loadWatchdogTask?.cancel()
             loadWatchdogTask = nil
@@ -354,6 +361,26 @@ public struct AdOverlayView: View {
     }
 
     // MARK: - Countdown
+
+    private var nativeClickBeaconImpressionId: String? {
+        fallbackNativeClickBeaconImpressionId(adId: adId, capabilities: .current)
+    }
+
+    private func handleAdClick(_ interaction: ClickInteraction) {
+        if let claim = fallbackNativeClickBeaconClaim(
+            adId: adId,
+            interaction: interaction,
+            capabilities: .current
+        ) {
+            AdBeaconManager.shared.enqueue(
+                impressionId: claim.impressionId,
+                action: "click",
+                interactionId: claim.interactionId,
+                clickSource: claim.clickSource
+            )
+        }
+        onAdClick?(interaction)
+    }
 
     private func updateClickHandoffPending(_ pending: Bool) {
         clickHandoffPending = pending
@@ -513,6 +540,36 @@ public struct AdOverlayView: View {
         adCountdown = 0
         ringProgress = 1
     }
+}
+
+func fallbackNativeClickBeaconImpressionId(
+    adId: String,
+    capabilities: DeviceCapabilities
+) -> String? {
+    guard capabilities.nativeClickBeaconV1, !adId.isEmpty else { return nil }
+    return adId
+}
+
+struct FallbackNativeClickBeaconClaim: Equatable {
+    let impressionId: String
+    let interactionId: String
+    let clickSource: String
+}
+
+func fallbackNativeClickBeaconClaim(
+    adId: String,
+    interaction: ClickInteraction,
+    capabilities: DeviceCapabilities
+) -> FallbackNativeClickBeaconClaim? {
+    guard let impressionId = fallbackNativeClickBeaconImpressionId(
+        adId: adId,
+        capabilities: capabilities
+    ) else { return nil }
+    return FallbackNativeClickBeaconClaim(
+        impressionId: impressionId,
+        interactionId: interaction.id,
+        clickSource: interaction.source.rawValue
+    )
 }
 
 // MARK: - AdCountdownLifecycle

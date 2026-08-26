@@ -370,12 +370,23 @@ final class FallbackAdPresenter {
               let trigger = AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: index),
               redirect.trigger == trigger,
               autoRedirectGuard.claim(), window != nil, self.index == index else { return }
-        _ = CreativeCTARouter.open(
+        let execution = AttributionRouteExecution(
+            isActive: {
+                self.window != nil
+                    && self.index == index
+                    && UIApplication.shared.applicationState == .active
+            },
+            onOutcome: { outcome in
+                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+            }
+        )
+        CreativeCTARouter.open(
             trackingUrl: ctaTrackingUrl,
             destination: ctaDestination,
             storeOpen: ctaStoreOpen,
             storeUrl: ctaStoreUrl,
-            attribution: attribution
+            attribution: attribution,
+            execution: execution
         )
     }
 

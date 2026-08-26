@@ -46,15 +46,6 @@ final class StoreExitTracker {
         )
     }
 
-    /// Record a `store_opened` only if no visit is already pending — for paths where the trigger
-    /// isn't known at the call site (e.g. a playable CTA whose tap is handled inside the web view,
-    /// surfaced only by the in-app store sheet appearing). A no-op when an explicit
-    /// ``recordStoreOpen(_:)`` already set the trigger for this visit.
-    func recordStoreOpenIfUntracked(_ trigger: String) {
-        guard pendingTrigger == nil else { return }
-        recordStoreOpen(trigger)
-    }
-
     /// App backgrounded, or an in-app sheet covered the ad — bank the foreground time accrued so far.
     func onAway() {
         guard inForeground else { return }

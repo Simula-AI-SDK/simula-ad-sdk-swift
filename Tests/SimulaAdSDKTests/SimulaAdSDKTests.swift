@@ -834,6 +834,13 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertNotNil(obj["storekit_available"])
         XCTAssertNotNil(obj["skan_version"])
         XCTAssertNotNil(obj["adattributionkit_available"])
+        #if os(iOS)
+        XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, true)
+        XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, true)
+        #else
+        XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, false)
+        XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, false)
+        #endif
     }
 
     // MARK: - Interstitial configuration defaults / mutability

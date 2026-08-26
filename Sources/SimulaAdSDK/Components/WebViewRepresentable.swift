@@ -108,12 +108,14 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// routing (App Store / cross-domain click-through). Lets the imperative HTML
     /// creative emit CLICKED. `nil` for the declarative game iframe (no behavior change).
     var onAdClick: ((ClickInteraction) -> Void)?
-    /// Reports ownership of a deferred click route so fullscreen containers cannot dismantle this
-    /// WebView after recording the click but before its destination opens.
+    /// Reports the short persistence/start handoff so fullscreen controls cannot dismantle this
+    /// WebView before a claimed click is durable and any asynchronous route safely starts.
     var onClickHandoffPendingChanged: ((Bool) -> Void)?
+    var onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)?
+    var attributionRouteLifecycle: AttributionRouteLifecycle?
     var clickSource: ClickSource
-    /// Non-nil only when the SDK owns this surface's backend click beacon. Native/fallback HTML
-    /// self-report and deliberately leave this nil.
+    /// Non-nil only when the SDK owns this surface's backend click beacon. Native-ad HTML leaves
+    /// this nil; capability-negotiated fullscreen/fallback surfaces supply their impression id.
     var clickBeaconImpressionId: String?
 
     /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the
@@ -172,6 +174,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
+        onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+        attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
         clickSource: ClickSource = .primaryCTA,
         clickBeaconImpressionId: String? = nil,
         bridge: CreativeBridge? = nil,
@@ -194,6 +198,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
         self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
+        self.onAttributionRouteOutcome = onAttributionRouteOutcome
+        self.attributionRouteLifecycle = attributionRouteLifecycle
         self.clickSource = clickSource
         self.clickBeaconImpressionId = clickBeaconImpressionId
         self.bridge = bridge
@@ -218,6 +224,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
+        onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
         bridge: CreativeBridge? = nil,
         attribution: AdAttribution? = nil,
         externalClickOnly: Bool = false,
@@ -239,6 +246,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
+            onAttributionRouteOutcome: onAttributionRouteOutcome,
             bridge: bridge,
             attribution: attribution,
             externalClickOnly: externalClickOnly,
@@ -316,6 +324,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onMessageReceived = onMessageReceived
         coordinator.onAdClick = onAdClick
         coordinator.onClickHandoffPendingChanged = onClickHandoffPendingChanged
+        coordinator.onAttributionRouteOutcome = onAttributionRouteOutcome
+        coordinator.attributionRouteLifecycle = attributionRouteLifecycle
         coordinator.clickSource = clickSource
         coordinator.clickBeaconImpressionId = clickBeaconImpressionId
         if coordinator.bridge !== bridge {
@@ -452,6 +462,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
+            onAttributionRouteOutcome: onAttributionRouteOutcome,
+            attributionRouteLifecycle: attributionRouteLifecycle,
             clickSource: clickSource,
             clickBeaconImpressionId: clickBeaconImpressionId,
             bridge: bridge,
@@ -476,6 +488,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: ((ClickInteraction) -> Void)?
         var onClickHandoffPendingChanged: ((Bool) -> Void)?
+        var onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)?
+        var attributionRouteLifecycle: AttributionRouteLifecycle?
         var clickSource: ClickSource
         var clickBeaconImpressionId: String?
         /// The WebView ↔ SDK bridge (PRD §3); `nil` for non-ad web views.
@@ -552,8 +566,8 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// One atomic claim guards both publisher notification and destination routing when WebKit
         /// reports one target=_blank gesture through both delegate methods.
         private var clickClaim = CreativeClickClaim()
-        private let clickRouteGuard = DeferredRouteGuard()
         private var clickHandoffPending = false
+        private var pendingAttributionRoute: AttributionRouteExecution?
 
         /// Pins `contentOffset` at zero for native ads. WKWebView owns `scrollView.delegate`, so we
         /// use KVO instead of becoming the scroll delegate.
@@ -561,14 +575,39 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         /// Claims a genuine activation, records it, then waits behind telemetry persistence before
         /// handing off to StoreKit/Safari. Returning false means this delegate path must not route.
-        private func routeClaimedClick(userActivated: Bool, route: @escaping @MainActor () -> Void) -> Bool {
+        private func routeClaimedClick(
+            userActivated: Bool,
+            route: @escaping @MainActor (AttributionRouteExecution) -> Void
+        ) -> Bool {
             let now = ProcessInfo.processInfo.systemUptime
             guard let interaction = clickClaim.claim(
                 userActivated: userActivated,
                 source: clickSource,
                 now: now
             ) else { return false }
-            let routeGeneration = clickRouteGuard.begin()
+            let lifecycle = attributionRouteLifecycle
+            let source = clickSource
+            let routeID = UUID()
+            let terminalOutcome = onAttributionRouteOutcome
+            let execution = makeCreativeAttributionRouteExecution(
+                id: routeID,
+                source: source,
+                isActive: { [weak self] in
+                    let presentationActive = lifecycle?.isActive ?? (self?.webView != nil)
+                    return presentationActive && UIApplication.shared.applicationState == .active
+                },
+                onUIHandoffReleased: { [weak self] in
+                    guard self?.pendingAttributionRoute?.id == routeID else { return }
+                    self?.setClickHandoffPending(false)
+                },
+                onTerminalOutcome: terminalOutcome,
+                onFinished: { [weak self] finishedID in
+                    if self?.pendingAttributionRoute?.id == finishedID {
+                        self?.pendingAttributionRoute = nil
+                    }
+                }
+            )
+            pendingAttributionRoute = execution
             setClickHandoffPending(true)
             onAdClick?(interaction)
             ClickHandoffPersistence.wait(
@@ -576,17 +615,23 @@ struct WebViewRepresentable: UIViewRepresentable {
                 beaconImpressionId: clickBeaconImpressionId
             ) {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.webView != nil,
-                          self.clickRouteGuard.consume(routeGeneration) else { return }
-                    route()
-                    self.setClickHandoffPending(false)
+                    guard self?.pendingAttributionRoute === execution || lifecycle != nil else {
+                        execution.cancel()
+                        return
+                    }
+                    route(execution)
                 }
             }
             return true
         }
 
         func detachPendingClickState() {
-            clickRouteGuard.cancel()
+            // Fullscreen/fallback containers own a presentation lifecycle and keep accepted routes
+            // alive across WebView replacement. Lifecycle-less native-ad rows cancel on rebind.
+            if attributionRouteLifecycle == nil {
+                pendingAttributionRoute?.cancel()
+                pendingAttributionRoute = nil
+            }
             setClickHandoffPending(false)
         }
 
@@ -646,6 +691,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             onMessageReceived: ((String) -> Void)?,
             onAdClick: ((ClickInteraction) -> Void)? = nil,
             onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
+            onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+            attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
             clickSource: ClickSource = .primaryCTA,
             clickBeaconImpressionId: String? = nil,
             bridge: CreativeBridge? = nil,
@@ -664,6 +711,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
             self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
+            self.onAttributionRouteOutcome = onAttributionRouteOutcome
+            self.attributionRouteLifecycle = attributionRouteLifecycle
             self.clickSource = clickSource
             self.clickBeaconImpressionId = clickBeaconImpressionId
             self.bridge = bridge
@@ -736,19 +785,23 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// `SKStoreProductViewController`, so the tokens ride the StoreKit-rendered sheet and the SKAN
         /// install postback credits the campaign (StoreKit tokens can't ride an external open). Absent /
         /// token-less attribution, or a `.web` destination, keeps today's external behavior unchanged.
-        private func nativeCTARoute(fallback: URL) -> @MainActor () -> Void {
-            let tracking = ctaTrackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trackingURL = tracking.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        private func nativeCTARoute(fallback: URL) -> @MainActor (AttributionRouteExecution) -> Void {
             let destination = ctaDestination
+            let selectedURL = preferredCreativeClickURL(
+                trackingUrl: ctaTrackingUrl,
+                fallback: fallback,
+                destination: destination,
+                externalClickOnly: true
+            )
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
-            return {
+            return { execution in
                 Self.routeNativeCTA(
-                    trackingURL: trackingURL,
+                    selectedURL: selectedURL,
                     destination: destination,
                     storeUrl: storeUrl,
                     attribution: attribution,
-                    fallback: fallback
+                    execution: execution
                 )
             }
         }
@@ -758,18 +811,29 @@ struct WebViewRepresentable: UIViewRepresentable {
         private func creativeCTARoute(
             fallback: URL,
             fallbackStoreAppID: String?
-        ) -> @MainActor () -> Void {
-            let target = preferredCreativeClickURL(trackingUrl: ctaTrackingUrl, fallback: fallback)
+        ) -> @MainActor (AttributionRouteExecution) -> Void {
             let destination = ctaDestination
+            let target = preferredCreativeClickURL(
+                trackingUrl: ctaTrackingUrl,
+                fallback: fallback,
+                destination: destination,
+                externalClickOnly: false
+            )
             let storeUrl = ctaStoreUrl
             let attribution = self.attribution
-            return {
+            return { execution in
+                guard let target else {
+                    guard execution.begin(path: .mmpRedirect) else { return }
+                    execution.fail("invalid_url")
+                    return
+                }
                 CreativeCTARouter.routeCreativeTap(
                     url: target,
                     destination: destination,
                     storeUrl: storeUrl,
                     fallbackStoreAppID: fallbackStoreAppID,
-                    attribution: attribution
+                    attribution: attribution,
+                    execution: execution
                 )
             }
         }
@@ -778,29 +842,40 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// TelemetryManager).
         @MainActor
         private static func routeNativeCTA(
-            trackingURL: URL?,
+            selectedURL: URL?,
             destination: AdDestination,
             storeUrl: String?,
             attribution: AdAttribution?,
-            fallback: URL
+            execution: AttributionRouteExecution
         ) {
+            guard let selectedURL else {
+                guard execution.begin(path: .mmpRedirect) else { return }
+                execution.fail("invalid_url")
+                return
+            }
             if destination == .appstore, attribution?.hasUsableTokens == true {
                 // In-app store sheet carrying the SKAN/App-Analytics tokens (parity with the
                 // imperative formats). Prefers the tracker (router resolves it to the store —
                 // deterministically via the raw store link when present), else the in-creative URL.
                 CreativeCTARouter.open(
-                    trackingUrl: (trackingURL ?? fallback).absoluteString,
+                    trackingUrl: selectedURL.absoluteString,
                     destination: destination,
                     storeOpen: .skstoreproduct,
                     storeUrl: storeUrl,
-                    attribution: attribution
+                    attribution: attribution,
+                    execution: execution
                 )
             } else {
                 // With no tracker, the in-creative URL (`fallback` — typically the macro-stamped
                 // click tracker baked into the creative) takes its place, so an aligned payload
                 // still gets the deterministic store open + background click. The router opens
                 // store links / non-http schemes / `.web` destinations as-is (previous behavior).
-                CreativeCTARouter.openExternally(initialURL: trackingURL ?? fallback, destination: destination, storeUrl: storeUrl)
+                CreativeCTARouter.openExternally(
+                    initialURL: selectedURL,
+                    destination: destination,
+                    storeUrl: storeUrl,
+                    execution: execution
+                )
             }
         }
 
@@ -1035,6 +1110,10 @@ struct WebViewRepresentable: UIViewRepresentable {
 
             // Intercept itms-apps:// and itms:// schemes (direct App Store links)
             if scheme == "itms-apps" || scheme == "itms" {
+                guard appStoreID(from: url) != nil else {
+                    decisionHandler(.cancel)
+                    return
+                }
                 if userActivated {
                     _ = routeClaimedClick(
                         userActivated: true,
@@ -1356,7 +1435,10 @@ struct WebViewRepresentable: NSViewRepresentable {
     /// creative is iOS-only, so these are unused on macOS).
     var onAdClick: ((ClickInteraction) -> Void)?
     var onClickHandoffPendingChanged: ((Bool) -> Void)?
+    var onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)?
+    var attributionRouteLifecycle: AttributionRouteLifecycle?
     var clickSource: ClickSource
+    var clickBeaconImpressionId: String?
     var attribution: AdAttribution?
     var ctaTrackingUrl: String?
     var ctaDestination: AdDestination
@@ -1372,7 +1454,10 @@ struct WebViewRepresentable: NSViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
+        onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+        attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
         clickSource: ClickSource = .primaryCTA,
+        clickBeaconImpressionId: String? = nil,
         attribution: AdAttribution? = nil,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
@@ -1387,7 +1472,10 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
         self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
+        self.onAttributionRouteOutcome = onAttributionRouteOutcome
+        self.attributionRouteLifecycle = attributionRouteLifecycle
         self.clickSource = clickSource
+        self.clickBeaconImpressionId = clickBeaconImpressionId
         self.attribution = attribution
         self.ctaTrackingUrl = ctaTrackingUrl
         self.ctaDestination = ctaDestination
@@ -1404,6 +1492,8 @@ struct WebViewRepresentable: NSViewRepresentable {
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
+        onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+        attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
         attribution: AdAttribution? = nil,
         ctaTrackingUrl: String? = nil,
         ctaDestination: AdDestination = .appstore,
@@ -1419,6 +1509,8 @@ struct WebViewRepresentable: NSViewRepresentable {
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
+            onAttributionRouteOutcome: onAttributionRouteOutcome,
+            attributionRouteLifecycle: attributionRouteLifecycle,
             attribution: attribution,
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,

@@ -86,6 +86,30 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertNil(result)
     }
 
+    @MainActor
+    func testTrackerOnlyOverlayResolutionDoesNotCreateMMPClick() {
+        var resolved: String? = "not-called"
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: "https://tracker.example/click",
+            destination: .appstore,
+            storeUrl: nil
+        ) { resolved = $0 }
+
+        XCTAssertNil(resolved, "tracker-only overlay setup must stay side-effect-free")
+    }
+
+    @MainActor
+    func testDirectItmsOverlayResolutionUsesStoreIdWithoutMMPRequest() {
+        var resolved: String? = nil
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: "itms-apps://apps.apple.com/app/id1575412509",
+            destination: .appstore,
+            storeUrl: nil
+        ) { resolved = $0 }
+
+        XCTAssertEqual(resolved, "1575412509")
+    }
+
     @available(iOS 16.0, *)
     func testAdImpressionNilOnNonNumericAppID() async throws {
         let result = await SKOverlayPresenter.adImpression(appID: "not-an-id", attribution: try skan4())

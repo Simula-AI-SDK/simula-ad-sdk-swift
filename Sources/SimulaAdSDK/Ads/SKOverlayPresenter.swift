@@ -5,6 +5,8 @@ import StoreKit
 // MARK: - SKOverlayPresenter
 
 /// Presents the native `SKOverlay` install banner for the `skoverlay` experiment (PRD Section 5).
+/// StoreKit exposes no overlay-tap callback, so this surface remains StoreKit/SKAN-attributed and
+/// never manufactures an SDK click or an MMP tracker request merely to observe engagement.
 ///
 /// This is purely the persistent bottom banner — `SKStoreProductViewController` stays available in
 /// the background via `CreativeCTARouter`, independent of this overlay. Presentation is gated to

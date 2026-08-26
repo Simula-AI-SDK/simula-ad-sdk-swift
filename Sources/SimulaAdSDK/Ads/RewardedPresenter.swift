@@ -265,6 +265,7 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
+    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     /// auto_store_redirect routes once per presentation and is never a user click.
@@ -357,6 +358,7 @@ private struct RewardedGameView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            attributionRouteLifecycle.activate()
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             startTimer()
             startImpressionTimer()
@@ -364,6 +366,7 @@ private struct RewardedGameView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
             impressionTask?.cancel()
@@ -387,9 +390,6 @@ private struct RewardedGameView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
-            // A store/Safari sheet only appears from a CTA tap — handled inside the playable's web
-            // view, so the trigger isn't known here. Tag it as a CTA open if nothing else claimed it.
-            storeExit?.recordStoreOpenIfUntracked("cta")
             storeExit?.onAway()
             reconcileTimer()
         }
@@ -419,9 +419,18 @@ private struct RewardedGameView: View {
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
         guard autoRedirectGuard.claim(), visible else { return }
-        if handleStorePromptTap() {
-            storeExit?.recordStoreOpen("auto_redirect")
-        }
+        let execution = AttributionRouteExecution(
+            isActive: {
+                attributionRouteLifecycle.isActive
+                    && visible
+                    && UIApplication.shared.applicationState == .active
+            },
+            onOutcome: { outcome in
+                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+            }
+        )
+        handleStorePromptTap(execution: execution)
     }
 
     /// PLAYABLE_END — fire once the close button appears (the reward is earned). SDK-native, no bridge.
@@ -518,13 +527,11 @@ private struct RewardedGameView: View {
         }
     }
 
-    /// A user-gesture CTA tap inside the playable: surface CLICKED to the publisher, then mark the
-    /// store-exit funnel (the creative's CTA opens the advertiser store). Mirrors the interstitial's
-    /// `handleHtmlClick` (minus SKOverlay — the rewarded uses post-close fallback ads instead). The
-    /// WebView coordinator does the actual store routing.
+    /// A user-gesture CTA tap inside the playable surfaces CLICKED to the publisher. The WebView
+    /// coordinator reports the terminal route outcome separately, and only a successful route marks
+    /// the store-exit funnel.
     private func handleHtmlClick(_ interaction: ClickInteraction) {
         onClick(interaction)
-        storeExit?.recordStoreOpen("cta")
     }
 
     private func creativeWebView(url: URL? = nil, html: String? = nil) -> some View {
@@ -535,6 +542,10 @@ private struct RewardedGameView: View {
             onClickHandoffPendingChanged: {
                 clickHandoffs.set(.creative, pending: $0)
             },
+            onAttributionRouteOutcome: { outcome in
+                if outcome.success { storeExit?.recordStoreOpen("cta") }
+            },
+            attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: impressionId,
             bridge: bridge,
             attribution: attribution,
@@ -547,9 +558,15 @@ private struct RewardedGameView: View {
     }
 
     /// Routes a store-prompt tap to the advertised destination (shared CTA router).
-    @discardableResult
-    private func handleStorePromptTap() -> Bool {
-        CreativeCTARouter.open(trackingUrl: trackingUrl, destination: destination, storeOpen: storeOpen, storeUrl: storeUrl, attribution: attribution)
+    private func handleStorePromptTap(execution: AttributionRouteExecution) {
+        CreativeCTARouter.open(
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeOpen: storeOpen,
+            storeUrl: storeUrl,
+            attribution: attribution,
+            execution: execution
+        )
     }
 
     private func handleStorePromptClick() {
@@ -563,21 +580,34 @@ private struct RewardedGameView: View {
             beaconImpressionId: impressionId
         ) {
             DispatchQueue.main.async {
+                let execution = AttributionRouteExecution(
+                    isActive: {
+                        attributionRouteLifecycle.isActive
+                            && visible
+                            && UIApplication.shared.applicationState == .active
+                    },
+                    onUIHandoffReleased: {
+                        clickHandoffs.set(.storePrompt, pending: false)
+                    },
+                    onOutcome: { outcome in
+                        recordAttributionRoute(outcome: outcome, source: .storePrompt)
+                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let generation = gestureGuard.complete() {
+                            DispatchQueue.main.asyncAfter(
+                                deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                            ) {
+                                gestureGuard.releaseRoutedFallback(generation: generation)
+                            }
+                        } else {
+                            gestureGuard.release()
+                        }
+                    }
+                )
                 guard visible else {
-                    clickHandoffs.set(.storePrompt, pending: false)
-                    gestureGuard.release()
+                    execution.cancel()
                     return
                 }
-                let routed = handleStorePromptTap()
-                if routed { storeExit?.recordStoreOpen("store_prompt") }
-                clickHandoffs.set(.storePrompt, pending: false)
-                if let generation = gestureGuard.complete() {
-                    DispatchQueue.main.asyncAfter(
-                        deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
-                    ) {
-                        gestureGuard.releaseRoutedFallback(generation: generation)
-                    }
-                }
+                handleStorePromptTap(execution: execution)
             }
         }
     }

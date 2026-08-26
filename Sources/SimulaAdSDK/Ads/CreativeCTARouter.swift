@@ -100,25 +100,165 @@ struct CreativeClickClaim {
     }
 }
 
-/// Generation guard for deferred-route ownership after a view has been torn down or rebound.
-/// A stale completion must neither route nor clear a newer surface's pending state.
-final class DeferredRouteGuard {
-    private var generation = 0
+final class AttributionRouteLifecycle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = false
 
-    func begin() -> Int {
-        generation += 1
-        return generation
+    func activate() { lock.lock(); active = true; lock.unlock() }
+    func deactivate() { lock.lock(); active = false; lock.unlock() }
+    var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
+}
+
+enum AttributionRoutePath: String, Equatable {
+    case mmpRedirect = "mmp_redirect"
+    case directStore = "direct_store"
+    case rawStoreFallback = "raw_store_fallback"
+    case web = "web"
+    case customScheme = "custom_scheme"
+    case automatic = "automatic"
+}
+
+struct AttributionRouteOutcome: Equatable {
+    let path: AttributionRoutePath?
+    let success: Bool
+    let failureClass: String?
+}
+
+@MainActor
+final class AttributionRouteExecution {
+    private enum State {
+        case pending
+        case running(AttributionRoutePath)
+        case finished
     }
 
-    func consume(_ expectedGeneration: Int) -> Bool {
-        guard generation == expectedGeneration else { return false }
-        generation += 1
+    private var state = State.pending
+    private var uiHandoffReleased = false
+    let id: UUID
+    private let isActive: () -> Bool
+    private let onUIHandoffReleased: () -> Void
+    private let onOutcome: (AttributionRouteOutcome) -> Void
+
+    init(
+        id: UUID = UUID(),
+        isActive: @escaping () -> Bool,
+        onUIHandoffReleased: @escaping () -> Void = {},
+        onOutcome: @escaping (AttributionRouteOutcome) -> Void
+    ) {
+        self.id = id
+        self.isActive = isActive
+        self.onUIHandoffReleased = onUIHandoffReleased
+        self.onOutcome = onOutcome
+    }
+
+    /// Releases only the short-lived UI close gate. The route remains running and retains its
+    /// presentation lifecycle until a terminal outcome arrives.
+    func releaseUIHandoff() {
+        guard !uiHandoffReleased else { return }
+        uiHandoffReleased = true
+        onUIHandoffReleased()
+    }
+
+    func begin(path: AttributionRoutePath) -> Bool {
+        guard case .pending = state else { return false }
+        guard isActive() else {
+            state = .finished
+            releaseUIHandoff()
+            onOutcome(AttributionRouteOutcome(
+                path: path,
+                success: false,
+                failureClass: "inactive_presentation"
+            ))
+            return false
+        }
+        state = .running(path)
         return true
     }
 
-    func cancel() {
-        generation += 1
+    func complete(_ route: () -> Bool) {
+        guard case .running(let path) = state else { return }
+        state = .finished
+        releaseUIHandoff()
+        guard isActive() else {
+            onOutcome(AttributionRouteOutcome(
+                path: path,
+                success: false,
+                failureClass: "inactive_presentation"
+            ))
+            return
+        }
+        let success = route()
+        onOutcome(AttributionRouteOutcome(
+            path: path,
+            success: success,
+            failureClass: success ? nil : "route_unavailable"
+        ))
     }
+
+    func fail(_ failureClass: String) {
+        guard case .running(let path) = state else { return }
+        state = .finished
+        releaseUIHandoff()
+        onOutcome(AttributionRouteOutcome(path: path, success: false, failureClass: failureClass))
+    }
+
+    func cancel() {
+        let path: AttributionRoutePath?
+        switch state {
+        case .pending: path = nil
+        case .running(let runningPath): path = runningPath
+        case .finished: return
+        }
+        state = .finished
+        releaseUIHandoff()
+        onOutcome(AttributionRouteOutcome(path: path, success: false, failureClass: "cancelled"))
+    }
+}
+
+@MainActor
+func startAsynchronousAttributionRoute(
+    execution: AttributionRouteExecution,
+    start: () -> Void
+) {
+    guard execution.begin(path: .mmpRedirect) else { return }
+    start()
+    execution.releaseUIHandoff()
+}
+
+func recordAttributionRoute(
+    outcome: AttributionRouteOutcome,
+    source: ClickSource,
+) {
+    var breadcrumb = "result=\(outcome.success ? "attempted" : "failed");source=\(source.rawValue)"
+    if let path = outcome.path { breadcrumb += ";path=\(path.rawValue)" }
+    Telemetry.shared.recordOperation(
+        name: "attribution_route",
+        durationMs: 0,
+        success: outcome.success,
+        failureClass: outcome.failureClass,
+        breadcrumb: breadcrumb
+    )
+}
+
+@MainActor
+func makeCreativeAttributionRouteExecution(
+    id: UUID,
+    source: ClickSource,
+    isActive: @escaping () -> Bool,
+    onUIHandoffReleased: @escaping () -> Void,
+    onTerminalOutcome: ((AttributionRouteOutcome) -> Void)?,
+    onFinished: @escaping (UUID) -> Void
+) -> AttributionRouteExecution {
+    AttributionRouteExecution(
+        id: id,
+        isActive: isActive,
+        onUIHandoffReleased: onUIHandoffReleased,
+        onOutcome: { outcome in
+            recordAttributionRoute(outcome: outcome, source: source)
+            onTerminalOutcome?(outcome)
+            onFinished(id)
+        }
+    )
 }
 
 /// Exactly-once automatic-route admission for one ad surface. Automatic store redirects are not
@@ -219,7 +359,6 @@ enum CreativeCTAOpenAuthentication: Equatable {
 
 enum CreativeCTAOpenMessage {
     static let type = "SIMULA_CTA_OPEN"
-    private static let alwaysAllowedSchemes: Set<String> = ["http", "https", "itms", "itms-apps"]
     private static let blockedSchemes: Set<String> = ["about", "blob", "data", "file", "javascript"]
 
     /// Parses only the SDK's structured popup envelope, then applies the current serve's routing
@@ -270,22 +409,108 @@ enum CreativeCTAOpenMessage {
         guard let scheme = url.scheme?.lowercased(),
               !scheme.isEmpty,
               !blockedSchemes.contains(scheme) else { return false }
-        if alwaysAllowedSchemes.contains(scheme) {
-            return true
+        if scheme == "http" || scheme == "https" {
+            return url.host?.isEmpty == false
+        }
+        if scheme == "itms" || scheme == "itms-apps" {
+            return directAppStoreID(from: url) != nil
         }
         return externalClickOnly || destination == .web
     }
 }
 
-/// Prefer the attribution URL carried outside rendered HTML, whose script text may HTML-escape
-/// query separators. Older payloads without a usable field keep using the creative's tapped URL.
-func preferredCreativeClickURL(trackingUrl: String?, fallback: URL) -> URL {
+func validatedMMPTrackingURL(_ trackingUrl: String?) -> URL? {
     guard let value = trackingUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
           !value.isEmpty,
-          let url = URL(string: value) else {
-        return fallback
+          let url = URL(string: value),
+          let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          let host = url.host, !host.isEmpty else {
+        return nil
     }
     return url
+}
+
+private let directAppStoreIDRegex = try? NSRegularExpression(pattern: #"id(\d+)"#)
+private let directAppStorePathIDRegex = try? NSRegularExpression(pattern: #"/id(\d+)"#)
+
+private func isAppleAppStoreHost(_ host: String) -> Bool {
+    let host = host.lowercased()
+    return host == "apps.apple.com"
+        || host.hasSuffix(".apps.apple.com")
+        || host == "itunes.apple.com"
+        || host.hasSuffix(".itunes.apple.com")
+}
+
+private func capturedDirectStoreID(_ regex: NSRegularExpression?, in string: String) -> String? {
+    guard let regex else { return nil }
+    let range = NSRange(string.startIndex..., in: string)
+    guard let match = regex.firstMatch(in: string, range: range),
+          match.numberOfRanges >= 2,
+          let idRange = Range(match.range(at: 1), in: string) else { return nil }
+    return String(string[idRange])
+}
+
+func directAppStoreID(from url: URL) -> String? {
+    let scheme = url.scheme?.lowercased() ?? ""
+    if scheme == "itms-apps" || scheme == "itms" {
+        return capturedDirectStoreID(directAppStoreIDRegex, in: url.absoluteString)
+    }
+    guard scheme == "http" || scheme == "https" else { return nil }
+    let host = url.host?.lowercased() ?? ""
+    guard isAppleAppStoreHost(host) else { return nil }
+    return capturedDirectStoreID(directAppStorePathIDRegex, in: url.path)
+}
+
+func validatedDirectAppStoreURL(_ value: String?) -> URL? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty,
+          let url = URL(string: value),
+          directAppStoreID(from: url) != nil else { return nil }
+    return url
+}
+
+func validatedTopLevelAttributionURL(_ value: String?) -> URL? {
+    validatedMMPTrackingURL(value) ?? validatedDirectAppStoreURL(value)
+}
+
+func validatedResolverRedirectURL(_ url: URL?) -> URL? {
+    guard let url else { return nil }
+    return validatedMMPTrackingURL(url.absoluteString)
+        ?? validatedDirectAppStoreURL(url.absoluteString)
+}
+
+@MainActor
+func terminalResolverRedirectURL(
+    _ url: URL?,
+    execution: AttributionRouteExecution
+) -> URL? {
+    guard let url else {
+        execution.fail("resolve_failed")
+        return nil
+    }
+    guard let validURL = validatedResolverRedirectURL(url) else {
+        execution.fail("invalid_redirect_url")
+        return nil
+    }
+    return validURL
+}
+
+/// Prefer a validated top-level tracker, then apply the same destination policy to the creative's
+/// tapped fallback URL before admitting a click or external open.
+func preferredCreativeClickURL(
+    trackingUrl: String?,
+    fallback: URL,
+    destination: AdDestination = .appstore,
+    externalClickOnly: Bool = false
+) -> URL? {
+    if let tracker = validatedTopLevelAttributionURL(trackingUrl) { return tracker }
+    guard CreativeCTAOpenMessage.isAllowed(
+        fallback,
+        destination: destination,
+        externalClickOnly: externalClickOnly
+    ) else { return nil }
+    return fallback
 }
 
 #if os(iOS)
@@ -340,33 +565,56 @@ enum CreativeCTARouter {
     /// from that id and the MMP tracker (`trackingUrl`) is fired in the background — no dependency
     /// on the tracker's redirect chain (the same pattern `resolveAppStoreID` uses for SKOverlay).
     /// `nil`/id-less falls back to redirect-chain resolution.
-    @discardableResult
     static func open(
         trackingUrl: String?,
         destination: AdDestination,
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
-        attribution: AdAttribution? = nil
-    ) -> Bool {
-        guard let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl) else {
+        attribution: AdAttribution? = nil,
+        execution: AttributionRouteExecution
+    ) {
+        if let directStoreURL = validatedDirectAppStoreURL(trackingUrl),
+           let appID = appStoreID(from: directStoreURL) {
+            guard execution.begin(path: .directStore) else { return }
+            execution.complete {
+                if storeOpen == .external {
+                    UIApplication.shared.open(directStoreURL)
+                    return true
+                }
+                return presentStoreProduct(appID: appID, attribution: attribution)
+            }
+            return
+        }
+
+        guard let url = validatedMMPTrackingURL(trackingUrl) else {
             // No tracker on the serve — a raw store link still gives the CTA somewhere to go
             // (previously a silent no-op). No tracker means no background click to fire.
             if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
-                if storeOpen == .external, let storeURL = storeUrl.flatMap(URL.init(string:)) {
-                    UIApplication.shared.open(storeURL)
-                    return true
-                } else {
+                guard execution.begin(path: .rawStoreFallback) else { return }
+                execution.complete {
+                    if storeOpen == .external, let storeURL = validatedDirectAppStoreURL(storeUrl) {
+                        UIApplication.shared.open(storeURL)
+                        return true
+                    }
                     return presentStoreProduct(appID: appID, attribution: attribution)
                 }
+                return
             }
-            return false
+            guard execution.begin(path: .mmpRedirect) else { return }
+            execution.fail("invalid_url")
+            return
         }
 
         if storeOpen == .external {
             // `.external` leaves the app to the App Store / browser, which StoreKit attribution tokens
             // can't ride on — they apply only to the in-app store sheet below.
-            openExternally(initialURL: url, destination: destination, storeUrl: storeUrl)
-            return true
+            openExternally(
+                initialURL: url,
+                destination: destination,
+                storeUrl: storeUrl,
+                execution: execution
+            )
+            return
         }
 
         switch destination {
@@ -375,22 +623,20 @@ enum CreativeCTARouter {
             // Otherwise prefer the deterministic route (store id from the raw `ios_store_url`,
             // tracker fired in the background); only without one resolve the redirect chain.
             if let appID = appStoreID(from: url) {
-                return presentStoreProduct(appID: appID, attribution: attribution)
+                guard execution.begin(path: .directStore) else { return }
+                execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
             } else if let appID = appStoreID(fromString: storeUrl) {
-                fireClickTracker(url)
-                return presentStoreProduct(appID: appID, attribution: attribution)
+                guard execution.begin(path: .rawStoreFallback) else { return }
+                execution.complete {
+                    fireClickTracker(url)
+                    return presentStoreProduct(appID: appID, attribution: attribution)
+                }
             } else {
-                resolveAndRoute(url: url, attribution: attribution)
-                return true
+                resolveAndRoute(url: url, attribution: attribution, execution: execution)
             }
         case .web:
-            let scheme = url.scheme?.lowercased() ?? ""
-            if scheme == "http" || scheme == "https" {
-                return presentSafari(url: url)
-            } else {
-                UIApplication.shared.open(url)
-                return true
-            }
+            guard execution.begin(path: .web) else { return }
+            execution.complete { presentSafari(url: url) }
         }
     }
 
@@ -409,29 +655,55 @@ enum CreativeCTARouter {
         destination: AdDestination,
         storeUrl: String?,
         fallbackStoreAppID: String? = nil,
-        attribution: AdAttribution? = nil
+        attribution: AdAttribution? = nil,
+        execution: AttributionRouteExecution
     ) {
+        guard CreativeCTAOpenMessage.isAllowed(
+            url,
+            destination: destination,
+            externalClickOnly: false
+        ) else {
+            guard execution.begin(path: .mmpRedirect) else { return }
+            execution.fail("invalid_url")
+            return
+        }
         // A tap straight onto a store URL needs no tracker fire — it IS the destination.
         if let appID = appStoreID(from: url) {
-            presentStoreProduct(appID: appID, attribution: attribution)
+            guard execution.begin(path: .directStore) else { return }
+            execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
             return
         }
         if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
-            fireClickTracker(url)
-            presentStoreProduct(appID: appID, attribution: attribution)
+            guard execution.begin(path: .rawStoreFallback) else { return }
+            execution.complete {
+                fireClickTracker(url)
+                return presentStoreProduct(appID: appID, attribution: attribution)
+            }
             return
         }
         if let fallbackStoreAppID, !fallbackStoreAppID.isEmpty {
-            fireClickTracker(url)
-            presentStoreProduct(appID: fallbackStoreAppID, attribution: attribution)
+            guard execution.begin(path: .rawStoreFallback) else { return }
+            execution.complete {
+                fireClickTracker(url)
+                return presentStoreProduct(appID: fallbackStoreAppID, attribution: attribution)
+            }
             return
         }
         let scheme = url.scheme?.lowercased() ?? ""
         if destination == .web, scheme != "http", scheme != "https" {
-            UIApplication.shared.open(url)
+            guard execution.begin(path: .customScheme) else { return }
+            execution.complete {
+                UIApplication.shared.open(url)
+                return true
+            }
             return
         }
-        resolveAndRoute(url: url, attribution: attribution)
+        guard validatedMMPTrackingURL(url.absoluteString) != nil else {
+            guard execution.begin(path: .mmpRedirect) else { return }
+            execution.fail("invalid_url")
+            return
+        }
+        resolveAndRoute(url: url, attribution: attribution, execution: execution)
     }
 
     /// Fires the MMP click tracker in the background (fire-and-forget GET), used when the store
@@ -460,20 +732,6 @@ enum CreativeCTARouter {
     // the pattern on every navigation. Group 1 captures the numeric ID.
     // `try?` (not `try!`) so a malformed pattern could never trap — the patterns are constant string
     // literals so this is always non-nil in practice, but it removes the only trap-on-error construct.
-    nonisolated private static let appStoreIDRegex = try? NSRegularExpression(pattern: #"id(\d+)"#)
-    nonisolated private static let appStorePathIDRegex = try? NSRegularExpression(pattern: #"/id(\d+)"#)
-
-    nonisolated private static func capturedID(_ regex: NSRegularExpression?, in string: String) -> String? {
-        guard let regex else { return nil }
-        let range = NSRange(string.startIndex..., in: string)
-        guard let match = regex.firstMatch(in: string, range: range),
-              match.numberOfRanges >= 2,
-              let idRange = Range(match.range(at: 1), in: string) else {
-            return nil
-        }
-        return String(string[idRange])
-    }
-
     /// String-flavored variant of `appStoreID(from:)` for optional raw links (e.g. the serve's
     /// `ios_store_url`). `nil`/empty/unparseable → nil.
     nonisolated static func appStoreID(fromString urlString: String?) -> String? {
@@ -485,20 +743,7 @@ enum CreativeCTARouter {
     /// decision (and any non-main context) can call it directly without a
     /// `MainActor.assumeIsolated` trap.
     nonisolated static func appStoreID(from url: URL) -> String? {
-        let scheme = url.scheme?.lowercased() ?? ""
-        let host = url.host?.lowercased() ?? ""
-
-        // For itms-apps:// and itms:// schemes, search the path for /id\d+
-        // regardless of host (these are always App Store URLs)
-        if scheme == "itms-apps" || scheme == "itms" {
-            return capturedID(appStoreIDRegex, in: url.absoluteString)
-        }
-
-        // For http/https, require known App Store hosts
-        guard host.contains("apps.apple.com") || host.contains("itunes.apple.com") else {
-            return nil
-        }
-        return capturedID(appStorePathIDRegex, in: url.path)
+        directAppStoreID(from: url)
     }
 
     // MARK: - App Store id resolution (for SKOverlay)
@@ -519,7 +764,7 @@ enum CreativeCTARouter {
         // (1) The tracker is already a store URL — its id wins (no network, no click to fire),
         // matching `open`'s precedence so the SKOverlay never advertises a different app than the
         // CTA / store-prompt taps.
-        if let trackingUrl, !trackingUrl.isEmpty, let url = URL(string: trackingUrl),
+        if let url = validatedDirectAppStoreURL(trackingUrl),
            let appID = appStoreID(from: url) {
             completion(appID)
             return
@@ -668,11 +913,9 @@ enum CreativeCTARouter {
     /// foreground-active scene — so both present on the same surface (matters on
     /// multi-window iPad).
     private static func activeWindowScene() -> UIWindowScene? {
-        let scenes = UIApplication.shared.connectedScenes
-        if let active = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
-            return active
-        }
-        return scenes.compactMap { $0 as? UIWindowScene }.first
+        UIApplication.shared.connectedScenes.first {
+            $0.activationState == .foregroundActive
+        } as? UIWindowScene
     }
 
     /// In-flight redirect resolvers. A Set (rather than a single static slot) lets
@@ -686,73 +929,123 @@ enum CreativeCTARouter {
     /// carries a raw store link (`storeUrl` — tracker fired in the background, store opened
     /// directly), else resolved through its redirect chain so we land on the real App Store
     /// page rather than bouncing through the tracker.
-    static func openExternally(initialURL: URL, destination: AdDestination, storeUrl: String? = nil) {
+    static func openExternally(
+        initialURL: URL,
+        destination: AdDestination,
+        storeUrl: String? = nil,
+        execution: AttributionRouteExecution
+    ) {
+        guard CreativeCTAOpenMessage.isAllowed(
+            initialURL,
+            destination: destination,
+            externalClickOnly: true
+        ) else {
+            guard execution.begin(path: .mmpRedirect) else { return }
+            execution.fail("invalid_url")
+            return
+        }
         let scheme = initialURL.scheme?.lowercased() ?? ""
         let isHTTP = scheme == "http" || scheme == "https"
 
         // Already a store / custom-scheme link, or a plain web destination — open as-is.
         if appStoreID(from: initialURL) != nil || !isHTTP || destination == .web {
-            UIApplication.shared.open(initialURL)
+            let path: AttributionRoutePath = appStoreID(from: initialURL) != nil
+                ? .directStore
+                : (destination == .web ? .web : .customScheme)
+            guard execution.begin(path: path) else { return }
+            execution.complete {
+                UIApplication.shared.open(initialURL)
+                return true
+            }
             return
         }
 
         // Deterministic external store open: fire the tracker in the background and jump straight
         // to the App Store from the raw store link — no redirect-chain dependency.
         if appStoreID(fromString: storeUrl) != nil, let storeURL = storeUrl.flatMap(URL.init(string:)) {
-            fireClickTracker(initialURL)
-            UIApplication.shared.open(storeURL)
+            guard execution.begin(path: .rawStoreFallback) else { return }
+            execution.complete {
+                fireClickTracker(initialURL)
+                UIApplication.shared.open(storeURL)
+                return true
+            }
             return
         }
 
         // appstore destination behind an http(s) tracker: resolve, then open the final URL.
-        weak var resolverRef: RedirectResolver?
-        let resolver = RedirectResolver { finalURL in
-            DispatchQueue.main.async {
-                UIApplication.shared.open(finalURL)
-                if let r = resolverRef { activeResolvers.remove(r) }
+        startAsynchronousAttributionRoute(execution: execution) {
+            weak var resolverRef: RedirectResolver?
+            let resolver = RedirectResolver { finalURL in
+                DispatchQueue.main.async {
+                    defer {
+                        if let r = resolverRef { activeResolvers.remove(r) }
+                    }
+                    guard let finalURL = terminalResolverRedirectURL(
+                        finalURL,
+                        execution: execution
+                    ) else { return }
+                    execution.complete {
+                        UIApplication.shared.open(finalURL)
+                        return true
+                    }
+                }
             }
+            resolverRef = resolver
+            activeResolvers.insert(resolver)
+            let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
+            resolver.session = session
+            session.dataTask(with: URLRequest(url: initialURL)).resume()
         }
-        resolverRef = resolver
-        activeResolvers.insert(resolver)
-        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
-        resolver.session = session
-        session.dataTask(with: URLRequest(url: initialURL)).resume()
     }
 
     /// Follows the HTTP redirect chain to determine the final destination.
     /// If it resolves to an App Store URL → `SKStoreProductViewController`.
     /// Otherwise → `SFSafariViewController` with the final URL.
-    static func resolveAndRoute(url: URL, attribution: AdAttribution? = nil) {
+    static func resolveAndRoute(
+        url: URL,
+        attribution: AdAttribution? = nil,
+        execution: AttributionRouteExecution
+    ) {
         // Quick check — already an App Store URL?
         if let appID = appStoreID(from: url) {
-            presentStoreProduct(appID: appID, attribution: attribution)
+            guard execution.begin(path: .directStore) else { return }
+            execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
             return
         }
 
-        // `weak` so the completion closure (stored on `resolver.completion`) doesn't
-        // strongly capture the resolver — that would be a retain cycle
-        // (resolver → completion → resolver) that outlives removal from
-        // `activeResolvers` and leaks one resolver per resolve. The Set + the
-        // delegate-retaining URLSession keep it alive through the request, so the
-        // weak ref is still valid when the completion fires.
-        weak var resolverRef: RedirectResolver?
-        let resolver = RedirectResolver { finalURL in
-            DispatchQueue.main.async {
-                if let appID = appStoreID(from: finalURL) {
-                    presentStoreProduct(appID: appID, attribution: attribution)
-                } else {
-                    presentSafari(url: finalURL)
+        startAsynchronousAttributionRoute(execution: execution) {
+            // `weak` so the completion closure (stored on `resolver.completion`) doesn't
+            // strongly capture the resolver — that would be a retain cycle
+            // (resolver → completion → resolver) that outlives removal from
+            // `activeResolvers` and leaks one resolver per resolve. The Set + the
+            // delegate-retaining URLSession keep it alive through the request, so the
+            // weak ref is still valid when the completion fires.
+            weak var resolverRef: RedirectResolver?
+            let resolver = RedirectResolver { finalURL in
+                DispatchQueue.main.async {
+                    defer {
+                        if let r = resolverRef { activeResolvers.remove(r) }
+                    }
+                    guard let finalURL = terminalResolverRedirectURL(
+                        finalURL,
+                        execution: execution
+                    ) else { return }
+                    execution.complete {
+                        if let appID = appStoreID(from: finalURL) {
+                            return presentStoreProduct(appID: appID, attribution: attribution)
+                        } else {
+                            return presentSafari(url: finalURL)
+                        }
+                    }
                 }
-                // Release this resolver (and its now-invalidated session).
-                if let r = resolverRef { activeResolvers.remove(r) }
             }
+            resolverRef = resolver
+            // Keep a strong reference so it isn't deallocated during the request.
+            activeResolvers.insert(resolver)
+            let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
+            resolver.session = session
+            session.dataTask(with: URLRequest(url: url)).resume()
         }
-        resolverRef = resolver
-        // Keep a strong reference so it isn't deallocated during the request.
-        activeResolvers.insert(resolver)
-        let session = URLSession(configuration: SimulaUserAgent.sessionConfiguration(), delegate: resolver, delegateQueue: nil)
-        resolver.session = session
-        session.dataTask(with: URLRequest(url: url)).resume()
     }
 }
 
@@ -803,14 +1096,14 @@ private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate {
 final class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate {
     // Identity-based `Hashable`/`Equatable` (inherited from `NSObject`) so instances
     // can live in the router's `Set<RedirectResolver>` of in-flight resolvers.
-    let completion: (URL) -> Void
+    let completion: (URL?) -> Void
     /// The session driving this resolution. Held so it can be invalidated on
     /// completion: a delegate-based URLSession otherwise retains its delegate
     /// (and an operation-queue thread) indefinitely until `invalidate` is called.
     var session: URLSession?
     private var completed = false
 
-    init(completion: @escaping (URL) -> Void) {
+    init(completion: @escaping (URL?) -> Void) {
         self.completion = completion
     }
 
@@ -832,7 +1125,7 @@ final class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDe
         let host = redirectURL.host?.lowercased() ?? ""
 
         // Stop at App Store URLs or non-HTTP schemes
-        if host.contains("apps.apple.com") || host.contains("itunes.apple.com")
+        if isAppleAppStoreHost(host)
             || scheme == "itms-apps" || scheme == "itms" {
             finish(with: redirectURL)
             completionHandler(nil)
@@ -856,7 +1149,7 @@ final class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDe
         guard !completed else { return }
         completed = true
         session?.finishTasksAndInvalidate()
-        if let url { completion(url) }
+        completion(url)
     }
 }
 

@@ -230,6 +230,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptTask: Task<Void, Never>?
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
+    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -330,6 +331,7 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            attributionRouteLifecycle.activate()
             if storeExit == nil {
                 storeExit = StoreExitTracker(
                     adId: response.impressionId,
@@ -345,6 +347,7 @@ private struct CreativeInterstitialView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
             gateTask = nil
             impressionTask?.cancel()
@@ -404,9 +407,18 @@ private struct CreativeInterstitialView: View {
     /// Opens the advertiser store once (no user tap) — shared by every auto_store_redirect trigger.
     private func fireAutoStoreRedirect() {
         guard autoRedirectGuard.claim(), visible else { return }
-        if handleStorePromptTap() {
-            storeExit?.recordStoreOpen("auto_redirect")
-        }
+        let execution = AttributionRouteExecution(
+            isActive: {
+                attributionRouteLifecycle.isActive
+                    && visible
+                    && UIApplication.shared.applicationState == .active
+            },
+            onOutcome: { outcome in
+                recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+            }
+        )
+        handleStorePromptTap(execution: execution)
     }
 
     /// PLAYABLE_END — fire once the close button is available (SDK-native, no bridge).
@@ -429,6 +441,10 @@ private struct CreativeInterstitialView: View {
             onClickHandoffPendingChanged: {
                 clickHandoffs.set(.creative, pending: $0)
             },
+            onAttributionRouteOutcome: { outcome in
+                if outcome.success { storeExit?.recordStoreOpen("cta") }
+            },
+            attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
             attribution: response.skanAttribution,
@@ -454,7 +470,6 @@ private struct CreativeInterstitialView: View {
     /// would destroy the just-presented sheet. Dismissal is driven by the close button.
     private func handleHtmlClick(_ interaction: ClickInteraction) {
         onClick(interaction) // CLICKED
-        storeExit?.recordStoreOpen("cta") // the creative CTA opens the advertiser store
         presentSKOverlayOnClickIfNeeded()
     }
 
@@ -628,15 +643,14 @@ private struct CreativeInterstitialView: View {
     }
 
     /// Routes a store-prompt tap to the same destination as the CTA (shared router).
-    @discardableResult
-    private func handleStorePromptTap() -> Bool {
-        let storeOpen = response.adBehavior?.storeOpen ?? .skstoreproduct
-        return CreativeCTARouter.open(
+    private func handleStorePromptTap(execution: AttributionRouteExecution) {
+        CreativeCTARouter.open(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
-            storeOpen: storeOpen,
+            storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             storeUrl: response.iosStoreUrl,
-            attribution: response.skanAttribution
+            attribution: response.skanAttribution,
+            execution: execution
         )
     }
 
@@ -651,21 +665,34 @@ private struct CreativeInterstitialView: View {
             beaconImpressionId: response.impressionId
         ) {
             DispatchQueue.main.async {
+                let execution = AttributionRouteExecution(
+                    isActive: {
+                        attributionRouteLifecycle.isActive
+                            && visible
+                            && UIApplication.shared.applicationState == .active
+                    },
+                    onUIHandoffReleased: {
+                        clickHandoffs.set(.storePrompt, pending: false)
+                    },
+                    onOutcome: { outcome in
+                        recordAttributionRoute(outcome: outcome, source: .storePrompt)
+                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let generation = gestureGuard.complete() {
+                            DispatchQueue.main.asyncAfter(
+                                deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
+                            ) {
+                                gestureGuard.releaseRoutedFallback(generation: generation)
+                            }
+                        } else {
+                            gestureGuard.release()
+                        }
+                    }
+                )
                 guard visible else {
-                    clickHandoffs.set(.storePrompt, pending: false)
-                    gestureGuard.release()
+                    execution.cancel()
                     return
                 }
-                let routed = handleStorePromptTap()
-                if routed { storeExit?.recordStoreOpen("store_prompt") }
-                clickHandoffs.set(.storePrompt, pending: false)
-                if let generation = gestureGuard.complete() {
-                    DispatchQueue.main.asyncAfter(
-                        deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout
-                    ) {
-                        gestureGuard.releaseRoutedFallback(generation: generation)
-                    }
-                }
+                handleStorePromptTap(execution: execution)
             }
         }
     }
