@@ -79,6 +79,280 @@ enum SimulaWebViewPrewarmDecision: String, Hashable {
     case inactive
 }
 
+enum CreativeActivationClaim: Equatable {
+    case none
+    case newGesture
+    case duplicateGesture
+}
+
+enum CreativeActivationEvent: Equatable {
+    case pointerDown(type: String, trusted: Bool)
+    case pointerUp(type: String, trusted: Bool)
+    case pointerCancel(trusted: Bool)
+    case mouseDown(trusted: Bool)
+    case touchStart(trusted: Bool)
+    case touchEnd(trusted: Bool)
+    case touchCancel(trusted: Bool)
+    case keyDown(key: String, repeatKey: Bool, trusted: Bool)
+    case click(trusted: Bool)
+}
+
+/// Cross-platform model of the document-start activation fallback used when
+/// `navigator.userActivation` is unavailable on older WebKit versions.
+struct CreativeUserActivationState: Equatable {
+    private(set) var gestureSequence = 0
+    private(set) var claimedGesture = -1
+    private(set) var trustedEventDispatch = false
+    private var awaitingClick = false
+    private var contactPending = false
+    private var cancelledContact = false
+
+    mutating func observe(_ event: CreativeActivationEvent) {
+        switch event {
+        case .pointerDown(let type, let trusted):
+            guard trusted else { return }
+            if type.lowercased() == "touch" || type.lowercased() == "pen" {
+                disarmForPendingContact()
+            } else {
+                beginGesture()
+            }
+        case .pointerUp(let type, let trusted):
+            guard trusted else { return }
+            if type.lowercased() == "touch" || type.lowercased() == "pen" {
+                guard contactPending else { return }
+                contactPending = false
+            }
+            beginGesture()
+        case .pointerCancel(let trusted), .touchCancel(let trusted):
+            guard trusted else { return }
+            contactPending = false
+            awaitingClick = false
+            trustedEventDispatch = false
+            cancelledContact = true
+        case .mouseDown(let trusted):
+            guard trusted, !contactPending else { return }
+            beginGesture()
+        case .touchStart(let trusted):
+            guard trusted else { return }
+            disarmForPendingContact()
+        case .touchEnd(let trusted):
+            guard trusted, contactPending else { return }
+            contactPending = false
+            beginGesture()
+        case .keyDown(let key, let repeatKey, let trusted):
+            guard trusted, !repeatKey, qualifiesKeyboardKey(key) else { return }
+            beginKeyboardGesture()
+        case .click(let trusted):
+            guard trusted, !cancelledContact, !contactPending else { return }
+            if !awaitingClick { beginGesture() } else { trustedEventDispatch = true }
+            awaitingClick = false
+        }
+    }
+
+    mutating func claim(navigatorIsActive: Bool) -> CreativeActivationClaim {
+        guard gestureSequence > 0 else { return .none }
+        if claimedGesture == gestureSequence { return .duplicateGesture }
+        guard !contactPending, !cancelledContact,
+              navigatorIsActive || trustedEventDispatch else { return .none }
+        claimedGesture = gestureSequence
+        return .newGesture
+    }
+
+    mutating func expireMacrotask() {
+        trustedEventDispatch = false
+        cancelledContact = false
+    }
+
+    private mutating func disarmForPendingContact() {
+        contactPending = true
+        awaitingClick = false
+        trustedEventDispatch = false
+        cancelledContact = false
+    }
+
+    private mutating func beginGesture() {
+        cancelledContact = false
+        if !awaitingClick { gestureSequence += 1 }
+        awaitingClick = true
+        trustedEventDispatch = true
+    }
+
+    private mutating func beginKeyboardGesture() {
+        cancelledContact = false
+        gestureSequence += 1
+        awaitingClick = true
+        trustedEventDispatch = true
+    }
+
+    private func qualifiesKeyboardKey(_ key: String) -> Bool {
+        let normalized = key.lowercased()
+        if normalized == "escape" || normalized == "esc" { return false }
+        return !["alt", "altgraph", "capslock", "control", "ctrl", "fn", "fnlock",
+                  "hyper", "meta", "numlock", "scrolllock", "shift", "super", "symbol",
+                  "symbollock"].contains(normalized)
+    }
+}
+
+func creativeUserActivationScriptSource(nonce: String) -> String {
+    """
+    (function() {
+      var originalOpen = window.open;
+      var nativeHandler = window.webkit && window.webkit.messageHandlers
+        ? window.webkit.messageHandlers.simulaSDK
+        : null;
+      var postNative = nativeHandler && typeof nativeHandler.postMessage === 'function'
+        ? nativeHandler.postMessage.bind(nativeHandler)
+        : null;
+      var capturedUserActivation = navigator.userActivation;
+      var nativeSetTimeout = window.setTimeout.bind(window);
+      var trustedEventDispatch = false;
+      var trustedEventEpoch = 0;
+      var trustedEventTimestamp = -1;
+      var gestureSequence = 0;
+      var claimedGesture = -1;
+      var awaitingClick = false;
+      var contactPending = false;
+      var cancelledContact = false;
+
+      function clearTrustedDispatchLater(epoch) {
+        nativeSetTimeout(function() {
+          if (trustedEventEpoch === epoch) { trustedEventDispatch = false; }
+        }, 0);
+      }
+
+      function markTrustedDispatch(event) {
+        trustedEventEpoch += 1;
+        trustedEventTimestamp = Number(event.timeStamp || 0);
+        trustedEventDispatch = true;
+        clearTrustedDispatchLater(trustedEventEpoch);
+      }
+
+      function beginGesture(event) {
+        cancelledContact = false;
+        if (!awaitingClick) { gestureSequence += 1; }
+        awaitingClick = true;
+        markTrustedDispatch(event);
+      }
+
+      function beginKeyboardGesture(event) {
+        cancelledContact = false;
+        gestureSequence += 1;
+        awaitingClick = true;
+        markTrustedDispatch(event);
+      }
+
+      function disarmPendingContact() {
+        contactPending = true;
+        awaitingClick = false;
+        trustedEventDispatch = false;
+        trustedEventEpoch += 1;
+        cancelledContact = false;
+      }
+
+      function cancelContact() {
+        contactPending = false;
+        awaitingClick = false;
+        trustedEventDispatch = false;
+        trustedEventEpoch += 1;
+        cancelledContact = true;
+        var epoch = trustedEventEpoch;
+        nativeSetTimeout(function() {
+          if (trustedEventEpoch === epoch) { cancelledContact = false; }
+        }, 0);
+      }
+
+      function isModifierOnlyKey(key) {
+        return ['alt','altgraph','capslock','control','ctrl','fn','fnlock','hyper','meta',
+          'numlock','scrolllock','shift','super','symbol','symbollock'].indexOf(key) !== -1;
+      }
+
+      function observeTrustedEvent(event) {
+        if (!event || event.isTrusted !== true) { return; }
+        var type = event.type;
+        var pointerType = String(event.pointerType || '').toLowerCase();
+        if (type === 'pointerdown') {
+          if (pointerType === 'touch' || pointerType === 'pen') { disarmPendingContact(); }
+          else { beginGesture(event); }
+        } else if (type === 'pointerup') {
+          if (pointerType === 'touch' || pointerType === 'pen') {
+            if (!contactPending) { return; }
+            contactPending = false;
+          }
+          beginGesture(event);
+        } else if (type === 'pointercancel' || type === 'touchcancel') {
+          cancelContact();
+        } else if (type === 'touchstart') {
+          disarmPendingContact();
+        } else if (type === 'touchend') {
+          if (!contactPending) { return; }
+          contactPending = false;
+          beginGesture(event);
+        } else if (type === 'mousedown') {
+          if (!contactPending) { beginGesture(event); }
+        } else if (type === 'keydown') {
+          var key = String(event.key || '').toLowerCase();
+          if (event.repeat === true || key === 'escape' || key === 'esc' || isModifierOnlyKey(key)) { return; }
+          beginKeyboardGesture(event);
+        } else if (type === 'click') {
+          if (cancelledContact || contactPending) { return; }
+          if (!awaitingClick) { beginGesture(event); }
+          else { markTrustedDispatch(event); }
+          awaitingClick = false;
+        }
+      }
+
+      ['click', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown',
+       'touchstart', 'touchend', 'touchcancel', 'keydown'].forEach(function(name) {
+        window.addEventListener(name, observeTrustedEvent, true);
+      });
+
+      function hasActiveUserGesture() {
+        if (contactPending || cancelledContact) { return false; }
+        if (capturedUserActivation && capturedUserActivation.isActive === true) { return true; }
+        return trustedEventDispatch && trustedEventTimestamp >= 0;
+      }
+
+      function resolvedURL(value) {
+        if (value === undefined || value === null) { return null; }
+        try { return new URL(String(value), document.baseURI).href; }
+        catch (_) { return null; }
+      }
+
+      function forwardCTA(value) {
+        if (!postNative || gestureSequence === 0) { return false; }
+        if (claimedGesture === gestureSequence) { return true; }
+        if (!hasActiveUserGesture()) { return false; }
+        var url = resolvedURL(value);
+        if (!url) { return false; }
+        claimedGesture = gestureSequence;
+        try {
+          postNative({
+            type: 'SIMULA_CTA_OPEN',
+            url: url,
+            activation_nonce: '\(nonce)'
+          });
+          return true;
+        } catch (_) {
+          if (claimedGesture === gestureSequence) { claimedGesture = -1; }
+          return false;
+        }
+      }
+
+      window.open = function() {
+        if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
+        return originalOpen.apply(window, arguments);
+      };
+
+      window.addEventListener('click', function(event) {
+        if (!event.isTrusted || !hasActiveUserGesture()) { return; }
+        var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+        if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
+        if (forwardCTA(anchor.href)) { event.preventDefault(); }
+      }, true);
+    })();
+    """
+}
+
 struct SimulaWebViewPrewarmSkipGate {
     private var reported: Set<SimulaWebViewPrewarmDecision> = []
 
@@ -393,102 +667,7 @@ final class WebViewPool {
     /// page calls to the public handler therefore cannot forge a billable activation message.
     private static func userActivationScript(nonce: String) -> WKUserScript {
         WKUserScript(
-            source: """
-        (function() {
-          var originalOpen = window.open;
-          var nativeHandler = window.webkit && window.webkit.messageHandlers
-            ? window.webkit.messageHandlers.simulaSDK
-            : null;
-          var postNative = nativeHandler && typeof nativeHandler.postMessage === 'function'
-            ? nativeHandler.postMessage.bind(nativeHandler)
-            : null;
-          var capturedUserActivation = navigator.userActivation;
-          var nativeQueueMicrotask = typeof queueMicrotask === 'function'
-            ? queueMicrotask.bind(window)
-            : null;
-          var resolvedPromise = Promise.resolve();
-          var nativePromiseThen = Promise.prototype.then;
-          var trustedEventDispatch = false;
-          var gestureSequence = 0;
-          var claimedGesture = -1;
-          var awaitingClick = false;
-
-          function clearTrustedDispatchLater() {
-            var clear = function() { trustedEventDispatch = false; };
-            if (nativeQueueMicrotask) { nativeQueueMicrotask(clear); }
-            else { nativePromiseThen.call(resolvedPromise, clear); }
-          }
-
-          function beginGesture() {
-            gestureSequence += 1;
-            awaitingClick = true;
-          }
-
-          function observeTrustedEvent(event) {
-            if (!event || event.isTrusted !== true) { return; }
-            trustedEventDispatch = true;
-            clearTrustedDispatchLater();
-            if (event.type === 'pointerdown' ||
-                (event.type === 'keydown' && event.repeat !== true)) {
-              beginGesture();
-            } else if (event.type === 'click') {
-              // Keyboard/accessibility activation can deliver a trusted click without pointerdown.
-              if (!awaitingClick) { beginGesture(); }
-              awaitingClick = false;
-            } else if (event.type === 'pointercancel') {
-              awaitingClick = false;
-            }
-          }
-
-          ['click', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'touchend', 'keydown'].forEach(function(name) {
-            window.addEventListener(name, observeTrustedEvent, true);
-          });
-
-          function hasActiveUserGesture() {
-            return trustedEventDispatch ||
-              !!(capturedUserActivation && capturedUserActivation.isActive === true);
-          }
-
-          function resolvedURL(value) {
-            if (value === undefined || value === null) { return null; }
-            try { return new URL(String(value), document.baseURI).href; }
-            catch (_) { return null; }
-          }
-
-          function forwardCTA(value) {
-            if (!postNative || gestureSequence === 0 || !hasActiveUserGesture()) { return false; }
-            var url = resolvedURL(value);
-            if (!url) { return false; }
-            // Returning true suppresses duplicate window.open/default navigation too. Falling
-            // through after the first claim would move the duplicate into WebKit's delegate path.
-            if (claimedGesture === gestureSequence) { return true; }
-            claimedGesture = gestureSequence;
-            try {
-              postNative({
-                type: 'SIMULA_CTA_OPEN',
-                url: url,
-                activation_nonce: '\(nonce)'
-              });
-              return true;
-            } catch (_) {
-              if (claimedGesture === gestureSequence) { claimedGesture = -1; }
-              return false;
-            }
-          }
-
-          window.open = function() {
-            if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
-            return originalOpen.apply(window, arguments);
-          };
-
-          window.addEventListener('click', function(event) {
-            if (!event.isTrusted || !hasActiveUserGesture()) { return; }
-            var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
-            if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
-            if (forwardCTA(anchor.href)) { event.preventDefault(); }
-          }, true);
-        })();
-        """,
+            source: creativeUserActivationScriptSource(nonce: nonce),
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         )

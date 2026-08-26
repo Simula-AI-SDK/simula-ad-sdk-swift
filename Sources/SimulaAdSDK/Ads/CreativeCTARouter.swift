@@ -271,6 +271,30 @@ final class AutomaticRouteGuard {
         claimed = true
         return true
     }
+
+    func reset() {
+        claimed = false
+    }
+}
+
+enum CreativePopupRouteAdmission: Equatable {
+    case billable
+    case automatic
+    case ignored
+}
+
+func creativeAutomaticRouteAdmission(
+    isPopup: Bool,
+    userActivated: Bool,
+    sameOriginHTTP: Bool,
+    isDirectStoreNavigation: Bool,
+    automaticGuard: AutomaticRouteGuard
+) -> CreativePopupRouteAdmission {
+    if userActivated { return .billable }
+    guard isPopup || isDirectStoreNavigation else { return .ignored }
+    guard isDirectStoreNavigation || !sameOriginHTTP else { return .ignored }
+    guard automaticGuard.claim() else { return .ignored }
+    return .automatic
 }
 
 /// One-in-flight admission used by store-prompt badges while click persistence and routing run.
@@ -431,8 +455,7 @@ func validatedMMPTrackingURL(_ trackingUrl: String?) -> URL? {
     return url
 }
 
-private let directAppStoreIDRegex = try? NSRegularExpression(pattern: #"id(\d+)"#)
-private let directAppStorePathIDRegex = try? NSRegularExpression(pattern: #"/id(\d+)"#)
+private let directAppStorePathIDRegex = try? NSRegularExpression(pattern: #"/id(\d+)(?:/|$)"#)
 
 private func isAppleAppStoreHost(_ host: String) -> Bool {
     let host = host.lowercased()
@@ -454,7 +477,9 @@ private func capturedDirectStoreID(_ regex: NSRegularExpression?, in string: Str
 func directAppStoreID(from url: URL) -> String? {
     let scheme = url.scheme?.lowercased() ?? ""
     if scheme == "itms-apps" || scheme == "itms" {
-        return capturedDirectStoreID(directAppStoreIDRegex, in: url.absoluteString)
+        let host = url.host?.lowercased() ?? ""
+        guard isAppleAppStoreHost(host) else { return nil }
+        return capturedDirectStoreID(directAppStorePathIDRegex, in: url.path)
     }
     guard scheme == "http" || scheme == "https" else { return nil }
     let host = url.host?.lowercased() ?? ""
@@ -472,6 +497,68 @@ func validatedDirectAppStoreURL(_ value: String?) -> URL? {
 
 func validatedTopLevelAttributionURL(_ value: String?) -> URL? {
     validatedMMPTrackingURL(value) ?? validatedDirectAppStoreURL(value)
+}
+
+enum CreativeRoutePlan: Equatable {
+    case directStore(url: URL, appID: String, storeOpen: StoreOpen)
+    case trackerWithStore(
+        tracker: URL,
+        storeURL: URL,
+        appID: String,
+        storeOpen: StoreOpen
+    )
+    case resolveTracker(url: URL, storeOpen: StoreOpen)
+    case web(url: URL, storeOpen: StoreOpen)
+    case customScheme(url: URL)
+    case invalid
+}
+
+func creativeRoutePlan(
+    selectedURL: URL,
+    destination: AdDestination,
+    storeOpen: StoreOpen,
+    campaignStoreURL: String?,
+    fallbackStoreURL: URL?,
+    externalClickOnly: Bool
+) -> CreativeRoutePlan {
+    guard CreativeCTAOpenMessage.isAllowed(
+        selectedURL,
+        destination: destination,
+        externalClickOnly: externalClickOnly
+    ) else { return .invalid }
+
+    if let appID = directAppStoreID(from: selectedURL) {
+        return .directStore(url: selectedURL, appID: appID, storeOpen: storeOpen)
+    }
+    if destination == .appstore,
+       let storeURL = validatedDirectAppStoreURL(campaignStoreURL),
+       let appID = directAppStoreID(from: storeURL) {
+        return .trackerWithStore(
+            tracker: selectedURL,
+            storeURL: storeURL,
+            appID: appID,
+            storeOpen: storeOpen
+        )
+    }
+    if let fallbackStoreURL,
+       let validatedFallback = validatedDirectAppStoreURL(fallbackStoreURL.absoluteString),
+       let appID = directAppStoreID(from: validatedFallback) {
+        return .trackerWithStore(
+            tracker: selectedURL,
+            storeURL: validatedFallback,
+            appID: appID,
+            storeOpen: storeOpen
+        )
+    }
+
+    let scheme = selectedURL.scheme?.lowercased() ?? ""
+    if scheme != "http" && scheme != "https" {
+        return .customScheme(url: selectedURL)
+    }
+    if destination == .web {
+        return .web(url: selectedURL, storeOpen: storeOpen)
+    }
+    return .resolveTracker(url: selectedURL, storeOpen: storeOpen)
 }
 
 func validatedResolverRedirectURL(_ url: URL?) -> URL? {
@@ -643,67 +730,94 @@ enum CreativeCTARouter {
     /// Routes a user-activated click-through from inside a creative WebView (the game iframe's
     /// `window.open(TRACKING_URL)` / cross-domain CTA), given the serve's routing context.
     ///
-    /// `url` is the URL the creative navigated to — the macro-stamped click tracker baked into the
-    /// creative at render time — and is always the click that's registered with the MMP. When the
-    /// serve supplied a raw `ios_store_url` (`storeUrl`) and the destination is `.appstore`, the
-    /// route is deterministic: fire `url` in the background and present the in-app store sheet from
-    /// the store link's app id. `fallbackStoreAppID` preserves an app id already parsed from the
-    /// user's tapped URL when a separately decoded tracking URL replaced it. Without either context
-    /// (older payloads, previews, the declarative menu), routing falls back to redirect resolution.
+    /// `url` is the selected tracker or creative destination. A validated fallback store URL retains
+    /// the original scheme/host/path so `.external` can open it verbatim instead of losing everything
+    /// except its app id.
     static func routeCreativeTap(
         url: URL,
         destination: AdDestination,
+        storeOpen: StoreOpen,
         storeUrl: String?,
-        fallbackStoreAppID: String? = nil,
+        fallbackStoreURL: URL? = nil,
+        externalClickOnly: Bool = false,
         attribution: AdAttribution? = nil,
         execution: AttributionRouteExecution
     ) {
-        guard CreativeCTAOpenMessage.isAllowed(
-            url,
+        let plan = creativeRoutePlan(
+            selectedURL: url,
             destination: destination,
-            externalClickOnly: false
-        ) else {
+            storeOpen: storeOpen,
+            campaignStoreURL: storeUrl,
+            fallbackStoreURL: fallbackStoreURL,
+            externalClickOnly: externalClickOnly
+        )
+
+        switch plan {
+        case .invalid:
             guard execution.begin(path: .mmpRedirect) else { return }
             execution.fail("invalid_url")
-            return
-        }
-        // A tap straight onto a store URL needs no tracker fire — it IS the destination.
-        if let appID = appStoreID(from: url) {
+        case .directStore(let storeURL, let appID, let mode):
             guard execution.begin(path: .directStore) else { return }
-            execution.complete { presentStoreProduct(appID: appID, attribution: attribution) }
-            return
-        }
-        if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
+            execution.complete {
+                openStoreDestination(
+                    storeURL: storeURL,
+                    appID: appID,
+                    storeOpen: mode,
+                    attribution: attribution
+                )
+            }
+        case .trackerWithStore(let tracker, let storeURL, let appID, let mode):
             guard execution.begin(path: .rawStoreFallback) else { return }
             execution.complete {
-                fireClickTracker(url)
-                return presentStoreProduct(appID: appID, attribution: attribution)
+                fireClickTracker(tracker)
+                return openStoreDestination(
+                    storeURL: storeURL,
+                    appID: appID,
+                    storeOpen: mode,
+                    attribution: attribution
+                )
             }
-            return
-        }
-        if let fallbackStoreAppID, !fallbackStoreAppID.isEmpty {
-            guard execution.begin(path: .rawStoreFallback) else { return }
-            execution.complete {
-                fireClickTracker(url)
-                return presentStoreProduct(appID: fallbackStoreAppID, attribution: attribution)
+        case .resolveTracker(let tracker, let mode):
+            if mode == .external {
+                openExternally(
+                    initialURL: tracker,
+                    destination: .appstore,
+                    execution: execution
+                )
+            } else {
+                resolveAndRoute(url: tracker, attribution: attribution, execution: execution)
             }
-            return
-        }
-        let scheme = url.scheme?.lowercased() ?? ""
-        if destination == .web, scheme != "http", scheme != "https" {
+        case .web(let webURL, let mode):
+            if mode == .external {
+                openExternally(
+                    initialURL: webURL,
+                    destination: .web,
+                    execution: execution
+                )
+            } else {
+                guard execution.begin(path: .web) else { return }
+                execution.complete { presentSafari(url: webURL) }
+            }
+        case .customScheme(let customURL):
             guard execution.begin(path: .customScheme) else { return }
             execution.complete {
-                UIApplication.shared.open(url)
+                UIApplication.shared.open(customURL)
                 return true
             }
-            return
         }
-        guard validatedMMPTrackingURL(url.absoluteString) != nil else {
-            guard execution.begin(path: .mmpRedirect) else { return }
-            execution.fail("invalid_url")
-            return
+    }
+
+    private static func openStoreDestination(
+        storeURL: URL,
+        appID: String,
+        storeOpen: StoreOpen,
+        attribution: AdAttribution?
+    ) -> Bool {
+        if storeOpen == .external {
+            UIApplication.shared.open(storeURL)
+            return true
         }
-        resolveAndRoute(url: url, attribution: attribution, execution: execution)
+        return presentStoreProduct(appID: appID, attribution: attribution)
     }
 
     /// Fires the MMP click tracker in the background (fire-and-forget GET), used when the store
@@ -797,6 +911,18 @@ enum CreativeCTARouter {
     /// no-window early-return can't wedge all future CTAs shut. Each sheet's delegate
     /// resets it on dismiss.
     private static var isPresentingExternal = false
+    private static var presentationRootOverrideForTesting: (() -> UIViewController?)?
+
+    /// Test cleanup for SDK-owned presentation state. Tests dismiss the presented controller first;
+    /// this only prevents a failed test from contaminating later route assertions.
+    static func resetExternalPresentationStateForTesting() {
+        isPresentingExternal = false
+        presentationRootOverrideForTesting = nil
+    }
+
+    static func setPresentationRootForTesting(_ provider: @escaping () -> UIViewController?) {
+        presentationRootOverrideForTesting = provider
+    }
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
     /// campaign/provider/SKAN [attribution] tokens so the install it drives is credited to the campaign.
@@ -898,9 +1024,16 @@ enum CreativeCTARouter {
     /// view-controller was found and `present` was invoked, `false` otherwise.
     @discardableResult
     static func presentViewController(_ vc: UIViewController) -> Bool {
-        guard let scene = activeWindowScene(),
-              let rootVC = (scene.windows.first(where: \.isKeyWindow)
-                            ?? scene.windows.first)?.rootViewController else { return false }
+        let rootVC: UIViewController?
+        if let override = presentationRootOverrideForTesting {
+            rootVC = override()
+        } else if let scene = activeWindowScene() {
+            rootVC = (scene.windows.first(where: \.isKeyWindow)
+                      ?? scene.windows.first)?.rootViewController
+        } else {
+            rootVC = nil
+        }
+        guard let rootVC else { return false }
         var topVC = rootVC
         while let presented = topVC.presentedViewController {
             topVC = presented

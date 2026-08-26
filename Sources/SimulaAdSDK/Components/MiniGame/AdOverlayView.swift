@@ -99,6 +99,7 @@ public struct AdOverlayView: View {
     /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
     var ctaTrackingUrl: String? = nil
     var ctaDestination: AdDestination = .appstore
+    var ctaStoreOpen: StoreOpen = .skstoreproduct
     var ctaStoreUrl: String? = nil
     /// Attribution tokens carried into the store sheet the end-screen CTA opens.
     var attribution: AdAttribution? = nil
@@ -212,6 +213,7 @@ public struct AdOverlayView: View {
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
+                                ctaStoreOpen: ctaStoreOpen,
                                 ctaStoreUrl: ctaStoreUrl
                             )
                             .allowsHitTesting(!clickHandoffPending)
@@ -228,6 +230,7 @@ public struct AdOverlayView: View {
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
                                 ctaDestination: ctaDestination,
+                                ctaStoreOpen: ctaStoreOpen,
                                 ctaStoreUrl: ctaStoreUrl
                             )
                             .allowsHitTesting(!clickHandoffPending)

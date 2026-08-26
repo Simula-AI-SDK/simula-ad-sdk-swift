@@ -319,9 +319,9 @@ public struct NativeAdSlot: View {
                                 interactionId: interaction.id, clickSource: interaction.source
                             )
                         },
-                        // SKAN/App-Analytics tokens (parity with interstitial/rewarded). When present, an
-                        // App Store CTA routes through the in-app store sheet so the tokens ride it; absent
-                        // tokens keep today's external open (see `openNativeCTA`).
+                        // SKAN/App-Analytics tokens (parity with interstitial/rewarded). Native serves
+                        // have no store_open field, so App Store CTAs use the default in-app StoreKit
+                        // sheet and carry these tokens.
                         attribution: response.skanAttribution,
                         externalClickOnly: true,
                         // Server-provided click-through routing — a CTA tap opens the tracking link (PRD).

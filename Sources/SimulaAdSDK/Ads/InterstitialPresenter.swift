@@ -452,6 +452,7 @@ private struct CreativeInterstitialView: View {
             // The serve's routing context: an in-creative CTA opens the store deterministically
             // (in-app sheet from the raw ios_store_url + background tracker fire) when available.
             ctaDestination: response.destinationKind,
+            ctaStoreOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             ctaStoreUrl: response.iosStoreUrl,
             telemetryAdFormat: "interstitial"
         )

@@ -410,6 +410,7 @@ final class FallbackAdPresenter {
             },
             ctaTrackingUrl: ctaTrackingUrl,
             ctaDestination: ctaDestination,
+            ctaStoreOpen: ctaStoreOpen,
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution,
             onPresented: { [weak self] in

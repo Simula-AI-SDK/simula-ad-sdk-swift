@@ -551,6 +551,7 @@ private struct RewardedGameView: View {
             attribution: attribution,
             ctaTrackingUrl: trackingUrl,
             ctaDestination: destination,
+            ctaStoreOpen: storeOpen,
             ctaStoreUrl: storeUrl,
             telemetryAdFormat: "rewarded"
         )

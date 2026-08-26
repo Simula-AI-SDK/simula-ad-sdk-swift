@@ -229,6 +229,24 @@ final class CreativeBridgeTests: XCTestCase {
         XCTAssertEqual(eventCount, 1, "old page audio callbacks must stay disarmed during rebind")
     }
 
+    @MainActor
+    func testRetainedServeRebindResetsAutomaticRouteOwnership() {
+        let coordinator = WebViewRepresentable.Coordinator(
+            onNavigationFinished: nil,
+            onNavigationFailed: nil,
+            onMessageReceived: nil,
+            retainedImpressionId: "old-serve"
+        )
+
+        XCTAssertTrue(coordinator.automaticPopupGuard.claim())
+        XCTAssertFalse(coordinator.automaticPopupGuard.claim())
+        coordinator.prepareForRetainedServeRebind()
+        XCTAssertTrue(
+            coordinator.automaticPopupGuard.claim(),
+            "a rebound serve must receive its own automatic-route allowance"
+        )
+    }
+
     func testNavigationIdentityRequiresTwoNonNilMatchingObjects() {
         final class NavigationToken {}
         let first = NavigationToken()
