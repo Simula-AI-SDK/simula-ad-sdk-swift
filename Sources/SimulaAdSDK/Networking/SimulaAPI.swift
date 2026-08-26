@@ -98,6 +98,7 @@ public struct DeviceCapabilities: Encodable, Sendable {
     public let storekitAvailable: Bool
     public let skanVersion: String
     public let adAttributionKitAvailable: Bool
+    /// Client support declaration only. Per-fallback server ownership is decoded separately.
     public let nativeClickBeaconV1: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -865,11 +866,20 @@ public struct FallbackAd: Sendable {
     public let adId: String
     public let iframeUrl: String
     public let html: String?
+    /// Whether the server removed this fallback HTML's legacy click beacon and assigned click
+    /// counting to the SDK. Client support is checked separately at the point of use.
+    public let nativeClickBeaconV1Enabled: Bool
 
-    public init(adId: String, iframeUrl: String, html: String? = nil) {
+    public init(
+        adId: String,
+        iframeUrl: String,
+        html: String? = nil,
+        nativeClickBeaconV1Enabled: Bool = false
+    ) {
         self.adId = adId
         self.iframeUrl = iframeUrl
         self.html = html
+        self.nativeClickBeaconV1Enabled = nativeClickBeaconV1Enabled
     }
 }
 
@@ -878,16 +888,35 @@ public struct FallbackAd: Sendable {
 struct FallbackAdsAPIResponse: Decodable {
     let impressionId: String?
     let ads: [FallbackAdItem]
+    let nativeClickBeaconV1Enabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case ads
+        case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.impressionId = try? c.decode(String.self, forKey: .impressionId)
         self.ads = (try? c.decode([FallbackAdItem].self, forKey: .ads)) ?? []
+        self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
+    }
+
+    var resolvedAds: [FallbackAd] {
+        ads.compactMap { item in
+            let html = (item.html?.isEmpty == false) ? item.html : nil
+            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
+            guard html != nil || url != nil else { return nil }
+            return FallbackAd(
+                adId: item.adId ?? "",
+                iframeUrl: url ?? "",
+                html: html,
+                nativeClickBeaconV1Enabled: item.nativeClickBeaconV1Enabled
+                    ?? nativeClickBeaconV1Enabled
+                    ?? false
+            )
+        }
     }
 }
 
@@ -895,11 +924,21 @@ struct FallbackAdItem: Decodable {
     let adId: String?
     let html: String?
     let iframeUrl: String?
+    let nativeClickBeaconV1Enabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case html
         case iframeUrl = "iframe_url"
+        case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.adId = try? c.decode(String.self, forKey: .adId)
+        self.html = try? c.decode(String.self, forKey: .html)
+        self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
+        self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
     }
 }
 
@@ -1550,14 +1589,7 @@ public final class SimulaAPI: @unchecked Sendable {
         }
 
         let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
-        return apiResponse.ads.compactMap { item in
-            // Prefer the inline html (rendered in AdOverlayView); keep the iframe url as the same-origin
-            // base + url fallback. Drop only when neither is present.
-            let html = (item.html?.isEmpty == false) ? item.html : nil
-            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
-            guard html != nil || url != nil else { return nil }
-            return FallbackAd(adId: item.adId ?? "", iframeUrl: url ?? "", html: html)
-        }
+        return apiResponse.resolvedAds
     }
 
     // MARK: - Track Menu Game Click

@@ -12,7 +12,7 @@ final class CreativeClickURLTests: XCTestCase {
         return data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
 
-    func testFallbackNativeBeaconOwnershipRequiresAdvertisedCapabilityAndAdId() {
+    func testFallbackNativeBeaconOwnershipRequiresClientSupportServerEnablementAndAdId() {
         let capable = DeviceCapabilities(
             osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
             adAttributionKitAvailable: true, nativeClickBeaconV1: true
@@ -23,16 +23,28 @@ final class CreativeClickURLTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            fallbackNativeClickBeaconImpressionId(adId: "fallback-ad", capabilities: capable),
+            fallbackNativeClickBeaconImpressionId(
+                adId: "fallback-ad",
+                capabilities: capable,
+                nativeClickBeaconV1Enabled: true
+            ),
             "fallback-ad"
         )
-        XCTAssertNil(fallbackNativeClickBeaconImpressionId(adId: "fallback-ad", capabilities: legacy))
-        XCTAssertNil(fallbackNativeClickBeaconImpressionId(adId: "", capabilities: capable))
+        XCTAssertNil(fallbackNativeClickBeaconImpressionId(
+            adId: "fallback-ad", capabilities: capable, nativeClickBeaconV1Enabled: false
+        ))
+        XCTAssertNil(fallbackNativeClickBeaconImpressionId(
+            adId: "fallback-ad", capabilities: legacy, nativeClickBeaconV1Enabled: true
+        ))
+        XCTAssertNil(fallbackNativeClickBeaconImpressionId(
+            adId: "", capabilities: capable, nativeClickBeaconV1Enabled: true
+        ))
 
         let interaction = ClickInteraction(id: "interaction", source: .fallbackCTA)
         XCTAssertEqual(
             fallbackNativeClickBeaconClaim(
-                adId: "fallback-ad", interaction: interaction, capabilities: capable
+                adId: "fallback-ad", interaction: interaction, capabilities: capable,
+                nativeClickBeaconV1Enabled: true
             ),
             FallbackNativeClickBeaconClaim(
                 impressionId: "fallback-ad",
@@ -41,7 +53,12 @@ final class CreativeClickURLTests: XCTestCase {
             )
         )
         XCTAssertNil(fallbackNativeClickBeaconClaim(
-            adId: "fallback-ad", interaction: interaction, capabilities: legacy
+            adId: "fallback-ad", interaction: interaction, capabilities: capable,
+            nativeClickBeaconV1Enabled: false
+        ))
+        XCTAssertNil(fallbackNativeClickBeaconClaim(
+            adId: "fallback-ad", interaction: interaction, capabilities: legacy,
+            nativeClickBeaconV1Enabled: true
         ))
     }
     func testTopLevelTrackerWinsOverHTMLEscapedURL() {

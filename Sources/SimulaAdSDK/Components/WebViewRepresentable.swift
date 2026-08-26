@@ -115,7 +115,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     var attributionRouteLifecycle: AttributionRouteLifecycle?
     var clickSource: ClickSource
     /// Non-nil only when the SDK owns this surface's backend click beacon. Native-ad HTML leaves
-    /// this nil; capability-negotiated fullscreen/fallback surfaces supply their impression id.
+    /// this nil; fallback surfaces require both client support and explicit server ownership.
     var clickBeaconImpressionId: String?
 
     /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the

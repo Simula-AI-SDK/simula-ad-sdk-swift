@@ -411,6 +411,7 @@ final class FallbackAdPresenter {
             onClose: { [weak self] in self?.advance(from: index) },
             adId: ad.adId,
             html: ad.html,
+            nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
             onAdClick: { [weak self] interaction in self?.onAdClick?(interaction) },
             onClickHandoffPendingChanged: { [weak self] pending in
                 guard let self, self.index == index else { return }

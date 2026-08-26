@@ -396,7 +396,7 @@ public final class SimulaRewardedAd {
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onClick: { [weak self] interaction in
-                // CLICKED — CTA, store prompt, or configured automatic redirect.
+                // CLICKED is one admitted user CTA/store-prompt tap; automatic redirects never enter here.
                 Telemetry.shared.recordLifecycle(
                     stage: "click", adFormat: Self.adFormat, adUnitId: salvageAdUnitId,
                     adId: response.impressionId, serveId: nil,

@@ -346,6 +346,65 @@ final class TelemetryManagerTests: XCTestCase {
         XCTAssertTrue(savedNames.last?.isEmpty == true)
     }
 
+    func testCriticalClickRedrainsWhenImmediateRequestCollidesWithPeriodicFlush() async {
+        for iteration in 0..<10 {
+            let sender = FakeSender()
+            sender.gateFirst()
+            let sleep = ControllablePersistenceSleep()
+            let mgr = build(
+                store: FakeStore(),
+                sender: sender,
+                timedFlushSleep: { await sleep.sleep($0) }
+            )
+            await mgr.waitForRecoveryForTests()
+            await mgr.waitForImmediateFlushIdleForTests()
+
+            mgr.recordNetwork(
+                path: "/load/interstitial",
+                method: "POST",
+                statusCode: 200,
+                durationMs: 1,
+                requestBytes: 0,
+                responseBytes: 1,
+                failureClass: nil
+            )
+            _ = await sleep.waitForRequest()
+            sleep.release()
+            await waitUntil { sender.attemptCount == 1 }
+
+            let interactionId = "critical-inflight-\(iteration)"
+            mgr.recordLifecycle(
+                stage: "click_fired",
+                adFormat: "interstitial",
+                adUnitId: "unit",
+                adId: "serve",
+                serveId: "serve",
+                durationMs: nil,
+                errorCode: nil,
+                interactionId: interactionId,
+                clickSource: "primary_cta"
+            )
+
+            let settled = TestSignal()
+            Task { await mgr.waitForImmediateFlushIdleForTests(); settled.signal() }
+            await Task.yield()
+            XCTAssertFalse(
+                settled.isSignaled,
+                "in-flight send must not report reconciliation at iteration \(iteration)"
+            )
+
+            sender.release()
+            await settled.wait()
+
+            XCTAssertEqual(sender.attemptCount, 2, "iteration \(iteration)")
+            XCTAssertEqual(
+                allEvents(sender.batches).filter { $0.interactionId == interactionId }.count,
+                1,
+                "iteration \(iteration)"
+            )
+        }
+    }
+
     func testFlushNowDoesNotWaitIndefinitelyForBlockedPersistence() async {
         let store = SlowStore()
         let mgr = build(

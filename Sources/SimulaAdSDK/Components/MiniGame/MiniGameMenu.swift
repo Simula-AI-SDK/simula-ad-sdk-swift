@@ -227,7 +227,8 @@ public struct MiniGameMenu: View {
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
                     playableBorderColor: theme.resolvedPlayableBorderColor,
                     adId: fallbackAd.adId,
-                    html: fallbackAd.html
+                    html: fallbackAd.html,
+                    nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled
                 )
                 .id(fallbackAdIndex)
                 .transition(.identity)

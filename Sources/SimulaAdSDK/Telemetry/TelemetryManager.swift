@@ -881,15 +881,9 @@ final class TelemetryManager: @unchecked Sendable {
             retryCount = 0
             snapshot = snapshotLocked()
             isFlushing = false
-            // Re-drain summaries that arrived during this send even below the normal threshold;
-            // their caller may have observed this in-flight flush and cannot drain them itself.
-            let hasPendingSummary = buffer.contains {
-                $0.type == TelemetryType.operation && ($0.name == "funnel_summary" || $0.name == "diagnostics")
-            }
-            result = (
-                buffer.count >= flushThreshold || !errorAgg.isEmpty || !metaAgg.isEmpty || hasPendingSummary,
-                false
-            )
+            // Re-drain urgent work that arrived during this send even below the normal threshold.
+            // Its request may have collided with this in-flight claim and cannot schedule itself.
+            result = (hasUrgentPendingWorkLocked(), false)
         case .retry:
             snapshot = snapshotLocked()
             if retryCount < Int.max { retryCount += 1 }
@@ -897,7 +891,9 @@ final class TelemetryManager: @unchecked Sendable {
             result = (false, true)
         }
         persistAsync(snapshot)
+        let idleWaiters = takeImmediateFlushIdleWaitersIfSettledLocked()
         lock.unlock()
+        idleWaiters.forEach { $0.resume() }
         return result
     }
 
@@ -1001,25 +997,56 @@ final class TelemetryManager: @unchecked Sendable {
         lock.lock()
         immediateFlushScheduled = false
         let needsAnotherFlush = isEnabled && !retryScheduled && !isFlushing
-            && (!errorAgg.isEmpty || !metaAgg.isEmpty || buffer.count >= flushThreshold)
-        let waiters = needsAnotherFlush ? [] : immediateFlushIdleWaiters
-        if !needsAnotherFlush { immediateFlushIdleWaiters.removeAll() }
+            && hasUrgentPendingWorkLocked()
+        let waiters = needsAnotherFlush ? [] : takeImmediateFlushIdleWaitersIfSettledLocked()
         lock.unlock()
         waiters.forEach { $0.resume() }
         if needsAnotherFlush { requestImmediateFlush() }
     }
 
+    /// Waits for both immediate and already-running periodic/retry flush reconciliation. A sender
+    /// accepting a batch is not sufficient: the manager must remove the claim and schedule any
+    /// urgent work that arrived during that send before tests may safely make their next assertion.
     func waitForImmediateFlushIdleForTests() async {
         await withCheckedContinuation { continuation in
             lock.lock()
-            if !immediateFlushScheduled {
+            if isImmediateFlushSettledLocked() {
                 lock.unlock()
                 continuation.resume()
             } else {
                 immediateFlushIdleWaiters.append(continuation)
+                let shouldKick = recoveryCompleted && isEnabled && !retryScheduled
+                    && !immediateFlushScheduled && !isFlushing && hasUrgentPendingWorkLocked()
                 lock.unlock()
+                if shouldKick { requestImmediateFlush() }
             }
         }
+    }
+
+    /// Caller holds `lock`. These rows must never wait for the normal performance threshold after
+    /// their original immediate request loses a race with an in-flight periodic/recovery flush.
+    private func hasUrgentPendingWorkLocked() -> Bool {
+        if !errorAgg.isEmpty || !metaAgg.isEmpty || buffer.count >= flushThreshold { return true }
+        return buffer.contains { event in
+            isCriticalClickLifecycle(event)
+                || (event.type == TelemetryType.operation
+                    && (event.name == "funnel_summary" || event.name == "diagnostics"))
+        }
+    }
+
+    /// Caller holds `lock`. A scheduled retry is settled for this barrier because no current drain
+    /// can make progress until its injected/real backoff elapses.
+    private func isImmediateFlushSettledLocked() -> Bool {
+        guard recoveryCompleted, !immediateFlushScheduled, !isFlushing else { return false }
+        return !isEnabled || retryScheduled || !hasUrgentPendingWorkLocked()
+    }
+
+    /// Caller holds `lock`; continuations are always resumed after unlocking.
+    private func takeImmediateFlushIdleWaitersIfSettledLocked() -> [CheckedContinuation<Void, Never>] {
+        guard isImmediateFlushSettledLocked() else { return [] }
+        let waiters = immediateFlushIdleWaiters
+        immediateFlushIdleWaiters.removeAll()
+        return waiters
     }
 
     func waitForRecoveryForTests() async {

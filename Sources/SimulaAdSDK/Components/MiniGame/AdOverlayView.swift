@@ -90,7 +90,9 @@ public struct AdOverlayView: View {
     /// Inline end-screen html (preferred over `iframeUrl` when present): the `<iframe srcdoc>` blob from
     /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin for creative resources.
     var html: String? = nil
-    /// Fired on a user tap that opens the store (CTA / window.open) so the host's click delegate runs.
+    /// Server-owned assignment for this fallback. False means the HTML retains click counting.
+    var nativeClickBeaconV1Enabled: Bool = false
+    /// Fired once for an admitted user CTA tap. Route success is reported separately.
     var onAdClick: ((ClickInteraction) -> Void)? = nil
     /// Mirrors deferred route ownership to imperative fallback presenters for a defensive close guard.
     var onClickHandoffPendingChanged: ((Bool) -> Void)? = nil
@@ -198,8 +200,8 @@ public struct AdOverlayView: View {
                     ZStack {
                         Color.black
 
-                        // Ad creative: prefer the inline html (rendered with the iframe origin as base
-                        // so the end screen's own click beacon stays same-origin), else load the url.
+                        // Ad creative: prefer inline HTML, retaining the iframe origin for its resources;
+                        // otherwise load the URL directly. Server ownership separately controls beacons.
                         // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
                         if let html, !html.isEmpty {
                             WebViewRepresentable(
@@ -368,7 +370,11 @@ public struct AdOverlayView: View {
     // MARK: - Countdown
 
     private var nativeClickBeaconImpressionId: String? {
-        fallbackNativeClickBeaconImpressionId(adId: adId, capabilities: .current)
+        fallbackNativeClickBeaconImpressionId(
+            adId: adId,
+            capabilities: .current,
+            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
+        )
     }
 
     private var activeRouteLifecycle: AttributionRouteLifecycle {
@@ -379,7 +385,8 @@ public struct AdOverlayView: View {
         if let claim = fallbackNativeClickBeaconClaim(
             adId: adId,
             interaction: interaction,
-            capabilities: .current
+            capabilities: .current,
+            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
         ) {
             AdBeaconManager.shared.enqueue(
                 impressionId: claim.impressionId,
@@ -553,9 +560,12 @@ public struct AdOverlayView: View {
 
 func fallbackNativeClickBeaconImpressionId(
     adId: String,
-    capabilities: DeviceCapabilities
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool
 ) -> String? {
-    guard capabilities.nativeClickBeaconV1, !adId.isEmpty else { return nil }
+    guard capabilities.nativeClickBeaconV1, nativeClickBeaconV1Enabled, !adId.isEmpty else {
+        return nil
+    }
     return adId
 }
 
@@ -568,11 +578,13 @@ struct FallbackNativeClickBeaconClaim: Equatable {
 func fallbackNativeClickBeaconClaim(
     adId: String,
     interaction: ClickInteraction,
-    capabilities: DeviceCapabilities
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool
 ) -> FallbackNativeClickBeaconClaim? {
     guard let impressionId = fallbackNativeClickBeaconImpressionId(
         adId: adId,
-        capabilities: capabilities
+        capabilities: capabilities,
+        nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
     ) else { return nil }
     return FallbackNativeClickBeaconClaim(
         impressionId: impressionId,
