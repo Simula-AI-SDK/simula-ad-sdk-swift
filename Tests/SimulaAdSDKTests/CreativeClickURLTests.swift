@@ -61,6 +61,75 @@ final class CreativeClickURLTests: XCTestCase {
             nativeClickBeaconV1Enabled: true
         ))
     }
+
+    func testFallbackClickAccountingUsesFallbackIdentityExactlyOnce() {
+        let capable = DeviceCapabilities(
+            osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
+            adAttributionKitAvailable: true, nativeClickBeaconV1: true
+        )
+        let interaction = ClickInteraction(id: "interaction", source: .fallbackCTA)
+        var telemetry: [(FallbackClickTelemetryContext, ClickInteraction)] = []
+        var beacons: [(FallbackNativeClickBeaconClaim, FallbackClickTelemetryContext)] = []
+        var publisher: [ClickInteraction] = []
+
+        accountFallbackClick(
+            adId: "fallback-ad",
+            interaction: interaction,
+            capabilities: capable,
+            nativeClickBeaconV1Enabled: true,
+            adFormat: "rewarded",
+            adUnitId: "unit",
+            serveId: "parent-serve",
+            recordTelemetry: { telemetry.append(($0, $1)) },
+            enqueueBeacon: { beacons.append(($0, $1)) },
+            notifyPublisher: { publisher.append($0) }
+        )
+
+        XCTAssertEqual(telemetry.count, 1)
+        XCTAssertEqual(
+            telemetry.first?.0,
+            FallbackClickTelemetryContext(
+                adFormat: "rewarded", adUnitId: "unit", adId: "fallback-ad",
+                serveId: "parent-serve"
+            )
+        )
+        XCTAssertEqual(telemetry.first?.1, interaction)
+        XCTAssertEqual(beacons.count, 1)
+        XCTAssertEqual(beacons.first?.0.impressionId, "fallback-ad")
+        XCTAssertEqual(beacons.first?.0.interactionId, interaction.id)
+        XCTAssertEqual(beacons.first?.0.clickSource, interaction.source.rawValue)
+        XCTAssertEqual(beacons.first?.1, telemetry.first?.0)
+        XCTAssertEqual(publisher, [interaction])
+    }
+
+    func testFallbackClickAccountingKeepsTelemetryAndPublisherWhenServerOwnsNoBeacon() {
+        let capable = DeviceCapabilities(
+            osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
+            adAttributionKitAvailable: true, nativeClickBeaconV1: true
+        )
+        let interaction = ClickInteraction(id: "interaction", source: .fallbackCTA)
+        var telemetryCount = 0
+        var beaconCount = 0
+        var publisherCount = 0
+
+        accountFallbackClick(
+            adId: "fallback-ad",
+            interaction: interaction,
+            capabilities: capable,
+            nativeClickBeaconV1Enabled: false,
+            adFormat: "interstitial",
+            adUnitId: nil,
+            serveId: nil,
+            recordTelemetry: { _, _ in telemetryCount += 1 },
+            enqueueBeacon: { _, _ in beaconCount += 1 },
+            notifyPublisher: { _ in publisherCount += 1 }
+        )
+
+        XCTAssertEqual(telemetryCount, 1)
+        XCTAssertEqual(beaconCount, 0)
+        XCTAssertEqual(publisherCount, 1)
+    }
+
     func testTopLevelTrackerWinsOverHTMLEscapedURL() {
         let fallback = URL(string: "https://tracker.example/click?a=1&amp;b=2")!
 
@@ -116,6 +185,7 @@ final class CreativeClickURLTests: XCTestCase {
         let fallback = URL(string: "https://safe.example/fallback")!
         let valid = [
             "itms-apps://apps.apple.com/app/id123456789",
+            "itms-appss://apps.apple.com/app/id246813579",
             "itms://itunes.apple.com/app/id987654321",
         ]
         for value in valid {
@@ -127,6 +197,7 @@ final class CreativeClickURLTests: XCTestCase {
         }
 
         XCTAssertNil(validatedDirectAppStoreURL("itms-apps://apps.apple.com/app/no-id"))
+        XCTAssertNil(validatedDirectAppStoreURL("itms-appss://apps.apple.com/app/no-id"))
         XCTAssertNil(validatedDirectAppStoreURL("itms://example.com/not-a-store-route"))
         XCTAssertNil(validatedDirectAppStoreURL("https://apps.apple.com.evil.example/app/id123"))
         XCTAssertNil(validatedDirectAppStoreURL("https://evilapps.apple.com/app/id123"))
@@ -172,6 +243,7 @@ final class CreativeClickURLTests: XCTestCase {
         for value in [
             "https://apps.apple.com.evil.example/app/id123",
             "itms-apps://evil.example/app/id123",
+            "itms-appss://evil.example/app/id123",
             "itms-apps://apps.apple.com/app/no-id",
             "javascript://apps.apple.com/app/id123",
             "ftp://apps.apple.com/app/id123",
@@ -277,6 +349,7 @@ final class CreativeClickURLTests: XCTestCase {
             "https://advertiser.example/landing",
             "http://tracker.example/click",
             "itms-apps://apps.apple.com/app/id123456789",
+            "itms-appss://apps.apple.com/app/id246813579",
             "itms://itunes.apple.com/app/id987654321",
         ]
         for value in valid {
@@ -291,6 +364,7 @@ final class CreativeClickURLTests: XCTestCase {
             "https:///missing-host",
             "https://:443/malformed-host",
             "itms-apps://apps.apple.com/app/no-id",
+            "itms-appss://apps.apple.com/app/no-id",
             "advertiser-app://offer/42",
             "about:blank",
             "blob:https://advertiser.example/id",
@@ -304,6 +378,23 @@ final class CreativeClickURLTests: XCTestCase {
                 "unexpectedly admitted terminal redirect \(value)"
             )
         }
+    }
+
+    func testRedirectResolverStopsAtEveryCanonicalStoreScheme() {
+        for value in [
+            "itms://itunes.apple.com/app/id123",
+            "itms-apps://apps.apple.com/app/id123",
+            "itms-appss://apps.apple.com/app/id123",
+            "https://apps.apple.com/app/id123",
+        ] {
+            XCTAssertTrue(shouldStopRedirectResolution(at: URL(string: value)!))
+        }
+        XCTAssertFalse(shouldStopRedirectResolution(
+            at: URL(string: "https://tracker.example/click")!
+        ))
+        XCTAssertFalse(shouldStopRedirectResolution(
+            at: URL(string: "advertiser-app://offer/42")!
+        ))
     }
 
     func testDualWebKitDelegatesClaimOneCallbackAndRoute() {
@@ -363,6 +454,7 @@ final class CreativeClickURLTests: XCTestCase {
             "https://example.com/path",
             "http://example.com/path",
             "itms-apps://apps.apple.com/app/id123",
+            "itms-appss://apps.apple.com/app/id456",
             "itms://itunes.apple.com/app/id123",
         ]
 
@@ -636,7 +728,7 @@ final class CreativeClickURLTests: XCTestCase {
     }
 
     @MainActor
-    func testSlowResolverCompletionAfterPresentationTeardownDoesNotLaunch() {
+    func testCommittedSlowResolverCompletionSurvivesPresentationTeardown() {
         let lifecycle = AttributionRouteLifecycle()
         lifecycle.activate()
         var outcomes: [AttributionRouteOutcome] = []
@@ -644,6 +736,7 @@ final class CreativeClickURLTests: XCTestCase {
         var clickHandoffPending = true
         let execution = AttributionRouteExecution(
             isActive: { lifecycle.isActive },
+            survivesPresentationTeardownAfterBegin: true,
             onUIHandoffReleased: { clickHandoffPending = false },
             onOutcome: { outcomes.append($0) }
         )
@@ -653,11 +746,11 @@ final class CreativeClickURLTests: XCTestCase {
 
         execution.complete { routes += 1; return true }
 
-        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(routes, 1)
         XCTAssertEqual(outcomes, [AttributionRouteOutcome(
             path: .mmpRedirect,
-            success: false,
-            failureClass: "inactive_presentation"
+            success: true,
+            failureClass: nil
         )])
     }
 
@@ -673,6 +766,7 @@ final class CreativeClickURLTests: XCTestCase {
             id: UUID(),
             source: .primaryCTA,
             isActive: { lifecycle.isActive },
+            canCompleteAfterPresentationTeardown: { true },
             onUIHandoffReleased: {},
             onTerminalOutcome: { outcomes.append($0) },
             onFinished: { [weak coordinator] _ in
@@ -686,12 +780,102 @@ final class CreativeClickURLTests: XCTestCase {
         execution.complete { routes += 1; return true }
 
         XCTAssertNil(weakCoordinator)
-        XCTAssertEqual(routes, 0, "an invalidated lifecycle must suppress terminal UI")
+        XCTAssertEqual(routes, 1, "a committed user route must survive its WebView owner")
+        XCTAssertEqual(outcomes, [AttributionRouteOutcome(
+            path: .mmpRedirect,
+            success: true,
+            failureClass: nil
+        )])
+    }
+
+    @MainActor
+    func testPresentationBoundAutomaticRouteStillStopsAfterTeardown() {
+        let lifecycle = AttributionRouteLifecycle()
+        lifecycle.activate()
+        var outcomes: [AttributionRouteOutcome] = []
+        var routes = 0
+        let execution = AttributionRouteExecution(
+            isActive: { lifecycle.isActive },
+            onOutcome: { outcomes.append($0) }
+        )
+        startAsynchronousAttributionRoute(execution: execution) {}
+        lifecycle.deactivate()
+
+        execution.complete { routes += 1; return true }
+
+        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testCommittedRouteDoesNotCompleteWhenCapturedSceneBecomesUnavailable() {
+        var outcomes: [AttributionRouteOutcome] = []
+        var routes = 0
+        var presentationActive = true
+        let execution = AttributionRouteExecution(
+            isActive: { presentationActive },
+            survivesPresentationTeardownAfterBegin: true,
+            canCompleteAfterPresentationTeardown: { false },
+            onOutcome: { outcomes.append($0) }
+        )
+        startAsynchronousAttributionRoute(execution: execution) {}
+        presentationActive = false
+
+        execution.complete { routes += 1; return true }
+
+        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testExplicitCancellationSuppressesCommittedRouteCompletion() {
+        var outcomes: [AttributionRouteOutcome] = []
+        var routes = 0
+        let execution = AttributionRouteExecution(
+            isActive: { true },
+            survivesPresentationTeardownAfterBegin: true,
+            onOutcome: { outcomes.append($0) }
+        )
+        startAsynchronousAttributionRoute(execution: execution) {}
+
+        execution.cancel()
+        execution.complete { routes += 1; return true }
+
+        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(outcomes.first?.failureClass, "cancelled")
+    }
+
+    @MainActor
+    func testResolverFailureCompletesCommittedRouteExactlyOnceWithoutLaunching() {
+        var outcomes: [AttributionRouteOutcome] = []
+        var routes = 0
+        let execution = AttributionRouteExecution(
+            isActive: { true },
+            survivesPresentationTeardownAfterBegin: true,
+            onOutcome: { outcomes.append($0) }
+        )
+        startAsynchronousAttributionRoute(execution: execution) {}
+
+        execution.fail("resolve_failed")
+        execution.complete { routes += 1; return true }
+        execution.fail("resolve_failed")
+
+        XCTAssertEqual(routes, 0)
         XCTAssertEqual(outcomes, [AttributionRouteOutcome(
             path: .mmpRedirect,
             success: false,
-            failureClass: "inactive_presentation"
+            failureClass: "resolve_failed"
         )])
+    }
+
+    func testWeakSceneReferenceRetainsIdentityWithoutOwningSceneLifetime() {
+        final class Scene {}
+        var scene: Scene? = Scene()
+        let reference = WeakObjectReference(scene)
+
+        XCTAssertTrue(reference.value === scene)
+        scene = nil
+        XCTAssertNil(reference.value)
     }
 
     @MainActor

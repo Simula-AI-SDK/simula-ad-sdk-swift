@@ -1,5 +1,14 @@
 import Foundation
 
+func beaconTelemetryServeId(
+    impressionId: String,
+    adFormat: String?,
+    explicitServeId: String?
+) -> String? {
+    if let explicitServeId { return explicitServeId.isEmpty ? nil : explicitServeId }
+    return adFormat == "interstitial" ? impressionId : nil
+}
+
 // MARK: - PendingBeacon
 
 /// A billing/measurement beacon waiting to be delivered. Today's `track*` helpers are fire-and-forget:
@@ -215,6 +224,7 @@ public final class AdBeaconManager: @unchecked Sendable {
             action: action,
             adFormat: adFormat,
             adUnitId: adUnitId,
+            telemetryServeId: nil,
             metadata: metadata,
             interactionId: nil,
             clickSource: nil
@@ -235,7 +245,29 @@ public final class AdBeaconManager: @unchecked Sendable {
             action: action,
             adFormat: adFormat,
             adUnitId: adUnitId,
+            telemetryServeId: nil,
             metadata: metadata,
+            interactionId: interactionId,
+            clickSource: clickSource
+        )
+    }
+
+    func enqueue(
+        impressionId: String,
+        action: String,
+        adFormat: String?,
+        adUnitId: String?,
+        telemetryServeId: String?,
+        interactionId: String,
+        clickSource: String
+    ) {
+        enqueueInternal(
+            impressionId: impressionId,
+            action: action,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            telemetryServeId: telemetryServeId,
+            metadata: nil,
             interactionId: interactionId,
             clickSource: clickSource
         )
@@ -246,6 +278,7 @@ public final class AdBeaconManager: @unchecked Sendable {
         action: String,
         adFormat: String?,
         adUnitId: String?,
+        telemetryServeId: String?,
         metadata: [String: String]?,
         interactionId: String?,
         clickSource: String?
@@ -257,6 +290,11 @@ public final class AdBeaconManager: @unchecked Sendable {
             : nil
         let normalizedClickSource = clickSource.flatMap(ClickSource.init(rawValue:)) ?? .primaryCTA
         let resolvedClickSource = action == "click" ? normalizedClickSource.rawValue : nil
+        let resolvedTelemetryServeId = beaconTelemetryServeId(
+            impressionId: impressionId,
+            adFormat: adFormat,
+            explicitServeId: telemetryServeId
+        )
         switch action {
         case "seen":
             Telemetry.shared.recordLifecycle(stage: "impression_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId)
@@ -264,7 +302,7 @@ public final class AdBeaconManager: @unchecked Sendable {
             if let resolvedInteractionId {
                 Telemetry.shared.recordLifecycle(
                     stage: "click_fired", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId,
-                    serveId: adFormat == "interstitial" ? impressionId : nil,
+                    serveId: resolvedTelemetryServeId,
                     interactionId: resolvedInteractionId, clickSource: normalizedClickSource
                 )
             }

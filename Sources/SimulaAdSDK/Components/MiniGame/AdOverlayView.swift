@@ -92,6 +92,11 @@ public struct AdOverlayView: View {
     var html: String? = nil
     /// Server-owned assignment for this fallback. False means the HTML retains click counting.
     var nativeClickBeaconV1Enabled: Bool = false
+    /// Measurement context for this fallback surface. The fallback ad id remains the event identity;
+    /// the parent serve is deliberately not reused for fallback click accounting.
+    var telemetryAdFormat: String = "interstitial"
+    var telemetryAdUnitId: String? = nil
+    var telemetryServeId: String? = nil
     /// Fired once for an admitted user CTA tap. Route success is reported separately.
     var onAdClick: ((ClickInteraction) -> Void)? = nil
     /// Mirrors deferred route ownership to imperative fallback presenters for a defensive close guard.
@@ -382,20 +387,38 @@ public struct AdOverlayView: View {
     }
 
     private func handleAdClick(_ interaction: ClickInteraction) {
-        if let claim = fallbackNativeClickBeaconClaim(
+        accountFallbackClick(
             adId: adId,
             interaction: interaction,
             capabilities: .current,
-            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
-        ) {
-            AdBeaconManager.shared.enqueue(
-                impressionId: claim.impressionId,
-                action: "click",
-                interactionId: claim.interactionId,
-                clickSource: claim.clickSource
-            )
-        }
-        onAdClick?(interaction)
+            nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled,
+            adFormat: telemetryAdFormat,
+            adUnitId: telemetryAdUnitId,
+            serveId: telemetryServeId,
+            recordTelemetry: { context, interaction in
+                Telemetry.shared.recordLifecycle(
+                    stage: "click",
+                    adFormat: context.adFormat,
+                    adUnitId: context.adUnitId,
+                    adId: context.adId,
+                    serveId: context.serveId,
+                    interactionId: interaction.id,
+                    clickSource: interaction.source
+                )
+            },
+            enqueueBeacon: { claim, context in
+                AdBeaconManager.shared.enqueue(
+                    impressionId: claim.impressionId,
+                    action: "click",
+                    adFormat: context.adFormat,
+                    adUnitId: context.adUnitId,
+                    telemetryServeId: context.serveId ?? "",
+                    interactionId: claim.interactionId,
+                    clickSource: claim.clickSource
+                )
+            },
+            notifyPublisher: { interaction in onAdClick?(interaction) }
+        )
     }
 
     private func updateClickHandoffPending(_ pending: Bool) {
@@ -573,6 +596,43 @@ struct FallbackNativeClickBeaconClaim: Equatable {
     let impressionId: String
     let interactionId: String
     let clickSource: String
+}
+
+struct FallbackClickTelemetryContext: Equatable {
+    let adFormat: String
+    let adUnitId: String?
+    let adId: String?
+    let serveId: String?
+}
+
+func accountFallbackClick(
+    adId: String,
+    interaction: ClickInteraction,
+    capabilities: DeviceCapabilities,
+    nativeClickBeaconV1Enabled: Bool,
+    adFormat: String,
+    adUnitId: String?,
+    serveId: String?,
+    recordTelemetry: (FallbackClickTelemetryContext, ClickInteraction) -> Void,
+    enqueueBeacon: (FallbackNativeClickBeaconClaim, FallbackClickTelemetryContext) -> Void,
+    notifyPublisher: (ClickInteraction) -> Void
+) {
+    let context = FallbackClickTelemetryContext(
+        adFormat: adFormat,
+        adUnitId: adUnitId,
+        adId: adId.isEmpty ? nil : adId,
+        serveId: serveId?.isEmpty == false ? serveId : nil
+    )
+    recordTelemetry(context, interaction)
+    if let claim = fallbackNativeClickBeaconClaim(
+        adId: adId,
+        interaction: interaction,
+        capabilities: capabilities,
+        nativeClickBeaconV1Enabled: nativeClickBeaconV1Enabled
+    ) {
+        enqueueBeacon(claim, context)
+    }
+    notifyPublisher(interaction)
 }
 
 func fallbackNativeClickBeaconClaim(

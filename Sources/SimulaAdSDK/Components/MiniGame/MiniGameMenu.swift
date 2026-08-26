@@ -228,7 +228,8 @@ public struct MiniGameMenu: View {
                     playableBorderColor: theme.resolvedPlayableBorderColor,
                     adId: fallbackAd.adId,
                     html: fallbackAd.html,
-                    nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled
+                    nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled,
+                    telemetryServeId: currentServeId
                 )
                 .id(fallbackAdIndex)
                 .transition(.identity)

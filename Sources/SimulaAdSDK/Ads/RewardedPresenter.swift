@@ -590,6 +590,10 @@ private struct RewardedGameView: View {
                             && visible
                             && UIApplication.shared.applicationState == .active
                     },
+                    survivesPresentationTeardownAfterBegin: true,
+                    canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
+                        originatingScene: originatingScene
+                    ),
                     onUIHandoffReleased: {
                         clickHandoffs.set(.storePrompt, pending: false)
                     },

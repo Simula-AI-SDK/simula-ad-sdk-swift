@@ -6,6 +6,21 @@ import XCTest
 /// network, simulator preferences daemon, or wall-clock timing.
 final class AdBeaconManagerTests: XCTestCase {
 
+    func testBeaconTelemetryServeIdPreservesDefaultsAndFallbackOverride() {
+        XCTAssertEqual(beaconTelemetryServeId(
+            impressionId: "primary", adFormat: "interstitial", explicitServeId: nil
+        ), "primary")
+        XCTAssertNil(beaconTelemetryServeId(
+            impressionId: "primary", adFormat: "rewarded", explicitServeId: nil
+        ))
+        XCTAssertEqual(beaconTelemetryServeId(
+            impressionId: "fallback", adFormat: "rewarded", explicitServeId: "parent"
+        ), "parent")
+        XCTAssertNil(beaconTelemetryServeId(
+            impressionId: "fallback", adFormat: "interstitial", explicitServeId: ""
+        ))
+    }
+
     // Must mirror AdBeaconManager.userDefaultsKey (private there).
     private let queueKey = "simula_pending_beacons"
 

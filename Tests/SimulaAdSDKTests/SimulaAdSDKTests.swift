@@ -843,6 +843,33 @@ final class SimulaAdSDKTests: XCTestCase {
         #endif
     }
 
+    func testExpandedCapabilityAndFallbackInitializersPreserveOldSourceShape() {
+        let legacyCapabilities = DeviceCapabilities(
+            osVersion: "17.0",
+            storekitAvailable: true,
+            skanVersion: "4.0",
+            adAttributionKitAvailable: false
+        )
+        let expandedCapabilities = DeviceCapabilities(
+            osVersion: "17.0",
+            storekitAvailable: true,
+            skanVersion: "4.0",
+            adAttributionKitAvailable: false,
+            nativeClickBeaconV1: true
+        )
+        XCTAssertFalse(legacyCapabilities.nativeClickBeaconV1)
+        XCTAssertTrue(expandedCapabilities.nativeClickBeaconV1)
+
+        let legacyFallback = FallbackAd(adId: "legacy", iframeUrl: "https://example.com")
+        let expandedFallback = FallbackAd(
+            adId: "expanded",
+            iframeUrl: "https://example.com",
+            nativeClickBeaconV1Enabled: true
+        )
+        XCTAssertFalse(legacyFallback.nativeClickBeaconV1Enabled)
+        XCTAssertTrue(expandedFallback.nativeClickBeaconV1Enabled)
+    }
+
     // MARK: - Interstitial configuration defaults / mutability
 
     @MainActor

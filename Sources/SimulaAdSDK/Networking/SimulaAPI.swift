@@ -113,8 +113,23 @@ public struct DeviceCapabilities: Encodable, Sendable {
         osVersion: String,
         storekitAvailable: Bool,
         skanVersion: String,
+        adAttributionKitAvailable: Bool
+    ) {
+        self.init(
+            osVersion: osVersion,
+            storekitAvailable: storekitAvailable,
+            skanVersion: skanVersion,
+            adAttributionKitAvailable: adAttributionKitAvailable,
+            nativeClickBeaconV1: false
+        )
+    }
+
+    public init(
+        osVersion: String,
+        storekitAvailable: Bool,
+        skanVersion: String,
         adAttributionKitAvailable: Bool,
-        nativeClickBeaconV1: Bool = false
+        nativeClickBeaconV1: Bool
     ) {
         self.osVersion = osVersion
         self.storekitAvailable = storekitAvailable
@@ -873,8 +888,21 @@ public struct FallbackAd: Sendable {
     public init(
         adId: String,
         iframeUrl: String,
+        html: String? = nil
+    ) {
+        self.init(
+            adId: adId,
+            iframeUrl: iframeUrl,
+            html: html,
+            nativeClickBeaconV1Enabled: false
+        )
+    }
+
+    public init(
+        adId: String,
+        iframeUrl: String,
         html: String? = nil,
-        nativeClickBeaconV1Enabled: Bool = false
+        nativeClickBeaconV1Enabled: Bool
     ) {
         self.adId = adId
         self.iframeUrl = iframeUrl

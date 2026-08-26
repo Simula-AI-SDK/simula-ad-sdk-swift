@@ -677,6 +677,10 @@ private struct CreativeInterstitialView: View {
                             && visible
                             && UIApplication.shared.applicationState == .active
                     },
+                    survivesPresentationTeardownAfterBegin: true,
+                    canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
+                        originatingScene: originatingScene
+                    ),
                     onUIHandoffReleased: {
                         clickHandoffs.set(.storePrompt, pending: false)
                     },
@@ -768,7 +772,12 @@ private struct CreativeInterstitialView: View {
         }
         guard #available(iOS 14.0, *) else { return }
         skOverlayPresented = true
-        SKOverlayPresenter.present(appID: appID, config: config, attribution: response.skanAttribution)
+        SKOverlayPresenter.present(
+            appID: appID,
+            config: config,
+            attribution: response.skanAttribution,
+            originatingScene: originatingScene
+        )
     }
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).

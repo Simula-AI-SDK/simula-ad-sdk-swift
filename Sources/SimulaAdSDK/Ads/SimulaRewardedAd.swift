@@ -933,14 +933,12 @@ public final class SimulaRewardedAd {
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
-            onAdClick: { [weak self] interaction in
-                Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
-                    adId: response.impressionId, serveId: nil,
-                    interactionId: interaction.id, clickSource: interaction.source
-                )
+            onAdClick: { [weak self] _ in
                 if let self { self.delegate?.rewardedDidClick(self) }
             },
+            telemetryAdFormat: Self.adFormat,
+            telemetryAdUnitId: fallbackAdUnitId,
+            telemetryServeId: response.impressionId,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -996,14 +994,12 @@ public final class SimulaRewardedAd {
             ctaStoreUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: autoStoreRedirect,
-            onAdClick: { [weak self] interaction in
-                Telemetry.shared.recordLifecycle(
-                    stage: "click", adFormat: Self.adFormat, adUnitId: fallbackAdUnitId,
-                    adId: response.impressionId, serveId: nil,
-                    interactionId: interaction.id, clickSource: interaction.source
-                )
+            onAdClick: { [weak self] _ in
                 if let self { self.delegate?.rewardedDidClick(self) }
             },
+            telemetryAdFormat: Self.adFormat,
+            telemetryAdUnitId: fallbackAdUnitId,
+            telemetryServeId: response.impressionId,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil

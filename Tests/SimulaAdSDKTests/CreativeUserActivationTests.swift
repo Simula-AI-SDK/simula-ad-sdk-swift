@@ -307,9 +307,16 @@ final class CreativeUserActivationTests: XCTestCase {
             directAppStoreID(from: URL(string: "itms-apps://apps.apple.com/app/id375380948")!),
             "375380948"
         )
+        XCTAssertEqual(
+            directAppStoreID(from: URL(string: "itms-appss://itunes.apple.com/app/id246813579")!),
+            "246813579"
+        )
+        XCTAssertTrue(isDirectAppStoreScheme("ITMS-APPSS"))
         for value in [
             "itms-apps://evil.example/app/id375380948",
+            "itms-appss://evil.example/app/id375380948",
             "itms-apps://apps.apple.com.evil.example/app/id375380948",
+            "itms-appss://apps.apple.com/app/no-id",
             "itms-apps://apps.apple.com/app?item=id375380948",
             "itms-apps://apps.apple.com/app/id375380948evil",
         ] {

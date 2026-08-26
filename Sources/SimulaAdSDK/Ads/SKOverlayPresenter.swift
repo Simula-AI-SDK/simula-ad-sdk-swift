@@ -18,12 +18,25 @@ import StoreKit
 @available(iOS 14.0, *)
 @MainActor
 enum SKOverlayPresenter {
+    private static let presentedScene = WeakObjectReference<UIWindowScene>()
+
     /// Presents an SKOverlay for `appID` (numeric App Store id) honoring position + dismissibility, and
     /// carrying any [attribution] tokens so the install the overlay drives is credited to the campaign.
     /// Best-effort: a disabled config or a missing scene simply no-ops (the impression is unaffected).
-    static func present(appID: String, config: SKOverlayConfig, attribution: AdAttribution? = nil) {
-        guard config.enabled, !appID.isEmpty,
-              let scene = preferredForegroundActiveWindowScene() else { return }
+    static func present(
+        appID: String,
+        config: SKOverlayConfig,
+        attribution: AdAttribution? = nil,
+        originatingScene: UIWindowScene? = nil
+    ) {
+        guard config.enabled, !appID.isEmpty else { return }
+        let scene: UIWindowScene?
+        if let originatingScene {
+            scene = originatingScene.activationState == .foregroundActive ? originatingScene : nil
+        } else {
+            scene = preferredForegroundActiveWindowScene()
+        }
+        guard let scene else { return }
 
         let position: SKOverlay.Position = config.position == .bottomRaised ? .bottomRaised : .bottom
         let appConfig = SKOverlay.AppConfiguration(appIdentifier: appID, position: position)
@@ -51,6 +64,7 @@ enum SKOverlayPresenter {
 
         let overlay = SKOverlay(configuration: appConfig)
         overlay.present(in: scene)
+        presentedScene.value = scene
     }
 
     /// Builds the documented view-through impression for the overlay from the server's signed
@@ -82,10 +96,11 @@ enum SKOverlayPresenter {
         return impression
     }
 
-    /// Dismisses any SKOverlay currently shown in the active scene (called on creative teardown so
-    /// the banner doesn't outlive the ad).
+    /// Dismisses in the exact scene used for presentation, so multi-window hosts cannot leak an
+    /// overlay into one scene while teardown targets another.
     static func dismiss() {
-        guard let scene = preferredForegroundActiveWindowScene() else { return }
+        guard let scene = presentedScene.value else { return }
+        presentedScene.value = nil
         SKOverlay.dismiss(in: scene)
     }
 

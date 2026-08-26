@@ -182,6 +182,9 @@ final class FallbackAdPresenter {
     private var ctaStoreOpen: StoreOpen = .skstoreproduct
     private var ctaStoreUrl: String?
     private var attribution: AdAttribution?
+    private var telemetryAdFormat = "interstitial"
+    private var telemetryAdUnitId: String?
+    private var telemetryServeId: String?
     private var loadingDeadlineTask: Task<Void, Never>?
     private var onLoadingTimeout: (() -> Void)?
     private var isLoading = false
@@ -202,6 +205,9 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        telemetryAdFormat: String = "interstitial",
+        telemetryAdUnitId: String? = nil,
+        telemetryServeId: String? = nil,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -218,6 +224,9 @@ final class FallbackAdPresenter {
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
+            telemetryAdFormat: telemetryAdFormat,
+            telemetryAdUnitId: telemetryAdUnitId,
+            telemetryServeId: telemetryServeId,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -235,6 +244,9 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        telemetryAdFormat: String = "interstitial",
+        telemetryAdUnitId: String? = nil,
+        telemetryServeId: String? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
@@ -252,6 +264,9 @@ final class FallbackAdPresenter {
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
+            telemetryAdFormat: telemetryAdFormat,
+            telemetryAdUnitId: telemetryAdUnitId,
+            telemetryServeId: telemetryServeId,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -281,6 +296,9 @@ final class FallbackAdPresenter {
         attribution: AdAttribution?,
         autoStoreRedirect: AutoStoreRedirect?,
         onAdClick: ((ClickInteraction) -> Void)?,
+        telemetryAdFormat: String,
+        telemetryAdUnitId: String?,
+        telemetryServeId: String?,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -298,6 +316,9 @@ final class FallbackAdPresenter {
         self.attribution = attribution
         self.autoStoreRedirect = autoStoreRedirect
         self.onAdClick = onAdClick
+        self.telemetryAdFormat = telemetryAdFormat
+        self.telemetryAdUnitId = telemetryAdUnitId
+        self.telemetryServeId = telemetryServeId
         self.presentationLease = presentationLease
         isLoading = startsLoading
         if !startsLoading { loadingGeneration = nil }
@@ -412,6 +433,9 @@ final class FallbackAdPresenter {
             adId: ad.adId,
             html: ad.html,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            telemetryAdFormat: telemetryAdFormat,
+            telemetryAdUnitId: telemetryAdUnitId,
+            telemetryServeId: telemetryServeId,
             onAdClick: { [weak self] interaction in self?.onAdClick?(interaction) },
             onClickHandoffPendingChanged: { [weak self] pending in
                 guard let self, self.index == index else { return }

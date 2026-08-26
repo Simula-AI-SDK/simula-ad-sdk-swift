@@ -1215,8 +1215,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
 
-            // Intercept itms-apps:// and itms:// schemes (direct App Store links)
-            if scheme == "itms-apps" || scheme == "itms" {
+            // Intercept every canonical direct App Store scheme.
+            if isDirectAppStoreScheme(scheme) {
                 guard appStoreID(from: url) != nil else {
                     decisionHandler(.cancel)
                     return

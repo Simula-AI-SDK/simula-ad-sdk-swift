@@ -42,6 +42,21 @@ final class CompletionLatch: @unchecked Sendable {
     }
 }
 
+final class WeakObjectReference<Object: AnyObject> {
+    weak var value: Object?
+
+    init(_ value: Object? = nil) {
+        self.value = value
+    }
+}
+
+private let directAppStoreSchemes: Set<String> = ["itms", "itms-apps", "itms-appss"]
+
+func isDirectAppStoreScheme(_ scheme: String?) -> Bool {
+    guard let scheme else { return false }
+    return directAppStoreSchemes.contains(scheme.lowercased())
+}
+
 enum ClickSource: String, Codable, Sendable {
     case primaryCTA = "primary_cta"
     case storePrompt = "store_prompt"
@@ -147,6 +162,19 @@ func preferredActiveScene<Scene: AnyObject>(
         ?? scenes.first { isActive($0) }
 }
 
+func committedRouteTerminalAvailability(originatingScene: AnyObject?) -> () -> Bool {
+    let scene = WeakObjectReference(originatingScene)
+    return {
+        #if os(iOS)
+        guard UIApplication.shared.applicationState == .active,
+              let windowScene = scene.value as? UIWindowScene else { return false }
+        return windowScene.activationState == .foregroundActive
+        #else
+        return scene.value != nil
+        #endif
+    }
+}
+
 #if os(iOS)
 @MainActor
 func preferredForegroundActiveWindowScene(originating: UIWindowScene? = nil) -> UIWindowScene? {
@@ -176,6 +204,8 @@ final class AttributionRouteExecution {
     var originatingScene: UIWindowScene? { originatingSceneObject as? UIWindowScene }
 #endif
     private let isActive: () -> Bool
+    private let survivesPresentationTeardownAfterBegin: Bool
+    private let canCompleteAfterPresentationTeardown: () -> Bool
     private let onUIHandoffReleased: () -> Void
     private let onOutcome: (AttributionRouteOutcome) -> Void
 
@@ -183,18 +213,22 @@ final class AttributionRouteExecution {
         id: UUID = UUID(),
         originatingScene: AnyObject? = nil,
         isActive: @escaping () -> Bool,
+        survivesPresentationTeardownAfterBegin: Bool = false,
+        canCompleteAfterPresentationTeardown: @escaping () -> Bool = { true },
         onUIHandoffReleased: @escaping () -> Void = {},
         onOutcome: @escaping (AttributionRouteOutcome) -> Void
     ) {
         self.id = id
         self.originatingSceneObject = originatingScene
         self.isActive = isActive
+        self.survivesPresentationTeardownAfterBegin = survivesPresentationTeardownAfterBegin
+        self.canCompleteAfterPresentationTeardown = canCompleteAfterPresentationTeardown
         self.onUIHandoffReleased = onUIHandoffReleased
         self.onOutcome = onOutcome
     }
 
-    /// Releases only the short-lived UI close gate. The route remains running and retains its
-    /// presentation lifecycle until a terminal outcome arrives.
+    /// Releases only the short-lived UI close gate. A committed user route remains running until a
+    /// terminal outcome arrives even if its fullscreen presentation is subsequently torn down.
     func releaseUIHandoff() {
         guard !uiHandoffReleased else { return }
         uiHandoffReleased = true
@@ -221,7 +255,11 @@ final class AttributionRouteExecution {
         guard case .running(let path) = state else { return }
         state = .finished
         releaseUIHandoff()
-        guard isActive() else {
+        let presentationActive = isActive()
+        let canCompleteCommittedRoute = !presentationActive
+            && survivesPresentationTeardownAfterBegin
+            && canCompleteAfterPresentationTeardown()
+        guard presentationActive || canCompleteCommittedRoute else {
             onOutcome(AttributionRouteOutcome(
                 path: path,
                 success: false,
@@ -288,6 +326,7 @@ func makeCreativeAttributionRouteExecution(
     source: ClickSource,
     originatingScene: AnyObject? = nil,
     isActive: @escaping () -> Bool,
+    canCompleteAfterPresentationTeardown: (() -> Bool)? = nil,
     onUIHandoffReleased: @escaping () -> Void,
     onTerminalOutcome: ((AttributionRouteOutcome) -> Void)?,
     onFinished: @escaping (UUID) -> Void
@@ -296,6 +335,9 @@ func makeCreativeAttributionRouteExecution(
         id: id,
         originatingScene: originatingScene,
         isActive: isActive,
+        survivesPresentationTeardownAfterBegin: true,
+        canCompleteAfterPresentationTeardown: canCompleteAfterPresentationTeardown
+            ?? committedRouteTerminalAvailability(originatingScene: originatingScene),
         onUIHandoffReleased: onUIHandoffReleased,
         onOutcome: { outcome in
             recordAttributionRoute(outcome: outcome, source: source)
@@ -575,7 +617,7 @@ enum CreativeCTAOpenMessage {
         if scheme == "http" || scheme == "https" {
             return url.host?.isEmpty == false
         }
-        if scheme == "itms" || scheme == "itms-apps" {
+        if isDirectAppStoreScheme(scheme) {
             return directAppStoreID(from: url) != nil
         }
         return externalClickOnly || destination == .web
@@ -604,6 +646,10 @@ private func isAppleAppStoreHost(_ host: String) -> Bool {
         || host.hasSuffix(".itunes.apple.com")
 }
 
+func shouldStopRedirectResolution(at url: URL) -> Bool {
+    isAppleAppStoreHost(url.host ?? "") || isDirectAppStoreScheme(url.scheme)
+}
+
 private func capturedDirectStoreID(_ regex: NSRegularExpression?, in string: String) -> String? {
     guard let regex else { return nil }
     let range = NSRange(string.startIndex..., in: string)
@@ -615,7 +661,7 @@ private func capturedDirectStoreID(_ regex: NSRegularExpression?, in string: Str
 
 func directAppStoreID(from url: URL) -> String? {
     let scheme = url.scheme?.lowercased() ?? ""
-    if scheme == "itms-apps" || scheme == "itms" {
+    if isDirectAppStoreScheme(scheme) {
         let host = url.host?.lowercased() ?? ""
         guard isAppleAppStoreHost(host) else { return nil }
         return capturedDirectStoreID(directAppStorePathIDRegex, in: url.path)
@@ -991,7 +1037,7 @@ enum CreativeCTARouter {
     /// surface is opened deterministically instead of by navigating the tracker's redirect chain.
     /// Uses the same Safari-style-UA session configuration as `RedirectResolver`, so the click
     /// fingerprints for probabilistic attribution exactly like a resolved click. Redirects are
-    /// followed by default; a hop into a non-http scheme (`itms-appss://`) just ends the task.
+    /// followed by default; App Store scheme hops are recognized by `RedirectResolver`.
     nonisolated static func fireClickTracker(_ url: URL) {
         let scheme = url.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else { return }
@@ -1201,7 +1247,11 @@ enum CreativeCTARouter {
         let rootVC: UIViewController?
         if let override = presentationRootOverrideForTesting {
             rootVC = override()
-        } else if let scene = preferredForegroundActiveWindowScene(originating: originatingScene) {
+        } else if let originatingScene {
+            guard originatingScene.activationState == .foregroundActive else { return false }
+            rootVC = (originatingScene.windows.first(where: \.isKeyWindow)
+                      ?? originatingScene.windows.first)?.rootViewController
+        } else if let scene = preferredForegroundActiveWindowScene() {
             rootVC = (scene.windows.first(where: \.isKeyWindow)
                       ?? scene.windows.first)?.rootViewController
         } else {
@@ -1432,12 +1482,8 @@ final class RedirectResolver: NSObject, URLSessionTaskDelegate, URLSessionDataDe
             return
         }
 
-        let scheme = redirectURL.scheme?.lowercased() ?? ""
-        let host = redirectURL.host?.lowercased() ?? ""
-
-        // Stop at App Store URLs or non-HTTP schemes
-        if isAppleAppStoreHost(host)
-            || scheme == "itms-apps" || scheme == "itms" {
+        // Stop at App Store hosts or canonical direct App Store schemes.
+        if shouldStopRedirectResolution(at: redirectURL) {
             finish(with: redirectURL)
             completionHandler(nil)
             return
