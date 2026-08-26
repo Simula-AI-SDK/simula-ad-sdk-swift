@@ -67,6 +67,10 @@ func canAdvanceFallback(renderedIndex: Int, currentIndex: Int, clickHandoffIndex
     renderedIndex == currentIndex && clickHandoffIndex != renderedIndex
 }
 
+func canHandleFallbackScreenCallback(renderedIndex: Int, currentIndex: Int) -> Bool {
+    renderedIndex == currentIndex
+}
+
 /// Pure one-presentation state machine. Generation ownership makes a timeout and a late fetch
 /// mutually exclusive, while terminal transitions return an outcome only once.
 struct FallbackPresentationCoordinator: Sendable {
@@ -451,9 +455,13 @@ final class FallbackAdPresenter {
             ctaStoreUrl: ctaStoreUrl,
             attribution: attribution,
             routeLifecycle: routeLifecycle,
-            onPresented: { [weak self] in
-                guard let self, self.index == index else { return }
+            onScreenMounted: { [weak self] in
+                guard let self, canHandleFallbackScreenCallback(
+                    renderedIndex: index,
+                    currentIndex: self.index
+                ) else { return false }
                 self.fireAutoStoreRedirectIfMatching(index: index, lifecycle: routeLifecycle)
+                return true
             }
         ).id(index))
     }

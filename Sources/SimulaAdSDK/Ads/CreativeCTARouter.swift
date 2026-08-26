@@ -198,12 +198,15 @@ final class AttributionRouteExecution {
 
     private var state = State.pending
     private var uiHandoffReleased = false
+    private var deterministicTrackerDelivered = false
     let id: UUID
+    private let originatingSceneWasProvided: Bool
     private weak var originatingSceneObject: AnyObject?
 #if os(iOS)
     var originatingScene: UIWindowScene? { originatingSceneObject as? UIWindowScene }
 #endif
     private let isActive: () -> Bool
+    private let allowsDetachedDeterministicAttribution: Bool
     private let survivesPresentationTeardownAfterBegin: Bool
     private let canCompleteAfterPresentationTeardown: () -> Bool
     private let onUIHandoffReleased: () -> Void
@@ -213,14 +216,17 @@ final class AttributionRouteExecution {
         id: UUID = UUID(),
         originatingScene: AnyObject? = nil,
         isActive: @escaping () -> Bool,
+        allowsDetachedDeterministicAttribution: Bool = false,
         survivesPresentationTeardownAfterBegin: Bool = false,
         canCompleteAfterPresentationTeardown: @escaping () -> Bool = { true },
         onUIHandoffReleased: @escaping () -> Void = {},
         onOutcome: @escaping (AttributionRouteOutcome) -> Void
     ) {
         self.id = id
+        self.originatingSceneWasProvided = originatingScene != nil
         self.originatingSceneObject = originatingScene
         self.isActive = isActive
+        self.allowsDetachedDeterministicAttribution = allowsDetachedDeterministicAttribution
         self.survivesPresentationTeardownAfterBegin = survivesPresentationTeardownAfterBegin
         self.canCompleteAfterPresentationTeardown = canCompleteAfterPresentationTeardown
         self.onUIHandoffReleased = onUIHandoffReleased
@@ -235,9 +241,37 @@ final class AttributionRouteExecution {
         onUIHandoffReleased()
     }
 
+    /// Delivers the click-classified tracker once for a deterministic tracker + store route. A
+    /// committed user click may outlive its presentation; automatic routes remain presentation-bound.
+    func deliverDeterministicTracker(_ tracker: URL, sender: (URL) -> Void) {
+        switch state {
+        case .pending, .running:
+            break
+        case .finished:
+            return
+        }
+        guard !deterministicTrackerDelivered,
+              allowsDetachedDeterministicAttribution || presentationIsActive() else { return }
+        deterministicTrackerDelivered = true
+        sender(tracker)
+    }
+
+    private func presentationIsActive() -> Bool {
+        guard isActive() else { return false }
+        #if os(iOS)
+        if originatingSceneWasProvided {
+            guard let originatingScene else { return false }
+            return originatingScene.activationState == .foregroundActive
+        }
+        #else
+        if originatingSceneWasProvided && originatingSceneObject == nil { return false }
+        #endif
+        return true
+    }
+
     func begin(path: AttributionRoutePath) -> Bool {
         guard case .pending = state else { return false }
-        guard isActive() else {
+        guard presentationIsActive() else {
             state = .finished
             releaseUIHandoff()
             onOutcome(AttributionRouteOutcome(
@@ -255,7 +289,7 @@ final class AttributionRouteExecution {
         guard case .running(let path) = state else { return }
         state = .finished
         releaseUIHandoff()
-        let presentationActive = isActive()
+        let presentationActive = presentationIsActive()
         let canCompleteCommittedRoute = !presentationActive
             && survivesPresentationTeardownAfterBegin
             && canCompleteAfterPresentationTeardown()
@@ -335,6 +369,7 @@ func makeCreativeAttributionRouteExecution(
         id: id,
         originatingScene: originatingScene,
         isActive: isActive,
+        allowsDetachedDeterministicAttribution: true,
         survivesPresentationTeardownAfterBegin: true,
         canCompleteAfterPresentationTeardown: canCompleteAfterPresentationTeardown
             ?? committedRouteTerminalAvailability(originatingScene: originatingScene),
@@ -440,6 +475,23 @@ final class AutomaticRouteCoordinator {
         start()
         return .started
     }
+}
+
+@MainActor
+@discardableResult
+func routeCommittedUserHandoff(
+    coordinator: AutomaticRouteCoordinator,
+    handoff: AutomaticRouteUserHandoff,
+    scope: AnyHashable,
+    execution: AttributionRouteExecution,
+    route: (AttributionRouteExecution) -> Void
+) -> Bool {
+    guard coordinator.commitUserHandoff(handoff, scope: scope) else {
+        execution.cancel()
+        return false
+    }
+    route(execution)
+    return true
 }
 
 /// Exactly-once automatic-route admission for one ad surface. Automatic store redirects are not
@@ -842,7 +894,8 @@ enum CreativeCTARouter {
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
-        execution: AttributionRouteExecution
+        execution: AttributionRouteExecution,
+        trackerSender: @escaping (URL) -> Void = { fireClickTracker($0) }
     ) {
         if let directStoreURL = validatedDirectAppStoreURL(trackingUrl),
            let appID = appStoreID(from: directStoreURL) {
@@ -891,7 +944,8 @@ enum CreativeCTARouter {
                 initialURL: url,
                 destination: destination,
                 storeUrl: storeUrl,
-                execution: execution
+                execution: execution,
+                trackerSender: trackerSender
             )
             return
         }
@@ -911,9 +965,9 @@ enum CreativeCTARouter {
                     )
                 }
             } else if let appID = appStoreID(fromString: storeUrl) {
+                execution.deliverDeterministicTracker(url, sender: trackerSender)
                 guard execution.begin(path: .rawStoreFallback) else { return }
                 execution.complete {
-                    fireClickTracker(url)
                     return presentStoreProduct(
                         appID: appID,
                         attribution: attribution,
@@ -945,7 +999,8 @@ enum CreativeCTARouter {
         fallbackStoreURL: URL? = nil,
         externalClickOnly: Bool = false,
         attribution: AdAttribution? = nil,
-        execution: AttributionRouteExecution
+        execution: AttributionRouteExecution,
+        trackerSender: @escaping (URL) -> Void = { fireClickTracker($0) }
     ) {
         let plan = creativeRoutePlan(
             selectedURL: url,
@@ -972,9 +1027,9 @@ enum CreativeCTARouter {
                 )
             }
         case .trackerWithStore(let tracker, let storeURL, let appID, let mode):
+            execution.deliverDeterministicTracker(tracker, sender: trackerSender)
             guard execution.begin(path: .rawStoreFallback) else { return }
             execution.complete {
-                fireClickTracker(tracker)
                 return openStoreDestination(
                     storeURL: storeURL,
                     appID: appID,
@@ -988,7 +1043,8 @@ enum CreativeCTARouter {
                 openExternally(
                     initialURL: tracker,
                     destination: .appstore,
-                    execution: execution
+                    execution: execution,
+                    trackerSender: trackerSender
                 )
             } else {
                 resolveAndRoute(url: tracker, attribution: attribution, execution: execution)
@@ -1281,7 +1337,8 @@ enum CreativeCTARouter {
         initialURL: URL,
         destination: AdDestination,
         storeUrl: String? = nil,
-        execution: AttributionRouteExecution
+        execution: AttributionRouteExecution,
+        trackerSender: @escaping (URL) -> Void = { fireClickTracker($0) }
     ) {
         guard CreativeCTAOpenMessage.isAllowed(
             initialURL,
@@ -1311,9 +1368,9 @@ enum CreativeCTARouter {
         // Deterministic external store open: fire the tracker in the background and jump straight
         // to the App Store from the raw store link — no redirect-chain dependency.
         if let storeURL = validatedDirectAppStoreURL(storeUrl) {
+            execution.deliverDeterministicTracker(initialURL, sender: trackerSender)
             guard execution.begin(path: .rawStoreFallback) else { return }
             execution.complete {
-                fireClickTracker(initialURL)
                 UIApplication.shared.open(storeURL)
                 return true
             }

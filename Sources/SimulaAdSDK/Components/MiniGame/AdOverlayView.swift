@@ -66,6 +66,30 @@ struct AdOverlayLoadCoordinator {
     }
 }
 
+/// One-shot ownership for the screen-installed event. A SwiftUI re-appearance or a late WebView
+/// callback cannot manufacture another END_SCREEN_N_OPEN trigger for the same overlay identity.
+struct AdOverlayScreenMountCoordinator {
+    private enum Phase { case idle, scheduled, delivered }
+    private var phase: Phase = .idle
+    var isMounted: Bool { phase == .delivered }
+
+    mutating func scheduleIfNeeded() -> Bool {
+        guard phase == .idle else { return false }
+        phase = .scheduled
+        return true
+    }
+
+    mutating func markDelivered() -> Bool {
+        guard phase == .scheduled else { return false }
+        phase = .delivered
+        return true
+    }
+
+    mutating func cancelScheduled() {
+        if phase == .scheduled { phase = .idle }
+    }
+}
+
 // MARK: - AdOverlayView
 
 /// Full-screen overlay that displays an ad iframe after a minigame session.
@@ -112,9 +136,9 @@ public struct AdOverlayView: View {
     var attribution: AdAttribution? = nil
     /// Presentation-owned routing state shared with configured and in-WebView automatic routes.
     var routeLifecycle: AttributionRouteLifecycle? = nil
-    /// Fires after lifecycle observers are mounted, so automatic store presentation cannot race
-    /// ahead of the sheet/background notifications that pause the close gate.
-    var onPresented: (() -> Void)? = nil
+    /// Fires once after this screen's route lifecycle and lifecycle observers are mounted. This is
+    /// deliberately independent of WebView readiness: END_SCREEN_N_OPEN means screen installation.
+    var onScreenMounted: (() -> Bool)? = nil
 
     /// The pooled WebView is transparent, so keep native black above it until the current page is
     /// actually ready. A failed navigation deliberately leaves the safe surface in place.
@@ -126,11 +150,11 @@ public struct AdOverlayView: View {
     @State private var pageFinished = false
     /// A watchdog timeout fails open: close remains available even if the same load finishes later.
     @State private var loadTimedOut = false
-    @State private var presentationStarted = false
     @State private var hasAppeared = false
     @State private var loadedCreativeIdentity: String?
     @State private var loadCoordinator = AdOverlayLoadCoordinator()
     @State private var loadWatchdogTask: Task<Void, Never>?
+    @State private var screenMountCoordinator = AdOverlayScreenMountCoordinator()
     @State private var clickHandoffPending = false
     @State private var localRouteLifecycle = AttributionRouteLifecycle()
     /// Countdown seconds remaining (starts at 5)
@@ -341,6 +365,23 @@ public struct AdOverlayView: View {
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
+            if screenMountCoordinator.scheduleIfNeeded() {
+                // Let the outer lifecycle modifier finish installing its notification subscriptions
+                // before an automatic store sheet can synchronously publish will-present.
+                let mounted = onScreenMounted
+                DispatchQueue.main.async {
+                    guard hasAppeared, activeRouteLifecycle.isActive else {
+                        screenMountCoordinator.cancelScheduled()
+                        return
+                    }
+                    let accepted = mounted?() ?? true
+                    if accepted {
+                        _ = screenMountCoordinator.markDelivered()
+                    } else {
+                        screenMountCoordinator.cancelScheduled()
+                    }
+                }
+            }
             if !hasLoadableCreative {
                 startCurrentCreativeLoadIfNeeded()
                 markPageFailed()
@@ -350,6 +391,7 @@ public struct AdOverlayView: View {
             }
         }
         .onDisappear {
+            screenMountCoordinator.cancelScheduled()
             activeRouteLifecycle.deactivate()
             hasAppeared = false
             loadWatchdogTask?.cancel()
@@ -465,7 +507,6 @@ public struct AdOverlayView: View {
         adPageFailed = false
         pageFinished = false
         loadTimedOut = false
-        presentationStarted = false
         adCountdown = 5
         ringProgress = 0
         accumulatedMs = 0
@@ -505,16 +546,11 @@ public struct AdOverlayView: View {
     /// after the view is mounted and lifecycle observers can pause any immediate store presentation.
     private func beginPresentationIfReady() {
         guard hasAppeared, pageFinished, !adPageFailed else { return }
-        if !presentationStarted {
-            presentationStarted = true
-            onPresented?()
-        }
         reconcileCountdown()
     }
 
     /// A terminal/no-content failure must not strand the user behind a spinner and a close gate for
-    /// content that was never viewable. It also deliberately does not call `onPresented`, preventing
-    /// presentation-timed auto redirects from firing for a failed end screen.
+    /// content that was never viewable. Screen-mounted behavior has already been delivered separately.
     private func markPageFailed() {
         startCurrentCreativeLoadIfNeeded()
         guard loadCoordinator.failCurrentLoad() else { return }
@@ -534,7 +570,7 @@ public struct AdOverlayView: View {
 
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
     private func reconcileCountdown() {
-        if hasAppeared && presentationStarted && !adPageFailed && !loadTimedOut
+        if hasAppeared && pageFinished && !adPageFailed && !loadTimedOut
             && appForegrounded && !storeSheetPresented {
             startCountdown()
         } else {

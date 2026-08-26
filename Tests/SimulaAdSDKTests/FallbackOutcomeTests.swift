@@ -9,6 +9,32 @@ final class FallbackOutcomeTests: XCTestCase {
         XCTAssertTrue(canAdvanceFallback(renderedIndex: 1, currentIndex: 1, clickHandoffIndex: 0))
     }
 
+    func testFallbackScreenMountIsOnceOnlyAndIndependentOfPageCompletion() {
+        var mount = AdOverlayScreenMountCoordinator()
+
+        XCTAssertTrue(mount.scheduleIfNeeded())
+        XCTAssertTrue(mount.markDelivered())
+        XCTAssertTrue(mount.isMounted)
+        XCTAssertFalse(mount.scheduleIfNeeded(), "re-appearance and late didFinish must not duplicate")
+    }
+
+    func testUndeliveredFallbackMountRearmsForSameScreenReappearance() {
+        var mount = AdOverlayScreenMountCoordinator()
+
+        XCTAssertTrue(mount.scheduleIfNeeded())
+        mount.cancelScheduled()
+        XCTAssertFalse(mount.isMounted)
+        XCTAssertTrue(mount.scheduleIfNeeded())
+        XCTAssertTrue(mount.markDelivered())
+        XCTAssertTrue(mount.isMounted)
+    }
+
+    func testFallbackMountedCallbackRejectsStaleScreenIndex() {
+        XCTAssertTrue(canHandleFallbackScreenCallback(renderedIndex: 0, currentIndex: 0))
+        XCTAssertFalse(canHandleFallbackScreenCallback(renderedIndex: 0, currentIndex: 1))
+        XCTAssertTrue(canHandleFallbackScreenCallback(renderedIndex: 1, currentIndex: 1))
+    }
+
     func testLoadingTimeoutProducesUnavailableOutcomeOnce() {
         var coordinator = FallbackPresentationCoordinator()
         let generation = coordinator.beginLoading()

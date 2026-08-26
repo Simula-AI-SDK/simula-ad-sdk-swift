@@ -6,6 +6,124 @@ import XCTest
 
 final class StoreProductPresentationTests: XCTestCase {
     @MainActor
+    func testCurrentHiddenHandoffCommitsTrackerButCannotPresentUI() throws {
+        let coordinator = AutomaticRouteCoordinator()
+        let scope = AnyHashable("hidden-current")
+        coordinator.activate(scope: scope)
+        let handoff = try XCTUnwrap(coordinator.beginUserHandoff(scope: scope))
+        let tracker = URL(string: "https://tracker.example/click")!
+        var sent: [URL] = []
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            isActive: { false },
+            allowsDetachedDeterministicAttribution: true,
+            onOutcome: { outcomes.append($0) }
+        )
+
+        XCTAssertTrue(routeCommittedUserHandoff(
+            coordinator: coordinator,
+            handoff: handoff,
+            scope: scope,
+            execution: execution,
+            route: { execution in
+                CreativeCTARouter.open(
+                    trackingUrl: tracker.absoluteString,
+                    destination: .appstore,
+                    storeUrl: "https://apps.apple.com/app/id375380948",
+                    execution: execution,
+                    trackerSender: { sent.append($0) }
+                )
+            }
+        ))
+
+        XCTAssertEqual(sent, [tracker])
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testInactiveCommittedWebViewRouteFiresDeterministicTrackerWithoutPresenting() {
+        let tracker = URL(string: "https://tracker.example/click")!
+        var sent: [URL] = []
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = makeCreativeAttributionRouteExecution(
+            id: UUID(),
+            source: .primaryCTA,
+            isActive: { false },
+            onUIHandoffReleased: {},
+            onTerminalOutcome: { outcomes.append($0) },
+            onFinished: { _ in }
+        )
+
+        CreativeCTARouter.routeCreativeTap(
+            url: tracker,
+            destination: .appstore,
+            storeOpen: .skstoreproduct,
+            storeUrl: "https://apps.apple.com/app/id375380948",
+            execution: execution,
+            trackerSender: { sent.append($0) }
+        )
+
+        XCTAssertEqual(sent, [tracker])
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testInactiveCommittedStorePromptRouteFiresTrackerExactlyOnce() {
+        let tracker = URL(string: "https://tracker.example/click")!
+        var sent: [URL] = []
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            isActive: { false },
+            allowsDetachedDeterministicAttribution: true,
+            onOutcome: { outcomes.append($0) }
+        )
+
+        for _ in 0..<2 {
+            CreativeCTARouter.open(
+                trackingUrl: tracker.absoluteString,
+                destination: .appstore,
+                storeUrl: "https://apps.apple.com/app/id375380948",
+                execution: execution,
+                trackerSender: { sent.append($0) }
+            )
+        }
+
+        XCTAssertEqual(sent, [tracker])
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testInactiveAutomaticAndCancelledUserRoutesDoNotFireInjectedTracker() {
+        let tracker = URL(string: "https://tracker.example/click")!
+        var sent: [URL] = []
+        let automatic = AttributionRouteExecution(isActive: { false }, onOutcome: { _ in })
+        CreativeCTARouter.open(
+            trackingUrl: tracker.absoluteString,
+            destination: .appstore,
+            storeUrl: "https://apps.apple.com/app/id375380948",
+            execution: automatic,
+            trackerSender: { sent.append($0) }
+        )
+
+        let cancelled = AttributionRouteExecution(
+            isActive: { true },
+            allowsDetachedDeterministicAttribution: true,
+            onOutcome: { _ in }
+        )
+        cancelled.cancel()
+        CreativeCTARouter.open(
+            trackingUrl: tracker.absoluteString,
+            destination: .appstore,
+            storeUrl: "https://apps.apple.com/app/id375380948",
+            execution: cancelled,
+            trackerSender: { sent.append($0) }
+        )
+
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    @MainActor
     func testDefaultAutomaticDirectStoreRoutePresentsStoreProductController() async {
         CreativeCTARouter.resetExternalPresentationStateForTesting()
         let window = UIWindow(frame: UIScreen.main.bounds)

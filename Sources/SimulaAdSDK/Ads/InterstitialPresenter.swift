@@ -228,7 +228,7 @@ private struct CreativeInterstitialView: View {
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
-    @State private var skOverlayPresented = false
+    @State private var skOverlayOwnership: SKOverlayOwnershipToken?
     @State private var skOverlayTask: Task<Void, Never>?
 
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
@@ -350,8 +350,9 @@ private struct CreativeInterstitialView: View {
             skOverlayTask?.cancel()
             skOverlayTask = nil
             // Tear the install banner down with the ad so it doesn't leak into the host app.
-            if skOverlayPresented, #available(iOS 14.0, *) {
-                SKOverlayPresenter.dismiss()
+            if let skOverlayOwnership, #available(iOS 14.0, *) {
+                SKOverlayPresenter.dismiss(ownershipToken: skOverlayOwnership)
+                self.skOverlayOwnership = nil
             }
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
@@ -677,6 +678,7 @@ private struct CreativeInterstitialView: View {
                             && visible
                             && UIApplication.shared.applicationState == .active
                     },
+                    allowsDetachedDeterministicAttribution: true,
                     survivesPresentationTeardownAfterBegin: true,
                     canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
                         originatingScene: originatingScene
@@ -698,22 +700,13 @@ private struct CreativeInterstitialView: View {
                         }
                     }
                 )
-                guard visible else {
-                    attributionRouteLifecycle.automaticRoutes.cancelUserHandoff(
-                        automaticUserHandoff,
-                        scope: attributionRouteLifecycle.automaticRouteScope
-                    )
-                    execution.cancel()
-                    return
-                }
-                guard attributionRouteLifecycle.automaticRoutes.commitUserHandoff(
-                    automaticUserHandoff,
-                    scope: attributionRouteLifecycle.automaticRouteScope
-                ) else {
-                    execution.cancel()
-                    return
-                }
-                handleStorePromptTap(execution: execution)
+                routeCommittedUserHandoff(
+                    coordinator: attributionRouteLifecycle.automaticRoutes,
+                    handoff: automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope,
+                    execution: execution,
+                    route: handleStorePromptTap
+                )
             }
         }
     }
@@ -739,7 +732,7 @@ private struct CreativeInterstitialView: View {
     }
 
     private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
-        guard !skOverlayPresented, resolvedAppID != nil else { return }
+        guard skOverlayOwnership == nil, resolvedAppID != nil else { return }
         skOverlayTask?.cancel()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         skOverlayTask = Task { await runSKOverlayPresent(config: config) }
@@ -759,7 +752,7 @@ private struct CreativeInterstitialView: View {
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
     /// link) safely no-ops with sampled telemetry.
     private func presentSKOverlay(config: SKOverlayConfig) {
-        guard !skOverlayPresented, let appID = resolvedAppID, !appID.isEmpty else {
+        guard skOverlayOwnership == nil, let appID = resolvedAppID, !appID.isEmpty else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
                 Telemetry.shared.recordOperation(
                     name: "skoverlay_skipped",
@@ -770,9 +763,11 @@ private struct CreativeInterstitialView: View {
             }
             return
         }
+        guard visible, attributionRouteLifecycle.isActive,
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
-        skOverlayPresented = true
-        SKOverlayPresenter.present(
+        skOverlayOwnership = SKOverlayPresenter.present(
             appID: appID,
             config: config,
             attribution: response.skanAttribution,

@@ -646,17 +646,16 @@ struct WebViewRepresentable: UIViewRepresentable {
                         execution.cancel()
                         return
                     }
-                    guard automaticRoutes.commitUserHandoff(
-                        automaticUserHandoff,
-                        scope: automaticRouteScope
-                    ) else {
-                        execution.cancel()
-                        return
-                    }
                     if self?.pendingAutomaticUserHandoff == automaticUserHandoff {
                         self?.pendingAutomaticUserHandoff = nil
                     }
-                    route(execution)
+                    routeCommittedUserHandoff(
+                        coordinator: automaticRoutes,
+                        handoff: automaticUserHandoff,
+                        scope: automaticRouteScope,
+                        execution: execution,
+                        route: route
+                    )
                 }
             }
             return true

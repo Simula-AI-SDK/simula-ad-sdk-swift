@@ -14,6 +14,18 @@ final class AdOverlayLoadCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .timedOut(generation))
     }
 
+    func testMountFiresOnceBeforeTimeoutAndLateFinishCannotDuplicateIt() {
+        var mount = AdOverlayScreenMountCoordinator()
+        var load = AdOverlayLoadCoordinator()
+        let generation = load.beginLoad()
+
+        XCTAssertTrue(mount.scheduleIfNeeded())
+        XCTAssertTrue(mount.markDelivered())
+        XCTAssertTrue(load.timeout(generation: generation))
+        XCTAssertFalse(load.finishCurrentLoad())
+        XCTAssertFalse(mount.scheduleIfNeeded())
+    }
+
     func testStaleTimeoutCannotFailReplacementLoad() {
         var coordinator = AdOverlayLoadCoordinator()
         let staleGeneration = coordinator.beginLoad()

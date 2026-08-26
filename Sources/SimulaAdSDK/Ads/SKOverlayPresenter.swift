@@ -1,3 +1,40 @@
+import Foundation
+
+struct SKOverlayOwnershipState<Owner: Hashable, Scene: Hashable> {
+    private var ownerByScene: [Scene: Owner] = [:]
+    private var sceneByOwner: [Owner: Scene] = [:]
+
+    mutating func install(owner: Owner, scene: Scene) {
+        if let replacedOwner = ownerByScene[scene] {
+            sceneByOwner[replacedOwner] = nil
+        }
+        if let previousScene = sceneByOwner[owner] {
+            ownerByScene[previousScene] = nil
+        }
+        ownerByScene[scene] = owner
+        sceneByOwner[owner] = scene
+    }
+
+    mutating func takeSceneForDismiss(owner: Owner) -> Scene? {
+        guard let scene = sceneByOwner.removeValue(forKey: owner),
+              ownerByScene[scene] == owner else { return nil }
+        ownerByScene[scene] = nil
+        return scene
+    }
+
+    func owns(owner: Owner, scene: Scene) -> Bool {
+        ownerByScene[scene] == owner && sceneByOwner[owner] == scene
+    }
+}
+
+struct SKOverlayOwnershipToken: Hashable, Sendable {
+    fileprivate let id: UUID
+
+    init(id: UUID = UUID()) {
+        self.id = id
+    }
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit
@@ -18,7 +55,8 @@ import StoreKit
 @available(iOS 14.0, *)
 @MainActor
 enum SKOverlayPresenter {
-    private static let presentedScene = WeakObjectReference<UIWindowScene>()
+    private static var ownership = SKOverlayOwnershipState<SKOverlayOwnershipToken, ObjectIdentifier>()
+    private static var presentedScenes: [ObjectIdentifier: WeakObjectReference<UIWindowScene>] = [:]
 
     /// Presents an SKOverlay for `appID` (numeric App Store id) honoring position + dismissibility, and
     /// carrying any [attribution] tokens so the install the overlay drives is credited to the campaign.
@@ -28,15 +66,16 @@ enum SKOverlayPresenter {
         config: SKOverlayConfig,
         attribution: AdAttribution? = nil,
         originatingScene: UIWindowScene? = nil
-    ) {
-        guard config.enabled, !appID.isEmpty else { return }
+    ) -> SKOverlayOwnershipToken? {
+        guard config.enabled, !appID.isEmpty,
+              UIApplication.shared.applicationState == .active else { return nil }
         let scene: UIWindowScene?
         if let originatingScene {
             scene = originatingScene.activationState == .foregroundActive ? originatingScene : nil
         } else {
             scene = preferredForegroundActiveWindowScene()
         }
-        guard let scene else { return }
+        guard let scene else { return nil }
 
         let position: SKOverlay.Position = config.position == .bottomRaised ? .bottomRaised : .bottom
         let appConfig = SKOverlay.AppConfiguration(appIdentifier: appID, position: position)
@@ -64,7 +103,11 @@ enum SKOverlayPresenter {
 
         let overlay = SKOverlay(configuration: appConfig)
         overlay.present(in: scene)
-        presentedScene.value = scene
+        let token = SKOverlayOwnershipToken()
+        let sceneID = ObjectIdentifier(scene)
+        ownership.install(owner: token, scene: sceneID)
+        presentedScenes[sceneID] = WeakObjectReference(scene)
+        return token
     }
 
     /// Builds the documented view-through impression for the overlay from the server's signed
@@ -98,9 +141,10 @@ enum SKOverlayPresenter {
 
     /// Dismisses in the exact scene used for presentation, so multi-window hosts cannot leak an
     /// overlay into one scene while teardown targets another.
-    static func dismiss() {
-        guard let scene = presentedScene.value else { return }
-        presentedScene.value = nil
+    static func dismiss(ownershipToken: SKOverlayOwnershipToken) {
+        guard let sceneID = ownership.takeSceneForDismiss(owner: ownershipToken) else { return }
+        let scene = presentedScenes.removeValue(forKey: sceneID)?.value
+        guard let scene, ObjectIdentifier(scene) == sceneID else { return }
         SKOverlay.dismiss(in: scene)
     }
 

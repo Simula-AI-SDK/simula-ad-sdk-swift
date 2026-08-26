@@ -590,6 +590,7 @@ private struct RewardedGameView: View {
                             && visible
                             && UIApplication.shared.applicationState == .active
                     },
+                    allowsDetachedDeterministicAttribution: true,
                     survivesPresentationTeardownAfterBegin: true,
                     canCompleteAfterPresentationTeardown: committedRouteTerminalAvailability(
                         originatingScene: originatingScene
@@ -611,22 +612,13 @@ private struct RewardedGameView: View {
                         }
                     }
                 )
-                guard visible else {
-                    attributionRouteLifecycle.automaticRoutes.cancelUserHandoff(
-                        automaticUserHandoff,
-                        scope: attributionRouteLifecycle.automaticRouteScope
-                    )
-                    execution.cancel()
-                    return
-                }
-                guard attributionRouteLifecycle.automaticRoutes.commitUserHandoff(
-                    automaticUserHandoff,
-                    scope: attributionRouteLifecycle.automaticRouteScope
-                ) else {
-                    execution.cancel()
-                    return
-                }
-                handleStorePromptTap(execution: execution)
+                routeCommittedUserHandoff(
+                    coordinator: attributionRouteLifecycle.automaticRoutes,
+                    handoff: automaticUserHandoff,
+                    scope: attributionRouteLifecycle.automaticRouteScope,
+                    execution: execution,
+                    route: handleStorePromptTap
+                )
             }
         }
     }

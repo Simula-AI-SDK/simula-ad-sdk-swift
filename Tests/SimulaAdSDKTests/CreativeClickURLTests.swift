@@ -808,6 +808,82 @@ final class CreativeClickURLTests: XCTestCase {
     }
 
     @MainActor
+    func testCommittedUserDeterministicTrackerSurvivesInactivePresentationExactlyOnce() {
+        var outcomes: [AttributionRouteOutcome] = []
+        var sent: [URL] = []
+        let tracker = URL(string: "https://tracker.example/click")!
+        let execution = makeCreativeAttributionRouteExecution(
+            id: UUID(),
+            source: .primaryCTA,
+            isActive: { false },
+            onUIHandoffReleased: {},
+            onTerminalOutcome: { outcomes.append($0) },
+            onFinished: { _ in }
+        )
+
+        execution.deliverDeterministicTracker(tracker) { sent.append($0) }
+        execution.deliverDeterministicTracker(tracker) { sent.append($0) }
+        XCTAssertFalse(execution.begin(path: .rawStoreFallback))
+
+        XCTAssertEqual(sent, [tracker])
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    @MainActor
+    func testAutomaticAndPreCommitCancelledRoutesDoNotDetachTrackerDelivery() {
+        let tracker = URL(string: "https://tracker.example/click")!
+        var automaticSends = 0
+        let automatic = AttributionRouteExecution(
+            isActive: { false },
+            onOutcome: { _ in }
+        )
+        automatic.deliverDeterministicTracker(tracker) { _ in automaticSends += 1 }
+        XCTAssertFalse(automatic.begin(path: .rawStoreFallback))
+        XCTAssertEqual(automaticSends, 0)
+
+        var cancelledSends = 0
+        let cancelled = AttributionRouteExecution(
+            isActive: { true },
+            allowsDetachedDeterministicAttribution: true,
+            onOutcome: { _ in }
+        )
+        cancelled.cancel()
+        cancelled.deliverDeterministicTracker(tracker) { _ in cancelledSends += 1 }
+        XCTAssertEqual(cancelledSends, 0)
+    }
+
+    @MainActor
+    func testStaleWebViewOrStorePromptHandoffNeverReachesCommittedRouteSender() throws {
+        let coordinator = AutomaticRouteCoordinator()
+        let scope = AnyHashable("stale-surface")
+        coordinator.activate(scope: scope)
+        let handoff = try XCTUnwrap(coordinator.beginUserHandoff(scope: scope))
+        coordinator.deactivate(scope: scope)
+        var sends = 0
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            isActive: { false },
+            allowsDetachedDeterministicAttribution: true,
+            onOutcome: { outcomes.append($0) }
+        )
+
+        XCTAssertFalse(routeCommittedUserHandoff(
+            coordinator: coordinator,
+            handoff: handoff,
+            scope: scope,
+            execution: execution,
+            route: { execution in
+                execution.deliverDeterministicTracker(
+                    URL(string: "https://tracker.example/click")!
+                ) { _ in sends += 1 }
+            }
+        ))
+
+        XCTAssertEqual(sends, 0)
+        XCTAssertEqual(outcomes.first?.failureClass, "cancelled")
+    }
+
+    @MainActor
     func testCommittedRouteDoesNotCompleteWhenCapturedSceneBecomesUnavailable() {
         var outcomes: [AttributionRouteOutcome] = []
         var routes = 0
@@ -876,6 +952,22 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertTrue(reference.value === scene)
         scene = nil
         XCTAssertNil(reference.value)
+    }
+
+    @MainActor
+    func testLostCapturedSceneCannotFallThroughToAnotherPresentationContext() {
+        final class Scene {}
+        var scene: Scene? = Scene()
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            originatingScene: scene,
+            isActive: { true },
+            onOutcome: { outcomes.append($0) }
+        )
+        scene = nil
+
+        XCTAssertFalse(execution.begin(path: .directStore))
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
     }
 
     @MainActor
