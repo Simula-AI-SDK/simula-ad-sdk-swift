@@ -1,5 +1,17 @@
 import Foundation
 
+enum StoreProductPrewarmMiss: String, Equatable {
+    case empty
+    case keyMismatch = "key_mismatch"
+    case alreadyConsumed = "already_consumed"
+    case disabled
+}
+
+enum StoreProductPrewarmLookup<Product> {
+    case hit(Product, ready: Bool)
+    case miss(StoreProductPrewarmMiss)
+}
+
 /// Pure one-entry ownership used to bound StoreKit controller allocation and make consumption
 /// one-shot. A reservation token prevents an old load completion from clearing a newer entry.
 struct StoreProductPrewarmSlot<Key: Equatable, Product> {
@@ -23,6 +35,7 @@ struct StoreProductPrewarmSlot<Key: Equatable, Product> {
         let key: Key
         var product: Product?
         var status: Status
+        var useEnabled: Bool
     }
 
     private var entry: Entry?
@@ -33,7 +46,7 @@ struct StoreProductPrewarmSlot<Key: Equatable, Product> {
         if let current = entry {
             switch current.status {
             case .loading:
-                if current.key != key { pendingKey = key }
+                if current.key != key || !current.useEnabled { pendingKey = key }
                 return nil
             case .ready:
                 guard current.key != key else { return nil }
@@ -42,13 +55,31 @@ struct StoreProductPrewarmSlot<Key: Equatable, Product> {
         }
         let token = UUID()
         let product = makeProduct()
-        entry = Entry(token: token, key: key, product: product, status: .loading)
+        entry = Entry(token: token, key: key, product: product, status: .loading, useEnabled: true)
         if pendingKey == key { pendingKey = nil }
         return Reservation(token: token, product: product)
     }
 
     mutating func consume(key: Key) -> Product? {
-        guard var current = entry, current.key == key, let product = current.product else { return nil }
+        guard case .hit(let product, _) = lookup(key: key) else { return nil }
+        return product
+    }
+
+    mutating func lookup(key: Key) -> StoreProductPrewarmLookup<Product> {
+        guard var current = entry else { return .miss(.empty) }
+        guard current.key == key else {
+            if pendingKey == key { pendingKey = nil }
+            return .miss(.keyMismatch)
+        }
+        guard current.useEnabled else {
+            if pendingKey == key { pendingKey = nil }
+            return .miss(.disabled)
+        }
+        guard let product = current.product else {
+            if pendingKey == key { pendingKey = nil }
+            return .miss(.alreadyConsumed)
+        }
+        let ready = current.status == .ready
         if current.status == .ready {
             entry = nil
         } else {
@@ -57,14 +88,14 @@ struct StoreProductPrewarmSlot<Key: Equatable, Product> {
             current.product = nil
             entry = current
         }
-        return product
+        return .hit(product, ready: ready)
     }
 
     mutating func complete(token: UUID, loaded: Bool) -> Completion {
         guard var current = entry, current.token == token else {
             return Completion(retainedReadyProduct: false, nextKey: nil)
         }
-        if loaded, current.product != nil, pendingKey == nil {
+        if loaded, current.product != nil, current.useEnabled, pendingKey == nil {
             current.status = .ready
             entry = current
             return Completion(retainedReadyProduct: true, nextKey: nil)
@@ -82,6 +113,20 @@ struct StoreProductPrewarmSlot<Key: Equatable, Product> {
         pendingKey = nil
         return next
     }
+
+    mutating func disable() {
+        pendingKey = nil
+        guard var current = entry else { return }
+        if current.status == .loading {
+            // StoreKit has no cancellation API. Retain the controller as a disabled marker until
+            // its callback returns so another speculative load cannot overlap it.
+            current.useEnabled = false
+            entry = current
+        } else {
+            entry = nil
+        }
+    }
+
 }
 
 #if os(iOS)
@@ -93,7 +138,7 @@ private struct StoreProductPrewarmKey: Equatable {
     let attribution: AdAttribution?
 }
 
-/// Process-wide, bounded StoreKit preparation. Only fullscreen ready-state hooks feed this cache;
+/// Process-wide, bounded StoreKit preparation. Only displayed fullscreen ads feed this cache;
 /// native feeds deliberately stay cold to avoid product loads for dozens of unviewed ads.
 @MainActor
 final class StoreProductPrewarmer {
@@ -102,6 +147,7 @@ final class StoreProductPrewarmer {
     private static let maxAgeNanoseconds: UInt64 = 5 * 60 * 1_000_000_000
     private var slot = StoreProductPrewarmSlot<StoreProductPrewarmKey, SKStoreProductViewController>()
     private var expiryTask: Task<Void, Never>?
+    private var lastAttemptedKey: StoreProductPrewarmKey?
 
     private init() {}
 
@@ -111,6 +157,7 @@ final class StoreProductPrewarmer {
               Int(appID) != nil else { return false }
 
         let key = StoreProductPrewarmKey(appID: appID, attribution: attribution)
+        lastAttemptedKey = key
         return startPrewarm(key: key)
     }
 
@@ -138,12 +185,39 @@ final class StoreProductPrewarmer {
     }
 
     func take(appID: String, attribution: AdAttribution?) -> SKStoreProductViewController? {
-        let product = slot.consume(key: StoreProductPrewarmKey(appID: appID, attribution: attribution))
-        if product != nil {
+        let requestedKey = StoreProductPrewarmKey(appID: appID, attribution: attribution)
+        switch slot.lookup(key: requestedKey) {
+        case .hit(let product, let ready):
             expiryTask?.cancel()
             expiryTask = nil
+            Telemetry.shared.recordOperation(
+                name: "store_product_prewarm_use",
+                durationMs: 0,
+                success: true,
+                breadcrumb: "result=hit_\(ready ? "ready" : "loading")"
+            )
+            if lastAttemptedKey == requestedKey { lastAttemptedKey = nil }
+            return product
+        case .miss(let reason):
+            if lastAttemptedKey == requestedKey {
+                Telemetry.shared.recordOperation(
+                    name: "store_product_prewarm_use",
+                    durationMs: 0,
+                    success: false,
+                    failureClass: reason.rawValue,
+                    breadcrumb: "result=miss"
+                )
+                if lastAttemptedKey == requestedKey { lastAttemptedKey = nil }
+            }
+            return nil
         }
-        return product
+    }
+
+    func disable() {
+        slot.disable()
+        expiryTask?.cancel()
+        expiryTask = nil
+        lastAttemptedKey = nil
     }
 
     private func didComplete(token: UUID, loaded: Bool, startedAt: UInt64) {

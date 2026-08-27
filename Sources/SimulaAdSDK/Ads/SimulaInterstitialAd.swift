@@ -382,17 +382,6 @@ public final class SimulaInterstitialAd {
                 durationMs: msSince(loadStartNanos), errorCode: nil
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
-            #if os(iOS)
-            if response.prewarmSKProduct {
-                CreativeCTARouter.prewarmStoreProduct(
-                    trackingUrl: response.trackingUrl,
-                    destination: response.destinationKind,
-                    storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                    storeUrl: response.iosStoreUrl,
-                    attribution: response.skanAttribution
-                )
-            }
-            #endif
             delegate?.interstitialDidLoad(self)
             #if os(iOS)
             Task { [weak self, impressionId = response.impressionId] in
@@ -423,15 +412,6 @@ public final class SimulaInterstitialAd {
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
-            if readyResponse.prewarmSKProduct {
-                CreativeCTARouter.prewarmStoreProduct(
-                    trackingUrl: readyResponse.trackingUrl,
-                    destination: readyResponse.destinationKind,
-                    storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
-                    storeUrl: readyResponse.iosStoreUrl,
-                    attribution: readyResponse.skanAttribution
-                )
-            }
             WebViewPool.shared.prewarm(trigger: "interstitial_ready")
         }
     }
@@ -486,6 +466,19 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
+            onWillPresent: {
+                if response.prewarmSKProduct {
+                    CreativeCTARouter.prewarmStoreProduct(
+                        trackingUrl: response.trackingUrl,
+                        destination: response.destinationKind,
+                        storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                        storeUrl: response.iosStoreUrl,
+                        attribution: response.skanAttribution
+                    )
+                } else {
+                    StoreProductPrewarmer.shared.disable()
+                }
+            },
             onClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
                     stage: "click", adFormat: Self.adFormat, adUnitId: clickAdUnitId,

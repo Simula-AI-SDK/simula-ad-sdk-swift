@@ -88,8 +88,8 @@ final class SKOverlayAttributionTests: XCTestCase {
         if #available(iOS 16.1, *) {
             XCTAssertEqual(imp.sourceIdentifier.intValue, 25)
         }
-        // SKAN 4 replaces the legacy campaign slot with sourceIdentifier.
-        XCTAssertEqual(imp.adCampaignIdentifier.intValue, 0)
+        // SKAN 4 replaces the legacy campaign slot; do not provide an out-of-range placeholder.
+        XCTAssertNil(imp.value(forKey: "adCampaignIdentifier"))
     }
 
     @available(iOS 16.0, *)

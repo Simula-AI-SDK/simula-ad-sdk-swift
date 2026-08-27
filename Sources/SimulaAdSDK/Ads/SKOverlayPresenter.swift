@@ -93,10 +93,25 @@ enum SKOverlayPresenter {
         // owns any later user engagement with the install banner.
         if let campaign = attribution?.campaignToken, !campaign.isEmpty { appConfig.campaignToken = campaign }
         if let provider = attribution?.providerToken, !provider.isEmpty { appConfig.providerToken = provider }
-        if #available(iOS 16.0, *), let impression = Self.adImpression(appID: appID, attribution: attribution) {
-            appConfig.setAdImpression(impression)
-        } else {
-            for (key, value) in CreativeCTARouter.skanAdditionalValues(attribution) {
+        var usedDocumentedImpression = false
+        var documentedRejectionRecorded = false
+        if #available(iOS 16.0, *) {
+            let viewSignatureWasSupplied = attribution?.skan?.viewAttributionSignature?.isEmpty == false
+            if let impression = Self.adImpression(appID: appID, attribution: attribution) {
+                appConfig.setAdImpression(impression)
+                usedDocumentedImpression = true
+            } else {
+                // Every nil path with a supplied view signature records its rejection in
+                // `adImpression`; a missing signature is a normal compatibility fallback.
+                documentedRejectionRecorded = viewSignatureWasSupplied
+            }
+        }
+        if !usedDocumentedImpression {
+            for (key, value) in CreativeCTARouter.skanAdditionalValues(
+                attribution,
+                surface: .skOverlayFallback,
+                recordRejection: !documentedRejectionRecorded
+            ) {
                 appConfig.setAdditionalValue(value, forKey: key)
             }
         }
@@ -116,42 +131,47 @@ enum SKOverlayPresenter {
     /// block is absent or malformed so the caller can fall back to `setAdditionalValue`.
     @available(iOS 16.0, *)
     static func adImpression(appID: String, attribution: AdAttribution?) -> SKAdImpression? {
-        guard let skan = attribution?.skan,
-              let viewSignature = skan.viewAttributionSignature, !viewSignature.isEmpty,
-              !skan.adNetworkIdentifier.isEmpty,
-              skan.sourceAppStoreIdentifier >= 0,
-              UUID(uuidString: skan.nonce) != nil,
-              skan.timestamp > 0,
-              let advertisedID = Int(appID),
-              ["2.2", "3.0", "4.0"].contains(skan.version),
-              let identifier = validatedSKANIdentifier(
-                  version: skan.version,
-                  campaignIdentifier: skan.campaignIdentifier,
-                  sourceIdentifier: skan.sourceIdentifier
-              )
-        else { return nil }
-
-        let campaignIdentifier: Int
-        switch identifier {
-        case .campaign(let value):
-            campaignIdentifier = value
-        case .source:
-            guard #available(iOS 16.1, *) else { return nil }
-            // The legacy initializer slot is ignored for a v4 signature once sourceIdentifier is set.
-            campaignIdentifier = 0
+        guard let skan = attribution?.skan else { return nil }
+        // Older payloads legitimately omit a view-through signature and use the additional-values
+        // fallback. Only a supplied but unusable signed payload is rejection telemetry.
+        guard let viewSignature = skan.viewAttributionSignature, !viewSignature.isEmpty else { return nil }
+        guard ["2.2", "3.0", "4.0"].contains(skan.version) else {
+            CreativeCTARouter.recordDroppedSKAN(.unsupportedViewVersion, surface: .skOverlayImpression)
+            return nil
+        }
+        guard let advertisedID = Int(appID) else {
+            CreativeCTARouter.recordDroppedSKAN(.invalidAdvertisedAppID, surface: .skOverlayImpression)
+            return nil
+        }
+        if let reason = skanPayloadRejectionReason(skan, signature: viewSignature) {
+            CreativeCTARouter.recordDroppedSKAN(reason, surface: .skOverlayImpression)
+            return nil
+        }
+        guard let identifier = validatedSKANIdentifier(
+            version: skan.version,
+            campaignIdentifier: skan.campaignIdentifier,
+            sourceIdentifier: skan.sourceIdentifier
+        ) else {
+            CreativeCTARouter.recordDroppedSKAN(.unsupportedVersion, surface: .skOverlayImpression)
+            return nil
         }
 
-        let impression = SKAdImpression(
-            sourceAppStoreItemIdentifier: NSNumber(value: skan.sourceAppStoreIdentifier),
-            advertisedAppStoreItemIdentifier: NSNumber(value: advertisedID),
-            adNetworkIdentifier: skan.adNetworkIdentifier,
-            adCampaignIdentifier: NSNumber(value: campaignIdentifier),
-            adImpressionIdentifier: skan.nonce.lowercased(),
-            timestamp: NSNumber(value: skan.timestamp),
-            signature: viewSignature,
-            version: skan.version
-        )
-        if case .source(let sourceID) = identifier, #available(iOS 16.1, *) {
+        let impression = SKAdImpression()
+        impression.sourceAppStoreItemIdentifier = NSNumber(value: skan.sourceAppStoreIdentifier)
+        impression.advertisedAppStoreItemIdentifier = NSNumber(value: advertisedID)
+        impression.adNetworkIdentifier = skan.adNetworkIdentifier
+        impression.adImpressionIdentifier = skan.nonce.lowercased()
+        impression.timestamp = NSNumber(value: skan.timestamp)
+        impression.signature = viewSignature
+        impression.version = skan.version
+        switch identifier {
+        case .campaign(let campaignID):
+            impression.adCampaignIdentifier = NSNumber(value: campaignID)
+        case .source(let sourceID):
+            guard #available(iOS 16.1, *) else {
+                CreativeCTARouter.recordDroppedSKAN(.unsupportedOS, surface: .skOverlayImpression)
+                return nil
+            }
             impression.sourceIdentifier = NSNumber(value: sourceID)
         }
         return impression

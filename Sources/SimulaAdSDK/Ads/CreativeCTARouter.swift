@@ -57,6 +57,68 @@ enum ValidatedSKANIdentifier: Equatable {
     case source(Int)
 }
 
+enum SKANRejectionReason: String, Equatable {
+    case missingNetwork = "missing_network"
+    case invalidSourceAppID = "invalid_source_app_id"
+    case invalidNonce = "invalid_nonce"
+    case invalidTimestamp = "invalid_timestamp"
+    case missingSignature = "missing_signature"
+    case unsupportedVersion = "unsupported_version"
+    case missingCampaignID = "missing_campaign_id"
+    case invalidCampaignID = "invalid_campaign_id"
+    case missingSourceID = "missing_source_id"
+    case invalidSourceID = "invalid_source_id"
+    case unsupportedOS = "unsupported_os"
+    case invalidAdvertisedAppID = "invalid_advertised_app_id"
+    case unsupportedViewVersion = "unsupported_view_version"
+}
+
+enum SKANIdentifierValidation: Equatable {
+    case valid(ValidatedSKANIdentifier)
+    case rejected(SKANRejectionReason)
+}
+
+enum SKANAttributionSurface: String {
+    case storeProduct = "store_product"
+    case skOverlayImpression = "skoverlay_impression"
+    case skOverlayFallback = "skoverlay_fallback"
+}
+
+func validateSKANIdentifier(
+    version: String,
+    campaignIdentifier: Int?,
+    sourceIdentifier: Int?
+) -> SKANIdentifierValidation {
+    switch version {
+    case "2.0", "2.1", "2.2", "3.0":
+        guard let campaignIdentifier else { return .rejected(.missingCampaignID) }
+        guard (1...100).contains(campaignIdentifier) else { return .rejected(.invalidCampaignID) }
+        return .valid(.campaign(campaignIdentifier))
+    case "4.0":
+        guard let sourceIdentifier else { return .rejected(.missingSourceID) }
+        guard (0...9_999).contains(sourceIdentifier) else { return .rejected(.invalidSourceID) }
+        return .valid(.source(sourceIdentifier))
+    default:
+        return .rejected(.unsupportedVersion)
+    }
+}
+
+func skanPayloadRejectionReason(_ skan: SKANParameters, signature: String) -> SKANRejectionReason? {
+    guard !skan.adNetworkIdentifier.isEmpty else { return .missingNetwork }
+    guard skan.sourceAppStoreIdentifier >= 0 else { return .invalidSourceAppID }
+    guard UUID(uuidString: skan.nonce) != nil else { return .invalidNonce }
+    guard skan.timestamp > 0 else { return .invalidTimestamp }
+    guard !signature.isEmpty else { return .missingSignature }
+    if case .rejected(let reason) = validateSKANIdentifier(
+        version: skan.version,
+        campaignIdentifier: skan.campaignIdentifier,
+        sourceIdentifier: skan.sourceIdentifier
+    ) {
+        return reason
+    }
+    return nil
+}
+
 /// Selects the identifier covered by the server signature. The signature version, not the running
 /// OS, determines which mutually exclusive field StoreKit must receive.
 func validatedSKANIdentifier(
@@ -64,16 +126,12 @@ func validatedSKANIdentifier(
     campaignIdentifier: Int?,
     sourceIdentifier: Int?
 ) -> ValidatedSKANIdentifier? {
-    switch version {
-    case "2.0", "2.1", "2.2", "3.0":
-        guard let campaignIdentifier, (1...100).contains(campaignIdentifier) else { return nil }
-        return .campaign(campaignIdentifier)
-    case "4.0":
-        guard let sourceIdentifier, (0...9_999).contains(sourceIdentifier) else { return nil }
-        return .source(sourceIdentifier)
-    default:
-        return nil
-    }
+    guard case .valid(let identifier) = validateSKANIdentifier(
+        version: version,
+        campaignIdentifier: campaignIdentifier,
+        sourceIdentifier: sourceIdentifier
+    ) else { return nil }
+    return identifier
 }
 
 func isDirectAppStoreScheme(_ scheme: String?) -> Bool {
@@ -1190,7 +1248,7 @@ enum CreativeCTARouter {
         completion(nil)
     }
 
-    /// Starts a side-effect-free StoreKit product load for a ready fullscreen serve. Resolution is
+    /// Starts a side-effect-free StoreKit product load for a displayed fullscreen serve. Resolution is
     /// intentionally limited to URLs that already contain an App Store id; an MMP tracker is never
     /// requested until a committed user click.
     static func prewarmStoreProduct(
@@ -1309,18 +1367,28 @@ enum CreativeCTARouter {
     /// `setAdditionalValue(_:forKey:)` both consume. StoreKit uses them to generate the SKAdNetwork
     /// install postback that credits the campaign without IDFA. Returns `[:]` when there's no SKAN
     /// payload or the nonce isn't a valid UUID (StoreKit would reject a malformed set anyway).
-    static func skanAdditionalValues(_ attribution: AdAttribution?) -> [String: Any] {
-        guard let skan = attribution?.skan,
-              !skan.adNetworkIdentifier.isEmpty,
-              skan.sourceAppStoreIdentifier >= 0,
-              let nonce = UUID(uuidString: skan.nonce),
-              skan.timestamp > 0,
-              !skan.attributionSignature.isEmpty,
-              let identifier = validatedSKANIdentifier(
-                  version: skan.version,
-                  campaignIdentifier: skan.campaignIdentifier,
-                  sourceIdentifier: skan.sourceIdentifier
-              ) else { return [:] }
+    static func skanAdditionalValues(
+        _ attribution: AdAttribution?,
+        surface: SKANAttributionSurface = .storeProduct,
+        recordRejection: Bool = true
+    ) -> [String: Any] {
+        guard let skan = attribution?.skan else { return [:] }
+        if let reason = skanPayloadRejectionReason(skan, signature: skan.attributionSignature) {
+            if recordRejection { recordDroppedSKAN(reason, surface: surface) }
+            return [:]
+        }
+        guard let nonce = UUID(uuidString: skan.nonce) else {
+            recordDroppedSKAN(.invalidNonce, surface: surface)
+            return [:]
+        }
+        guard let identifier = validatedSKANIdentifier(
+            version: skan.version,
+            campaignIdentifier: skan.campaignIdentifier,
+            sourceIdentifier: skan.sourceIdentifier
+        ) else {
+            if recordRejection { recordDroppedSKAN(.unsupportedVersion, surface: surface) }
+            return [:]
+        }
         var values: [String: Any] = [
             SKStoreProductParameterAdNetworkIdentifier: skan.adNetworkIdentifier,
             SKStoreProductParameterAdNetworkVersion: skan.version,
@@ -1333,10 +1401,26 @@ enum CreativeCTARouter {
         case .campaign(let campaignID):
             values[SKStoreProductParameterAdNetworkCampaignIdentifier] = NSNumber(value: campaignID)
         case .source(let sourceID):
-            guard #available(iOS 16.1, *) else { return [:] }
+            guard #available(iOS 16.1, *) else {
+                if recordRejection { recordDroppedSKAN(.unsupportedOS, surface: surface) }
+                return [:]
+            }
             values[SKStoreProductParameterAdNetworkSourceIdentifier] = NSNumber(value: sourceID)
         }
         return values
+    }
+
+    static func recordDroppedSKAN(
+        _ reason: SKANRejectionReason,
+        surface: SKANAttributionSurface
+    ) {
+        Telemetry.shared.recordOperation(
+            name: "skan_payload_dropped",
+            durationMs: 0,
+            success: false,
+            failureClass: reason.rawValue,
+            breadcrumb: "surface=\(surface.rawValue)"
+        )
     }
 
     /// Presents `SFSafariViewController` for external links.

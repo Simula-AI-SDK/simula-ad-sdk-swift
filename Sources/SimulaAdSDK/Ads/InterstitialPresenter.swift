@@ -48,6 +48,7 @@ final class InterstitialPresenter {
     func present(
         apiKey: String,
         response: AdLoadResponse,
+        onWillPresent: () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
@@ -89,6 +90,9 @@ final class InterstitialPresenter {
         window.windowLevel = .normal + 1
         window.backgroundColor = .black
         window.rootViewController = hosting
+        // The scene and window are valid, but SwiftUI has not appeared yet. StoreKit prewarm policy
+        // must be applied here so a zero-delay automatic route cannot beat it from `onAppear`.
+        onWillPresent()
         window.makeKeyAndVisible()
         self.window = window
         retainedWhilePresenting = self
@@ -105,6 +109,7 @@ final class InterstitialPresenter {
     func present(
         apiKey: String,
         response: AdLoadResponse,
+        onWillPresent: () -> Void = {},
         onClick: @escaping () -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
@@ -112,6 +117,7 @@ final class InterstitialPresenter {
         present(
             apiKey: apiKey,
             response: response,
+            onWillPresent: onWillPresent,
             onClick: { _ in onClick() },
             onImpression: onImpression,
             onClose: onClose

@@ -302,17 +302,6 @@ public final class SimulaRewardedAd {
                 adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
-            #if os(iOS)
-            if response.prewarmSKProduct {
-                CreativeCTARouter.prewarmStoreProduct(
-                    trackingUrl: response.trackingUrl,
-                    destination: response.destinationKind,
-                    storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                    storeUrl: response.iosStoreUrl,
-                    attribution: response.skanAttribution
-                )
-            }
-            #endif
             delegate?.rewardedDidLoad(self)
             #if os(iOS)
             Task { [weak self, impressionId = response.impressionId] in
@@ -341,15 +330,6 @@ public final class SimulaRewardedAd {
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
-            if readyResponse.prewarmSKProduct {
-                CreativeCTARouter.prewarmStoreProduct(
-                    trackingUrl: readyResponse.trackingUrl,
-                    destination: readyResponse.destinationKind,
-                    storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
-                    storeUrl: readyResponse.iosStoreUrl,
-                    attribution: readyResponse.skanAttribution
-                )
-            }
             WebViewPool.shared.prewarm(trigger: "rewarded_ready")
         }
     }
@@ -415,6 +395,19 @@ public final class SimulaRewardedAd {
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+            onWillPresent: {
+                if response.prewarmSKProduct {
+                    CreativeCTARouter.prewarmStoreProduct(
+                        trackingUrl: response.trackingUrl,
+                        destination: response.destinationKind,
+                        storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                        storeUrl: response.iosStoreUrl,
+                        attribution: response.skanAttribution
+                    )
+                } else {
+                    StoreProductPrewarmer.shared.disable()
+                }
+            },
             onClick: { [weak self] interaction in
                 // CLICKED is one admitted user CTA/store-prompt tap; automatic redirects never enter here.
                 Telemetry.shared.recordLifecycle(

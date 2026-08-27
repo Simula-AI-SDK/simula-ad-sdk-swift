@@ -77,6 +77,18 @@ final class StoreProductPrewarmerTests: XCTestCase {
         XCTAssertNil(validatedSKANIdentifier(
             version: "5.0", campaignIdentifier: nil, sourceIdentifier: 1
         ))
+        XCTAssertEqual(
+            validateSKANIdentifier(
+                version: "3.0", campaignIdentifier: nil, sourceIdentifier: nil
+            ),
+            .rejected(.missingCampaignID)
+        )
+        XCTAssertEqual(
+            validateSKANIdentifier(
+                version: "4.0", campaignIdentifier: nil, sourceIdentifier: 10_000
+            ),
+            .rejected(.invalidSourceID)
+        )
     }
 
     func testPrewarmSlotIsBoundedAndConsumesOnlyExactMatch() throws {
@@ -91,7 +103,7 @@ final class StoreProductPrewarmerTests: XCTestCase {
 
         let completion = slot.complete(token: first.token, loaded: true)
         XCTAssertFalse(completion.retainedReadyProduct)
-        XCTAssertEqual(completion.nextKey, "campaign-b")
+        XCTAssertNil(completion.nextKey)
         XCTAssertFalse(slot.isOccupied)
     }
 
@@ -118,4 +130,96 @@ final class StoreProductPrewarmerTests: XCTestCase {
         XCTAssertEqual(completion.nextKey, "campaign-c")
         XCTAssertFalse(slot.isOccupied)
     }
+
+    func testLookupReportsReadyLoadingAndMissReasons() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        if case .miss(let reason) = slot.lookup(key: "a") {
+            XCTAssertEqual(reason, .empty)
+        } else {
+            XCTFail("expected empty miss")
+        }
+
+        let loading = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "loading" }))
+        if case .miss(let reason) = slot.lookup(key: "b") {
+            XCTAssertEqual(reason, .keyMismatch)
+        } else {
+            XCTFail("expected key mismatch")
+        }
+        if case .hit(let product, let ready) = slot.lookup(key: "a") {
+            XCTAssertEqual(product, "loading")
+            XCTAssertFalse(ready)
+        } else {
+            XCTFail("expected loading hit")
+        }
+        if case .miss(let reason) = slot.lookup(key: "a") {
+            XCTAssertEqual(reason, .alreadyConsumed)
+        } else {
+            XCTFail("expected consumed miss")
+        }
+        _ = slot.complete(token: loading.token, loaded: true)
+
+        let readyReservation = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "ready" }))
+        XCTAssertTrue(slot.complete(token: readyReservation.token, loaded: true).retainedReadyProduct)
+        if case .hit(let product, let ready) = slot.lookup(key: "a") {
+            XCTAssertEqual(product, "ready")
+            XCTAssertTrue(ready)
+        } else {
+            XCTFail("expected ready hit")
+        }
+    }
+
+    func testDisableKeepsLoadingBoundButPreventsConsumption() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "first" }))
+
+        slot.disable()
+
+        if case .miss(let reason) = slot.lookup(key: "a") {
+            XCTAssertEqual(reason, .disabled)
+        } else {
+            XCTFail("expected disabled miss")
+        }
+        XCTAssertNil(slot.reserve(key: "b", makeProduct: { "second" }))
+        let completion = slot.complete(token: first.token, loaded: true)
+        XCTAssertFalse(completion.retainedReadyProduct)
+        XCTAssertEqual(completion.nextKey, "b")
+    }
+
+    func testDisableDropsReadyProductImmediately() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "first" }))
+        XCTAssertTrue(slot.complete(token: first.token, loaded: true).retainedReadyProduct)
+
+        slot.disable()
+
+        XCTAssertFalse(slot.isOccupied)
+        XCTAssertNotNil(slot.reserve(key: "b", makeProduct: { "second" }))
+    }
+
+    func testLookupMissCancelsQueuedDuplicateBeforeColdFallback() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "first" }))
+        XCTAssertNil(slot.reserve(key: "b", makeProduct: { "second" }))
+
+        if case .miss(let reason) = slot.lookup(key: "b") {
+            XCTAssertEqual(reason, .keyMismatch)
+        } else {
+            XCTFail("expected key mismatch")
+        }
+
+        let completion = slot.complete(token: first.token, loaded: true)
+        XCTAssertNil(completion.nextKey, "tap-time cold load must cancel queued duplicate prewarm")
+    }
+
+    func testReenableSameKeyQueuesBehindDisabledInflightLoad() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "a", makeProduct: { "first" }))
+        slot.disable()
+
+        XCTAssertNil(slot.reserve(key: "a", makeProduct: { "replacement" }))
+
+        let completion = slot.complete(token: first.token, loaded: true)
+        XCTAssertEqual(completion.nextKey, "a")
+    }
+
 }
