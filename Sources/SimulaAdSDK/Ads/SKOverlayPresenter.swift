@@ -123,6 +123,7 @@ enum SKOverlayPresenter {
               UUID(uuidString: skan.nonce) != nil,
               skan.timestamp > 0,
               let advertisedID = Int(appID),
+              ["2.2", "3.0", "4.0"].contains(skan.version),
               let identifier = validatedSKANIdentifier(
                   version: skan.version,
                   campaignIdentifier: skan.campaignIdentifier,

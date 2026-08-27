@@ -87,11 +87,35 @@ final class StoreProductPrewarmerTests: XCTestCase {
         XCTAssertNil(slot.reserve(key: "campaign-b", makeProduct: { "second" }))
         XCTAssertNil(slot.consume(key: "campaign-b"))
         XCTAssertEqual(slot.consume(key: "campaign-a"), "first")
+        XCTAssertTrue(slot.isOccupied, "an in-flight consumed controller keeps the allocation bound")
+
+        let completion = slot.complete(token: first.token, loaded: true)
+        XCTAssertFalse(completion.retainedReadyProduct)
+        XCTAssertEqual(completion.nextKey, "campaign-b")
         XCTAssertFalse(slot.isOccupied)
+    }
+
+    func testCompletedProductCanBeReplacedWithoutOverlappingLoads() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "campaign-a", makeProduct: { "first" }))
+        let completion = slot.complete(token: first.token, loaded: true)
+        XCTAssertTrue(completion.retainedReadyProduct)
 
         let second = try XCTUnwrap(slot.reserve(key: "campaign-b", makeProduct: { "second" }))
-        XCTAssertFalse(slot.remove(token: first.token))
-        XCTAssertTrue(slot.remove(token: second.token))
+        XCTAssertEqual(second.product, "second")
+        XCTAssertNil(slot.consume(key: "campaign-a"))
+        XCTAssertEqual(slot.consume(key: "campaign-b"), "second")
+    }
+
+    func testFailedLoadAdvancesLatestQueuedCandidate() throws {
+        var slot = StoreProductPrewarmSlot<String, String>()
+        let first = try XCTUnwrap(slot.reserve(key: "campaign-a", makeProduct: { "first" }))
+        XCTAssertNil(slot.reserve(key: "campaign-b", makeProduct: { "second" }))
+        XCTAssertNil(slot.reserve(key: "campaign-c", makeProduct: { "third" }))
+
+        let completion = slot.complete(token: first.token, loaded: false)
+        XCTAssertFalse(completion.retainedReadyProduct)
+        XCTAssertEqual(completion.nextKey, "campaign-c")
         XCTAssertFalse(slot.isOccupied)
     }
 }

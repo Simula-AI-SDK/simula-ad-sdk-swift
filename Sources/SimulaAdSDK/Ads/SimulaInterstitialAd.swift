@@ -382,6 +382,15 @@ public final class SimulaInterstitialAd {
                 durationMs: msSince(loadStartNanos), errorCode: nil
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
+            #if os(iOS)
+            CreativeCTARouter.prewarmStoreProduct(
+                trackingUrl: response.trackingUrl,
+                destination: response.destinationKind,
+                storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                storeUrl: response.iosStoreUrl,
+                attribution: response.skanAttribution
+            )
+            #endif
             delegate?.interstitialDidLoad(self)
             #if os(iOS)
             Task { [weak self, impressionId = response.impressionId] in

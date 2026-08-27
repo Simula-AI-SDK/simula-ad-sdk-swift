@@ -151,5 +151,16 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertEqual(imp.signature, "view_sig")
         XCTAssertEqual(imp.version, "3.0")
     }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionRejectsPreViewThroughSkanVersion() async throws {
+        let a = try attribution("""
+        "version":"2.1","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1784691000000,
+        "attribution_signature":"click_sig","view_attribution_signature":"view_sig","campaign_id":42
+        """)
+        let built = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: a)
+        XCTAssertNil(built)
+    }
     #endif
 }

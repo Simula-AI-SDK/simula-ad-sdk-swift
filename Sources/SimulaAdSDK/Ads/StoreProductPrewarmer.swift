@@ -3,39 +3,84 @@ import Foundation
 /// Pure one-entry ownership used to bound StoreKit controller allocation and make consumption
 /// one-shot. A reservation token prevents an old load completion from clearing a newer entry.
 struct StoreProductPrewarmSlot<Key: Equatable, Product> {
+    struct Completion {
+        let retainedReadyProduct: Bool
+        let nextKey: Key?
+    }
+
     struct Reservation {
         let token: UUID
         let product: Product
     }
 
+    private enum Status {
+        case loading
+        case ready
+    }
+
     private struct Entry {
         let token: UUID
         let key: Key
-        let product: Product
+        var product: Product?
+        var status: Status
     }
 
     private var entry: Entry?
+    private var pendingKey: Key?
     var isOccupied: Bool { entry != nil }
 
     mutating func reserve(key: Key, makeProduct: () -> Product) -> Reservation? {
-        guard entry == nil else { return nil }
+        if let current = entry {
+            switch current.status {
+            case .loading:
+                if current.key != key { pendingKey = key }
+                return nil
+            case .ready:
+                guard current.key != key else { return nil }
+                entry = nil
+            }
+        }
         let token = UUID()
         let product = makeProduct()
-        entry = Entry(token: token, key: key, product: product)
+        entry = Entry(token: token, key: key, product: product, status: .loading)
+        if pendingKey == key { pendingKey = nil }
         return Reservation(token: token, product: product)
     }
 
     mutating func consume(key: Key) -> Product? {
-        guard let current = entry, current.key == key else { return nil }
-        entry = nil
-        return current.product
+        guard var current = entry, current.key == key, let product = current.product else { return nil }
+        if current.status == .ready {
+            entry = nil
+        } else {
+            // Keep a marker until the in-flight StoreKit callback returns, preventing another
+            // speculative allocation while this controller is already being presented.
+            current.product = nil
+            entry = current
+        }
+        return product
     }
 
-    @discardableResult
-    mutating func remove(token: UUID) -> Bool {
-        guard entry?.token == token else { return false }
+    mutating func complete(token: UUID, loaded: Bool) -> Completion {
+        guard var current = entry, current.token == token else {
+            return Completion(retainedReadyProduct: false, nextKey: nil)
+        }
+        if loaded, current.product != nil, pendingKey == nil {
+            current.status = .ready
+            entry = current
+            return Completion(retainedReadyProduct: true, nextKey: nil)
+        }
         entry = nil
-        return true
+        let next = pendingKey
+        pendingKey = nil
+        return Completion(retainedReadyProduct: false, nextKey: next)
+    }
+
+    mutating func expire(token: UUID) -> Key? {
+        guard entry?.token == token else { return nil }
+        entry = nil
+        let next = pendingKey
+        pendingKey = nil
+        return next
     }
 }
 
@@ -63,10 +108,13 @@ final class StoreProductPrewarmer {
     @discardableResult
     func prewarm(appID: String, attribution: AdAttribution?) -> Bool {
         guard UIApplication.shared.applicationState == .active,
-              Int(appID) != nil,
-              !slot.isOccupied else { return false }
+              Int(appID) != nil else { return false }
 
         let key = StoreProductPrewarmKey(appID: appID, attribution: attribution)
+        return startPrewarm(key: key)
+    }
+
+    private func startPrewarm(key: StoreProductPrewarmKey) -> Bool {
         guard let reservation = slot.reserve(
             key: key,
             makeProduct: { SKStoreProductViewController() }
@@ -74,17 +122,16 @@ final class StoreProductPrewarmer {
 
         let start = DispatchTime.now().uptimeNanoseconds
         expiryTask?.cancel()
-        expiryTask = Task { [weak self] in
-            await self?.expire(token: reservation.token)
-        }
+        expiryTask = nil
+        let token = reservation.token
         reservation.product.loadProduct(
             withParameters: CreativeCTARouter.storeProductParameters(
-                appID: appID,
-                attribution: attribution
+                appID: key.appID,
+                attribution: key.attribution
             )
         ) { [weak self] loaded, _ in
             Task { @MainActor [weak self] in
-                self?.didComplete(token: reservation.token, loaded: loaded, startedAt: start)
+                self?.didComplete(token: token, loaded: loaded, startedAt: start)
             }
         }
         return true
@@ -107,9 +154,14 @@ final class StoreProductPrewarmer {
             success: loaded,
             failureClass: loaded ? nil : "load_failed"
         )
-        if !loaded, slot.remove(token: token) {
-            expiryTask?.cancel()
-            expiryTask = nil
+        let completion = slot.complete(token: token, loaded: loaded)
+        if completion.retainedReadyProduct {
+            expiryTask = Task { [weak self] in
+                await self?.expire(token: token)
+            }
+        } else if let nextKey = completion.nextKey,
+                  UIApplication.shared.applicationState == .active {
+            _ = startPrewarm(key: nextKey)
         }
     }
 
@@ -119,8 +171,10 @@ final class StoreProductPrewarmer {
         } catch {
             return
         }
-        if slot.remove(token: token) {
-            expiryTask = nil
+        let nextKey = slot.expire(token: token)
+        expiryTask = nil
+        if let nextKey, UIApplication.shared.applicationState == .active {
+            _ = startPrewarm(key: nextKey)
         }
     }
 }
