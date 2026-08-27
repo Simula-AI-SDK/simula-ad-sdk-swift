@@ -8,7 +8,7 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.1.9-dev.8"
+let SIMULA_SDK_VERSION = "1.1.9-dev.9"
 
 struct DuplicateInitializeCountBuffer {
     private(set) var count = 0
