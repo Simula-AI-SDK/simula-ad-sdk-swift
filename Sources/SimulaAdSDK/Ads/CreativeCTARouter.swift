@@ -52,6 +52,30 @@ final class WeakObjectReference<Object: AnyObject> {
 
 private let directAppStoreSchemes: Set<String> = ["itms", "itms-apps", "itms-appss"]
 
+enum ValidatedSKANIdentifier: Equatable {
+    case campaign(Int)
+    case source(Int)
+}
+
+/// Selects the identifier covered by the server signature. The signature version, not the running
+/// OS, determines which mutually exclusive field StoreKit must receive.
+func validatedSKANIdentifier(
+    version: String,
+    campaignIdentifier: Int?,
+    sourceIdentifier: Int?
+) -> ValidatedSKANIdentifier? {
+    switch version {
+    case "2.0", "2.1", "2.2", "3.0":
+        guard let campaignIdentifier, (1...100).contains(campaignIdentifier) else { return nil }
+        return .campaign(campaignIdentifier)
+    case "4.0":
+        guard let sourceIdentifier, (0...9_999).contains(sourceIdentifier) else { return nil }
+        return .source(sourceIdentifier)
+    default:
+        return nil
+    }
+}
+
 func isDirectAppStoreScheme(_ scheme: String?) -> Bool {
     guard let scheme else { return false }
     return directAppStoreSchemes.contains(scheme.lowercased())
@@ -1166,6 +1190,27 @@ enum CreativeCTARouter {
         completion(nil)
     }
 
+    /// Starts a side-effect-free StoreKit product load for a ready fullscreen serve. Resolution is
+    /// intentionally limited to URLs that already contain an App Store id; an MMP tracker is never
+    /// requested until a committed user click.
+    static func prewarmStoreProduct(
+        trackingUrl: String?,
+        destination: AdDestination,
+        storeOpen: StoreOpen,
+        storeUrl: String?,
+        attribution: AdAttribution?
+    ) {
+        guard storeOpen != .external else { return }
+        resolveAppStoreID(
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeUrl: storeUrl
+        ) { appID in
+            guard let appID else { return }
+            StoreProductPrewarmer.shared.prewarm(appID: appID, attribution: attribution)
+        }
+    }
+
     // MARK: - Presentation
 
     /// Associated-object keys under which a presented store / Safari sheet retains
@@ -1202,7 +1247,8 @@ enum CreativeCTARouter {
         originatingScene: UIWindowScene? = nil
     ) -> Bool {
         guard !isPresentingExternal else { return false }
-        let storeVC = SKStoreProductViewController()
+        let prepared = StoreProductPrewarmer.shared.take(appID: appID, attribution: attribution)
+        let storeVC = prepared ?? SKStoreProductViewController()
         let delegate = StoreProductDelegate {
             isPresentingExternal = false
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
@@ -1215,7 +1261,20 @@ enum CreativeCTARouter {
         objc_setAssociatedObject(
             storeVC, &storeDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
-        storeVC.loadProduct(withParameters: storeProductParameters(appID: appID, attribution: attribution))
+        if prepared == nil {
+            let start = DispatchTime.now().uptimeNanoseconds
+            storeVC.loadProduct(
+                withParameters: storeProductParameters(appID: appID, attribution: attribution)
+            ) { loaded, _ in
+                let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+                Telemetry.shared.recordOperation(
+                    name: "store_product_load",
+                    durationMs: Int(elapsed / 1_000_000),
+                    success: loaded,
+                    failureClass: loaded ? nil : "load_failed"
+                )
+            }
+        }
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick true forever on a no-window early-return.
         if presentViewController(storeVC, originatingScene: originatingScene) {
@@ -1251,7 +1310,17 @@ enum CreativeCTARouter {
     /// install postback that credits the campaign without IDFA. Returns `[:]` when there's no SKAN
     /// payload or the nonce isn't a valid UUID (StoreKit would reject a malformed set anyway).
     static func skanAdditionalValues(_ attribution: AdAttribution?) -> [String: Any] {
-        guard let skan = attribution?.skan, let nonce = UUID(uuidString: skan.nonce) else { return [:] }
+        guard let skan = attribution?.skan,
+              !skan.adNetworkIdentifier.isEmpty,
+              skan.sourceAppStoreIdentifier >= 0,
+              let nonce = UUID(uuidString: skan.nonce),
+              skan.timestamp > 0,
+              !skan.attributionSignature.isEmpty,
+              let identifier = validatedSKANIdentifier(
+                  version: skan.version,
+                  campaignIdentifier: skan.campaignIdentifier,
+                  sourceIdentifier: skan.sourceIdentifier
+              ) else { return [:] }
         var values: [String: Any] = [
             SKStoreProductParameterAdNetworkIdentifier: skan.adNetworkIdentifier,
             SKStoreProductParameterAdNetworkVersion: skan.version,
@@ -1260,12 +1329,12 @@ enum CreativeCTARouter {
             SKStoreProductParameterAdNetworkSourceAppStoreIdentifier: NSNumber(value: skan.sourceAppStoreIdentifier),
             SKStoreProductParameterAdNetworkAttributionSignature: skan.attributionSignature,
         ]
-        // SKAN 4 keys the install by a numeric source identifier (iOS 16.1+); earlier versions use the
-        // campaign identifier. Supply whichever the backend signed for this `version`.
-        if #available(iOS 16.1, *), let sourceID = skan.sourceIdentifier {
-            values[SKStoreProductParameterAdNetworkSourceIdentifier] = NSNumber(value: sourceID)
-        } else if let campaignID = skan.campaignIdentifier {
+        switch identifier {
+        case .campaign(let campaignID):
             values[SKStoreProductParameterAdNetworkCampaignIdentifier] = NSNumber(value: campaignID)
+        case .source(let sourceID):
+            guard #available(iOS 16.1, *) else { return [:] }
+            values[SKStoreProductParameterAdNetworkSourceIdentifier] = NSNumber(value: sourceID)
         }
         return values
     }

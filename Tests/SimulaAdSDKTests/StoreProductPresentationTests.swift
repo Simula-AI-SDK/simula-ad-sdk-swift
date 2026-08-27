@@ -5,6 +5,57 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class StoreProductPresentationTests: XCTestCase {
+    private func attribution(
+        version: String,
+        campaignID: Int? = nil,
+        sourceID: Int? = nil
+    ) throws -> AdAttribution {
+        var skan: [String: Any] = [
+            "version": version,
+            "ad_network_id": "net123.skadnetwork",
+            "source_app_store_id": 987_654_321,
+            "nonce": "00000000-0000-0000-0000-000000000001",
+            "timestamp": 1_700_000_000_000,
+            "attribution_signature": "sig==",
+        ]
+        if let campaignID { skan["campaign_id"] = campaignID }
+        if let sourceID { skan["source_id"] = sourceID }
+        let data = try JSONSerialization.data(withJSONObject: ["skan": skan])
+        return try JSONDecoder().decode(AdAttribution.self, from: data)
+    }
+
+    @MainActor
+    @available(iOS 16.1, *)
+    func testStoreParametersSelectIdentifierFromSkanVersion() throws {
+        let v3 = CreativeCTARouter.skanAdditionalValues(try attribution(
+            version: "3.0", campaignID: 42, sourceID: 1_234
+        ))
+        XCTAssertEqual(
+            (v3[SKStoreProductParameterAdNetworkCampaignIdentifier] as? NSNumber)?.intValue,
+            42
+        )
+        XCTAssertNil(v3[SKStoreProductParameterAdNetworkSourceIdentifier])
+
+        let v4 = CreativeCTARouter.skanAdditionalValues(try attribution(
+            version: "4.0", campaignID: 42, sourceID: 1_234
+        ))
+        XCTAssertEqual(
+            (v4[SKStoreProductParameterAdNetworkSourceIdentifier] as? NSNumber)?.intValue,
+            1_234
+        )
+        XCTAssertNil(v4[SKStoreProductParameterAdNetworkCampaignIdentifier])
+    }
+
+    @MainActor
+    func testStoreParametersDropIncompleteSignedSet() throws {
+        XCTAssertTrue(CreativeCTARouter.skanAdditionalValues(
+            try attribution(version: "3.0", sourceID: 1_234)
+        ).isEmpty)
+        XCTAssertTrue(CreativeCTARouter.skanAdditionalValues(
+            try attribution(version: "4.0", campaignID: 42)
+        ).isEmpty)
+    }
+
     @MainActor
     func testCurrentHiddenHandoffCommitsTrackerButCannotPresentUI() throws {
         let coordinator = AutomaticRouteCoordinator()

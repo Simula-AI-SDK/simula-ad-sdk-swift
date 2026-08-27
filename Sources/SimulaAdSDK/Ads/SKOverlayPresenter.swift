@@ -118,22 +118,39 @@ enum SKOverlayPresenter {
     static func adImpression(appID: String, attribution: AdAttribution?) -> SKAdImpression? {
         guard let skan = attribution?.skan,
               let viewSignature = skan.viewAttributionSignature, !viewSignature.isEmpty,
-              let advertisedID = Int(appID)
+              !skan.adNetworkIdentifier.isEmpty,
+              skan.sourceAppStoreIdentifier >= 0,
+              UUID(uuidString: skan.nonce) != nil,
+              skan.timestamp > 0,
+              let advertisedID = Int(appID),
+              let identifier = validatedSKANIdentifier(
+                  version: skan.version,
+                  campaignIdentifier: skan.campaignIdentifier,
+                  sourceIdentifier: skan.sourceIdentifier
+              )
         else { return nil }
+
+        let campaignIdentifier: Int
+        switch identifier {
+        case .campaign(let value):
+            campaignIdentifier = value
+        case .source:
+            guard #available(iOS 16.1, *) else { return nil }
+            // The legacy initializer slot is ignored for a v4 signature once sourceIdentifier is set.
+            campaignIdentifier = 0
+        }
 
         let impression = SKAdImpression(
             sourceAppStoreItemIdentifier: NSNumber(value: skan.sourceAppStoreIdentifier),
             advertisedAppStoreItemIdentifier: NSNumber(value: advertisedID),
             adNetworkIdentifier: skan.adNetworkIdentifier,
-            adCampaignIdentifier: NSNumber(value: skan.campaignIdentifier ?? skan.sourceIdentifier ?? 0),
-            adImpressionIdentifier: skan.nonce,
+            adCampaignIdentifier: NSNumber(value: campaignIdentifier),
+            adImpressionIdentifier: skan.nonce.lowercased(),
             timestamp: NSNumber(value: skan.timestamp),
             signature: viewSignature,
             version: skan.version
         )
-        // SKAN 4 keys the install by the four-digit source identifier (iOS 16.1+); earlier
-        // versions read the campaign identifier from the init. Mirrors the SKStoreProduct path.
-        if #available(iOS 16.1, *), let sourceID = skan.sourceIdentifier {
+        if case .source(let sourceID) = identifier, #available(iOS 16.1, *) {
             impression.sourceIdentifier = NSNumber(value: sourceID)
         }
         return impression

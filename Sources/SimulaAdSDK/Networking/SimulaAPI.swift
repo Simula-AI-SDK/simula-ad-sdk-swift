@@ -138,6 +138,26 @@ public struct DeviceCapabilities: Encodable, Sendable {
         self.nativeClickBeaconV1 = nativeClickBeaconV1
     }
 
+    /// Highest signed-ad version available on a running iOS version. Keep this aligned with
+    /// StoreKit's release availability so the backend never signs a payload this client cannot use.
+    static func supportedSKANVersion(for osVersion: OperatingSystemVersion) -> String {
+        if osVersion.majorVersion > 16
+            || (osVersion.majorVersion == 16 && osVersion.minorVersion >= 1) {
+            return "4.0"
+        }
+        if osVersion.majorVersion > 14
+            || (osVersion.majorVersion == 14 && osVersion.minorVersion >= 6) {
+            return "3.0"
+        }
+        if osVersion.majorVersion == 14 && osVersion.minorVersion == 5 {
+            return "2.2"
+        }
+        if osVersion.majorVersion == 14 {
+            return "2.1"
+        }
+        return "0"
+    }
+
     /// The running device's capabilities, evaluated once. `storekit_available` mirrors SKOverlay
     /// availability (iOS 14+); `skan_version` reports the max SKAdNetwork version the SDK supports.
     public static let current: DeviceCapabilities = {
@@ -147,14 +167,14 @@ public struct DeviceCapabilities: Encodable, Sendable {
         var skanVersion = "0"
         var adAttributionKitAvailable = false
         var nativeClickBeaconV1 = false
+        #if os(iOS)
         if #available(iOS 14.0, *) {
             storekitAvailable = true
-            skanVersion = "4.0"
+            skanVersion = supportedSKANVersion(for: v)
         }
         if #available(iOS 17.4, *) {
             adAttributionKitAvailable = true
         }
-        #if os(iOS)
         nativeClickBeaconV1 = true
         #endif
         return DeviceCapabilities(

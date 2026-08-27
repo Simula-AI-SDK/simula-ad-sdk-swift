@@ -412,6 +412,13 @@ public final class SimulaInterstitialAd {
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
+            CreativeCTARouter.prewarmStoreProduct(
+                trackingUrl: readyResponse.trackingUrl,
+                destination: readyResponse.destinationKind,
+                storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
+                storeUrl: readyResponse.iosStoreUrl,
+                attribution: readyResponse.skanAttribution
+            )
             WebViewPool.shared.prewarm(trigger: "interstitial_ready")
         }
     }

@@ -330,6 +330,13 @@ public final class SimulaRewardedAd {
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
+            CreativeCTARouter.prewarmStoreProduct(
+                trackingUrl: readyResponse.trackingUrl,
+                destination: readyResponse.destinationKind,
+                storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
+                storeUrl: readyResponse.iosStoreUrl,
+                attribution: readyResponse.skanAttribution
+            )
             WebViewPool.shared.prewarm(trigger: "rewarded_ready")
         }
     }
