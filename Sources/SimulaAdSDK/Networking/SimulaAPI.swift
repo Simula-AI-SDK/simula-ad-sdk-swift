@@ -138,6 +138,26 @@ public struct DeviceCapabilities: Encodable, Sendable {
         self.nativeClickBeaconV1 = nativeClickBeaconV1
     }
 
+    /// Highest signed-ad version available on a running iOS version. Keep this aligned with
+    /// StoreKit's release availability so the backend never signs a payload this client cannot use.
+    static func supportedSKANVersion(for osVersion: OperatingSystemVersion) -> String {
+        if osVersion.majorVersion > 16
+            || (osVersion.majorVersion == 16 && osVersion.minorVersion >= 1) {
+            return "4.0"
+        }
+        if osVersion.majorVersion > 14
+            || (osVersion.majorVersion == 14 && osVersion.minorVersion >= 6) {
+            return "3.0"
+        }
+        if osVersion.majorVersion == 14 && osVersion.minorVersion == 5 {
+            return "2.2"
+        }
+        if osVersion.majorVersion == 14 {
+            return "2.1"
+        }
+        return "0"
+    }
+
     /// The running device's capabilities, evaluated once. `storekit_available` mirrors SKOverlay
     /// availability (iOS 14+); `skan_version` reports the max SKAdNetwork version the SDK supports.
     public static let current: DeviceCapabilities = {
@@ -147,14 +167,14 @@ public struct DeviceCapabilities: Encodable, Sendable {
         var skanVersion = "0"
         var adAttributionKitAvailable = false
         var nativeClickBeaconV1 = false
+        #if os(iOS)
         if #available(iOS 14.0, *) {
             storekitAvailable = true
-            skanVersion = "4.0"
+            skanVersion = supportedSKANVersion(for: v)
         }
         if #available(iOS 17.4, *) {
             adAttributionKitAvailable = true
         }
-        #if os(iOS)
         nativeClickBeaconV1 = true
         #endif
         return DeviceCapabilities(
@@ -608,6 +628,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// in the background, removing the dependency on the MMP tracker's redirect chain. `nil` when
     /// the campaign has no raw store link — the CTA then falls back to redirect-chain resolution.
     public let iosStoreUrl: String?
+    /// Whether the SDK may speculatively load the StoreKit product before a CTA tap.
+    /// Missing or malformed values default to `false`.
+    public let prewarmSKProduct: Bool
     /// Server-rendered HTML creative. When present (non-blank) it is rendered
     /// full-screen in a web view — the imperative interstitial's sole creative.
     public let renderedHtml: String?
@@ -657,6 +680,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         case renderedFormat = "rendered_format"
         case trackingUrl = "tracking_url"
         case iosStoreUrl = "ios_store_url"
+        case prewarmSKProduct = "prewarm_sk_product"
         case renderedHtml = "rendered_html"
         case adBehavior = "ad_behavior"
         case skanAttribution = "skan_attribution"
@@ -674,6 +698,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.renderedFormat = try? c.decode(String.self, forKey: .renderedFormat)
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
+        self.prewarmSKProduct = (try? c.decode(Bool.self, forKey: .prewarmSKProduct)) ?? false
         self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
         // Absent `ad_behavior` decodes to nil (render today's defaults); a present object
         // decodes tolerantly (partial/unknown fields fall back per-field, never throwing).
@@ -698,7 +723,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         skanAttribution: AdAttribution? = nil,
         creative: Creative? = nil,
         experiment: Experiment? = nil,
-        bidAmt: Double = 0
+        bidAmt: Double = 0,
+        prewarmSKProduct: Bool = false
     ) {
         self.impressionId = impressionId
         self.adInserted = adInserted
@@ -713,6 +739,7 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.creative = creative
         self.experiment = experiment
         self.bidAmt = bidAmt
+        self.prewarmSKProduct = prewarmSKProduct
     }
 }
 
@@ -808,6 +835,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// the deterministic CTA route (in-app store sheet from this link's app id, tracker fired in the
     /// background); `nil` falls back to redirect-chain resolution.
     public let iosStoreUrl: String?
+    /// Whether the SDK may speculatively load the StoreKit product before a CTA tap.
+    /// Missing or malformed values default to `false`.
+    public let prewarmSKProduct: Bool
     public let adBehavior: AdBehavior?
     /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
     /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
@@ -831,6 +861,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case destination
         case trackingUrl = "tracking_url"
         case iosStoreUrl = "ios_store_url"
+        case prewarmSKProduct = "prewarm_sk_product"
         case adBehavior = "ad_behavior"
         case skanAttribution = "skan_attribution"
         case bidAmt = "bid_amt"
@@ -844,6 +875,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
+        self.prewarmSKProduct = (try? c.decode(Bool.self, forKey: .prewarmSKProduct)) ?? false
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
         self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
@@ -859,7 +891,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
         iosStoreUrl: String? = nil,
         adBehavior: AdBehavior? = nil,
         skanAttribution: AdAttribution? = nil,
-        bidAmt: Double = 0
+        bidAmt: Double = 0,
+        prewarmSKProduct: Bool = false
     ) {
         self.impressionId = impressionId
         self.iframeUrl = iframeUrl
@@ -870,6 +903,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.adBehavior = adBehavior
         self.skanAttribution = skanAttribution
         self.bidAmt = bidAmt
+        self.prewarmSKProduct = prewarmSKProduct
     }
 }
 

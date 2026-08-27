@@ -88,8 +88,8 @@ final class SKOverlayAttributionTests: XCTestCase {
         if #available(iOS 16.1, *) {
             XCTAssertEqual(imp.sourceIdentifier.intValue, 25)
         }
-        // v4 fallback: campaign slot carries the source id when no campaign_id exists.
-        XCTAssertEqual(imp.adCampaignIdentifier.intValue, 25)
+        // SKAN 4 replaces the legacy campaign slot; do not provide an out-of-range placeholder.
+        XCTAssertNil(imp.value(forKey: "adCampaignIdentifier"))
     }
 
     @available(iOS 16.0, *)
@@ -142,7 +142,7 @@ final class SKOverlayAttributionTests: XCTestCase {
     func testAdImpressionSkan3UsesCampaignIdentifier() async throws {
         let a = try attribution("""
         "version":"3.0","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
-        "nonce":"n","timestamp":1784691000000,"attribution_signature":"click_sig",
+        "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1784691000000,"attribution_signature":"click_sig",
         "view_attribution_signature":"view_sig","campaign_id":42
         """)
         let built = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: a)
@@ -150,6 +150,17 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertEqual(imp.adCampaignIdentifier.intValue, 42)
         XCTAssertEqual(imp.signature, "view_sig")
         XCTAssertEqual(imp.version, "3.0")
+    }
+
+    @available(iOS 16.0, *)
+    func testAdImpressionRejectsPreViewThroughSkanVersion() async throws {
+        let a = try attribution("""
+        "version":"2.1","ad_network_id":"2xg367y5gd.adattributionkit","source_app_store_id":1671705818,
+        "nonce":"00000000-0000-0000-0000-000000000001","timestamp":1784691000000,
+        "attribution_signature":"click_sig","view_attribution_signature":"view_sig","campaign_id":42
+        """)
+        let built = await SKOverlayPresenter.adImpression(appID: "1575412509", attribution: a)
+        XCTAssertNil(built)
     }
     #endif
 }

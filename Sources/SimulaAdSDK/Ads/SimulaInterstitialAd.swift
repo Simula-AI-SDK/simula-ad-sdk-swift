@@ -466,6 +466,19 @@ public final class SimulaInterstitialAd {
         let didPresent = presenter.present(
             apiKey: provider.apiKey,
             response: response,
+            onWillPresent: {
+                if response.prewarmSKProduct {
+                    CreativeCTARouter.prewarmStoreProduct(
+                        trackingUrl: response.trackingUrl,
+                        destination: response.destinationKind,
+                        storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                        storeUrl: response.iosStoreUrl,
+                        attribution: response.skanAttribution
+                    )
+                } else {
+                    StoreProductPrewarmer.shared.disable()
+                }
+            },
             onClick: { [weak self] interaction in
                 Telemetry.shared.recordLifecycle(
                     stage: "click", adFormat: Self.adFormat, adUnitId: clickAdUnitId,

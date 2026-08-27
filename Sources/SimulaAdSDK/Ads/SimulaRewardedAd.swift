@@ -395,6 +395,19 @@ public final class SimulaRewardedAd {
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
+            onWillPresent: {
+                if response.prewarmSKProduct {
+                    CreativeCTARouter.prewarmStoreProduct(
+                        trackingUrl: response.trackingUrl,
+                        destination: response.destinationKind,
+                        storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                        storeUrl: response.iosStoreUrl,
+                        attribution: response.skanAttribution
+                    )
+                } else {
+                    StoreProductPrewarmer.shared.disable()
+                }
+            },
             onClick: { [weak self] interaction in
                 // CLICKED is one admitted user CTA/store-prompt tap; automatic redirects never enter here.
                 Telemetry.shared.recordLifecycle(

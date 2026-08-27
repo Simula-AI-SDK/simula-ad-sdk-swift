@@ -49,6 +49,7 @@ final class RewardedPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
+        onWillPresent: () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
@@ -102,6 +103,8 @@ final class RewardedPresenter {
         window.windowLevel = .normal + 1
         window.backgroundColor = .black
         window.rootViewController = hosting
+        // Apply StoreKit prewarm policy before SwiftUI `onAppear` can fire an automatic route.
+        onWillPresent()
         window.makeKeyAndVisible()
         self.window = window
         retainedWhilePresenting = self
@@ -129,6 +132,7 @@ final class RewardedPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
+        onWillPresent: () -> Void = {},
         onClick: @escaping () -> Void,
         onImpression: @escaping () -> Void,
         onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
@@ -147,6 +151,7 @@ final class RewardedPresenter {
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
+            onWillPresent: onWillPresent,
             onClick: { _ in onClick() },
             onImpression: onImpression,
             onClose: onClose
