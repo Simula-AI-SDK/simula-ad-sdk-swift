@@ -383,13 +383,15 @@ public final class SimulaInterstitialAd {
             )
             state = .ready(response, metadata: metadata, loadedAt: Date())
             #if os(iOS)
-            CreativeCTARouter.prewarmStoreProduct(
-                trackingUrl: response.trackingUrl,
-                destination: response.destinationKind,
-                storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
-                storeUrl: response.iosStoreUrl,
-                attribution: response.skanAttribution
-            )
+            if response.prewarmSKProduct {
+                CreativeCTARouter.prewarmStoreProduct(
+                    trackingUrl: response.trackingUrl,
+                    destination: response.destinationKind,
+                    storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
+                    storeUrl: response.iosStoreUrl,
+                    attribution: response.skanAttribution
+                )
+            }
             #endif
             delegate?.interstitialDidLoad(self)
             #if os(iOS)
@@ -421,13 +423,15 @@ public final class SimulaInterstitialAd {
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
-            CreativeCTARouter.prewarmStoreProduct(
-                trackingUrl: readyResponse.trackingUrl,
-                destination: readyResponse.destinationKind,
-                storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
-                storeUrl: readyResponse.iosStoreUrl,
-                attribution: readyResponse.skanAttribution
-            )
+            if readyResponse.prewarmSKProduct {
+                CreativeCTARouter.prewarmStoreProduct(
+                    trackingUrl: readyResponse.trackingUrl,
+                    destination: readyResponse.destinationKind,
+                    storeOpen: readyResponse.adBehavior?.storeOpen ?? .skstoreproduct,
+                    storeUrl: readyResponse.iosStoreUrl,
+                    attribution: readyResponse.skanAttribution
+                )
+            }
             WebViewPool.shared.prewarm(trigger: "interstitial_ready")
         }
     }

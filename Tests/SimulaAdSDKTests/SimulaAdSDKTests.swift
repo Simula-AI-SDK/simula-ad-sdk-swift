@@ -186,7 +186,7 @@ final class SimulaAdSDKTests: XCTestCase {
         {"impression_id":"ad_1","ad_inserted":true,"ad_unit_id":"unit_1","rewarded":true,
          "destination":"web","rendered_format":"rewarded_video",
          "rendered_html":"<b>hi</b>",
-         "tracking_url":"https://x/click"}
+         "tracking_url":"https://x/click","prewarm_sk_product":true}
         """
         let r = try decodeAdLoad(json)
         XCTAssertEqual(r.impressionId, "ad_1")
@@ -197,6 +197,7 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(r.renderedFormat, "rewarded_video")
         XCTAssertEqual(r.renderedHtml, "<b>hi</b>")
         XCTAssertEqual(r.trackingUrl, "https://x/click")
+        XCTAssertTrue(r.prewarmSKProduct)
     }
 
     func testAdLoadDestinationDefaultsToAppstoreWhenAbsent() throws {
@@ -204,6 +205,7 @@ final class SimulaAdSDKTests: XCTestCase {
         let r = try decodeAdLoad(json)
         XCTAssertEqual(r.destination, "appstore")
         XCTAssertEqual(r.destinationKind, .appstore)
+        XCTAssertFalse(r.prewarmSKProduct)
     }
 
     func testAdLoadDestinationUnknownFallsBackToAppstore() throws {
@@ -228,6 +230,11 @@ final class SimulaAdSDKTests: XCTestCase {
 
     func testAdLoadMalformedJSONThrows() {
         XCTAssertThrowsError(try JSONDecoder().decode(AdLoadResponse.self, from: Data("not json".utf8)))
+    }
+
+    func testAdLoadMalformedSKProductPrewarmDefaultsToFalse() throws {
+        let r = try decodeAdLoad(#"{"prewarm_sk_product":"yes"}"#)
+        XCTAssertFalse(r.prewarmSKProduct)
     }
 
     // MARK: - Ad load: rendered_html (HTML creative precedence)
@@ -976,12 +983,13 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testRewardedInitHappyPath() throws {
-        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","ad_behavior":{"close":{"delay_seconds":30}}}"#
+        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","prewarm_sk_product":true,"ad_behavior":{"close":{"delay_seconds":30}}}"#
         let r = try decodeRewardedInit(json)
         XCTAssertEqual(r.impressionId, "imp_1")
         XCTAssertEqual(r.iframeUrl, "https://x/play")
         // The play-to-earn gate now rides on `ad_behavior.close.delay_seconds` (no top-level field).
         XCTAssertEqual(r.adBehavior?.close.delaySeconds, 30)
+        XCTAssertTrue(r.prewarmSKProduct)
     }
 
     func testRewardedInitMissingFieldsFallBackToDefaults() throws {
@@ -990,6 +998,7 @@ final class SimulaAdSDKTests: XCTestCase {
         let r = try decodeRewardedInit(#"{"iframe_url":"https://x/p","serve_id":"srv_2","ad_id":"a"}"#)
         XCTAssertEqual(r.impressionId, "")   // missing → ""
         XCTAssertNil(r.adBehavior)           // absent `ad_behavior` → nil → no gate, no store prompt
+        XCTAssertFalse(r.prewarmSKProduct)
     }
 
     func testRewardedInitMalformedJSONThrows() {
