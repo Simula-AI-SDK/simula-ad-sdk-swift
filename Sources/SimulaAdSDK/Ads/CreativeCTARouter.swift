@@ -80,6 +80,7 @@ enum SKANIdentifierValidation: Equatable {
 
 enum SKANAttributionSurface: String {
     case storeProduct = "store_product"
+    case interstitialViewThrough = "interstitial_view_through"
     case skOverlayImpression = "skoverlay_impression"
     case skOverlayFallback = "skoverlay_fallback"
 }

@@ -1,7 +1,47 @@
+struct ViewThroughImpressionLifecycleState<Impression> {
+    private(set) var impression: Impression?
+    private(set) var isCreativeReady = false
+    private(set) var didAttemptStart = false
+    private(set) var didEnd = false
+
+    mutating func markCreativeReady() {
+        isCreativeReady = true
+    }
+
+    mutating func markCreativeNotReady() {
+        isCreativeReady = false
+    }
+
+    mutating func start(
+        makeImpression: () -> Impression?,
+        perform: (Impression) -> Void
+    ) {
+        guard isCreativeReady, !didAttemptStart, !didEnd else { return }
+        didAttemptStart = true
+        guard let impression = makeImpression() else { return }
+        self.impression = impression
+        perform(impression)
+    }
+
+    mutating func end(perform: (Impression) -> Void) {
+        guard !didEnd else { return }
+        didEnd = true
+        guard let impression else { return }
+        self.impression = nil
+        perform(impression)
+    }
+
+    mutating func endIfStarted(perform: (Impression) -> Void) {
+        guard impression != nil else { return }
+        end(perform: perform)
+    }
+}
+
 #if os(iOS)
 import SwiftUI
 import UIKit
 import Combine
+import StoreKit
 
 /// Foreground on-screen time after begin-to-render before the billable IMPRESSION + PAID fire for a
 /// full-screen ad. The PRD's OMID rule: "fire IMPRESSION + PAID at begin-to-render after 2 seconds"
@@ -11,6 +51,16 @@ let fullscreenImpressionDelayMs: Double = 2_000
 /// Poll cadence for the foreground impression timer — fine enough to land the 2s mark within ~1 frame,
 /// coarse enough to stay negligible. Shared by the interstitial and rewarded presenters.
 let impressionTickNanos: UInt64 = 200_000_000
+
+private func recordInterstitialSKANViewThroughOperation(name: String, error: Error?) {
+    Telemetry.shared.recordOperation(
+        name: name,
+        durationMs: 0,
+        success: error == nil,
+        failureClass: error == nil ? nil : "storekit_error",
+        breadcrumb: "surface=interstitial"
+    )
+}
 
 // MARK: - InterstitialPresenter
 
@@ -237,6 +287,10 @@ private struct CreativeInterstitialView: View {
     @State private var skOverlayOwnership: SKOverlayOwnershipToken?
     @State private var skOverlayTask: Task<Void, Never>?
 
+    // Custom-rendered interstitial view-through attribution. Enabled SKOverlay serves are excluded
+    // until those two surfaces receive distinct signed impression identifiers from the backend.
+    @State private var skanViewThrough = ViewThroughImpressionLifecycleState<SKAdImpression>()
+
     // Billable IMPRESSION + PAID — fired once, after `fullscreenImpressionDelayMs` of foreground
     // on-screen time from begin-to-render (the same foreground gating the close countdown uses).
     @State private var impressionFired = false
@@ -346,6 +400,7 @@ private struct CreativeInterstitialView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            endSKANViewThroughImpression()
             attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
             gateTask = nil
@@ -367,6 +422,7 @@ private struct CreativeInterstitialView: View {
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            endSKANViewThroughImpressionIfStarted()
             appForegrounded = false
             storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
@@ -376,8 +432,18 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            startSKANViewThroughImpression()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            endSKANViewThroughImpressionIfStarted()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
+            endSKANViewThroughImpressionIfStarted()
             storeSheetPresented = true
             storeExit?.onAway() // an in-app store/Safari sheet covered the ad
             reconcileGate()
@@ -387,6 +453,7 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // the in-app sheet was dismissed
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            startSKANViewThroughImpression()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
         // immediately, cancelling the close-delay gate.
@@ -442,6 +509,9 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
+            onNavigationFinished: { handleSKANCreativeReady() },
+            onNavigationFailed: { _ in handleSKANCreativeFailure() },
+            onWebContentProcessTerminated: { handleSKANRendererTermination() },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 clickHandoffs.set(.creative, pending: $0)
@@ -467,6 +537,65 @@ private struct CreativeInterstitialView: View {
         // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
     }
 
+    // MARK: SKAdNetwork view-through attribution
+
+    private func handleSKANCreativeReady() {
+        skanViewThrough.markCreativeReady()
+        startSKANViewThroughImpression()
+    }
+
+    private func handleSKANCreativeFailure() {
+        skanViewThrough.markCreativeNotReady()
+        endSKANViewThroughImpression()
+    }
+
+    private func handleSKANRendererTermination() {
+        skanViewThrough.markCreativeNotReady()
+        endSKANViewThroughImpressionIfStarted()
+    }
+
+    private func startSKANViewThroughImpression() {
+        guard visible, appForegrounded, !storeSheetPresented,
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive else { return }
+        skanViewThrough.start(
+            makeImpression: {
+                // SKOverlay currently shares this serve's nonce. Avoid registering both surfaces
+                // until its attribution tuple is split from the custom creative's tuple.
+                guard response.adBehavior?.skoverlay?.enabled != true,
+                      response.destinationKind == .appstore,
+                      let appID = CreativeCTARouter.appStoreID(fromString: response.iosStoreUrl)
+                else { return nil }
+                return makeSKANViewThroughImpression(
+                    appID: appID,
+                    attribution: response.skanAttribution,
+                    surface: .interstitialViewThrough
+                )
+            },
+            perform: { impression in
+                SKAdNetwork.startImpression(impression) { error in
+                    recordInterstitialSKANViewThroughOperation(name: "skan_view_start", error: error)
+                }
+            }
+        )
+    }
+
+    private func endSKANViewThroughImpression() {
+        skanViewThrough.end { impression in
+            SKAdNetwork.endImpression(impression) { error in
+                recordInterstitialSKANViewThroughOperation(name: "skan_view_end", error: error)
+            }
+        }
+    }
+
+    private func endSKANViewThroughImpressionIfStarted() {
+        skanViewThrough.endIfStarted { impression in
+            SKAdNetwork.endImpression(impression) { error in
+                recordInterstitialSKANViewThroughOperation(name: "skan_view_end", error: error)
+            }
+        }
+    }
+
     // MARK: Actions
 
     /// Fired when a user-initiated link inside the HTML creative is intercepted by the web view.
@@ -484,6 +613,7 @@ private struct CreativeInterstitialView: View {
             dismissUnlocked: closeEnabled,
             clickHandoffPending: clickHandoffPending
         ) else { return }
+        endSKANViewThroughImpression()
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {

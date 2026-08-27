@@ -39,6 +39,59 @@ struct SKOverlayOwnershipToken: Hashable, Sendable {
 import UIKit
 import StoreKit
 
+/// Builds a fidelity-type 0 impression for APIs that consume the server's
+/// `view_attribution_signature`. The caller owns the impression lifecycle.
+@available(iOS 14.5, *)
+@MainActor
+func makeSKANViewThroughImpression(
+    appID: String,
+    attribution: AdAttribution?,
+    surface: SKANAttributionSurface
+) -> SKAdImpression? {
+    guard let skan = attribution?.skan else { return nil }
+    guard let viewSignature = skan.viewAttributionSignature, !viewSignature.isEmpty else { return nil }
+    guard ["2.2", "3.0", "4.0"].contains(skan.version) else {
+        CreativeCTARouter.recordDroppedSKAN(.unsupportedViewVersion, surface: surface)
+        return nil
+    }
+    guard let advertisedID = Int(appID) else {
+        CreativeCTARouter.recordDroppedSKAN(.invalidAdvertisedAppID, surface: surface)
+        return nil
+    }
+    if let reason = skanPayloadRejectionReason(skan, signature: viewSignature) {
+        CreativeCTARouter.recordDroppedSKAN(reason, surface: surface)
+        return nil
+    }
+    guard let identifier = validatedSKANIdentifier(
+        version: skan.version,
+        campaignIdentifier: skan.campaignIdentifier,
+        sourceIdentifier: skan.sourceIdentifier
+    ) else {
+        CreativeCTARouter.recordDroppedSKAN(.unsupportedVersion, surface: surface)
+        return nil
+    }
+
+    let impression = SKAdImpression()
+    impression.sourceAppStoreItemIdentifier = NSNumber(value: skan.sourceAppStoreIdentifier)
+    impression.advertisedAppStoreItemIdentifier = NSNumber(value: advertisedID)
+    impression.adNetworkIdentifier = skan.adNetworkIdentifier
+    impression.adImpressionIdentifier = skan.nonce.lowercased()
+    impression.timestamp = NSNumber(value: skan.timestamp)
+    impression.signature = viewSignature
+    impression.version = skan.version
+    switch identifier {
+    case .campaign(let campaignID):
+        impression.adCampaignIdentifier = NSNumber(value: campaignID)
+    case .source(let sourceID):
+        guard #available(iOS 16.1, *) else {
+            CreativeCTARouter.recordDroppedSKAN(.unsupportedOS, surface: surface)
+            return nil
+        }
+        impression.sourceIdentifier = NSNumber(value: sourceID)
+    }
+    return impression
+}
+
 // MARK: - SKOverlayPresenter
 
 /// Presents the native `SKOverlay` install banner for the `skoverlay` experiment (PRD Section 5).
@@ -131,50 +184,11 @@ enum SKOverlayPresenter {
     /// block is absent or malformed so the caller can fall back to `setAdditionalValue`.
     @available(iOS 16.0, *)
     static func adImpression(appID: String, attribution: AdAttribution?) -> SKAdImpression? {
-        guard let skan = attribution?.skan else { return nil }
-        // Older payloads legitimately omit a view-through signature and use the additional-values
-        // fallback. Only a supplied but unusable signed payload is rejection telemetry.
-        guard let viewSignature = skan.viewAttributionSignature, !viewSignature.isEmpty else { return nil }
-        guard ["2.2", "3.0", "4.0"].contains(skan.version) else {
-            CreativeCTARouter.recordDroppedSKAN(.unsupportedViewVersion, surface: .skOverlayImpression)
-            return nil
-        }
-        guard let advertisedID = Int(appID) else {
-            CreativeCTARouter.recordDroppedSKAN(.invalidAdvertisedAppID, surface: .skOverlayImpression)
-            return nil
-        }
-        if let reason = skanPayloadRejectionReason(skan, signature: viewSignature) {
-            CreativeCTARouter.recordDroppedSKAN(reason, surface: .skOverlayImpression)
-            return nil
-        }
-        guard let identifier = validatedSKANIdentifier(
-            version: skan.version,
-            campaignIdentifier: skan.campaignIdentifier,
-            sourceIdentifier: skan.sourceIdentifier
-        ) else {
-            CreativeCTARouter.recordDroppedSKAN(.unsupportedVersion, surface: .skOverlayImpression)
-            return nil
-        }
-
-        let impression = SKAdImpression()
-        impression.sourceAppStoreItemIdentifier = NSNumber(value: skan.sourceAppStoreIdentifier)
-        impression.advertisedAppStoreItemIdentifier = NSNumber(value: advertisedID)
-        impression.adNetworkIdentifier = skan.adNetworkIdentifier
-        impression.adImpressionIdentifier = skan.nonce.lowercased()
-        impression.timestamp = NSNumber(value: skan.timestamp)
-        impression.signature = viewSignature
-        impression.version = skan.version
-        switch identifier {
-        case .campaign(let campaignID):
-            impression.adCampaignIdentifier = NSNumber(value: campaignID)
-        case .source(let sourceID):
-            guard #available(iOS 16.1, *) else {
-                CreativeCTARouter.recordDroppedSKAN(.unsupportedOS, surface: .skOverlayImpression)
-                return nil
-            }
-            impression.sourceIdentifier = NSNumber(value: sourceID)
-        }
-        return impression
+        makeSKANViewThroughImpression(
+            appID: appID,
+            attribution: attribution,
+            surface: .skOverlayImpression
+        )
     }
 
     /// Dismisses in the exact scene used for presentation, so multi-window hosts cannot leak an
