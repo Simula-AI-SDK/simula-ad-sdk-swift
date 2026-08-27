@@ -101,6 +101,9 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// Called when the web view fails to load content
     var onNavigationFailed: ((Error) -> Void)?
 
+    /// Called immediately when WebKit's content process terminates, before any in-place recovery.
+    var onWebContentProcessTerminated: (() -> Void)?
+
     /// Called when the web view receives a postMessage from JavaScript
     var onMessageReceived: ((String) -> Void)?
 
@@ -171,6 +174,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
+        onWebContentProcessTerminated: (() -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
@@ -196,6 +200,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onNavigationCommitted = onNavigationCommitted
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
+        self.onWebContentProcessTerminated = onWebContentProcessTerminated
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
         self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
@@ -223,6 +228,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
+        onWebContentProcessTerminated: (() -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
@@ -246,6 +252,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onWebContentProcessTerminated: onWebContentProcessTerminated,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
@@ -325,6 +332,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onNavigationCommitted = onNavigationCommitted
         coordinator.onNavigationFinished = onNavigationFinished
         coordinator.onNavigationFailed = onNavigationFailed
+        coordinator.onWebContentProcessTerminated = onWebContentProcessTerminated
         coordinator.onMessageReceived = onMessageReceived
         coordinator.onAdClick = onAdClick
         coordinator.onClickHandoffPendingChanged = onClickHandoffPendingChanged
@@ -464,6 +472,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onWebContentProcessTerminated: onWebContentProcessTerminated,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick,
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
@@ -491,6 +500,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
+        var onWebContentProcessTerminated: (() -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var onAdClick: ((ClickInteraction) -> Void)?
         var onClickHandoffPendingChanged: ((Bool) -> Void)?
@@ -776,6 +786,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onNavigationCommitted: (() -> Void)? = nil,
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
+            onWebContentProcessTerminated: (() -> Void)? = nil,
             onMessageReceived: ((String) -> Void)?,
             onAdClick: ((ClickInteraction) -> Void)? = nil,
             onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
@@ -797,6 +808,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onNavigationCommitted = onNavigationCommitted
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
+            self.onWebContentProcessTerminated = onWebContentProcessTerminated
             self.onMessageReceived = onMessageReceived
             self.onAdClick = onAdClick
             self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
@@ -1047,6 +1059,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 breadcrumb: telemetryAdFormat
             )
             bridge?.stop()
+            onWebContentProcessTerminated?()
             // A renderer death is a real pressure signal: drain idle views and suppress retention /
             // explicit minigame prewarm for the cooldown. Ordinary backgrounding does not do this.
             WebViewPool.shared.handleRendererDeath()

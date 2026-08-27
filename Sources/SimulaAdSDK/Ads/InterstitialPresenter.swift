@@ -1,13 +1,22 @@
 struct ViewThroughImpressionLifecycleState<Impression> {
     private(set) var impression: Impression?
+    private(set) var isCreativeReady = false
     private(set) var didAttemptStart = false
     private(set) var didEnd = false
+
+    mutating func markCreativeReady() {
+        isCreativeReady = true
+    }
+
+    mutating func markCreativeNotReady() {
+        isCreativeReady = false
+    }
 
     mutating func start(
         makeImpression: () -> Impression?,
         perform: (Impression) -> Void
     ) {
-        guard !didAttemptStart, !didEnd else { return }
+        guard isCreativeReady, !didAttemptStart, !didEnd else { return }
         didAttemptStart = true
         guard let impression = makeImpression() else { return }
         self.impression = impression
@@ -20,6 +29,11 @@ struct ViewThroughImpressionLifecycleState<Impression> {
         guard let impression else { return }
         self.impression = nil
         perform(impression)
+    }
+
+    mutating func endIfStarted(perform: (Impression) -> Void) {
+        guard impression != nil else { return }
+        end(perform: perform)
     }
 }
 
@@ -408,7 +422,7 @@ private struct CreativeInterstitialView: View {
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
-            endSKANViewThroughImpression()
+            endSKANViewThroughImpressionIfStarted()
             appForegrounded = false
             storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
@@ -418,9 +432,18 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            startSKANViewThroughImpression()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            endSKANViewThroughImpressionIfStarted()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
-            endSKANViewThroughImpression()
+            endSKANViewThroughImpressionIfStarted()
             storeSheetPresented = true
             storeExit?.onAway() // an in-app store/Safari sheet covered the ad
             reconcileGate()
@@ -430,6 +453,7 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // the in-app sheet was dismissed
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            startSKANViewThroughImpression()
         }
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early, so unlock the close button
         // immediately, cancelling the close-delay gate.
@@ -485,8 +509,9 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
-            onNavigationCommitted: { startSKANViewThroughImpression() },
-            onNavigationFailed: { _ in endSKANViewThroughImpression() },
+            onNavigationFinished: { handleSKANCreativeReady() },
+            onNavigationFailed: { _ in handleSKANCreativeFailure() },
+            onWebContentProcessTerminated: { handleSKANRendererTermination() },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 clickHandoffs.set(.creative, pending: $0)
@@ -514,9 +539,25 @@ private struct CreativeInterstitialView: View {
 
     // MARK: SKAdNetwork view-through attribution
 
+    private func handleSKANCreativeReady() {
+        skanViewThrough.markCreativeReady()
+        startSKANViewThroughImpression()
+    }
+
+    private func handleSKANCreativeFailure() {
+        skanViewThrough.markCreativeNotReady()
+        endSKANViewThroughImpression()
+    }
+
+    private func handleSKANRendererTermination() {
+        skanViewThrough.markCreativeNotReady()
+        endSKANViewThroughImpressionIfStarted()
+    }
+
     private func startSKANViewThroughImpression() {
         guard visible, appForegrounded, !storeSheetPresented,
-              UIApplication.shared.applicationState == .active else { return }
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive else { return }
         skanViewThrough.start(
             makeImpression: {
                 // SKOverlay currently shares this serve's nonce. Avoid registering both surfaces
@@ -547,6 +588,14 @@ private struct CreativeInterstitialView: View {
         }
     }
 
+    private func endSKANViewThroughImpressionIfStarted() {
+        skanViewThrough.endIfStarted { impression in
+            SKAdNetwork.endImpression(impression) { error in
+                recordInterstitialSKANViewThroughOperation(name: "skan_view_end", error: error)
+            }
+        }
+    }
+
     // MARK: Actions
 
     /// Fired when a user-initiated link inside the HTML creative is intercepted by the web view.
@@ -564,6 +613,7 @@ private struct CreativeInterstitialView: View {
             dismissUnlocked: closeEnabled,
             clickHandoffPending: clickHandoffPending
         ) else { return }
+        endSKANViewThroughImpression()
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
