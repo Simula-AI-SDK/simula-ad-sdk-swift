@@ -27,7 +27,8 @@ Pod::Spec.new do |s|
   # publishing a SOURCE pod (which would re-expose the miscompile to hosts). Push from the
   # release staging layout (podspec + extracted SimulaAdSDK.xcframework side by side).
   s.source           = {
-    :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip"
+    :http => "https://github.com/Simula-AI-SDK/simula-ad-sdk-swift/releases/download/#{s.version}/SimulaAdSDK.xcframework.zip",
+    :sha256 => "d403728aba921f0a02096f7a8812a38ae11cc81036db135601b0ca3f2fa47204"
   }
 
   s.platform         = :ios, "15.0"
