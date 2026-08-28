@@ -255,7 +255,7 @@ private struct RewardedGameView: View {
     /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
     @State private var storeExit: StoreExitTracker?
 
-    @State private var gateClock = RewardedGateClock()
+    @State private var gateClock = FullscreenGateClock()
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
     /// per 1 s accrual tick — `closeProgress` below is the instantaneous truth used to anchor it.

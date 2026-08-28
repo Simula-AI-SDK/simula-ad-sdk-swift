@@ -264,14 +264,9 @@ private struct CreativeInterstitialView: View {
     @State private var closeRemaining: Int
     /// 0→1 fill for the close-delay countdown (`countdown_circle` ring / `progress_bar`).
     @State private var closeProgress: Double = 0
-    /// Monotonic anchor (`systemUptime`) for the gate, so a re-`onAppear` resumes the countdown
-    /// from where it was instead of restarting it. `nil` until first set.
-    @State private var gateStartedAt: TimeInterval?
-    /// Total time the gate spent paused (app not foreground-active), excluded from the dwell so
-    /// leaving the app pauses the countdown instead of letting it elapse in the background.
-    @State private var gatePausedTotal: TimeInterval = 0
-    /// `systemUptime` when the current pause began; `nil` while running.
-    @State private var gatePausedAt: TimeInterval?
+    /// Shared monotonic gate state. It preserves fractional elapsed time and makes duplicate pause
+    /// notifications from StoreKit and the app lifecycle idempotent.
+    @State private var gateClock = FullscreenGateClock()
 
     // Mid-ad store prompt (`store_prompt`) — a tappable badge shown from `closeTime / 2` until the
     // real close button appears.
@@ -461,6 +456,12 @@ private struct CreativeInterstitialView: View {
             guard earlyComplete, !closeEnabled else { return }
             gateTask?.cancel()
             gateTask = nil
+            if let close = response.adBehavior?.close {
+                gateClock.pause(
+                    at: ProcessInfo.processInfo.systemUptime,
+                    total: TimeInterval(close.delaySeconds)
+                )
+            }
             withAnimation(.easeInOut(duration: 0.2)) { closeEnabled = true }
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears.
@@ -667,8 +668,8 @@ private struct CreativeInterstitialView: View {
 
         guard total > 0, !closeEnabled else { return }
 
-        // Resume from the monotonic anchor so a re-`onAppear` doesn't restart the countdown.
-        let remaining = remainingGateTime(total: total)
+        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
+        let remaining = gateClock.remaining(total: total)
         if remaining <= 0 {
             closeEnabled = true
             return
@@ -677,35 +678,33 @@ private struct CreativeInterstitialView: View {
         // Ring / bar treatments fill linearly over the remaining delay (resuming from the fraction
         // already elapsed, so a re-`onAppear` doesn't snap the fill back to 0).
         if treatment == .countdownCircle || treatment == .progressBar {
-            closeProgress = (total - remaining) / total
+            closeProgress = gateClock.progress(total: total)
             withAnimation(.linear(duration: remaining)) { closeProgress = 1 }
+        } else if treatment == .rewardOrCloseLabel {
+            closeRemaining = gateClock.secondsRemaining(total: total)
         }
 
         // Cancellable gate: a fire-and-forget asyncAfter would still fire after dismiss and mutate
         // dead @State. The Task is cancelled in `.onDisappear`.
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        gateTask = Task { await runGate(treatment: treatment, remaining: remaining) }
+        gateTask = Task { await runGate(treatment: treatment, total: total) }
     }
 
     /// Close-gate task body (named method — see the task-shape note in TelemetryManager).
     @MainActor
-    private func runGate(treatment: CloseTreatment, remaining: TimeInterval) async {
-        if treatment == .rewardOrCloseLabel {
-            var left = Int(exactly: ceil(remaining)) ?? 0
-            closeRemaining = left
-            while left > 0 {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                if Task.isCancelled { return }
-                left -= 1
-                closeRemaining = left
-            }
-        } else {
-            // UInt64(negative or non-finite) traps; only sleep for a sane positive duration.
-            let sleepNs = remaining * 1_000_000_000
-            if sleepNs.isFinite, sleepNs > 0, sleepNs < Double(UInt64.max) {
-                // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-                do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
+    private func runGate(treatment: CloseTreatment, total: TimeInterval) async {
+        while gateClock.elapsed < total && !Task.isCancelled {
+            let sleepSeconds = treatment == .rewardOrCloseLabel
+                ? gateClock.timeUntilNextTick(total: total)
+                : gateClock.remaining(total: total)
+            let sleepNs = sleepSeconds * 1_000_000_000
+            guard sleepNs.isFinite, sleepNs > 0, sleepNs < Double(UInt64.max) else { return }
+            // do/catch, not `try?` — see the task-shape note in TelemetryManager.
+            do { try await Task.sleep(nanoseconds: UInt64(sleepNs)) } catch { return }
+            if Task.isCancelled { return }
+            gateClock.update(at: ProcessInfo.processInfo.systemUptime, total: total)
+            if treatment == .rewardOrCloseLabel {
+                closeRemaining = gateClock.secondsRemaining(total: total)
             }
         }
         if Task.isCancelled { return }
@@ -718,22 +717,18 @@ private struct CreativeInterstitialView: View {
         guard let close = response.adBehavior?.close, close.delaySeconds > 0, !closeEnabled else { return }
         gateTask?.cancel()
         gateTask = nil
-        if gatePausedAt == nil { gatePausedAt = ProcessInfo.processInfo.systemUptime }
+        let total = TimeInterval(close.delaySeconds)
+        gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: total)
         if close.treatment == .countdownCircle || close.treatment == .progressBar {
-            let total = TimeInterval(close.delaySeconds)
-            let fraction = min(1, max(0, (total - remainingGateTime(total: total)) / total))
             var tx = Transaction(); tx.disablesAnimations = true
-            withTransaction(tx) { closeProgress = fraction }
+            withTransaction(tx) { closeProgress = gateClock.progress(total: total) }
+        } else if close.treatment == .rewardOrCloseLabel {
+            closeRemaining = gateClock.secondsRemaining(total: total)
         }
     }
 
-    /// Resumes the countdown when the app returns to the foreground: folds the paused interval into
-    /// the excluded total and restarts from where it left off.
+    /// Resumes the countdown from the fractional elapsed time captured by `pauseGate()`.
     private func resumeGate() {
-        if let pausedAt = gatePausedAt {
-            gatePausedTotal += ProcessInfo.processInfo.systemUptime - pausedAt
-            gatePausedAt = nil
-        }
         startGate()
     }
 
@@ -917,16 +912,6 @@ private struct CreativeInterstitialView: View {
         presentSKOverlay(config: config)
     }
 
-    /// Seconds left on the active gate, anchored to a monotonic clock the first time it's asked.
-    /// Reusing one anchor across `onAppear` calls means the countdown resumes instead of resetting.
-    private func remainingGateTime(total: TimeInterval) -> TimeInterval {
-        let now = ProcessInfo.processInfo.systemUptime
-        let startedAt = gateStartedAt ?? now
-        if gateStartedAt == nil { gateStartedAt = startedAt }
-        // Subtract time spent paused (app backgrounded / not foreground-active) so the dwell only
-        // counts foreground time — leaving the app pauses the countdown.
-        return total - (now - startedAt - gatePausedTotal)
-    }
 }
 
 // MARK: - CloseButtonView

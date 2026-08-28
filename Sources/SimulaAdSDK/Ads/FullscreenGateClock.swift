@@ -1,6 +1,6 @@
 import Foundation
 
-struct RewardedGateClock {
+struct FullscreenGateClock {
     private(set) var elapsed: TimeInterval = 0
     private var resumedAt: TimeInterval?
 
