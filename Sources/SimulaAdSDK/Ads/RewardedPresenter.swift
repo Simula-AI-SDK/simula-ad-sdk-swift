@@ -255,7 +255,7 @@ private struct RewardedGameView: View {
     /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
     @State private var storeExit: StoreExitTracker?
 
-    @State private var elapsedPlayTime: Double = 0
+    @State private var gateClock = FullscreenGateClock()
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
     /// per 1 s accrual tick — `closeProgress` below is the instantaneous truth used to anchor it.
@@ -279,15 +279,16 @@ private struct RewardedGameView: View {
     /// same value that ungates the close button). `nil` close → 0 → instantly earned.
     private var gateSeconds: Int { close?.delaySeconds ?? 0 }
 
+    private var gateDuration: TimeInterval { TimeInterval(gateSeconds) }
+
     private var secondsLeft: Int {
-        max(0, gateSeconds - Int(elapsedPlayTime))
+        gateClock.secondsRemaining(total: gateDuration)
     }
 
-    /// Instantaneous 0→1 play-to-earn fraction (whole-second granularity). Not rendered directly —
-    /// `closeProgressAnim` glides between these values; this is the anchor the animation snaps to on
-    /// pause/resume.
+    /// Instantaneous 0→1 play-to-earn fraction. Not rendered directly — `closeProgressAnim` glides
+    /// between these values and re-anchors here when the timer pauses or resumes.
     private var closeProgress: Double {
-        gateSeconds > 0 ? min(1.0, max(0.0, elapsedPlayTime / Double(gateSeconds))) : 1.0
+        gateClock.progress(total: gateDuration)
     }
 
     private var clickHandoffPending: Bool { clickHandoffs.isPending }
@@ -365,6 +366,7 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
+            gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             impressionTask?.cancel()
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
@@ -401,6 +403,7 @@ private struct RewardedGameView: View {
             guard earlyComplete, !rewardEarned else { return }
             timerTask?.cancel()
             timerTask = nil
+            gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             rewardEarned = true
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
@@ -453,14 +456,16 @@ private struct RewardedGameView: View {
             rewardEarned = true
             return
         }
-        // Glide the bar/ring fill linearly to full over the remaining gate (resuming from the
-        // fraction already elapsed). The 1 s accrual loop below only drives gate / store-prompt /
-        // reward logic — the indicator is animated, not stepped, so it no longer looks laggy.
-        let remaining = Double(gateSeconds) - elapsedPlayTime
-        closeProgressAnim = closeProgress
-        if remaining > 0 {
-            withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
+        // Glide the bar/ring fill linearly to full over the remaining gate. The monotonic clock keeps
+        // fractional elapsed time so pausing for StoreKit cannot snap the indicator to a prior second.
+        let remaining = gateClock.remaining(total: gateDuration)
+        guard remaining > 0 else {
+            rewardEarned = true
+            return
         }
+        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
+        closeProgressAnim = closeProgress
+        withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         timerTask = Task { await runPlayTimer() }
     }
@@ -468,18 +473,27 @@ private struct RewardedGameView: View {
     /// Play-to-earn timer task body (named method — see the task-shape note in TelemetryManager).
     @MainActor
     private func runPlayTimer() async {
-        while elapsedPlayTime < Double(gateSeconds) && !Task.isCancelled {
+        while gateClock.elapsed < gateDuration && !Task.isCancelled {
+            // Resume at the next elapsed-second boundary rather than starting a fresh one-second
+            // sleep, preserving the countdown phase after a fractional StoreKit pause.
+            let sleepSeconds = gateClock.timeUntilNextTick(total: gateDuration)
+            let sleepNanos = sleepSeconds * 1_000_000_000
+            guard sleepNanos.isFinite, sleepNanos > 0, sleepNanos < Double(UInt64.max) else { return }
             // do/catch, not `try?` — see the task-shape note in TelemetryManager.
-            do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+            do { try await Task.sleep(nanoseconds: UInt64(sleepNanos)) } catch { return }
             if Task.isCancelled { return }
-            elapsedPlayTime += 1
-            // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
-            if elapsedPlayTime >= Double(gateSeconds) / 2 {
-                withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
-            }
-            if elapsedPlayTime >= Double(gateSeconds) {
-                rewardEarned = true
-            }
+            gateClock.update(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
+            applyElapsedPlayTime()
+        }
+    }
+
+    private func applyElapsedPlayTime() {
+        // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
+        if gateClock.elapsed >= gateDuration / 2, !storePromptVisible {
+            withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
+        }
+        if gateClock.elapsed >= gateDuration {
+            rewardEarned = true
         }
     }
 
@@ -521,6 +535,8 @@ private struct RewardedGameView: View {
         } else {
             timerTask?.cancel()
             timerTask = nil
+            gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
+            applyElapsedPlayTime()
             // Freeze the animated fill at the true elapsed fraction so it stops gliding while paused
             // (disable the implicit animation so it doesn't tween toward the frozen value).
             var tx = Transaction(); tx.disablesAnimations = true
@@ -635,7 +651,7 @@ private struct RewardedGameView: View {
             dismissUnlocked: earned,
             clickHandoffPending: clickHandoffPending
         ) else { return }
-        let elapsed = elapsedPlayTime
+        let elapsed = gateClock.elapsed
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
             onFinish(earned, elapsed)
