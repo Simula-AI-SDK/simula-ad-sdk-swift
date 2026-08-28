@@ -1,5 +1,7 @@
 import Foundation
 
+private let fullscreenGateBoundaryTolerance: TimeInterval = 1e-9
+
 struct FullscreenGateClock {
     private(set) var elapsed: TimeInterval = 0
     private var resumedAt: TimeInterval?
@@ -12,7 +14,11 @@ struct FullscreenGateClock {
     mutating func update(at now: TimeInterval, total: TimeInterval) {
         guard let resumedAt, now.isFinite, now >= resumedAt else { return }
         let boundedTotal = total.isFinite ? max(0, total) : 0
-        elapsed = min(boundedTotal, elapsed + now - resumedAt)
+        let accrued = min(boundedTotal, elapsed + now - resumedAt)
+        let nearestSecond = accrued.rounded()
+        elapsed = abs(accrued - nearestSecond) <= fullscreenGateBoundaryTolerance
+            ? nearestSecond
+            : accrued
         self.resumedAt = now
     }
 

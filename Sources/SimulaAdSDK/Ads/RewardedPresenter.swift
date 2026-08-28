@@ -366,6 +366,7 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
+            gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             impressionTask?.cancel()
             impressionTask = nil
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
@@ -457,12 +458,14 @@ private struct RewardedGameView: View {
         }
         // Glide the bar/ring fill linearly to full over the remaining gate. The monotonic clock keeps
         // fractional elapsed time so pausing for StoreKit cannot snap the indicator to a prior second.
-        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
         let remaining = gateClock.remaining(total: gateDuration)
-        closeProgressAnim = closeProgress
-        if remaining > 0 {
-            withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
+        guard remaining > 0 else {
+            rewardEarned = true
+            return
         }
+        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
+        closeProgressAnim = closeProgress
+        withAnimation(.linear(duration: remaining)) { closeProgressAnim = 1 }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         timerTask = Task { await runPlayTimer() }
     }

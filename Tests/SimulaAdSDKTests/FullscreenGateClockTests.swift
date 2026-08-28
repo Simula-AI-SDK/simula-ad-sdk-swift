@@ -14,13 +14,19 @@ final class FullscreenGateClockTests: XCTestCase {
         XCTAssertEqual(clock.secondsRemaining(total: 10), 6)
     }
 
-    func testResumeExcludesStoreSheetTimeAndContinuesFromFractionalProgress() {
+    func testResumeAfterDisappearExcludesHiddenTimeAndContinuesFromFractionalProgress() {
         var clock = FullscreenGateClock()
         clock.resume(at: 10)
         clock.pause(at: 14.7, total: 10)
 
         clock.resume(at: 30)
+        XCTAssertEqual(clock.remaining(total: 10), 5.3, accuracy: 0.000_001)
         XCTAssertEqual(clock.timeUntilNextTick(total: 10), 0.3, accuracy: 0.000_001)
+        clock.update(at: 30.3, total: 10)
+
+        XCTAssertEqual(clock.elapsed, 5, accuracy: 0.000_001)
+        XCTAssertEqual(clock.secondsRemaining(total: 10), 5)
+
         clock.update(at: 31.3, total: 10)
 
         XCTAssertEqual(clock.elapsed, 6, accuracy: 0.000_001)

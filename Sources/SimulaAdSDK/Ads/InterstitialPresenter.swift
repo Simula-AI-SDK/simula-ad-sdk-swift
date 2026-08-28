@@ -399,6 +399,12 @@ private struct CreativeInterstitialView: View {
             attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
             gateTask = nil
+            if let close = response.adBehavior?.close {
+                gateClock.pause(
+                    at: ProcessInfo.processInfo.systemUptime,
+                    total: TimeInterval(close.delaySeconds)
+                )
+            }
             impressionTask?.cancel()
             impressionTask = nil
             storePromptTask?.cancel()
@@ -668,12 +674,12 @@ private struct CreativeInterstitialView: View {
 
         guard total > 0, !closeEnabled else { return }
 
-        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
         let remaining = gateClock.remaining(total: total)
         if remaining <= 0 {
             closeEnabled = true
             return
         }
+        gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
 
         // Ring / bar treatments fill linearly over the remaining delay (resuming from the fraction
         // already elapsed, so a re-`onAppear` doesn't snap the fill back to 0).
