@@ -9,12 +9,6 @@ private let DOT_SIZE_EDGE: CGFloat = 6
 private let SWIPE_THRESHOLD: CGFloat = 50
 private let DESKTOP_PAGE_SIZE = 4
 private let CAROUSEL_GAP_DP: CGFloat = 12
-private let DEFAULT_MAX_GAMES_TO_SHOW = 6
-
-func limitGamesForMenu(_ games: [GameData], maxGamesToShow: Int) -> [GameData] {
-    let limit = maxGamesToShow > 0 ? maxGamesToShow : DEFAULT_MAX_GAMES_TO_SHOW
-    return Array(games.prefix(limit))
-}
 
 // MARK: - GameGrid
 
@@ -52,17 +46,16 @@ public struct GameGrid: View {
     }
 
     public var body: some View {
-        let displayedGames = limitGamesForMenu(games, maxGamesToShow: maxGamesToShow)
-        if displayedGames.isEmpty { EmptyView() }
+        if games.isEmpty { EmptyView() }
         else if isCompact {
             MobileCarouselView(
-                games: displayedGames,
+                games: games,
                 theme: theme,
                 onGameSelect: onGameSelect
             )
         } else {
             DesktopGridView(
-                games: displayedGames,
+                games: games,
                 theme: theme,
                 onGameSelect: onGameSelect
             )
