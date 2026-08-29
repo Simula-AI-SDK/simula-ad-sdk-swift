@@ -85,6 +85,28 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(MaxGamesToShow.nine.rawValue, 9)
     }
 
+    func testMiniGameCatalogIsCappedInServerOrder() {
+        let games = (1...10).map {
+            GameData(id: "game-\($0)", name: "Game \($0)", iconUrl: "", description: "")
+        }
+
+        XCTAssertEqual(
+            limitGamesForMenu(games, maxGamesToShow: 3).map(\.id),
+            ["game-1", "game-2", "game-3"]
+        )
+        XCTAssertEqual(limitGamesForMenu(games, maxGamesToShow: 6).count, 6)
+        XCTAssertEqual(limitGamesForMenu(games, maxGamesToShow: 9).count, 9)
+    }
+
+    func testMiniGameCatalogUsesDefaultForInvalidLimit() {
+        let games = (1...10).map {
+            GameData(id: "game-\($0)", name: "Game \($0)", iconUrl: "", description: "")
+        }
+
+        XCTAssertEqual(limitGamesForMenu(games, maxGamesToShow: 0).count, 6)
+        XCTAssertEqual(limitGamesForMenu(games, maxGamesToShow: -1).count, 6)
+    }
+
     func testThemeDefaults() {
         let theme = MiniGameTheme()
         XCTAssertEqual(theme.resolvedBackgroundColor, "#0b0b0f")
