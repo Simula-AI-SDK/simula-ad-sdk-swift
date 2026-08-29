@@ -166,26 +166,14 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertThrowsError(try parseCatalog(data("not json")))
     }
 
-    // MARK: - Catalog request URL (session_id query)
+    // MARK: - Catalog request URL
 
-    func testCatalogURLAppendsSessionId() throws {
-        let url = try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "sess_9"))
-        XCTAssertTrue(url.absoluteString.hasSuffix("/minigames/catalog?session_id=sess_9"),
-                      "Unexpected URL: \(url.absoluteString)")
-    }
+    func testCatalogURLIsIndependentOfSession() throws {
+        let expected = "https://simula-api-701226639755.us-central1.run.app/minigames/catalogv2"
 
-    func testCatalogURLOmitsSessionWhenNilOrEmpty() throws {
-        XCTAssertNil(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: nil)).query)
-        XCTAssertNil(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "")).query)
-    }
-
-    func testCatalogURLEncodesSpecialCharacters() throws {
-        let url = try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "a b&c"))
-        // Round-trips back to the original value (decoded)...
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
-        XCTAssertEqual(items?.first(where: { $0.name == "session_id" })?.value, "a b&c")
-        // ...and the raw string is percent-encoded (no literal space/&).
-        XCTAssertFalse(url.absoluteString.contains("a b&c"))
+        XCTAssertEqual(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "sess_9")).absoluteString, expected)
+        XCTAssertEqual(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: nil)).absoluteString, expected)
+        XCTAssertEqual(try XCTUnwrap(SimulaAPI.catalogURL(sessionId: "a b&c")).absoluteString, expected)
     }
 
     // MARK: - Ad load parsing (AdLoadResponse decode)
