@@ -10,6 +10,20 @@ private let SWIPE_THRESHOLD: CGFloat = 50
 private let DESKTOP_PAGE_SIZE = 4
 private let CAROUSEL_GAP_DP: CGFloat = 12
 
+func boundedCarouselSnapTarget(startPosition: CGFloat, projectedPosition: CGFloat) -> CGFloat {
+    guard startPosition.isFinite else { return 0 }
+    let origin = startPosition.rounded()
+    guard projectedPosition.isFinite else { return origin }
+    return min(origin + 1, max(origin - 1, projectedPosition.rounded()))
+}
+
+func carouselGameIndex(position: CGFloat, gameCount: Int) -> Int {
+    guard gameCount > 0, position.isFinite, let rawIndex = Int(exactly: position.rounded()) else {
+        return 0
+    }
+    return ((rawIndex % gameCount) + gameCount) % gameCount
+}
+
 // MARK: - GameGrid
 
 /// Responsive game grid: mobile carousel (compact) or 4-column grid (regular).
@@ -196,6 +210,7 @@ private struct MobileCarouselView: View {
     @StateObject private var animator = CarouselAnimator()
     @State private var velocityTracker = SimpleVelocityTracker()
     @State private var lastDragValue: CGFloat = 0
+    @State private var dragStartPosition: CGFloat?
 
     var body: some View {
         GeometryReader { geometry in
@@ -219,6 +234,7 @@ private struct MobileCarouselView: View {
                     let centerIndex = convertedIndex.map {
                         (Int.min + 2...Int.max - 2).contains($0) ? $0 : 0
                     } ?? 0
+                    let currentGameIndex = carouselGameIndex(position: CGFloat(centerIndex), gameCount: n)
                     let visibleIndices = (-2...2).map { centerIndex + $0 }
 
                     ForEach(visibleIndices, id: \.self) { rawIndex in
@@ -242,14 +258,29 @@ private struct MobileCarouselView: View {
                         .offset(x: xTranslation)
                         .zIndex(Double(3 - abs(cardOffset)))
                     }
+
+                    Text("\(currentGameIndex + 1) / \(n)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color(hex: theme.resolvedSecondaryFontColor))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.black.opacity(0.35), in: Capsule())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .allowsHitTesting(false)
+                        .accessibilityLabel("Game \(currentGameIndex + 1) of \(n)")
                 }
             }
             .frame(width: geometry.size.width, height: carouselHeight)
             .frame(maxWidth: .infinity, maxHeight: .infinity) // Center carousel within GeometryReader
             .contentShape(Rectangle())
-            .gesture(
-                DragGesture()
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 10)
                     .onChanged { value in
+                        if dragStartPosition == nil {
+                            dragStartPosition = animator.scrollPosition
+                            lastDragValue = 0
+                            velocityTracker.reset()
+                        }
                         // KEY: stop any ongoing animation — gives immediate control to user
                         animator.stopAnimation()
 
@@ -260,21 +291,31 @@ private struct MobileCarouselView: View {
                         lastDragValue = value.translation.width
                     }
                     .onEnded { _ in
+                        let startPosition = dragStartPosition ?? animator.scrollPosition
                         lastDragValue = 0
+                        dragStartPosition = nil
 
-                        // Velocity-based fling with snap
+                        // Keep each gesture to one catalog step so no game is skipped.
                         let velocityPx = velocityTracker.estimateVelocity()
                         let velocityCards = -velocityPx / cardStep
                         let decayFactor: CGFloat = 0.15
                         let projected = animator.scrollPosition + velocityCards * decayFactor
-                        let snapTarget = projected.rounded()
+                        let snapTarget = boundedCarouselSnapTarget(
+                            startPosition: startPosition,
+                            projectedPosition: projected
+                        )
 
                         animator.animateTo(snapTarget, initialVelocity: velocityCards)
                         velocityTracker.reset()
                     }
             )
         }
-        .onDisappear { animator.stopAnimation() }
+        .onDisappear {
+            animator.stopAnimation()
+            dragStartPosition = nil
+            lastDragValue = 0
+            velocityTracker.reset()
+        }
     }
 }
 
