@@ -1252,8 +1252,8 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Fetches the game catalog.
     /// Translates `fetchCatalog()` from api.ts
     ///
-    /// `sessionId` is passed through as the `session_id` query param when available (the backend
-    /// ties the catalog to the session); omitted when nil/empty.
+    /// `sessionId` is retained for source compatibility. The public v2 catalog is
+    /// session-independent so every supported game remains available in the menu.
     public func fetchCatalog(sessionId: String? = nil) async throws -> CatalogResponse {
         guard let url = Self.catalogURL(sessionId: sessionId) else {
             throw SimulaAPIError.invalidURL
@@ -1276,15 +1276,10 @@ public final class SimulaAPI: @unchecked Sendable {
         return try parseCatalog(data)
     }
 
-    /// Builds the catalog request URL, adding `session_id` when available. Pure/testable.
+    /// Builds the session-independent public catalog URL. Pure/testable.
     static func catalogURL(sessionId: String? = nil) -> URL? {
-        guard var components = URLComponents(string: "\(API_BASE_URL)/minigames/catalog") else {
-            return nil
-        }
-        if let sessionId, !sessionId.isEmpty {
-            components.queryItems = [URLQueryItem(name: "session_id", value: sessionId)]
-        }
-        return components.url
+        _ = sessionId
+        return URL(string: "\(API_BASE_URL)/minigames/catalogv2")
     }
 
     // MARK: - Fetch Characters (Character Selector)
