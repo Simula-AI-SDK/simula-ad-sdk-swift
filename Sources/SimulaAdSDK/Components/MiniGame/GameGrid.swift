@@ -273,8 +273,8 @@ private struct MobileCarouselView: View {
             .frame(width: geometry.size.width, height: carouselHeight)
             .frame(maxWidth: .infinity, maxHeight: .infinity) // Center carousel within GeometryReader
             .contentShape(Rectangle())
-            .simultaneousGesture(
-                DragGesture()
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 10)
                     .onChanged { value in
                         if dragStartPosition == nil {
                             dragStartPosition = animator.scrollPosition
