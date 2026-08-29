@@ -85,6 +85,19 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(MaxGamesToShow.nine.rawValue, 9)
     }
 
+    func testMiniGameCarouselCannotSkipCatalogEntries() {
+        XCTAssertEqual(boundedCarouselSnapTarget(startPosition: 4, projectedPosition: 10), 5)
+        XCTAssertEqual(boundedCarouselSnapTarget(startPosition: 4, projectedPosition: -10), 3)
+        XCTAssertEqual(boundedCarouselSnapTarget(startPosition: 4, projectedPosition: 4.4), 4)
+        XCTAssertEqual(boundedCarouselSnapTarget(startPosition: .nan, projectedPosition: 10), 0)
+    }
+
+    func testMiniGameCarouselIndexVisitsEntireCatalogBeforeWrapping() {
+        XCTAssertEqual((0..<19).map { carouselGameIndex(position: CGFloat($0), gameCount: 19) }, Array(0..<19))
+        XCTAssertEqual(carouselGameIndex(position: 19, gameCount: 19), 0)
+        XCTAssertEqual(carouselGameIndex(position: -1, gameCount: 19), 18)
+    }
+
     func testThemeDefaults() {
         let theme = MiniGameTheme()
         XCTAssertEqual(theme.resolvedBackgroundColor, "#0b0b0f")
