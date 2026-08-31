@@ -558,8 +558,15 @@ func creativeBridgeRelayScriptSource(capability: String) -> String {
             !isCreativeRootSource(event.source)) { return; }
         try {
           var envelope = typeof event.data === 'string' ? nativeParse(event.data) : event.data;
-          if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope) ||
-              envelope.__simulaSdkResponse) { return; }
+          if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) { return; }
+          // Replies and pushes belong to the creative. SDK-internal diagnostics do not: consume
+          // them before later page listeners can observe them or throw and create an error loop.
+          if (envelope.__simulaSdkResponse) { return; }
+          if (envelope.type === 'SIMULA_JS_ERROR' || envelope.type === 'SIMULA_AD_HEIGHT') {
+            if (typeof event.stopImmediatePropagation === 'function') {
+              event.stopImmediatePropagation();
+            }
+          }
           var serialized = nativeStringify(envelope);
           if (!serialized || serialized.charAt(0) !== '{') { return; }
           nativePost('{"\(creativeBridgeCapabilityKey)":' + nativeStringify(bridgeCapability) +

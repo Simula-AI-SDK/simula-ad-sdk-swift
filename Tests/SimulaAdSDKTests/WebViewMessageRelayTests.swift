@@ -32,6 +32,19 @@ final class WebViewMessageRelayTests: XCTestCase {
         XCTAssertTrue(source.contains("String(source.location.href) === 'about:srcdoc'"))
         XCTAssertTrue(source.contains("!isCreativeRootSource(event.source)"))
         XCTAssertTrue(source.contains("envelope.__simulaSdkResponse"))
+        XCTAssertTrue(source.contains("envelope.type === 'SIMULA_JS_ERROR'"))
+        XCTAssertTrue(source.contains("envelope.type === 'SIMULA_AD_HEIGHT'"))
+        XCTAssertTrue(source.contains("event.stopImmediatePropagation()"))
+        let responseGuard = source.range(of: "if (envelope.__simulaSdkResponse) { return; }")
+        let internalGuard = source.range(of: "if (envelope.type === 'SIMULA_JS_ERROR'")
+        let serialization = source.range(of: "var serialized = nativeStringify(envelope)")
+        XCTAssertNotNil(responseGuard)
+        XCTAssertNotNil(internalGuard)
+        XCTAssertNotNil(serialization)
+        if let responseGuard, let internalGuard, let serialization {
+            XCTAssertLessThan(responseGuard.lowerBound, internalGuard.lowerBound)
+            XCTAssertLessThan(internalGuard.lowerBound, serialization.lowerBound)
+        }
         XCTAssertFalse(source.contains("window.frames"))
         XCTAssertFalse(source.contains("contentWindow.frames"))
     }
