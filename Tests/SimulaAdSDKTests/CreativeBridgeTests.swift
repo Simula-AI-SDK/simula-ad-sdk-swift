@@ -318,14 +318,12 @@ final class CreativeBridgeTests: XCTestCase {
         body(payload, dict["requestId"])
     }
 
-    /// `window.postMessage(<json>, '*');` → `<json>`.
+    /// Extracts the JSON object assigned by the generated targeted-delivery script.
     private func stripPostMessageWrapper(_ js: String) -> String {
-        var s = js
-        let prefix = "window.postMessage("
-        let suffix = ", '*');"
-        if s.hasPrefix(prefix) { s.removeFirst(prefix.count) }
-        if s.hasSuffix(suffix) { s.removeLast(suffix.count) }
-        return s
+        let prefix = "var message = "
+        guard let start = js.range(of: prefix)?.upperBound,
+              let end = js[start...].firstIndex(of: ";") else { return js }
+        return String(js[start..<end])
     }
 
     private func decodeMessage(_ js: String) -> [String: Any]? {

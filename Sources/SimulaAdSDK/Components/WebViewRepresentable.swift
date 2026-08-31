@@ -1463,10 +1463,9 @@ struct WebViewRepresentable: UIViewRepresentable {
           function send() {
             try {
               var h = measure();
-              if (h > 0 && Math.abs(h - lastH) >= 1 &&
-                  window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.simulaSDK) {
+              if (h > 0 && Math.abs(h - lastH) >= 1) {
                 lastH = h;
-                window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify({ type: 'SIMULA_AD_HEIGHT', height: h }));
+                window.postMessage({ type: 'SIMULA_AD_HEIGHT', height: h }, '*');
               }
             } catch (e) {}
           }

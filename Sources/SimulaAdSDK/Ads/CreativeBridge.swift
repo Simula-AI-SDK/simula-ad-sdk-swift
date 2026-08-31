@@ -242,8 +242,28 @@ final class CreativeBridge: ObservableObject {
         if let requestId { resp["requestId"] = requestId }
         guard let data = try? JSONSerialization.data(withJSONObject: resp),
               let body = String(data: data, encoding: .utf8) else { return }
-        // `body` is valid JSON, hence a valid JS object literal.
-        reply("window.postMessage(\(body), '*');")
+        // `body` is valid JSON, hence a valid JS object literal. The server normally places the
+        // creative in a direct srcdoc child, so target that root as well as top-level creatives.
+        reply("""
+        (function() {
+          'use strict';
+          if (window !== window.top) { return; }
+          var message = \(body);
+          function deliver(target) {
+            try { if (target) { target.postMessage(message, '*'); } } catch (_) {}
+          }
+          deliver(window);
+          var frame;
+          try { frame = document.querySelector('iframe[srcdoc]'); }
+          catch (_) { return; }
+          var target = null;
+          try {
+            target = frame && frame.contentWindow;
+            if (!target || String(target.location.href) !== 'about:srcdoc') { return; }
+          } catch (_) { return; }
+          deliver(target);
+        })();
+        """)
     }
 
     // MARK: Audio events
