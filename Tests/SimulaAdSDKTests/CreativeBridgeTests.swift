@@ -15,11 +15,16 @@ final class CreativeBridgeTests: XCTestCase {
 
     private final class FakeAudioVolumeSource: CreativeAudioVolumeSource {
         var outputVolume: Float
+        private(set) var prepares = 0
         private(set) var callbacks: [(Float) -> Void] = []
         private(set) var observations: [FakeAudioObservation] = []
 
         init(_ outputVolume: Float) {
             self.outputVolume = outputVolume
+        }
+
+        func prepareForObservation() {
+            prepares += 1
         }
 
         func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation? {
@@ -100,6 +105,36 @@ final class CreativeBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testAudioStateOnlyModeRejectsFullscreenCommandsAndEvents() {
+        let bridge = CreativeBridge(mode: .audioStateOnly)
+        var replied = false
+
+        bridge.handle(#"{"type":"AD_EARLY_COMPLETE"}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"TRIGGER_HAPTIC","payload":{"style":"success"}}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"SET_ORIENTATION","payload":{"orientation":"landscape"}}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"GET_DEVICE_CONTEXT"}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"GET_ORIENTATION"}"#) { _ in replied = true }
+
+        XCTAssertFalse(bridge.earlyComplete)
+        XCTAssertFalse(replied)
+    }
+
+    @MainActor
+    func testAudioStateOnlyModeAnswersAudioQuery() {
+        let source = FakeAudioVolumeSource(0.42)
+        let bridge = CreativeBridge(
+            audioVolumeSource: source,
+            mode: .audioStateOnly
+        )
+        assertQueryReply(bridge: bridge, type: "GET_AUDIO_STATE", requestId: "menu") { payload, rid in
+            XCTAssertEqual(rid as? String, "menu")
+            XCTAssertEqual(payload["muted"] as? Bool, false)
+            XCTAssertEqual(payload["volume"] as? Int, 42)
+        }
+        XCTAssertEqual(source.prepares, 1)
+    }
+
+    @MainActor
     func testGetAudioStateReplyShape() {
         let bridge = CreativeBridge(audioVolumeSource: FakeAudioVolumeSource(0.42))
         assertQueryReply(bridge: bridge, type: "GET_AUDIO_STATE", requestId: "42") { payload, rid in
@@ -135,6 +170,7 @@ final class CreativeBridgeTests: XCTestCase {
         bridge.pageDidFinishLoading { [weak self] js in
             if let event = self?.decodeMessage(js) { events.append(event) }
         }
+        XCTAssertEqual(source.prepares, 1)
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0]["type"] as? String, "AUDIO_STATE_CHANGED")
         XCTAssertNil(events[0]["requestId"])

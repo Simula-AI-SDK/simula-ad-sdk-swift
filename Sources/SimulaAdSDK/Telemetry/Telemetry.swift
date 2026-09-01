@@ -76,9 +76,14 @@ final class Telemetry: @unchecked Sendable {
     private var initializationTask: Task<TelemetryInitialization, Never>?
     private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
     private var backgroundFlushObserver: TelemetryBackgroundFlushObserver?
+    private let hostDebugPrint: (@Sendable (String) -> Void)?
 
-    init(managerFactory: @escaping ManagerFactory = Telemetry.defaultManagerFactory) {
+    init(
+        managerFactory: @escaping ManagerFactory = Telemetry.defaultManagerFactory,
+        hostDebugPrint: (@Sendable (String) -> Void)? = nil
+    ) {
         self.managerFactory = managerFactory
+        self.hostDebugPrint = hostDebugPrint
     }
 
     /// Install the telemetry pipeline. Called once from `SimulaProvider`'s deferred startup (the
@@ -200,6 +205,17 @@ final class Telemetry: @unchecked Sendable {
 
     private var current: TelemetryManager? {
         lock.lock(); defer { lock.unlock() }; return manager
+    }
+
+    /// Host-visible diagnostic line. Always prints so production hosts can see bridge/WebView
+    /// diagnostics in Xcode / `log-ios` (not Metro).
+    func logHostDebug(_ message: String) {
+        let line = "[SimulaAdSDK] \(message)"
+        if let hostDebugPrint {
+            hostDebugPrint(line)
+        } else {
+            print(line)
+        }
     }
 
     /// Count duplicate imperative initialization without requiring telemetry to be installed yet.

@@ -38,11 +38,26 @@ extension NSKeyValueObservation: CreativeAudioVolumeObservation {}
 
 protocol CreativeAudioVolumeSource: AnyObject {
     var outputVolume: Float { get }
+    func prepareForObservation()
     func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation?
+}
+
+extension CreativeAudioVolumeSource {
+    func prepareForObservation() {}
 }
 
 private final class SystemCreativeAudioVolumeSource: CreativeAudioVolumeSource {
     var outputVolume: Float { AVAudioSession.sharedInstance().outputVolume }
+
+    func prepareForObservation() {
+        do {
+            // KVO does not reliably emit live changes while the process audio session is inactive.
+            // Preserve the host's category/mode/options and never deactivate a session we do not own.
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            Telemetry.shared.logHostDebug("audio session activation failed: \(error.localizedDescription)")
+        }
+    }
 
     func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation? {
         AVAudioSession.sharedInstance().observe(\.outputVolume, options: [.new]) { session, change in
@@ -54,6 +69,11 @@ private final class SystemCreativeAudioVolumeSource: CreativeAudioVolumeSource {
 protocol CreativeAudioVolumePolling: AnyObject {
     func start(_ onPoll: @escaping () -> Void)
     func stop()
+}
+
+enum CreativeBridgeMode {
+    case fullScreenAd
+    case audioStateOnly
 }
 
 /** Fallback for iOS versions that emit output-volume KVO only while the host audio session is active. */
@@ -160,6 +180,7 @@ final class CreativeBridge: ObservableObject {
 
     private let audioVolumeSource: CreativeAudioVolumeSource
     private let audioVolumePoller: CreativeAudioVolumePolling
+    private let mode: CreativeBridgeMode
     private var audioObservation: CreativeAudioVolumeObservation?
     private var audioEventReply: ((String) -> Void)?
     private var lastSentAudioState: CreativeAudioState?
@@ -167,10 +188,12 @@ final class CreativeBridge: ObservableObject {
 
     init(
         audioVolumeSource: CreativeAudioVolumeSource = SystemCreativeAudioVolumeSource(),
-        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller()
+        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller(),
+        mode: CreativeBridgeMode = .fullScreenAd
     ) {
         self.audioVolumeSource = audioVolumeSource
         self.audioVolumePoller = audioVolumePoller
+        self.mode = mode
     }
 
     deinit {
@@ -197,6 +220,7 @@ final class CreativeBridge: ObservableObject {
               let type = root["type"] as? String else {
             return
         }
+        guard mode == .fullScreenAd || type == "GET_AUDIO_STATE" else { return }
         // Preserve the requestId's original JSON type (string or number) so the reply
         // echoes it verbatim.
         let requestId = root["requestId"]
@@ -221,7 +245,10 @@ final class CreativeBridge: ObservableObject {
         case "GET_DEVICE_CONTEXT":
             sendMessage(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
         case "GET_AUDIO_STATE":
-            sendMessage(type: type, requestId: requestId, payload: currentAudioState().payload, reply: reply)
+            audioVolumeSource.prepareForObservation()
+            let audioPayload = currentAudioState().payload
+            Telemetry.shared.logHostDebug("GET_AUDIO_STATE muted=\(audioPayload["muted"] ?? "?") volume=\(audioPayload["volume"] ?? "?")")
+            sendMessage(type: type, requestId: requestId, payload: audioPayload, reply: reply)
         case "GET_ORIENTATION":
             sendMessage(type: type, requestId: requestId, payload: ["orientation": currentOrientation()], reply: reply)
 
@@ -277,6 +304,7 @@ final class CreativeBridge: ObservableObject {
     func pageDidFinishLoading(reply: @escaping (String) -> Void) {
         runOnMain { bridge in
             bridge.endAudioEvents()
+            bridge.audioVolumeSource.prepareForObservation()
             bridge.audioEventReply = reply
             let generation = bridge.audioPageGeneration
             bridge.audioObservation = bridge.audioVolumeSource.observe { [weak bridge] volume in
@@ -285,7 +313,9 @@ final class CreativeBridge: ObservableObject {
             bridge.audioVolumePoller.start { [weak bridge] in
                 bridge?.audioVolumePolled(generation: generation)
             }
-            bridge.publishAudioState(bridge.currentAudioState())
+            let initial = bridge.currentAudioState()
+            Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED observe start muted=\(initial.muted) volume=\(initial.volume)")
+            bridge.publishAudioState(initial)
         }
     }
 
@@ -306,6 +336,9 @@ final class CreativeBridge: ObservableObject {
     }
 
     private func endAudioEvents() {
+        if audioEventReply != nil {
+            Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED observe stop")
+        }
         audioPageGeneration &+= 1
         audioObservation?.invalidate()
         audioObservation = nil
@@ -331,6 +364,7 @@ final class CreativeBridge: ObservableObject {
     private func publishAudioState(_ state: CreativeAudioState) {
         guard let reply = audioEventReply, state != lastSentAudioState else { return }
         lastSentAudioState = state
+        Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED muted=\(state.muted) volume=\(state.volume)")
         sendMessage(type: "AUDIO_STATE_CHANGED", requestId: nil, payload: state.payload, reply: reply)
     }
 

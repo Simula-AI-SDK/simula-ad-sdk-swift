@@ -70,6 +70,18 @@ internal func stopBeforeRecycling(stop: () -> Void, recycle: () -> Void) {
     recycle()
 }
 
+private func logAudioBridgeScript(_ js: String, outcome: String) {
+    let kind: String
+    if js.contains("AUDIO_STATE_CHANGED") {
+        kind = "AUDIO_STATE_CHANGED"
+    } else if js.contains("GET_AUDIO_STATE") {
+        kind = "GET_AUDIO_STATE"
+    } else {
+        return
+    }
+    Telemetry.shared.logHostDebug("webview \(kind) \(outcome)")
+}
+
 // MARK: - WebViewRepresentable
 
 /// A UIViewRepresentable wrapper around WKWebView for loading game iframes and ad content.
@@ -122,8 +134,8 @@ struct WebViewRepresentable: UIViewRepresentable {
     var clickBeaconImpressionId: String?
 
     /// The WebView ↔ SDK bridge (PRD §3). When set, `window.postMessage` envelopes from the
-    /// creative are routed to it (and `GET_*` replies are posted back via the web view). `nil`
-    /// for the game iframe / previews, which keep the plain `onMessageReceived` path.
+    /// creative are routed to it (and `GET_*` replies are posted back via the web view). Menu games
+    /// use an audio-only bridge; previews keep the plain `onMessageReceived` path.
     var bridge: CreativeBridge?
 
     /// Ad-network attribution tokens carried into the in-app store sheet for click-through / auto-redirect
@@ -870,10 +882,28 @@ struct WebViewRepresentable: UIViewRepresentable {
             }
             if let bridge {
                 bridge.handle(body) { [weak self] js in
-                    self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+                    self?.evaluateBridgeJavaScript(js)
                 }
             } else {
                 onMessageReceived?(body)
+            }
+        }
+
+        private func evaluateBridgeJavaScript(_ js: String) {
+            guard let webView else {
+                logAudioBridgeScript(js, outcome: "skipped (webview gone)")
+                return
+            }
+            evaluateBridgeJavaScript(js, on: webView)
+        }
+
+        private func evaluateBridgeJavaScript(_ js: String, on webView: WKWebView) {
+            webView.evaluateJavaScript(js) { _, error in
+                if let error {
+                    logAudioBridgeScript(js, outcome: "inject failed: \(error.localizedDescription)")
+                } else {
+                    logAudioBridgeScript(js, outcome: "injected")
+                }
             }
         }
 
@@ -1034,8 +1064,11 @@ struct WebViewRepresentable: UIViewRepresentable {
                 )
             }
             bridge?.pageDidFinishLoading { [weak self, weak webView] js in
-                guard let self, let webView, self.webView === webView else { return }
-                webView.evaluateJavaScript(js, completionHandler: nil)
+                guard let self, let webView, self.webView === webView else {
+                    logAudioBridgeScript(js, outcome: "skipped (webview gone)")
+                    return
+                }
+                self.evaluateBridgeJavaScript(js, on: webView)
             }
             onNavigationFinished?()
             // Native ad: start reporting content height so the slot can size its container.

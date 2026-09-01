@@ -655,6 +655,20 @@ final class TelemetryManagerTests: XCTestCase {
         completion.set(effective)
     }
 
+    func testLogHostDebugAlwaysPrints() {
+        let sink = LogSink()
+        let telemetry = Telemetry(
+            managerFactory: { _, _ in
+                XCTFail("logHostDebug must not create a manager")
+                return self.build(store: FakeStore(), sender: FakeSender())
+            },
+            hostDebugPrint: { sink.append($0) }
+        )
+
+        telemetry.logHostDebug("AUDIO_STATE_CHANGED muted=false volume=50")
+        XCTAssertEqual(sink.all, ["[SimulaAdSDK] AUDIO_STATE_CHANGED muted=false volume=50"])
+    }
+
     func testDisabledFirstEnabledSecondReturnsDisabledWinningStateToBothCallers() async {
         let factoryCalled = CompletionFlag()
         let unexpectedManager = build(store: FakeStore(), sender: FakeSender())
