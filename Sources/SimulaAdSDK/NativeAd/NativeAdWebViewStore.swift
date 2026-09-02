@@ -204,10 +204,11 @@ final class NativeAdWebViewStore {
     /// mount and deallocates on dismantle (`detach` won't match, and the pool no longer owns it).
     func rebind(_ webView: WKWebView, from oldImpressionId: String, to newImpressionId: String?, creativeKey: String) {
         guard let session = sessions[oldImpressionId], session.webView === webView else { return }
-        session.forwarder.rotateUserActivationNonce()
+        session.forwarder.rotatePresentationCapabilities()
         WebViewPool.installUserScripts(
             on: webView.configuration.userContentController,
-            nonce: session.forwarder.userActivationNonce
+            nonce: session.forwarder.userActivationNonce,
+            bridgeCapability: session.forwarder.bridgeCapability
         )
         sessions.removeValue(forKey: oldImpressionId)
         if let idx = accessOrder.firstIndex(of: oldImpressionId) { accessOrder.remove(at: idx) }

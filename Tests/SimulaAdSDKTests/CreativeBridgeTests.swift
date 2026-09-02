@@ -100,6 +100,35 @@ final class CreativeBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testAudioStateOnlyModeRejectsFullscreenCommandsAndEvents() {
+        let bridge = CreativeBridge(mode: .audioStateOnly)
+        var replied = false
+
+        bridge.handle(#"{"type":"AD_EARLY_COMPLETE"}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"TRIGGER_HAPTIC","payload":{"style":"success"}}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"SET_ORIENTATION","payload":{"orientation":"landscape"}}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"GET_DEVICE_CONTEXT"}"#) { _ in replied = true }
+        bridge.handle(#"{"type":"GET_ORIENTATION"}"#) { _ in replied = true }
+
+        XCTAssertFalse(bridge.earlyComplete)
+        XCTAssertFalse(replied)
+    }
+
+    @MainActor
+    func testAudioStateOnlyModeAnswersAudioQuery() {
+        let source = FakeAudioVolumeSource(0.42)
+        let bridge = CreativeBridge(
+            audioVolumeSource: source,
+            mode: .audioStateOnly
+        )
+        assertQueryReply(bridge: bridge, type: "GET_AUDIO_STATE", requestId: "menu") { payload, rid in
+            XCTAssertEqual(rid as? String, "menu")
+            XCTAssertEqual(payload["muted"] as? Bool, false)
+            XCTAssertEqual(payload["volume"] as? Int, 42)
+        }
+    }
+
+    @MainActor
     func testGetAudioStateReplyShape() {
         let bridge = CreativeBridge(audioVolumeSource: FakeAudioVolumeSource(0.42))
         assertQueryReply(bridge: bridge, type: "GET_AUDIO_STATE", requestId: "42") { payload, rid in
@@ -318,14 +347,12 @@ final class CreativeBridgeTests: XCTestCase {
         body(payload, dict["requestId"])
     }
 
-    /// `window.postMessage(<json>, '*');` → `<json>`.
+    /// Extracts the JSON object assigned by the generated targeted-delivery script.
     private func stripPostMessageWrapper(_ js: String) -> String {
-        var s = js
-        let prefix = "window.postMessage("
-        let suffix = ", '*');"
-        if s.hasPrefix(prefix) { s.removeFirst(prefix.count) }
-        if s.hasSuffix(suffix) { s.removeLast(suffix.count) }
-        return s
+        let prefix = "var message = "
+        guard let start = js.range(of: prefix)?.upperBound,
+              let end = js[start...].firstIndex(of: ";") else { return js }
+        return String(js[start..<end])
     }
 
     private func decodeMessage(_ js: String) -> [String: Any]? {
