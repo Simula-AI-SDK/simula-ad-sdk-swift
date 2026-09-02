@@ -1515,6 +1515,12 @@ enum CreativeCTARouter {
         storeVC.dismiss(animated: true) {
             finishStoreProductDismiss(owner: owner, controllerID: controllerID)
         }
+        // StoreKit can omit the completion when dismissal races the sheet's own presentation
+        // transition. Reconcile only after UIKit has actually detached the controller.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            guard storeVC.presentingViewController == nil, storeVC.viewIfLoaded?.window == nil else { return }
+            finishStoreProductDismiss(owner: owner, controllerID: controllerID)
+        }
     }
 
     private static func finishStoreProductDismiss(
