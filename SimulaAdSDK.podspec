@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "SimulaAdSDK"
-  s.version          = "1.2.1-dev.2"
+  s.version          = "1.2.1"
   s.summary          = "Interactive, AI-native ad experiences for modern apps"
 
   s.description      = <<-DESC
