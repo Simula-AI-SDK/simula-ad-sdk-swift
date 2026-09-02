@@ -950,7 +950,7 @@ private struct CreativeInterstitialView: View {
 
     private func showSKOverlayFromCreative() {
         guard skOverlayState.requestCreativePresentation() else { return }
-        endSKANViewThroughImpressionIfStarted()
+        endSKANViewThroughImpression()
         skOverlayTask?.cancel()
         skOverlayTask = nil
         startSKOverlay()
