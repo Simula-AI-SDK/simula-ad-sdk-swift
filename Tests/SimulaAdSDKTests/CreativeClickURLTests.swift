@@ -601,6 +601,13 @@ final class CreativeClickURLTests: XCTestCase {
         )
         XCTAssertEqual(
             CreativeStoreMessage.authenticate(
+                storeBody(type: CreativeStoreMessage.showOverlayType),
+                expectedNonce: activationNonce
+            ),
+            .showOverlay
+        )
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(
                 storeBody(type: CreativeStoreMessage.dismissType),
                 expectedNonce: activationNonce
             ),
@@ -616,7 +623,7 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertEqual(
             CreativeStoreMessage.authenticate(
                 storeBody(
-                    type: CreativeStoreMessage.openType,
+                    type: CreativeStoreMessage.showOverlayType,
                     extra: ["url": "https://apps.apple.com/app/id123", "app_id": "123"]
                 ),
                 expectedNonce: activationNonce

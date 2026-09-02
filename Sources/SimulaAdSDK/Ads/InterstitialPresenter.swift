@@ -281,6 +281,7 @@ private struct CreativeInterstitialView: View {
     @State private var resolvedAppID: String?
     @State private var skOverlayState = SKOverlayPresentationState<SKOverlayOwnershipToken>()
     @State private var skOverlayTask: Task<Void, Never>?
+    @State private var skOverlayResolutionStarted = false
 
     // Custom-rendered interstitial view-through attribution. Enabled SKOverlay serves are excluded
     // until those two surfaces receive distinct signed impression identifiers from the backend.
@@ -429,6 +430,7 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            presentRequestedSKOverlayIfNeeded()
             startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { notification in
@@ -437,6 +439,7 @@ private struct CreativeInterstitialView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
             guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            presentRequestedSKOverlayIfNeeded()
             startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
@@ -522,6 +525,7 @@ private struct CreativeInterstitialView: View {
             onAttributionRouteOutcome: { outcome in
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
+            onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
             onStoreDismissRequest: { dismissSKOverlay() },
             storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
@@ -854,8 +858,10 @@ private struct CreativeInterstitialView: View {
     /// the CTA tap. iOS 14+ only — below that the config is simply ignored.
     private func startSKOverlay() {
         guard let config = response.adBehavior?.skoverlay, config.enabled,
-              resolvedAppID == nil, !skOverlayState.suppressPending else { return }
+              resolvedAppID == nil, !skOverlayResolutionStarted,
+              !skOverlayState.suppressPending else { return }
         guard #available(iOS 14.0, *) else { return }
+        skOverlayResolutionStarted = true
         CreativeCTARouter.resolveAppStoreID(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
@@ -863,7 +869,9 @@ private struct CreativeInterstitialView: View {
         ) { id in
             guard !skOverlayState.suppressPending else { return }
             resolvedAppID = id
-            if config.timing == .duringPlay || config.timing == .delayed {
+            if skOverlayState.creativePresentationRequested {
+                presentSKOverlay(config: config)
+            } else if config.timing == .duringPlay || config.timing == .delayed {
                 scheduleSKOverlayPresent(config: config)
             }
         }
@@ -923,6 +931,22 @@ private struct CreativeInterstitialView: View {
         // If StoreOpen also selects SKStoreProductViewController, the sheet takes foreground while
         // this scene-owned overlay remains behind it. Both server-selected StoreKit surfaces retain
         // exact ownership and are independently dismissible.
+        presentSKOverlay(config: config)
+    }
+
+    private func showSKOverlayFromCreative() {
+        guard let config = response.adBehavior?.skoverlay, config.enabled,
+              skOverlayState.requestCreativePresentation() else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        startSKOverlay()
+        presentRequestedSKOverlayIfNeeded()
+    }
+
+    private func presentRequestedSKOverlayIfNeeded() {
+        guard skOverlayState.creativePresentationRequested,
+              resolvedAppID?.isEmpty == false,
+              let config = response.adBehavior?.skoverlay, config.enabled else { return }
         presentSKOverlay(config: config)
     }
 

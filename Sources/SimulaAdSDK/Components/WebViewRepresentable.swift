@@ -115,6 +115,7 @@ struct WebViewRepresentable: UIViewRepresentable {
     /// WebView before a claimed click is durable and any asynchronous route safely starts.
     var onClickHandoffPendingChanged: ((Bool) -> Void)?
     var onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)?
+    var onStoreOverlayShowRequest: (() -> Void)?
     var onStoreDismissRequest: (() -> Void)?
     var storeProductOwnershipToken: StoreProductOwnershipToken?
     var attributionRouteLifecycle: AttributionRouteLifecycle?
@@ -181,6 +182,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+        onStoreOverlayShowRequest: (() -> Void)? = nil,
         onStoreDismissRequest: (() -> Void)? = nil,
         storeProductOwnershipToken: StoreProductOwnershipToken? = nil,
         attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
@@ -209,6 +211,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onAdClick = onAdClick
         self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
         self.onAttributionRouteOutcome = onAttributionRouteOutcome
+        self.onStoreOverlayShowRequest = onStoreOverlayShowRequest
         self.onStoreDismissRequest = onStoreDismissRequest
         self.storeProductOwnershipToken = storeProductOwnershipToken
         self.attributionRouteLifecycle = attributionRouteLifecycle
@@ -239,6 +242,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         onAdClick: (() -> Void)?,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
         onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+        onStoreOverlayShowRequest: (() -> Void)? = nil,
         onStoreDismissRequest: (() -> Void)? = nil,
         storeProductOwnershipToken: StoreProductOwnershipToken? = nil,
         bridge: CreativeBridge? = nil,
@@ -265,6 +269,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onAdClick: onAdClick.map { callback in { _ in callback() } },
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
             onAttributionRouteOutcome: onAttributionRouteOutcome,
+            onStoreOverlayShowRequest: onStoreOverlayShowRequest,
             onStoreDismissRequest: onStoreDismissRequest,
             storeProductOwnershipToken: storeProductOwnershipToken,
             bridge: bridge,
@@ -324,7 +329,8 @@ struct WebViewRepresentable: UIViewRepresentable {
             webView = WebViewPool.shared.acquire(
                 delegate: coordinator,
                 onMessage: onMessage,
-                surface: telemetryAdFormat
+                surface: telemetryAdFormat,
+                exposesStoreAPI: bridge != nil && !externalClickOnly
             )
         }
         // The coordinator needs the web view to post `GET_*` replies back into the page.
@@ -347,6 +353,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         coordinator.onAdClick = onAdClick
         coordinator.onClickHandoffPendingChanged = onClickHandoffPendingChanged
         coordinator.onAttributionRouteOutcome = onAttributionRouteOutcome
+        coordinator.onStoreOverlayShowRequest = onStoreOverlayShowRequest
         coordinator.onStoreDismissRequest = onStoreDismissRequest
         if let storeProductOwnershipToken {
             coordinator.storeProductOwnership = storeProductOwnershipToken
@@ -492,6 +499,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onAdClick: onAdClick,
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
             onAttributionRouteOutcome: onAttributionRouteOutcome,
+            onStoreOverlayShowRequest: onStoreOverlayShowRequest,
             onStoreDismissRequest: onStoreDismissRequest,
             storeProductOwnershipToken: storeProductOwnershipToken,
             attributionRouteLifecycle: attributionRouteLifecycle,
@@ -522,6 +530,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         var onAdClick: ((ClickInteraction) -> Void)?
         var onClickHandoffPendingChanged: ((Bool) -> Void)?
         var onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)?
+        var onStoreOverlayShowRequest: (() -> Void)?
         var onStoreDismissRequest: (() -> Void)?
         var attributionRouteLifecycle: AttributionRouteLifecycle?
         var clickSource: ClickSource
@@ -827,6 +836,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             onAdClick: ((ClickInteraction) -> Void)? = nil,
             onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
             onAttributionRouteOutcome: ((AttributionRouteOutcome) -> Void)? = nil,
+            onStoreOverlayShowRequest: (() -> Void)? = nil,
             onStoreDismissRequest: (() -> Void)? = nil,
             storeProductOwnershipToken: StoreProductOwnershipToken? = nil,
             attributionRouteLifecycle: AttributionRouteLifecycle? = nil,
@@ -851,6 +861,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             self.onAdClick = onAdClick
             self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
             self.onAttributionRouteOutcome = onAttributionRouteOutcome
+            self.onStoreOverlayShowRequest = onStoreOverlayShowRequest
             self.onStoreDismissRequest = onStoreDismissRequest
             self.storeProductOwnership = storeProductOwnershipToken ?? StoreProductOwnershipToken()
             self.storeProductOwnershipIsExternallyOwned = storeProductOwnershipToken != nil
@@ -901,6 +912,10 @@ struct WebViewRepresentable: UIViewRepresentable {
                     storeDismissible: true,
                     route: creativeStoreRoute()
                 )
+                return
+            case .storeOverlayShow:
+                guard bridge != nil, !externalClickOnly else { return }
+                onStoreOverlayShowRequest?()
                 return
             case .storeDismiss:
                 guard bridge != nil, !externalClickOnly else { return }

@@ -30,12 +30,27 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("Object.defineProperty(window, 'SimulaAd'"))
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'openStore'"))
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'dismissStore'"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'showInstallBanner'"))
         XCTAssertTrue(source.contains("function openStore()"))
         XCTAssertTrue(source.contains("function dismissStore()"))
+        XCTAssertTrue(source.contains("function showInstallBanner()"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW'"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify(message))"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify({"))
         XCTAssertFalse(source.contains("function openStore(value"))
         XCTAssertFalse(source.contains("activation_nonce: 'nonce'"))
+    }
+
+    func testGeneratedScriptOmitsStoreAPIOnUnsupportedSurfaces() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce", exposesStoreAPI: false)
+
+        XCTAssertFalse(source.contains("Object.defineProperty(window, 'SimulaAd'"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_OPEN"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_DISMISS"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_OVERLAY_SHOW"))
+        XCTAssertTrue(source.contains("window.open = function()"))
     }
 
     func testOpenStoreSharesWindowOpenGestureClaimWhileDismissDoesNotClaim() {

@@ -280,6 +280,7 @@ private struct RewardedGameView: View {
     @State private var resolvedAppID: String?
     @State private var skOverlayState = SKOverlayPresentationState<SKOverlayOwnershipToken>()
     @State private var skOverlayTask: Task<Void, Never>?
+    @State private var skOverlayResolutionStarted = false
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -396,6 +397,7 @@ private struct RewardedGameView: View {
             storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
+            presentRequestedSKOverlayIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
@@ -574,6 +576,7 @@ private struct RewardedGameView: View {
             onAttributionRouteOutcome: { outcome in
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
+            onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
             onStoreDismissRequest: { dismissSKOverlay() },
             storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
@@ -663,8 +666,10 @@ private struct RewardedGameView: View {
 
     private func startSKOverlay() {
         guard let config = skOverlay, config.enabled,
-              resolvedAppID == nil, !skOverlayState.suppressPending else { return }
+              resolvedAppID == nil, !skOverlayResolutionStarted,
+              !skOverlayState.suppressPending else { return }
         guard #available(iOS 14.0, *) else { return }
+        skOverlayResolutionStarted = true
         CreativeCTARouter.resolveAppStoreID(
             trackingUrl: trackingUrl,
             destination: destination,
@@ -672,7 +677,9 @@ private struct RewardedGameView: View {
         ) { id in
             guard !skOverlayState.suppressPending else { return }
             resolvedAppID = id
-            if config.timing == .duringPlay || config.timing == .delayed {
+            if skOverlayState.creativePresentationRequested {
+                presentSKOverlay(config: config)
+            } else if config.timing == .duringPlay || config.timing == .delayed {
                 scheduleSKOverlayPresent(config: config)
             }
         }
@@ -715,6 +722,22 @@ private struct RewardedGameView: View {
         guard let config = skOverlay, config.enabled, config.timing == .onClick else { return }
         // A configured product sheet remains foreground when both StoreKit surfaces are selected;
         // the overlay stays exactly owned by this scene/presentation behind it.
+        presentSKOverlay(config: config)
+    }
+
+    private func showSKOverlayFromCreative() {
+        guard let config = skOverlay, config.enabled,
+              skOverlayState.requestCreativePresentation() else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        startSKOverlay()
+        presentRequestedSKOverlayIfNeeded()
+    }
+
+    private func presentRequestedSKOverlayIfNeeded() {
+        guard skOverlayState.creativePresentationRequested,
+              resolvedAppID?.isEmpty == false,
+              let config = skOverlay, config.enabled else { return }
         presentSKOverlay(config: config)
     }
 

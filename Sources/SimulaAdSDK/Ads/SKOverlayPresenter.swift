@@ -38,6 +38,7 @@ struct SKOverlayOwnershipToken: Hashable, Sendable {
 struct SKOverlayPresentationState<Ownership> {
     private(set) var ownership: Ownership?
     private(set) var suppressPending = false
+    private(set) var creativePresentationRequested = false
 
     func canPresent(hasResolvedAppID: Bool) -> Bool {
         !suppressPending && ownership == nil && hasResolvedAppID
@@ -49,8 +50,15 @@ struct SKOverlayPresentationState<Ownership> {
         return true
     }
 
+    mutating func requestCreativePresentation() -> Bool {
+        guard !suppressPending, ownership == nil else { return false }
+        creativePresentationRequested = true
+        return true
+    }
+
     mutating func dismiss() -> Ownership? {
         suppressPending = true
+        creativePresentationRequested = false
         defer { ownership = nil }
         return ownership
     }

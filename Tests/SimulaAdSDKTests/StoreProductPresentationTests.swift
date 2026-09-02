@@ -254,8 +254,47 @@ final class StoreProductPresentationTests: XCTestCase {
 
         CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
         CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
+        XCTAssertFalse(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: stale
+        ))
         await fulfillment(of: [dismissed], timeout: 2)
         XCTAssertEqual(dismissNotifications, 1)
+    }
+
+    @MainActor
+    func testInteractiveProductDismissRunsOwnedCleanup() async throws {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        CreativeCTARouter.setPresentationRootForTesting { root }
+        let dismissed = expectation(description: "interactive store product dismissed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetDidDismiss,
+            object: nil,
+            queue: .main
+        ) { _ in dismissed.fulfill() }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+
+        XCTAssertTrue(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: StoreProductOwnershipToken()
+        ))
+        let storeVC = try XCTUnwrap(root.presentedViewController as? SKStoreProductViewController)
+        let presentationController = try XCTUnwrap(storeVC.presentationController)
+        let presentationDelegate = try XCTUnwrap(presentationController.delegate)
+
+        storeVC.dismiss(animated: false)
+        presentationDelegate.presentationControllerDidDismiss?(presentationController)
+
+        await fulfillment(of: [dismissed], timeout: 2)
     }
 }
 #endif

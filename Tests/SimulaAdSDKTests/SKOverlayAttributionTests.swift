@@ -48,8 +48,12 @@ final class SKOverlayAttributionTests: XCTestCase {
     func testOverlayCannotScheduleBeforeResolutionAndDismissSuppressesPendingWork() {
         var state = SKOverlayPresentationState<String>()
         XCTAssertFalse(state.canPresent(hasResolvedAppID: false))
+        XCTAssertTrue(state.requestCreativePresentation())
+        XCTAssertTrue(state.creativePresentationRequested)
         XCTAssertNil(state.dismiss())
         XCTAssertTrue(state.suppressPending)
+        XCTAssertFalse(state.creativePresentationRequested)
+        XCTAssertFalse(state.requestCreativePresentation())
         XCTAssertFalse(state.canPresent(hasResolvedAppID: true))
     }
 

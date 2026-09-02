@@ -745,11 +745,13 @@ enum CreativeStoreMessageAuthentication: Equatable {
     case notMessage
     case rejected
     case open
+    case showOverlay
     case dismiss
 }
 
 enum CreativeStoreMessage {
     static let openType = "SIMULA_INTERNAL_STORE_OPEN"
+    static let showOverlayType = "SIMULA_INTERNAL_STORE_OVERLAY_SHOW"
     static let dismissType = "SIMULA_INTERNAL_STORE_DISMISS"
 
     static func authenticate(
@@ -761,13 +763,19 @@ enum CreativeStoreMessage {
               let messageType = object["type"] as? String else {
             return .notMessage
         }
-        guard messageType == openType || messageType == dismissType else { return .notMessage }
+        guard messageType == openType || messageType == showOverlayType || messageType == dismissType else {
+            return .notMessage
+        }
         guard !expectedNonce.isEmpty,
               object["activation_nonce"] as? String == expectedNonce,
               Set(object.keys).isSubset(of: ["type", "activation_nonce"]) else {
             return .rejected
         }
-        return messageType == openType ? .open : .dismiss
+        switch messageType {
+        case openType: return .open
+        case showOverlayType: return .showOverlay
+        default: return .dismiss
+        }
     }
 }
 
@@ -1418,9 +1426,15 @@ enum CreativeCTARouter {
         let owner = ownershipToken ?? StoreProductOwnershipToken()
         let prepared = StoreProductPrewarmer.shared.take(appID: appID, attribution: attribution)
         let storeVC = prepared ?? SKStoreProductViewController()
-        let delegate = StoreProductDelegate { viewController in
-            requestStoreProductDismiss(viewController, owner: owner)
-        }
+        let delegate = StoreProductDelegate(
+            onRequestDismiss: { viewController in
+                requestStoreProductDismiss(viewController, owner: owner)
+            },
+            onDidDismiss: { viewController in
+                finishObservedStoreProductDismiss(viewController, owner: owner)
+            }
+        )
+        delegate.storeViewController = storeVC
         storeVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
         // global slot — multiple sheets can be presented/dismissed independently.
@@ -1455,6 +1469,7 @@ enum CreativeCTARouter {
             }
             activeStoreProduct = WeakObjectReference(storeVC)
             isPresentingExternal = true
+            storeVC.presentationController?.delegate = delegate
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
             return true
         }
@@ -1497,8 +1512,9 @@ enum CreativeCTARouter {
     ) {
         guard let controllerID = storeProductOwnership.beginDismiss(owner: owner),
               controllerID == ObjectIdentifier(storeVC) else { return }
-        storeVC.dismiss(animated: true)
-        finishStoreProductDismiss(owner: owner, controllerID: controllerID)
+        storeVC.dismiss(animated: true) {
+            finishStoreProductDismiss(owner: owner, controllerID: controllerID)
+        }
     }
 
     private static func finishStoreProductDismiss(
@@ -1509,6 +1525,15 @@ enum CreativeCTARouter {
         activeStoreProduct = WeakObjectReference()
         isPresentingExternal = false
         NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
+    }
+
+    private static func finishObservedStoreProductDismiss(
+        _ storeVC: SKStoreProductViewController,
+        owner: StoreProductOwnershipToken
+    ) {
+        let controllerID = ObjectIdentifier(storeVC)
+        guard storeProductOwnership.beginDismiss(owner: owner) == controllerID else { return }
+        finishStoreProductDismiss(owner: owner, controllerID: controllerID)
     }
 
     // MARK: - Attribution token mapping
@@ -1793,20 +1818,31 @@ enum CreativeCTARouter {
 
 // MARK: - StoreProductDelegate
 
-/// Minimal `SKStoreProductViewControllerDelegate` that dismisses the store sheet
-/// and clears the "showing" guard when the user finishes. `nonisolated` so it can
-/// satisfy the (nonisolated) delegate requirement; StoreKit always calls this on
-/// the main thread, so the hop in the body is effectively a no-op.
-private final class StoreProductDelegate: NSObject, SKStoreProductViewControllerDelegate {
-    private let onFinish: @MainActor (SKStoreProductViewController) -> Void
+/// Reconciles StoreKit's Done button and interactive sheet dismissal through the same owned cleanup.
+private final class StoreProductDelegate: NSObject,
+    SKStoreProductViewControllerDelegate,
+    UIAdaptivePresentationControllerDelegate {
+    weak var storeViewController: SKStoreProductViewController?
+    private let onRequestDismiss: @MainActor (SKStoreProductViewController) -> Void
+    private let onDidDismiss: @MainActor (SKStoreProductViewController) -> Void
 
-    init(onFinish: @escaping @MainActor (SKStoreProductViewController) -> Void) {
-        self.onFinish = onFinish
+    init(
+        onRequestDismiss: @escaping @MainActor (SKStoreProductViewController) -> Void,
+        onDidDismiss: @escaping @MainActor (SKStoreProductViewController) -> Void
+    ) {
+        self.onRequestDismiss = onRequestDismiss
+        self.onDidDismiss = onDidDismiss
     }
 
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
-        let onFinish = self.onFinish
-        Task { @MainActor in onFinish(viewController) }
+        let onRequestDismiss = self.onRequestDismiss
+        Task { @MainActor in onRequestDismiss(viewController) }
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        guard let viewController = storeViewController else { return }
+        let onDidDismiss = self.onDidDismiss
+        Task { @MainActor in onDidDismiss(viewController) }
     }
 }
 
