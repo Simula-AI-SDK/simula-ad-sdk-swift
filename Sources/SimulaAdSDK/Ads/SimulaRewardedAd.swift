@@ -394,6 +394,7 @@ public final class SimulaRewardedAd {
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            skOverlay: response.adBehavior?.skoverlay,
             autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
             onWillPresent: {
                 if response.prewarmSKProduct {

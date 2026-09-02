@@ -193,9 +193,56 @@ struct CreativeUserActivationState: Equatable {
     }
 }
 
-func creativeUserActivationScriptSource(nonce: String) -> String {
-    """
+func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = true) -> String {
+    let storeAPI = exposesStoreAPI ? """
+      function openStore() {
+        return claimGesture({
+          type: 'SIMULA_INTERNAL_STORE_OPEN',
+          activation_nonce: activationNonce
+        });
+      }
+
+      function dismissStore() {
+        if (!postNative) { return false; }
+        try {
+          postNative(nativeStringify({
+            type: 'SIMULA_INTERNAL_STORE_DISMISS',
+            activation_nonce: activationNonce
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      function showInstallBanner() {
+        if (!postNative) { return false; }
+        try {
+          postNative(nativeStringify({
+            type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW',
+            activation_nonce: activationNonce
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      try {
+        var simulaAdAPI = {};
+        Object.defineProperty(simulaAdAPI, 'openStore', {
+          value: openStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(simulaAdAPI, 'dismissStore', {
+          value: dismissStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(simulaAdAPI, 'showInstallBanner', {
+          value: showInstallBanner, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(window, 'SimulaAd', {
+          value: simulaAdAPI, writable: false, configurable: false, enumerable: true
+        });
+      } catch (_) {}
+    """ : ""
+    return """
     (function() {
+      var activationNonce = '\(nonce)';
       var originalOpen = window.open;
       var nativeHandler = window.webkit && window.webkit.messageHandlers
         ? window.webkit.messageHandlers.simulaSDK
@@ -319,25 +366,31 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
         catch (_) { return null; }
       }
 
-      function forwardCTA(value) {
+      function claimGesture(message) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
         if (!hasActiveUserGesture()) { return false; }
-        var url = resolvedURL(value);
-        if (!url) { return false; }
         claimedGesture = gestureSequence;
         try {
-          postNative(nativeStringify({
-            type: 'SIMULA_CTA_OPEN',
-            url: url,
-            activation_nonce: '\(nonce)'
-          }));
+          postNative(nativeStringify(message));
           return true;
         } catch (_) {
           if (claimedGesture === gestureSequence) { claimedGesture = -1; }
           return false;
         }
       }
+
+      function forwardCTA(value) {
+        var url = resolvedURL(value);
+        if (!url) { return false; }
+        return claimGesture({
+          type: 'SIMULA_CTA_OPEN',
+          url: url,
+          activation_nonce: activationNonce
+        });
+      }
+
+    \(storeAPI)
 
       window.open = function() {
         if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
@@ -504,6 +557,9 @@ private func waitForNativeAdDisplayFrame() async {
 enum WebViewForwardedMessage {
     case page(String)
     case userActivatedCTA(URL)
+    case userActivatedStoreOpen
+    case storeOverlayShow
+    case storeDismiss
 }
 
 let creativeBridgeMaxMessageUTF16Characters = 64 * 1024
@@ -617,6 +673,21 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
     ) {
         guard let body = message.body as? String,
               body.utf16.count <= creativeBridgeMaxMessageUTF16Characters else { return }
+        switch CreativeStoreMessage.authenticate(body, expectedNonce: userActivationNonce) {
+        case .open:
+            onMessage?(.userActivatedStoreOpen)
+            return
+        case .showOverlay:
+            onMessage?(.storeOverlayShow)
+            return
+        case .dismiss:
+            onMessage?(.storeDismiss)
+            return
+        case .rejected:
+            return
+        case .notMessage:
+            break
+        }
         switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
         case .accepted(let url):
             onMessage?(.userActivatedCTA(url))
@@ -740,9 +811,9 @@ final class WebViewPool {
     /// suppressed synchronously and forwarded as a structured message over the existing bridge.
     /// The per-WebView nonce and bound native handler are captured before creative code runs. Direct
     /// page calls to the public handler therefore cannot forge a billable activation message.
-    private static func userActivationScript(nonce: String) -> WKUserScript {
+    private static func userActivationScript(nonce: String, exposesStoreAPI: Bool) -> WKUserScript {
         WKUserScript(
-            source: creativeUserActivationScriptSource(nonce: nonce),
+            source: creativeUserActivationScriptSource(nonce: nonce, exposesStoreAPI: exposesStoreAPI),
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         )
@@ -751,12 +822,13 @@ final class WebViewPool {
     static func installUserScripts(
         on controller: WKUserContentController,
         nonce: String,
-        bridgeCapability: String
+        bridgeCapability: String,
+        exposesStoreAPI: Bool = false
     ) {
         controller.removeAllUserScripts()
         controller.addUserScript(postMessageScript(capability: bridgeCapability))
         controller.addUserScript(errorCaptureScript)
-        controller.addUserScript(userActivationScript(nonce: nonce))
+        controller.addUserScript(userActivationScript(nonce: nonce, exposesStoreAPI: exposesStoreAPI))
     }
 
     private func makePooled() -> Pooled {
@@ -769,7 +841,8 @@ final class WebViewPool {
         WebViewPool.installUserScripts(
             on: controller,
             nonce: forwarder.userActivationNonce,
-            bridgeCapability: forwarder.bridgeCapability
+            bridgeCapability: forwarder.bridgeCapability,
+            exposesStoreAPI: false
         )
 
         let config = WKWebViewConfiguration()
@@ -853,7 +926,8 @@ final class WebViewPool {
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (WebViewForwardedMessage) -> Void,
-        surface: String? = nil
+        surface: String? = nil,
+        exposesStoreAPI: Bool = false
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
         // Drop any prewarmed views whose storage policy no longer matches the
@@ -870,7 +944,8 @@ final class WebViewPool {
         Self.installUserScripts(
             on: pooled.webView.configuration.userContentController,
             nonce: pooled.forwarder.userActivationNonce,
-            bridgeCapability: pooled.forwarder.bridgeCapability
+            bridgeCapability: pooled.forwarder.bridgeCapability,
+            exposesStoreAPI: exposesStoreAPI
         )
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate
