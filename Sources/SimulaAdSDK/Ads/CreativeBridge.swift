@@ -38,26 +38,11 @@ extension NSKeyValueObservation: CreativeAudioVolumeObservation {}
 
 protocol CreativeAudioVolumeSource: AnyObject {
     var outputVolume: Float { get }
-    func prepareForObservation()
     func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation?
-}
-
-extension CreativeAudioVolumeSource {
-    func prepareForObservation() {}
 }
 
 private final class SystemCreativeAudioVolumeSource: CreativeAudioVolumeSource {
     var outputVolume: Float { AVAudioSession.sharedInstance().outputVolume }
-
-    func prepareForObservation() {
-        do {
-            // KVO does not reliably emit live changes while the process audio session is inactive.
-            // Preserve the host's category/mode/options and never deactivate a session we do not own.
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
-            Telemetry.shared.logHostDebug("audio session activation failed: \(error.localizedDescription)")
-        }
-    }
 
     func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation? {
         AVAudioSession.sharedInstance().observe(\.outputVolume, options: [.new]) { session, change in
@@ -245,7 +230,6 @@ final class CreativeBridge: ObservableObject {
         case "GET_DEVICE_CONTEXT":
             sendMessage(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
         case "GET_AUDIO_STATE":
-            audioVolumeSource.prepareForObservation()
             let audioPayload = currentAudioState().payload
             Telemetry.shared.logHostDebug("GET_AUDIO_STATE muted=\(audioPayload["muted"] ?? "?") volume=\(audioPayload["volume"] ?? "?")")
             sendMessage(type: type, requestId: requestId, payload: audioPayload, reply: reply)
@@ -304,7 +288,6 @@ final class CreativeBridge: ObservableObject {
     func pageDidFinishLoading(reply: @escaping (String) -> Void) {
         runOnMain { bridge in
             bridge.endAudioEvents()
-            bridge.audioVolumeSource.prepareForObservation()
             bridge.audioEventReply = reply
             let generation = bridge.audioPageGeneration
             bridge.audioObservation = bridge.audioVolumeSource.observe { [weak bridge] volume in

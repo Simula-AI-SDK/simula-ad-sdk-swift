@@ -49,6 +49,20 @@ final class WebViewMessageRelayTests: XCTestCase {
         XCTAssertFalse(source.contains("contentWindow.frames"))
     }
 
+    func testErrorCaptureRunsOnlyInCreativeRoots() {
+        let rootGuard = creativeRootGuardScriptSource()
+        let source = creativeErrorCaptureScriptSource()
+
+        XCTAssertTrue(source.contains(rootGuard))
+        XCTAssertTrue(source.contains("if (!isTop && !isDirectSrcdoc) { return; }"))
+        XCTAssertTrue(source.contains("window.addEventListener('error'"))
+        guard let guardRange = source.range(of: rootGuard),
+              let listenerRange = source.range(of: "window.addEventListener('error'") else {
+            return XCTFail("error capture must install after the creative-root guard")
+        }
+        XCTAssertLessThan(guardRange.lowerBound, listenerRange.lowerBound)
+    }
+
     func testForwarderRotatesBridgeAndActivationCapabilitiesTogether() {
         let forwarder = WebViewMessageForwarder()
         let oldBridge = forwarder.bridgeCapability

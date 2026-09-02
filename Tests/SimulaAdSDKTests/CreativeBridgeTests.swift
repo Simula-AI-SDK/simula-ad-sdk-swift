@@ -15,16 +15,11 @@ final class CreativeBridgeTests: XCTestCase {
 
     private final class FakeAudioVolumeSource: CreativeAudioVolumeSource {
         var outputVolume: Float
-        private(set) var prepares = 0
         private(set) var callbacks: [(Float) -> Void] = []
         private(set) var observations: [FakeAudioObservation] = []
 
         init(_ outputVolume: Float) {
             self.outputVolume = outputVolume
-        }
-
-        func prepareForObservation() {
-            prepares += 1
         }
 
         func observe(_ onChange: @escaping (Float) -> Void) -> CreativeAudioVolumeObservation? {
@@ -131,7 +126,6 @@ final class CreativeBridgeTests: XCTestCase {
             XCTAssertEqual(payload["muted"] as? Bool, false)
             XCTAssertEqual(payload["volume"] as? Int, 42)
         }
-        XCTAssertEqual(source.prepares, 1)
     }
 
     @MainActor
@@ -170,7 +164,6 @@ final class CreativeBridgeTests: XCTestCase {
         bridge.pageDidFinishLoading { [weak self] js in
             if let event = self?.decodeMessage(js) { events.append(event) }
         }
-        XCTAssertEqual(source.prepares, 1)
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0]["type"] as? String, "AUDIO_STATE_CHANGED")
         XCTAssertNil(events[0]["requestId"])

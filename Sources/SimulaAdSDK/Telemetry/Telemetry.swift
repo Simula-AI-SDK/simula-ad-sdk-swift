@@ -76,6 +76,7 @@ final class Telemetry: @unchecked Sendable {
     private var initializationTask: Task<TelemetryInitialization, Never>?
     private var duplicateInitializeCount = DuplicateInitializeCountBuffer(limit: 1_000_000)
     private var backgroundFlushObserver: TelemetryBackgroundFlushObserver?
+    private var hostDebugEnabled = false
     private let hostDebugPrint: (@Sendable (String) -> Void)?
 
     init(
@@ -109,6 +110,7 @@ final class Telemetry: @unchecked Sendable {
             return initializationTask
         }
         // Single-call task closure into a named method; see swift-concurrency-task-shape.
+        hostDebugEnabled = devMode
         let created = Task { await self.install(apiKey: apiKey, devMode: devMode, enabled: enabled) }
         initializationTask = created
         return created
@@ -207,9 +209,13 @@ final class Telemetry: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return manager
     }
 
-    /// Host-visible diagnostic line. Always prints so production hosts can see bridge/WebView
-    /// diagnostics in Xcode / `log-ios` (not Metro).
+    /// Host-visible diagnostic line for bridge/WebView troubleshooting in development mode.
     func logHostDebug(_ message: String) {
+        lock.lock()
+        let enabled = hostDebugEnabled
+        lock.unlock()
+        guard enabled else { return }
+
         let line = "[SimulaAdSDK] \(message)"
         if let hostDebugPrint {
             hostDebugPrint(line)

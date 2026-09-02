@@ -519,21 +519,27 @@ func authenticatedCreativeBridgeMessage(_ message: String, expectedCapability: S
     return message
 }
 
+func creativeRootGuardScriptSource() -> String {
+    """
+    var isTop = window === window.top;
+    var isDirectSrcdoc = false;
+    if (!isTop) {
+      try {
+        isDirectSrcdoc = window.parent === window.top && window.frameElement &&
+          window.frameElement.hasAttribute('srcdoc') &&
+          window.frameElement === window.top.document.querySelector('iframe[srcdoc]') &&
+          String(window.location.href) === 'about:srcdoc';
+      } catch (_) {}
+    }
+    if (!isTop && !isDirectSrcdoc) { return; }
+    """
+}
+
 func creativeBridgeRelayScriptSource(capability: String) -> String {
     """
     (function() {
       'use strict';
-      var isTop = window === window.top;
-      var isDirectSrcdoc = false;
-      if (!isTop) {
-        try {
-          isDirectSrcdoc = window.parent === window.top && window.frameElement &&
-            window.frameElement.hasAttribute('srcdoc') &&
-            window.frameElement === window.top.document.querySelector('iframe[srcdoc]') &&
-            String(window.location.href) === 'about:srcdoc';
-        } catch (_) {}
-      }
-      if (!isTop && !isDirectSrcdoc) { return; }
+      \(creativeRootGuardScriptSource())
       var bridgeCapability = '\(capability)';
       var nativeHandler = window.webkit && window.webkit.messageHandlers
         ? window.webkit.messageHandlers.simulaSDK
@@ -571,6 +577,24 @@ func creativeBridgeRelayScriptSource(capability: String) -> String {
           if (!serialized || serialized.charAt(0) !== '{') { return; }
           nativePost('{"\(creativeBridgeCapabilityKey)":' + nativeStringify(bridgeCapability) +
             ',' + serialized.substring(1));
+        } catch (_) {}
+      });
+    })();
+    """
+}
+
+func creativeErrorCaptureScriptSource() -> String {
+    """
+    (function() {
+      'use strict';
+      \(creativeRootGuardScriptSource())
+      window.addEventListener('error', function(e) {
+        try {
+          window.postMessage({
+            type: 'SIMULA_JS_ERROR',
+            message: (e && e.message) ? String(e.message) : 'error',
+            line: (e && e.lineno) ? e.lineno : 0
+          }, '*');
         } catch (_) {}
       });
     })();
@@ -706,17 +730,7 @@ final class WebViewPool {
     /// Forwards creative JS errors (`window.onerror`) to native via the same `simulaSDK` handler, where
     /// the coordinator records them as telemetry. Document-start so early errors are caught too.
     private static let errorCaptureScript = WKUserScript(
-        source: """
-        window.addEventListener('error', function(e) {
-            try {
-                window.postMessage({
-                    type: 'SIMULA_JS_ERROR',
-                    message: (e && e.message) ? String(e.message) : 'error',
-                    line: (e && e.lineno) ? e.lineno : 0
-                }, '*');
-            } catch (_) {}
-        });
-        """,
+        source: creativeErrorCaptureScriptSource(),
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false
     )

@@ -655,18 +655,31 @@ final class TelemetryManagerTests: XCTestCase {
         completion.set(effective)
     }
 
-    func testLogHostDebugAlwaysPrints() {
-        let sink = LogSink()
-        let telemetry = Telemetry(
+    func testLogHostDebugPrintsOnlyInDevMode() async {
+        let productionSink = LogSink()
+        let productionTelemetry = Telemetry(
             managerFactory: { _, _ in
                 XCTFail("logHostDebug must not create a manager")
                 return self.build(store: FakeStore(), sender: FakeSender())
             },
-            hostDebugPrint: { sink.append($0) }
+            hostDebugPrint: { productionSink.append($0) }
         )
+        productionTelemetry.logHostDebug("before initialization")
+        _ = await productionTelemetry.initialize(apiKey: "production", devMode: false, enabled: false)
+        productionTelemetry.logHostDebug("production")
+        XCTAssertTrue(productionSink.all.isEmpty)
 
-        telemetry.logHostDebug("AUDIO_STATE_CHANGED muted=false volume=50")
-        XCTAssertEqual(sink.all, ["[SimulaAdSDK] AUDIO_STATE_CHANGED muted=false volume=50"])
+        let developmentSink = LogSink()
+        let developmentTelemetry = Telemetry(
+            managerFactory: { _, _ in
+                XCTFail("logHostDebug must not create a manager")
+                return self.build(store: FakeStore(), sender: FakeSender())
+            },
+            hostDebugPrint: { developmentSink.append($0) }
+        )
+        _ = await developmentTelemetry.initialize(apiKey: "development", devMode: true, enabled: false)
+        developmentTelemetry.logHostDebug("AUDIO_STATE_CHANGED muted=false volume=50")
+        XCTAssertEqual(developmentSink.all, ["[SimulaAdSDK] AUDIO_STATE_CHANGED muted=false volume=50"])
     }
 
     func testDisabledFirstEnabledSecondReturnsDisabledWinningStateToBothCallers() async {
