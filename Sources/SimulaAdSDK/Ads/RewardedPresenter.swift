@@ -680,7 +680,8 @@ private struct RewardedGameView: View {
     // MARK: SKOverlay
 
     private func startSKOverlay() {
-        guard let config = skOverlay, config.enabled,
+        let config = skOverlay
+        guard config?.enabled == true || skOverlayState.creativePresentationRequested,
               resolvedAppID == nil, !skOverlayResolutionStarted,
               !skOverlayState.suppressPending else { return }
         guard #available(iOS 14.0, *) else { return }
@@ -693,8 +694,9 @@ private struct RewardedGameView: View {
             guard !skOverlayState.suppressPending else { return }
             resolvedAppID = id
             if skOverlayState.creativePresentationRequested {
-                presentSKOverlay(config: config)
-            } else if config.timing == .duringPlay || config.timing == .delayed {
+                presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: config))
+            } else if let config, config.enabled,
+                      config.timing == .duringPlay || config.timing == .delayed {
                 scheduleSKOverlayPresent(config: config)
             }
         }
@@ -741,8 +743,7 @@ private struct RewardedGameView: View {
     }
 
     private func showSKOverlayFromCreative() {
-        guard let config = skOverlay, config.enabled,
-              skOverlayState.requestCreativePresentation() else { return }
+        guard skOverlayState.requestCreativePresentation() else { return }
         skOverlayTask?.cancel()
         skOverlayTask = nil
         startSKOverlay()
@@ -751,9 +752,8 @@ private struct RewardedGameView: View {
 
     private func presentRequestedSKOverlayIfNeeded() {
         guard skOverlayState.creativePresentationRequested,
-              resolvedAppID?.isEmpty == false,
-              let config = skOverlay, config.enabled else { return }
-        presentSKOverlay(config: config)
+              resolvedAppID?.isEmpty == false else { return }
+        presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: skOverlay))
     }
 
     private func dismissSKOverlay() {

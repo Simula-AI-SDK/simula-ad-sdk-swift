@@ -64,6 +64,14 @@ struct SKOverlayPresentationState<Ownership> {
     }
 }
 
+func creativeRequestedSKOverlayConfig(from config: SKOverlayConfig?) -> SKOverlayConfig {
+    SKOverlayConfig(
+        enabled: true,
+        position: config?.position ?? .bottom,
+        dismissible: config?.dismissible ?? true
+    )
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit
