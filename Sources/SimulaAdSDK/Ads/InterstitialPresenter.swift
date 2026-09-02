@@ -264,6 +264,12 @@ private struct CreativeInterstitialView: View {
     @State private var closeRemaining: Int
     /// 0→1 fill for the close-delay countdown (`countdown_circle` ring / `progress_bar`).
     @State private var closeProgress: Double = 0
+    /// Bumped on every pause; keyed into `CloseButtonView`'s `.id()` so pausing discards the
+    /// in-flight linear fill animation along with the old view identity. SwiftUI animations are
+    /// additive and a non-animated write alone cannot cancel a running delta — without this the
+    /// fill jumps backwards when a store sheet pauses the gate, and repeated pause/resume cycles
+    /// stack deltas until the displayed fill pins at zero.
+    @State private var closeGateGeneration = 0
     /// Shared monotonic gate state. It preserves fractional elapsed time and makes duplicate pause
     /// notifications from StoreKit and the app lifecycle idempotent.
     @State private var gateClock = FullscreenGateClock()
@@ -352,6 +358,8 @@ private struct CreativeInterstitialView: View {
                 progress: closeProgress,
                 onClose: { handleClose() }
             )
+            // Identity keyed to the pause generation — see `closeGateGeneration`.
+            .id(closeGateGeneration)
 
             // Mid-ad store prompt — independent of the close button and SKOverlay. Pinned to the
             // corner opposite the close button (the SDK mirrors the close position horizontally)
@@ -729,7 +737,10 @@ private struct CreativeInterstitialView: View {
         gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: total)
         if close.treatment == .countdownCircle || close.treatment == .progressBar {
             var tx = Transaction(); tx.disablesAnimations = true
-            withTransaction(tx) { closeProgress = gateClock.progress(total: total) }
+            withTransaction(tx) {
+                closeProgress = gateClock.progress(total: total)
+                closeGateGeneration += 1
+            }
         } else if close.treatment == .rewardOrCloseLabel {
             closeRemaining = gateClock.secondsRemaining(total: total)
         }
