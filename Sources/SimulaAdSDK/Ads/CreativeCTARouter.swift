@@ -1313,6 +1313,10 @@ enum CreativeCTARouter {
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         storeVC.delegate = delegate
+        // Also observe the sheet's interactive swipe-down, which does not reliably fire
+        // `productViewControllerDidFinish` (long-standing iOS bug) — without this the pause
+        // flag and `isPresentingExternal` would stick forever after a swiped-away sheet.
+        storeVC.presentationController?.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
         // global slot — multiple sheets can be presented/dismissed independently.
         // NOTE for host/dependency auditors: this is a scoped associated object on an SDK-owned VC —
@@ -1434,6 +1438,8 @@ enum CreativeCTARouter {
             NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
         }
         safariVC.delegate = delegate
+        // Catch the interactive swipe-down too — see the note in `presentStoreProduct`.
+        safariVC.presentationController?.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet).
         objc_setAssociatedObject(
             safariVC, &safariDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
@@ -1627,8 +1633,15 @@ enum CreativeCTARouter {
 /// and clears the "showing" guard when the user finishes. `nonisolated` so it can
 /// satisfy the (nonisolated) delegate requirement; StoreKit always calls this on
 /// the main thread, so the hop in the body is effectively a no-op.
-private final class StoreProductDelegate: NSObject, SKStoreProductViewControllerDelegate {
+/// Also the sheet's `UIAdaptivePresentationControllerDelegate`: an interactive swipe-down
+/// does not reliably fire `productViewControllerDidFinish`, and on some iOS versions both
+/// callbacks fire for a single dismissal — so both funnel into `finishOnce()`, which runs
+/// the cleanup exactly once per presentation.
+private final class StoreProductDelegate: NSObject, SKStoreProductViewControllerDelegate,
+                                          UIAdaptivePresentationControllerDelegate {
     private let onFinish: @MainActor () -> Void
+    /// Main-thread only (both StoreKit and UIKit deliver these callbacks there).
+    private var finished = false
 
     init(onFinish: @escaping @MainActor () -> Void) {
         self.onFinish = onFinish
@@ -1636,6 +1649,17 @@ private final class StoreProductDelegate: NSObject, SKStoreProductViewController
 
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
         viewController.dismiss(animated: true)
+        finishOnce()
+    }
+
+    /// The user swiped the sheet down (interactive dismissal).
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finishOnce()
+    }
+
+    private func finishOnce() {
+        guard !finished else { return }
+        finished = true
         let onFinish = self.onFinish
         Task { @MainActor in onFinish() }
     }
@@ -1646,14 +1670,31 @@ private final class StoreProductDelegate: NSObject, SKStoreProductViewController
 /// Clears the "presenting" guard when the user dismisses the Safari sheet. Retained
 /// per-sheet via an associated object (like `StoreProductDelegate`). `SFSafariViewController`
 /// dismisses itself, so this only resets the guard. Delivered on the main thread.
-private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate {
+/// Also the sheet's `UIAdaptivePresentationControllerDelegate` so an interactive swipe-down
+/// (which can skip `safariViewControllerDidFinish`) still resets the guard; both callbacks
+/// funnel into `finishOnce()` so a double-fire cleans up exactly once.
+private final class SafariDelegate: NSObject, SFSafariViewControllerDelegate,
+                                    UIAdaptivePresentationControllerDelegate {
     private let onFinish: @MainActor () -> Void
+    /// Main-thread only (both SafariServices and UIKit deliver these callbacks there).
+    private var finished = false
 
     init(onFinish: @escaping @MainActor () -> Void) {
         self.onFinish = onFinish
     }
 
     func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
+        finishOnce()
+    }
+
+    /// The user swiped the sheet down (interactive dismissal).
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finishOnce()
+    }
+
+    private func finishOnce() {
+        guard !finished else { return }
+        finished = true
         let onFinish = self.onFinish
         Task { @MainActor in onFinish() }
     }
