@@ -186,9 +186,16 @@ final class StoreProductPresentationTests: XCTestCase {
         CreativeCTARouter.setStoreProductControllerProviderForTesting {
             SKStoreProductViewController()
         }
+        var presentedController: UIViewController?
+        CreativeCTARouter.setViewControllerPresenterForTesting { controller in
+            presentedController = controller
+            return true
+        }
+        UIView.setAnimationsEnabled(false)
         defer {
             root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
+            UIView.setAnimationsEnabled(true)
             CreativeCTARouter.resetExternalPresentationStateForTesting()
         }
         XCTAssertFalse(window.isHidden)
@@ -209,7 +216,7 @@ final class StoreProductPresentationTests: XCTestCase {
 
         await Task.yield()
         XCTAssertTrue(
-            root.presentedViewController is SKStoreProductViewController,
+            presentedController is SKStoreProductViewController,
             "default StoreOpen must present SKStoreProductViewController on a live foreground window"
         )
         XCTAssertEqual(outcomes, [AttributionRouteOutcome(
@@ -230,6 +237,12 @@ final class StoreProductPresentationTests: XCTestCase {
         CreativeCTARouter.setStoreProductControllerProviderForTesting {
             SKStoreProductViewController()
         }
+        var presentedController: UIViewController?
+        CreativeCTARouter.setViewControllerPresenterForTesting { controller in
+            presentedController = controller
+            return true
+        }
+        UIView.setAnimationsEnabled(false)
         let owner = StoreProductOwnershipToken()
         let stale = StoreProductOwnershipToken()
         var dismissNotifications = 0
@@ -246,6 +259,7 @@ final class StoreProductPresentationTests: XCTestCase {
             NotificationCenter.default.removeObserver(observer)
             root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
+            UIView.setAnimationsEnabled(true)
             CreativeCTARouter.resetExternalPresentationStateForTesting()
         }
 
@@ -255,7 +269,7 @@ final class StoreProductPresentationTests: XCTestCase {
         ))
         CreativeCTARouter.dismissStoreProduct(ownershipToken: stale)
         await Task.yield()
-        XCTAssertTrue(root.presentedViewController is SKStoreProductViewController)
+        XCTAssertTrue(presentedController is SKStoreProductViewController)
         XCTAssertEqual(dismissNotifications, 0)
 
         CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
@@ -279,6 +293,7 @@ final class StoreProductPresentationTests: XCTestCase {
         CreativeCTARouter.setStoreProductControllerProviderForTesting {
             SKStoreProductViewController()
         }
+        UIView.setAnimationsEnabled(false)
         let dismissed = expectation(description: "interactive store product dismissed")
         let observer = NotificationCenter.default.addObserver(
             forName: .simulaAdExternalSheetDidDismiss,
@@ -289,6 +304,7 @@ final class StoreProductPresentationTests: XCTestCase {
             NotificationCenter.default.removeObserver(observer)
             root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
+            UIView.setAnimationsEnabled(true)
             CreativeCTARouter.resetExternalPresentationStateForTesting()
         }
 

@@ -1400,6 +1400,7 @@ enum CreativeCTARouter {
     /// resets it on dismiss.
     private static var isPresentingExternal = false
     private static var presentationRootOverrideForTesting: (() -> UIViewController?)?
+    private static var viewControllerPresenterForTesting: ((UIViewController) -> Bool)?
 
     /// Test cleanup for SDK-owned presentation state. Tests dismiss the presented controller first;
     /// this only prevents a failed test from contaminating later route assertions.
@@ -1409,6 +1410,7 @@ enum CreativeCTARouter {
         activeStoreProduct = WeakObjectReference()
         storeProductControllerProviderForTesting = nil
         presentationRootOverrideForTesting = nil
+        viewControllerPresenterForTesting = nil
     }
 
     static func setPresentationRootForTesting(_ provider: @escaping () -> UIViewController?) {
@@ -1419,6 +1421,12 @@ enum CreativeCTARouter {
         _ provider: @escaping () -> SKStoreProductViewController
     ) {
         storeProductControllerProviderForTesting = provider
+    }
+
+    static func setViewControllerPresenterForTesting(
+        _ presenter: @escaping (UIViewController) -> Bool
+    ) {
+        viewControllerPresenterForTesting = presenter
     }
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
@@ -1500,6 +1508,11 @@ enum CreativeCTARouter {
             finishStoreProductDismiss(owner: ownershipToken, controllerID: controllerID)
             return
         }
+        if storeVC.presentingViewController == nil, storeVC.viewIfLoaded?.window == nil {
+            guard storeProductOwnership.beginDismiss(owner: ownershipToken) == controllerID else { return }
+            finishStoreProductDismiss(owner: ownershipToken, controllerID: controllerID)
+            return
+        }
         if storeVC.isBeingPresented, let transition = storeVC.transitionCoordinator {
             transition.animate(alongsideTransition: nil) { _ in
                 requestStoreProductDismiss(storeVC, owner: ownershipToken)
@@ -1521,7 +1534,8 @@ enum CreativeCTARouter {
     ) {
         guard let controllerID = storeProductOwnership.beginDismiss(owner: owner),
               controllerID == ObjectIdentifier(storeVC) else { return }
-        storeVC.dismiss(animated: true) {
+        let dismissingController = storeVC.presentingViewController ?? storeVC
+        dismissingController.dismiss(animated: true) {
             finishStoreProductDismiss(owner: owner, controllerID: controllerID)
         }
         // StoreKit can omit the completion when dismissal races the sheet's own presentation
@@ -1661,6 +1675,9 @@ enum CreativeCTARouter {
         _ vc: UIViewController,
         originatingScene: UIWindowScene? = nil
     ) -> Bool {
+        if let presenter = viewControllerPresenterForTesting {
+            return presenter(vc)
+        }
         let rootVC: UIViewController?
         if let override = presentationRootOverrideForTesting {
             rootVC = override()
