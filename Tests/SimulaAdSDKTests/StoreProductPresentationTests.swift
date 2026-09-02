@@ -183,6 +183,9 @@ final class StoreProductPresentationTests: XCTestCase {
         window.rootViewController = root
         window.makeKeyAndVisible()
         CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
         defer {
             root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
@@ -224,6 +227,9 @@ final class StoreProductPresentationTests: XCTestCase {
         window.rootViewController = root
         window.makeKeyAndVisible()
         CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
         let owner = StoreProductOwnershipToken()
         let stale = StoreProductOwnershipToken()
         var dismissNotifications = 0
@@ -270,6 +276,9 @@ final class StoreProductPresentationTests: XCTestCase {
         window.rootViewController = root
         window.makeKeyAndVisible()
         CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
         let dismissed = expectation(description: "interactive store product dismissed")
         let observer = NotificationCenter.default.addObserver(
             forName: .simulaAdExternalSheetDidDismiss,

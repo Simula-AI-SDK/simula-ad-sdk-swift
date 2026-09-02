@@ -1391,6 +1391,7 @@ enum CreativeCTARouter {
     private static var safariDelegateAssocKey: UInt8 = 0
     private static var storeProductOwnership = StoreProductOwnershipState<StoreProductOwnershipToken, ObjectIdentifier>()
     private static var activeStoreProduct = WeakObjectReference<SKStoreProductViewController>()
+    private static var storeProductControllerProviderForTesting: (() -> SKStoreProductViewController)?
 
     /// Guards against stacking a second in-app sheet (store OR Safari) on top of one
     /// already showing — only one external surface should be up at a time. Set `true`
@@ -1406,11 +1407,18 @@ enum CreativeCTARouter {
         isPresentingExternal = false
         storeProductOwnership.reset()
         activeStoreProduct = WeakObjectReference()
+        storeProductControllerProviderForTesting = nil
         presentationRootOverrideForTesting = nil
     }
 
     static func setPresentationRootForTesting(_ provider: @escaping () -> UIViewController?) {
         presentationRootOverrideForTesting = provider
+    }
+
+    static func setStoreProductControllerProviderForTesting(
+        _ provider: @escaping () -> SKStoreProductViewController
+    ) {
+        storeProductControllerProviderForTesting = provider
     }
 
     /// Presents `SKStoreProductViewController` in-app for the given App Store ID, carrying any
@@ -1425,7 +1433,8 @@ enum CreativeCTARouter {
         guard !isPresentingExternal, Int(appID) != nil else { return false }
         let owner = ownershipToken ?? StoreProductOwnershipToken()
         let prepared = StoreProductPrewarmer.shared.take(appID: appID, attribution: attribution)
-        let storeVC = prepared ?? SKStoreProductViewController()
+        let testController = storeProductControllerProviderForTesting?()
+        let storeVC = prepared ?? testController ?? SKStoreProductViewController()
         let delegate = StoreProductDelegate(
             onRequestDismiss: { viewController in
                 requestStoreProductDismiss(viewController, owner: owner)
@@ -1443,7 +1452,7 @@ enum CreativeCTARouter {
         objc_setAssociatedObject(
             storeVC, &storeDelegateAssocKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
-        if prepared == nil {
+        if prepared == nil, testController == nil {
             let start = DispatchTime.now().uptimeNanoseconds
             storeVC.loadProduct(
                 withParameters: storeProductParameters(appID: appID, attribution: attribution)

@@ -399,6 +399,10 @@ private struct RewardedGameView: View {
             reconcileTimer()
             presentRequestedSKOverlayIfNeeded()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            presentRequestedSKOverlayIfNeeded()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
             storeExit?.onAway()

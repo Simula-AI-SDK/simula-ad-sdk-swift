@@ -772,6 +772,16 @@ struct WebViewRepresentable: UIViewRepresentable {
 
         private func cancelPendingStoreRoute() {
             guard pendingStoreRoute else { return }
+            if let pendingAutomaticUserHandoff {
+                let lifecycle = attributionRouteLifecycle
+                let automaticRoutes = lifecycle?.automaticRoutes ?? ownedAutomaticRoutes
+                let automaticRouteScope = lifecycle?.automaticRouteScope ?? ownedAutomaticRouteScope
+                automaticRoutes.cancelUserHandoff(
+                    pendingAutomaticUserHandoff,
+                    scope: automaticRouteScope
+                )
+                self.pendingAutomaticUserHandoff = nil
+            }
             pendingAttributionRoute?.cancel()
             pendingAttributionRoute = nil
             pendingStoreRoute = false
