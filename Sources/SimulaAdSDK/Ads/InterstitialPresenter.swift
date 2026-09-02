@@ -579,7 +579,8 @@ private struct CreativeInterstitialView: View {
             makeImpression: {
                 // SKOverlay currently shares this serve's nonce. Avoid registering both surfaces
                 // until its attribution tuple is split from the custom creative's tuple.
-                guard response.adBehavior?.skoverlay?.enabled != true,
+                guard !skOverlayState.creativePresentationRequested,
+                      response.adBehavior?.skoverlay?.enabled != true,
                       response.destinationKind == .appstore,
                       let appID = CreativeCTARouter.appStoreID(fromString: response.iosStoreUrl)
                 else { return nil }
@@ -949,6 +950,7 @@ private struct CreativeInterstitialView: View {
 
     private func showSKOverlayFromCreative() {
         guard skOverlayState.requestCreativePresentation() else { return }
+        endSKANViewThroughImpressionIfStarted()
         skOverlayTask?.cancel()
         skOverlayTask = nil
         startSKOverlay()
