@@ -215,5 +215,47 @@ final class StoreProductPresentationTests: XCTestCase {
             failureClass: nil
         )])
     }
+
+    @MainActor
+    func testOwnedProductDismissIgnoresStaleOwnerAndBalancesCleanupOnce() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        CreativeCTARouter.setPresentationRootForTesting { root }
+        let owner = StoreProductOwnershipToken()
+        let stale = StoreProductOwnershipToken()
+        var dismissNotifications = 0
+        let dismissed = expectation(description: "owned store product dismissed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetDidDismiss,
+            object: nil,
+            queue: .main
+        ) { _ in
+            dismissNotifications += 1
+            dismissed.fulfill()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+
+        XCTAssertTrue(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: owner
+        ))
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: stale)
+        await Task.yield()
+        XCTAssertTrue(root.presentedViewController is SKStoreProductViewController)
+        XCTAssertEqual(dismissNotifications, 0)
+
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
+        await fulfillment(of: [dismissed], timeout: 2)
+        XCTAssertEqual(dismissNotifications, 1)
+    }
 }
 #endif

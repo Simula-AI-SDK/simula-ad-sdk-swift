@@ -12,6 +12,14 @@ final class CreativeClickURLTests: XCTestCase {
         return data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
 
+    private func storeBody(type: String, nonce: String? = "activation-nonce", extra: [String: Any] = [:]) -> String {
+        var object: [String: Any] = ["type": type]
+        if let nonce { object["activation_nonce"] = nonce }
+        extra.forEach { object[$0.key] = $0.value }
+        let data = try? JSONSerialization.data(withJSONObject: object)
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
+
     func testFallbackNativeBeaconOwnershipRequiresClientSupportServerEnablementAndAdId() {
         let capable = DeviceCapabilities(
             osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
@@ -581,6 +589,85 @@ final class CreativeClickURLTests: XCTestCase {
             ),
             .rejected
         )
+    }
+
+    func testStoreMessagesRequireNonceAndRejectCreativePayloads() {
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(
+                storeBody(type: CreativeStoreMessage.openType),
+                expectedNonce: activationNonce
+            ),
+            .open
+        )
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(
+                storeBody(type: CreativeStoreMessage.dismissType),
+                expectedNonce: activationNonce
+            ),
+            .dismiss
+        )
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(
+                storeBody(type: CreativeStoreMessage.openType, nonce: "stale"),
+                expectedNonce: activationNonce
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(
+                storeBody(
+                    type: CreativeStoreMessage.openType,
+                    extra: ["url": "https://apps.apple.com/app/id123", "app_id": "123"]
+                ),
+                expectedNonce: activationNonce
+            ),
+            .rejected
+        )
+        XCTAssertEqual(
+            CreativeStoreMessage.authenticate(#"{"type":"OPEN_STORE"}"#, expectedNonce: activationNonce),
+            .notMessage
+        )
+    }
+
+    func testStoreAPIRequiresTrustedAppStoreMetadataBeforeClickAdmission() {
+        XCTAssertTrue(hasTrustedCreativeStoreDestination(
+            trackingUrl: "itms-apps://apps.apple.com/app/id123",
+            destination: .appstore,
+            storeUrl: nil
+        ))
+        XCTAssertTrue(hasTrustedCreativeStoreDestination(
+            trackingUrl: "https://tracker.example/click",
+            destination: .appstore,
+            storeUrl: "https://apps.apple.com/app/id456"
+        ))
+        XCTAssertFalse(hasTrustedCreativeStoreDestination(
+            trackingUrl: "https://tracker.example/click",
+            destination: .appstore,
+            storeUrl: nil
+        ))
+        XCTAssertFalse(hasTrustedCreativeStoreDestination(
+            trackingUrl: "https://apps.apple.com/app/id123",
+            destination: .web,
+            storeUrl: "https://apps.apple.com/app/id456"
+        ))
+        XCTAssertFalse(hasTrustedCreativeStoreDestination(
+            trackingUrl: nil,
+            destination: .appstore,
+            storeUrl: "https://apps.apple.com.evil.example/app/id456"
+        ))
+    }
+
+    func testStoreProductOwnershipRejectsStaleDismissAndCleansUpOnce() {
+        var ownership = StoreProductOwnershipState<String, String>()
+        XCTAssertTrue(ownership.install(owner: "first", controller: "sheet-1"))
+        XCTAssertFalse(ownership.install(owner: "second", controller: "sheet-2"))
+        XCTAssertNil(ownership.beginDismiss(owner: "stale"))
+        XCTAssertEqual(ownership.beginDismiss(owner: "first"), "sheet-1")
+        XCTAssertNil(ownership.beginDismiss(owner: "first"))
+        XCTAssertFalse(ownership.finishDismiss(owner: "stale", controller: "sheet-1"))
+        XCTAssertTrue(ownership.finishDismiss(owner: "first", controller: "sheet-1"))
+        XCTAssertFalse(ownership.finishDismiss(owner: "first", controller: "sheet-1"))
+        XCTAssertTrue(ownership.install(owner: "second", controller: "sheet-2"))
     }
 
     func testAuthenticatedMessageAndDelegateStillClaimExactlyOnce() {

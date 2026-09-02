@@ -318,25 +318,60 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
         catch (_) { return null; }
       }
 
-      function forwardCTA(value) {
+      function claimGesture(message) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
         if (!hasActiveUserGesture()) { return false; }
-        var url = resolvedURL(value);
-        if (!url) { return false; }
         claimedGesture = gestureSequence;
         try {
-          postNative({
-            type: 'SIMULA_CTA_OPEN',
-            url: url,
-            activation_nonce: '\(nonce)'
-          });
+          postNative(message);
           return true;
         } catch (_) {
           if (claimedGesture === gestureSequence) { claimedGesture = -1; }
           return false;
         }
       }
+
+      function forwardCTA(value) {
+        var url = resolvedURL(value);
+        if (!url) { return false; }
+        return claimGesture({
+          type: 'SIMULA_CTA_OPEN',
+          url: url,
+          activation_nonce: '\(nonce)'
+        });
+      }
+
+      function openStore() {
+        return claimGesture({
+          type: 'SIMULA_INTERNAL_STORE_OPEN',
+          activation_nonce: '\(nonce)'
+        });
+      }
+
+      function dismissStore() {
+        if (!postNative) { return false; }
+        try {
+          postNative({
+            type: 'SIMULA_INTERNAL_STORE_DISMISS',
+            activation_nonce: '\(nonce)'
+          });
+          return true;
+        } catch (_) { return false; }
+      }
+
+      try {
+        var simulaAdAPI = {};
+        Object.defineProperty(simulaAdAPI, 'openStore', {
+          value: openStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(simulaAdAPI, 'dismissStore', {
+          value: dismissStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(window, 'SimulaAd', {
+          value: simulaAdAPI, writable: false, configurable: false, enumerable: true
+        });
+      } catch (_) {}
 
       window.open = function() {
         if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
@@ -503,6 +538,8 @@ private func waitForNativeAdDisplayFrame() async {
 enum WebViewForwardedMessage {
     case page(String)
     case userActivatedCTA(URL)
+    case userActivatedStoreOpen
+    case storeDismiss
 }
 
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
@@ -527,6 +564,18 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
             body = nil
         }
         guard let body else { return }
+        switch CreativeStoreMessage.authenticate(body, expectedNonce: userActivationNonce) {
+        case .open:
+            onMessage?(.userActivatedStoreOpen)
+            return
+        case .dismiss:
+            onMessage?(.storeDismiss)
+            return
+        case .rejected:
+            return
+        case .notMessage:
+            break
+        }
         switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
         case .accepted(let url):
             onMessage?(.userActivatedCTA(url))

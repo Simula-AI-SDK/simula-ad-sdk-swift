@@ -201,6 +201,49 @@ struct CreativeClickClaim {
     }
 }
 
+struct StoreProductOwnershipToken: Hashable, Sendable {
+    fileprivate let id: UUID
+
+    init(id: UUID = UUID()) {
+        self.id = id
+    }
+}
+
+struct StoreProductOwnershipState<Owner: Hashable, Controller: Hashable> {
+    private var active: (owner: Owner, controller: Controller)?
+    private var dismissing = false
+
+    mutating func install(owner: Owner, controller: Controller) -> Bool {
+        guard active == nil else { return false }
+        active = (owner, controller)
+        dismissing = false
+        return true
+    }
+
+    mutating func beginDismiss(owner: Owner) -> Controller? {
+        guard let active, active.owner == owner, !dismissing else { return nil }
+        dismissing = true
+        return active.controller
+    }
+
+    func controller(owner: Owner) -> Controller? {
+        guard let active, active.owner == owner else { return nil }
+        return active.controller
+    }
+
+    mutating func finishDismiss(owner: Owner, controller: Controller) -> Bool {
+        guard let active, active.owner == owner, active.controller == controller else { return false }
+        self.active = nil
+        dismissing = false
+        return true
+    }
+
+    mutating func reset() {
+        active = nil
+        dismissing = false
+    }
+}
+
 final class AttributionRouteLifecycle: @unchecked Sendable {
     private let lock = NSLock()
     private var active = false
@@ -697,6 +740,36 @@ enum CreativeCTAOpenAuthentication: Equatable {
     case accepted(URL)
 }
 
+enum CreativeStoreMessageAuthentication: Equatable {
+    case notMessage
+    case rejected
+    case open
+    case dismiss
+}
+
+enum CreativeStoreMessage {
+    static let openType = "SIMULA_INTERNAL_STORE_OPEN"
+    static let dismissType = "SIMULA_INTERNAL_STORE_DISMISS"
+
+    static func authenticate(
+        _ body: String,
+        expectedNonce: String
+    ) -> CreativeStoreMessageAuthentication {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messageType = object["type"] as? String else {
+            return .notMessage
+        }
+        guard messageType == openType || messageType == dismissType else { return .notMessage }
+        guard !expectedNonce.isEmpty,
+              object["activation_nonce"] as? String == expectedNonce,
+              Set(object.keys).isSubset(of: ["type", "activation_nonce"]) else {
+            return .rejected
+        }
+        return messageType == openType ? .open : .dismiss
+    }
+}
+
 enum CreativeCTAOpenMessage {
     static let type = "SIMULA_CTA_OPEN"
     private static let blockedSchemes: Set<String> = ["about", "blob", "data", "file", "javascript"]
@@ -817,6 +890,16 @@ func validatedDirectAppStoreURL(_ value: String?) -> URL? {
 
 func validatedTopLevelAttributionURL(_ value: String?) -> URL? {
     validatedMMPTrackingURL(value) ?? validatedDirectAppStoreURL(value)
+}
+
+func hasTrustedCreativeStoreDestination(
+    trackingUrl: String?,
+    destination: AdDestination,
+    storeUrl: String?
+) -> Bool {
+    guard destination == .appstore else { return false }
+    return validatedDirectAppStoreURL(trackingUrl) != nil
+        || validatedDirectAppStoreURL(storeUrl) != nil
 }
 
 enum CreativeRoutePlan: Equatable {
@@ -977,6 +1060,7 @@ enum CreativeCTARouter {
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
+        storeProductOwnership: StoreProductOwnershipToken? = nil,
         execution: AttributionRouteExecution,
         trackerSender: @escaping (URL) -> Void = { fireClickTracker($0) }
     ) {
@@ -991,7 +1075,8 @@ enum CreativeCTARouter {
                 return presentStoreProduct(
                     appID: appID,
                     attribution: attribution,
-                    originatingScene: execution.originatingScene
+                    originatingScene: execution.originatingScene,
+                    ownershipToken: storeProductOwnership
                 )
             }
             return
@@ -1010,7 +1095,8 @@ enum CreativeCTARouter {
                     return presentStoreProduct(
                         appID: appID,
                         attribution: attribution,
-                        originatingScene: execution.originatingScene
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
                     )
                 }
                 return
@@ -1044,7 +1130,8 @@ enum CreativeCTARouter {
                     presentStoreProduct(
                         appID: appID,
                         attribution: attribution,
-                        originatingScene: execution.originatingScene
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
                     )
                 }
             } else if let appID = appStoreID(fromString: storeUrl) {
@@ -1054,11 +1141,17 @@ enum CreativeCTARouter {
                     return presentStoreProduct(
                         appID: appID,
                         attribution: attribution,
-                        originatingScene: execution.originatingScene
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
                     )
                 }
             } else {
-                resolveAndRoute(url: url, attribution: attribution, execution: execution)
+                resolveAndRoute(
+                    url: url,
+                    attribution: attribution,
+                    storeProductOwnership: storeProductOwnership,
+                    execution: execution
+                )
             }
         case .web:
             guard execution.begin(path: .web) else { return }
@@ -1082,6 +1175,7 @@ enum CreativeCTARouter {
         fallbackStoreURL: URL? = nil,
         externalClickOnly: Bool = false,
         attribution: AdAttribution? = nil,
+        storeProductOwnership: StoreProductOwnershipToken? = nil,
         execution: AttributionRouteExecution,
         trackerSender: @escaping (URL) -> Void = { fireClickTracker($0) }
     ) {
@@ -1106,7 +1200,8 @@ enum CreativeCTARouter {
                     appID: appID,
                     storeOpen: mode,
                     attribution: attribution,
-                    originatingScene: execution.originatingScene
+                    originatingScene: execution.originatingScene,
+                    ownershipToken: storeProductOwnership
                 )
             }
         case .trackerWithStore(let tracker, let storeURL, let appID, let mode):
@@ -1118,7 +1213,8 @@ enum CreativeCTARouter {
                     appID: appID,
                     storeOpen: mode,
                     attribution: attribution,
-                    originatingScene: execution.originatingScene
+                    originatingScene: execution.originatingScene,
+                    ownershipToken: storeProductOwnership
                 )
             }
         case .resolveTracker(let tracker, let mode):
@@ -1130,7 +1226,12 @@ enum CreativeCTARouter {
                     trackerSender: trackerSender
                 )
             } else {
-                resolveAndRoute(url: tracker, attribution: attribution, execution: execution)
+                resolveAndRoute(
+                    url: tracker,
+                    attribution: attribution,
+                    storeProductOwnership: storeProductOwnership,
+                    execution: execution
+                )
             }
         case .web(let webURL, let mode):
             if mode == .external {
@@ -1159,7 +1260,8 @@ enum CreativeCTARouter {
         appID: String,
         storeOpen: StoreOpen,
         attribution: AdAttribution?,
-        originatingScene: UIWindowScene?
+        originatingScene: UIWindowScene?,
+        ownershipToken: StoreProductOwnershipToken?
     ) -> Bool {
         if storeOpen == .external {
             UIApplication.shared.open(storeURL)
@@ -1168,7 +1270,8 @@ enum CreativeCTARouter {
         return presentStoreProduct(
             appID: appID,
             attribution: attribution,
-            originatingScene: originatingScene
+            originatingScene: originatingScene,
+            ownershipToken: ownershipToken
         )
     }
 
@@ -1277,6 +1380,8 @@ enum CreativeCTARouter {
     /// slot that a second present would clobber).
     private static var storeDelegateAssocKey: UInt8 = 0
     private static var safariDelegateAssocKey: UInt8 = 0
+    private static var storeProductOwnership = StoreProductOwnershipState<StoreProductOwnershipToken, ObjectIdentifier>()
+    private static var activeStoreProduct = WeakObjectReference<SKStoreProductViewController>()
 
     /// Guards against stacking a second in-app sheet (store OR Safari) on top of one
     /// already showing — only one external surface should be up at a time. Set `true`
@@ -1290,6 +1395,8 @@ enum CreativeCTARouter {
     /// this only prevents a failed test from contaminating later route assertions.
     static func resetExternalPresentationStateForTesting() {
         isPresentingExternal = false
+        storeProductOwnership.reset()
+        activeStoreProduct = WeakObjectReference()
         presentationRootOverrideForTesting = nil
     }
 
@@ -1303,14 +1410,15 @@ enum CreativeCTARouter {
     static func presentStoreProduct(
         appID: String,
         attribution: AdAttribution? = nil,
-        originatingScene: UIWindowScene? = nil
+        originatingScene: UIWindowScene? = nil,
+        ownershipToken: StoreProductOwnershipToken? = nil
     ) -> Bool {
-        guard !isPresentingExternal else { return false }
+        guard !isPresentingExternal, Int(appID) != nil else { return false }
+        let owner = ownershipToken ?? StoreProductOwnershipToken()
         let prepared = StoreProductPrewarmer.shared.take(appID: appID, attribution: attribution)
         let storeVC = prepared ?? SKStoreProductViewController()
-        let delegate = StoreProductDelegate {
-            isPresentingExternal = false
-            NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
+        let delegate = StoreProductDelegate { viewController in
+            requestStoreProductDismiss(viewController, owner: owner)
         }
         storeVC.delegate = delegate
         // Retain the delegate on the presented VC itself (per-sheet), not a single
@@ -1337,11 +1445,69 @@ enum CreativeCTARouter {
         // Only mark "showing" once the present actually succeeds; otherwise the
         // guard would stick true forever on a no-window early-return.
         if presentViewController(storeVC, originatingScene: originatingScene) {
+            guard storeProductOwnership.install(
+                owner: owner,
+                controller: ObjectIdentifier(storeVC)
+            ) else {
+                storeVC.dismiss(animated: false)
+                return false
+            }
+            activeStoreProduct = WeakObjectReference(storeVC)
             isPresentingExternal = true
             NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
             return true
         }
         return false
+    }
+
+    static func dismissStoreProduct(ownershipToken: StoreProductOwnershipToken) {
+        guard storeProductOwnership.controller(owner: ownershipToken) != nil else { return }
+        DispatchQueue.main.async {
+            dismissStoreProductWhenReady(ownershipToken: ownershipToken)
+        }
+    }
+
+    private static func dismissStoreProductWhenReady(ownershipToken: StoreProductOwnershipToken) {
+        guard let controllerID = storeProductOwnership.controller(owner: ownershipToken) else { return }
+        guard let storeVC = activeStoreProduct.value,
+              ObjectIdentifier(storeVC) == controllerID else {
+            guard storeProductOwnership.beginDismiss(owner: ownershipToken) == controllerID else { return }
+            finishStoreProductDismiss(owner: ownershipToken, controllerID: controllerID)
+            return
+        }
+        if storeVC.isBeingPresented, let transition = storeVC.transitionCoordinator {
+            transition.animate(alongsideTransition: nil) { _ in
+                requestStoreProductDismiss(storeVC, owner: ownershipToken)
+            }
+            // Some StoreKit failures never complete the presentation coordinator. Keep dismissal
+            // bounded; exact ownership + beginDismiss make this fallback idempotent with the normal
+            // transition completion.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                requestStoreProductDismiss(storeVC, owner: ownershipToken)
+            }
+            return
+        }
+        requestStoreProductDismiss(storeVC, owner: ownershipToken)
+    }
+
+    private static func requestStoreProductDismiss(
+        _ storeVC: SKStoreProductViewController,
+        owner: StoreProductOwnershipToken
+    ) {
+        guard let controllerID = storeProductOwnership.beginDismiss(owner: owner),
+              controllerID == ObjectIdentifier(storeVC) else { return }
+        storeVC.dismiss(animated: true)
+        finishStoreProductDismiss(owner: owner, controllerID: controllerID)
+    }
+
+    private static func finishStoreProductDismiss(
+        owner: StoreProductOwnershipToken,
+        controllerID: ObjectIdentifier
+    ) {
+        guard storeProductOwnership.finishDismiss(owner: owner, controller: controllerID) else { return }
+        activeStoreProduct = WeakObjectReference()
+        isPresentingExternal = false
+        NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
     }
 
     // MARK: - Attribution token mapping
@@ -1563,6 +1729,7 @@ enum CreativeCTARouter {
     static func resolveAndRoute(
         url: URL,
         attribution: AdAttribution? = nil,
+        storeProductOwnership: StoreProductOwnershipToken? = nil,
         execution: AttributionRouteExecution
     ) {
         // Quick check — already an App Store URL?
@@ -1572,7 +1739,8 @@ enum CreativeCTARouter {
                 presentStoreProduct(
                     appID: appID,
                     attribution: attribution,
-                    originatingScene: execution.originatingScene
+                    originatingScene: execution.originatingScene,
+                    ownershipToken: storeProductOwnership
                 )
             }
             return
@@ -1600,7 +1768,8 @@ enum CreativeCTARouter {
                             return presentStoreProduct(
                                 appID: appID,
                                 attribution: attribution,
-                                originatingScene: execution.originatingScene
+                                originatingScene: execution.originatingScene,
+                                ownershipToken: storeProductOwnership
                             )
                         } else {
                             return presentSafari(
@@ -1628,16 +1797,15 @@ enum CreativeCTARouter {
 /// satisfy the (nonisolated) delegate requirement; StoreKit always calls this on
 /// the main thread, so the hop in the body is effectively a no-op.
 private final class StoreProductDelegate: NSObject, SKStoreProductViewControllerDelegate {
-    private let onFinish: @MainActor () -> Void
+    private let onFinish: @MainActor (SKStoreProductViewController) -> Void
 
-    init(onFinish: @escaping @MainActor () -> Void) {
+    init(onFinish: @escaping @MainActor (SKStoreProductViewController) -> Void) {
         self.onFinish = onFinish
     }
 
     func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
-        viewController.dismiss(animated: true)
         let onFinish = self.onFinish
-        Task { @MainActor in onFinish() }
+        Task { @MainActor in onFinish(viewController) }
     }
 }
 

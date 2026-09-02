@@ -35,6 +35,27 @@ struct SKOverlayOwnershipToken: Hashable, Sendable {
     }
 }
 
+struct SKOverlayPresentationState<Ownership> {
+    private(set) var ownership: Ownership?
+    private(set) var suppressPending = false
+
+    func canPresent(hasResolvedAppID: Bool) -> Bool {
+        !suppressPending && ownership == nil && hasResolvedAppID
+    }
+
+    mutating func install(_ ownership: Ownership) -> Bool {
+        guard !suppressPending, self.ownership == nil else { return false }
+        self.ownership = ownership
+        return true
+    }
+
+    mutating func dismiss() -> Ownership? {
+        suppressPending = true
+        defer { ownership = nil }
+        return ownership
+    }
+}
+
 #if os(iOS)
 import UIKit
 import StoreKit
@@ -120,7 +141,7 @@ enum SKOverlayPresenter {
         attribution: AdAttribution? = nil,
         originatingScene: UIWindowScene? = nil
     ) -> SKOverlayOwnershipToken? {
-        guard config.enabled, !appID.isEmpty,
+        guard config.enabled, Int(appID) != nil,
               UIApplication.shared.applicationState == .active else { return nil }
         let scene: UIWindowScene?
         if let originatingScene {

@@ -34,6 +34,25 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertEqual(ownership.takeSceneForDismiss(owner: "second"), "scene-a")
     }
 
+    func testOverlayDismissReturnsExactOwnerAndSuppressesLatePresentation() {
+        var state = SKOverlayPresentationState<String>()
+        XCTAssertTrue(state.canPresent(hasResolvedAppID: true))
+        XCTAssertTrue(state.install("overlay-1"))
+        XCTAssertFalse(state.install("overlay-2"))
+        XCTAssertEqual(state.dismiss(), "overlay-1")
+        XCTAssertNil(state.dismiss())
+        XCTAssertFalse(state.canPresent(hasResolvedAppID: true))
+        XCTAssertFalse(state.install("late-overlay"))
+    }
+
+    func testOverlayCannotScheduleBeforeResolutionAndDismissSuppressesPendingWork() {
+        var state = SKOverlayPresentationState<String>()
+        XCTAssertFalse(state.canPresent(hasResolvedAppID: false))
+        XCTAssertNil(state.dismiss())
+        XCTAssertTrue(state.suppressPending)
+        XCTAssertFalse(state.canPresent(hasResolvedAppID: true))
+    }
+
     private func attribution(_ skanFields: String) throws -> AdAttribution {
         let json = """
         {"campaign_token":"camp_tok","provider_token":"prov_tok","skan":{\(skanFields)}}
