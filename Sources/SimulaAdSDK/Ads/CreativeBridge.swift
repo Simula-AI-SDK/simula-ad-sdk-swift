@@ -231,7 +231,6 @@ final class CreativeBridge: ObservableObject {
             sendMessage(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
         case "GET_AUDIO_STATE":
             let audioPayload = currentAudioState().payload
-            Telemetry.shared.logHostDebug("GET_AUDIO_STATE muted=\(audioPayload["muted"] ?? "?") volume=\(audioPayload["volume"] ?? "?")")
             sendMessage(type: type, requestId: requestId, payload: audioPayload, reply: reply)
         case "GET_ORIENTATION":
             sendMessage(type: type, requestId: requestId, payload: ["orientation": currentOrientation()], reply: reply)
@@ -297,7 +296,6 @@ final class CreativeBridge: ObservableObject {
                 bridge?.audioVolumePolled(generation: generation)
             }
             let initial = bridge.currentAudioState()
-            Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED observe start muted=\(initial.muted) volume=\(initial.volume)")
             bridge.publishAudioState(initial)
         }
     }
@@ -319,9 +317,6 @@ final class CreativeBridge: ObservableObject {
     }
 
     private func endAudioEvents() {
-        if audioEventReply != nil {
-            Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED observe stop")
-        }
         audioPageGeneration &+= 1
         audioObservation?.invalidate()
         audioObservation = nil
@@ -347,7 +342,6 @@ final class CreativeBridge: ObservableObject {
     private func publishAudioState(_ state: CreativeAudioState) {
         guard let reply = audioEventReply, state != lastSentAudioState else { return }
         lastSentAudioState = state
-        Telemetry.shared.logHostDebug("AUDIO_STATE_CHANGED muted=\(state.muted) volume=\(state.volume)")
         sendMessage(type: "AUDIO_STATE_CHANGED", requestId: nil, payload: state.payload, reply: reply)
     }
 
