@@ -47,6 +47,9 @@ public struct GameIframeView: View {
     @State private var currentHeight: CGFloat = 0
     /// Height captured at drag start, used to compute live height from translation
     @State private var dragStartHeight: CGFloat = 0
+    #if os(iOS)
+    @StateObject private var audioBridge = CreativeBridge(mode: .audioStateOnly)
+    #endif
 
     private let api = SimulaAPI()
 
@@ -165,6 +168,16 @@ public struct GameIframeView: View {
                                 Spacer()
                             }
                         } else if let urlString = iframeUrl, let url = URL(string: urlString) {
+                            #if os(iOS)
+                            WebViewRepresentable(
+                                url: url,
+                                onNavigationFailed: { _ in
+                                    self.error = "Failed to load game. Please try again."
+                                },
+                                onMessageReceived: { _ in },
+                                bridge: audioBridge
+                            )
+                            #else
                             WebViewRepresentable(
                                 url: url,
                                 onNavigationFailed: { _ in
@@ -172,6 +185,7 @@ public struct GameIframeView: View {
                                 },
                                 onMessageReceived: { _ in }
                             )
+                            #endif
                         }
 
                         // Close button — top right of content area
