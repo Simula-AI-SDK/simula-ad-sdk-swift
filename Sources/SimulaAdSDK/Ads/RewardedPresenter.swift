@@ -47,6 +47,7 @@ final class RewardedPresenter {
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
+        skOverlay: SKOverlayConfig? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
@@ -82,6 +83,7 @@ final class RewardedPresenter {
             storeOpen: storeOpen,
             storeUrl: storeUrl,
             attribution: attribution,
+            skOverlay: skOverlay,
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             bridge: bridge,
@@ -130,6 +132,7 @@ final class RewardedPresenter {
         storeOpen: StoreOpen = .skstoreproduct,
         storeUrl: String? = nil,
         attribution: AdAttribution? = nil,
+        skOverlay: SKOverlayConfig? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
@@ -149,6 +152,7 @@ final class RewardedPresenter {
             storeOpen: storeOpen,
             storeUrl: storeUrl,
             attribution: attribution,
+            skOverlay: skOverlay,
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             onWillPresent: onWillPresent,
@@ -234,6 +238,8 @@ private struct RewardedGameView: View {
     let storeUrl: String?
     /// Ad-network attribution tokens carried into the store sheet when the mid-ad store prompt is tapped.
     let attribution: AdAttribution?
+    /// Native install-banner configuration. The destination remains server-owned by the response.
+    let skOverlay: SKOverlayConfig?
     /// auto_store_redirect config — fires the store open once at the configured creative moment.
     let autoStoreRedirect: AutoStoreRedirect?
     /// When set, render this HTML instead of `iframeUrl` (preview / QA placeholder playable).
@@ -277,6 +283,10 @@ private struct RewardedGameView: View {
     // on-screen time from begin-to-render. Independent of the play-to-earn timer / reward gate.
     @State private var impressionFired = false
     @State private var impressionTask: Task<Void, Never>?
+    @State private var resolvedAppID: String?
+    @State private var skOverlayState = SKOverlayPresentationState<SKOverlayOwnershipToken>()
+    @State private var skOverlayTask: Task<Void, Never>?
+    @State private var skOverlayResolutionStarted = false
 
     /// Matches the dismiss fade before the window is removed.
     private let dismissAnimationDuration: TimeInterval = 0.25
@@ -367,6 +377,7 @@ private struct RewardedGameView: View {
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             startTimer()
             startImpressionTimer()
+            startSKOverlay()
             // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
             fireAutoStoreRedirectIfCloseShown()
         }
@@ -377,6 +388,7 @@ private struct RewardedGameView: View {
             gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             impressionTask?.cancel()
             impressionTask = nil
+            dismissSKOverlay()
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
             clickHandoffs.reset()
@@ -393,6 +405,11 @@ private struct RewardedGameView: View {
             storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
+            presentRequestedSKOverlayIfNeeded()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
+            guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            presentRequestedSKOverlayIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
@@ -560,6 +577,7 @@ private struct RewardedGameView: View {
     /// the store-exit funnel.
     private func handleHtmlClick(_ interaction: ClickInteraction) {
         onClick(interaction)
+        presentSKOverlayOnClickIfNeeded()
     }
 
     private func creativeWebView(url: URL? = nil, html: String? = nil) -> some View {
@@ -573,6 +591,9 @@ private struct RewardedGameView: View {
             onAttributionRouteOutcome: { outcome in
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
+            onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
+            onStoreDismissRequest: { dismissSKOverlay() },
+            storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: impressionId,
             bridge: bridge,
@@ -594,6 +615,7 @@ private struct RewardedGameView: View {
             storeOpen: storeOpen,
             storeUrl: storeUrl,
             attribution: attribution,
+            storeProductOwnership: attributionRouteLifecycle.storeProductOwnership,
             execution: execution
         )
     }
@@ -653,6 +675,93 @@ private struct RewardedGameView: View {
                 )
             }
         }
+    }
+
+    // MARK: SKOverlay
+
+    private func startSKOverlay() {
+        guard let config = skOverlay, config.enabled,
+              resolvedAppID == nil, !skOverlayResolutionStarted,
+              !skOverlayState.suppressPending else { return }
+        guard #available(iOS 14.0, *) else { return }
+        skOverlayResolutionStarted = true
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeUrl: storeUrl
+        ) { id in
+            guard !skOverlayState.suppressPending else { return }
+            resolvedAppID = id
+            if skOverlayState.creativePresentationRequested {
+                presentSKOverlay(config: config)
+            } else if config.timing == .duringPlay || config.timing == .delayed {
+                scheduleSKOverlayPresent(config: config)
+            }
+        }
+    }
+
+    private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
+        guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID != nil) else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = Task { await runSKOverlayPresent(config: config) }
+    }
+
+    @MainActor
+    private func runSKOverlayPresent(config: SKOverlayConfig) async {
+        if config.delaySeconds > 0 {
+            do { try await Task.sleep(nanoseconds: UInt64(config.delaySeconds) * 1_000_000_000) } catch { return }
+        }
+        if Task.isCancelled { return }
+        presentSKOverlay(config: config)
+    }
+
+    private func presentSKOverlay(config: SKOverlayConfig) {
+        guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID?.isEmpty == false),
+              let appID = resolvedAppID else { return }
+        guard visible, attributionRouteLifecycle.isActive,
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive else { return }
+        guard #available(iOS 14.0, *) else { return }
+        guard let ownership = SKOverlayPresenter.present(
+            appID: appID,
+            config: config,
+            attribution: attribution,
+            originatingScene: originatingScene
+        ) else { return }
+        if !skOverlayState.install(ownership) {
+            SKOverlayPresenter.dismiss(ownershipToken: ownership)
+        }
+    }
+
+    private func presentSKOverlayOnClickIfNeeded() {
+        guard let config = skOverlay, config.enabled, config.timing == .onClick else { return }
+        // A configured product sheet remains foreground when both StoreKit surfaces are selected;
+        // the overlay stays exactly owned by this scene/presentation behind it.
+        presentSKOverlay(config: config)
+    }
+
+    private func showSKOverlayFromCreative() {
+        guard let config = skOverlay, config.enabled,
+              skOverlayState.requestCreativePresentation() else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        startSKOverlay()
+        presentRequestedSKOverlayIfNeeded()
+    }
+
+    private func presentRequestedSKOverlayIfNeeded() {
+        guard skOverlayState.creativePresentationRequested,
+              resolvedAppID?.isEmpty == false,
+              let config = skOverlay, config.enabled else { return }
+        presentSKOverlay(config: config)
+    }
+
+    private func dismissSKOverlay() {
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        let ownership = skOverlayState.dismiss()
+        guard let ownership, #available(iOS 14.0, *) else { return }
+        SKOverlayPresenter.dismiss(ownershipToken: ownership)
     }
 
     // MARK: Close

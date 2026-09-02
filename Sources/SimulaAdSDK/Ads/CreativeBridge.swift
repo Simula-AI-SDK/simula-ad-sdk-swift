@@ -56,6 +56,11 @@ protocol CreativeAudioVolumePolling: AnyObject {
     func stop()
 }
 
+enum CreativeBridgeMode {
+    case fullScreenAd
+    case audioStateOnly
+}
+
 /** Fallback for iOS versions that emit output-volume KVO only while the host audio session is active. */
 private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling {
     // KVO remains the fast path. This only closes inactive-session gaps, so sub-second polling is enough.
@@ -160,6 +165,7 @@ final class CreativeBridge: ObservableObject {
 
     private let audioVolumeSource: CreativeAudioVolumeSource
     private let audioVolumePoller: CreativeAudioVolumePolling
+    private let mode: CreativeBridgeMode
     private var audioObservation: CreativeAudioVolumeObservation?
     private var audioEventReply: ((String) -> Void)?
     private var lastSentAudioState: CreativeAudioState?
@@ -167,10 +173,12 @@ final class CreativeBridge: ObservableObject {
 
     init(
         audioVolumeSource: CreativeAudioVolumeSource = SystemCreativeAudioVolumeSource(),
-        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller()
+        audioVolumePoller: CreativeAudioVolumePolling = SystemCreativeAudioVolumePoller(),
+        mode: CreativeBridgeMode = .fullScreenAd
     ) {
         self.audioVolumeSource = audioVolumeSource
         self.audioVolumePoller = audioVolumePoller
+        self.mode = mode
     }
 
     deinit {
@@ -197,6 +205,7 @@ final class CreativeBridge: ObservableObject {
               let type = root["type"] as? String else {
             return
         }
+        guard mode == .fullScreenAd || type == "GET_AUDIO_STATE" else { return }
         // Preserve the requestId's original JSON type (string or number) so the reply
         // echoes it verbatim.
         let requestId = root["requestId"]
@@ -221,7 +230,8 @@ final class CreativeBridge: ObservableObject {
         case "GET_DEVICE_CONTEXT":
             sendMessage(type: type, requestId: requestId, payload: deviceContext(), reply: reply)
         case "GET_AUDIO_STATE":
-            sendMessage(type: type, requestId: requestId, payload: currentAudioState().payload, reply: reply)
+            let audioPayload = currentAudioState().payload
+            sendMessage(type: type, requestId: requestId, payload: audioPayload, reply: reply)
         case "GET_ORIENTATION":
             sendMessage(type: type, requestId: requestId, payload: ["orientation": currentOrientation()], reply: reply)
 
@@ -242,8 +252,28 @@ final class CreativeBridge: ObservableObject {
         if let requestId { resp["requestId"] = requestId }
         guard let data = try? JSONSerialization.data(withJSONObject: resp),
               let body = String(data: data, encoding: .utf8) else { return }
-        // `body` is valid JSON, hence a valid JS object literal.
-        reply("window.postMessage(\(body), '*');")
+        // `body` is valid JSON, hence a valid JS object literal. The server normally places the
+        // creative in a direct srcdoc child, so target that root as well as top-level creatives.
+        reply("""
+        (function() {
+          'use strict';
+          if (window !== window.top) { return; }
+          var message = \(body);
+          function deliver(target) {
+            try { if (target) { target.postMessage(message, '*'); } } catch (_) {}
+          }
+          deliver(window);
+          var frame;
+          try { frame = document.querySelector('iframe[srcdoc]'); }
+          catch (_) { return; }
+          var target = null;
+          try {
+            target = frame && frame.contentWindow;
+            if (!target || String(target.location.href) !== 'about:srcdoc') { return; }
+          } catch (_) { return; }
+          deliver(target);
+        })();
+        """)
     }
 
     // MARK: Audio events
@@ -265,7 +295,8 @@ final class CreativeBridge: ObservableObject {
             bridge.audioVolumePoller.start { [weak bridge] in
                 bridge?.audioVolumePolled(generation: generation)
             }
-            bridge.publishAudioState(bridge.currentAudioState())
+            let initial = bridge.currentAudioState()
+            bridge.publishAudioState(initial)
         }
     }
 

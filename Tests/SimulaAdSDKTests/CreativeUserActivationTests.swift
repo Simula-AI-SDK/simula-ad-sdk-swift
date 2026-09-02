@@ -20,7 +20,57 @@ final class CreativeUserActivationTests: XCTestCase {
         if let navigatorCheck, let fallbackCheck {
             XCTAssertLessThan(navigatorCheck.lowerBound, fallbackCheck.lowerBound)
         }
-        XCTAssertTrue(source.contains("activation_nonce: 'nonce'"))
+        XCTAssertTrue(source.contains("var activationNonce = 'nonce'"))
+        XCTAssertTrue(source.contains("activation_nonce: activationNonce"))
+    }
+
+    func testGeneratedScriptExposesStablePayloadFreeStoreAPI() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce")
+
+        XCTAssertTrue(source.contains("Object.defineProperty(window, 'SimulaAd'"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'openStore'"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'dismissStore'"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'showInstallBanner'"))
+        XCTAssertTrue(source.contains("function openStore()"))
+        XCTAssertTrue(source.contains("function dismissStore()"))
+        XCTAssertTrue(source.contains("function showInstallBanner()"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW'"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify(message))"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify({"))
+        XCTAssertFalse(source.contains("function openStore(value"))
+        XCTAssertFalse(source.contains("activation_nonce: 'nonce'"))
+    }
+
+    func testGeneratedScriptOmitsStoreAPIOnUnsupportedSurfaces() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce", exposesStoreAPI: false)
+
+        XCTAssertFalse(source.contains("Object.defineProperty(window, 'SimulaAd'"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_OPEN"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_DISMISS"))
+        XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_OVERLAY_SHOW"))
+        XCTAssertTrue(source.contains("window.open = function()"))
+    }
+
+    func testOpenStoreSharesWindowOpenGestureClaimWhileDismissDoesNotClaim() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce")
+        let openStore = source.range(of: "function openStore()")
+        let dismissStore = source.range(of: "function dismissStore()")
+        let windowOpen = source.range(of: "window.open = function()")
+
+        XCTAssertNotNil(openStore)
+        XCTAssertNotNil(dismissStore)
+        XCTAssertNotNil(windowOpen)
+        if let openStore, let dismissStore {
+            let body = String(source[openStore.lowerBound..<dismissStore.lowerBound])
+            XCTAssertTrue(body.contains("claimGesture"))
+        }
+        if let dismissStore, let windowOpen {
+            let body = String(source[dismissStore.lowerBound..<windowOpen.lowerBound])
+            XCTAssertFalse(body.contains("claimGesture"))
+            XCTAssertTrue(body.contains("postNative"))
+        }
     }
 
     func testPre164FallbackSurvivesLaterListenerAndClaimsPhysicalGestureOnce() {

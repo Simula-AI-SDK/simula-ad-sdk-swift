@@ -193,9 +193,56 @@ struct CreativeUserActivationState: Equatable {
     }
 }
 
-func creativeUserActivationScriptSource(nonce: String) -> String {
-    """
+func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = true) -> String {
+    let storeAPI = exposesStoreAPI ? """
+      function openStore() {
+        return claimGesture({
+          type: 'SIMULA_INTERNAL_STORE_OPEN',
+          activation_nonce: activationNonce
+        });
+      }
+
+      function dismissStore() {
+        if (!postNative) { return false; }
+        try {
+          postNative(nativeStringify({
+            type: 'SIMULA_INTERNAL_STORE_DISMISS',
+            activation_nonce: activationNonce
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      function showInstallBanner() {
+        if (!postNative) { return false; }
+        try {
+          postNative(nativeStringify({
+            type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW',
+            activation_nonce: activationNonce
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      try {
+        var simulaAdAPI = {};
+        Object.defineProperty(simulaAdAPI, 'openStore', {
+          value: openStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(simulaAdAPI, 'dismissStore', {
+          value: dismissStore, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(simulaAdAPI, 'showInstallBanner', {
+          value: showInstallBanner, writable: false, configurable: false, enumerable: true
+        });
+        Object.defineProperty(window, 'SimulaAd', {
+          value: simulaAdAPI, writable: false, configurable: false, enumerable: true
+        });
+      } catch (_) {}
+    """ : ""
+    return """
     (function() {
+      var activationNonce = '\(nonce)';
       var originalOpen = window.open;
       var nativeHandler = window.webkit && window.webkit.messageHandlers
         ? window.webkit.messageHandlers.simulaSDK
@@ -203,6 +250,7 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
       var postNative = nativeHandler && typeof nativeHandler.postMessage === 'function'
         ? nativeHandler.postMessage.bind(nativeHandler)
         : null;
+      var nativeStringify = JSON.stringify.bind(JSON);
       var capturedUserActivation = navigator.userActivation;
       var nativeSetTimeout = window.setTimeout.bind(window);
       var trustedEventDispatch = false;
@@ -318,25 +366,31 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
         catch (_) { return null; }
       }
 
-      function forwardCTA(value) {
+      function claimGesture(message) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
         if (!hasActiveUserGesture()) { return false; }
-        var url = resolvedURL(value);
-        if (!url) { return false; }
         claimedGesture = gestureSequence;
         try {
-          postNative({
-            type: 'SIMULA_CTA_OPEN',
-            url: url,
-            activation_nonce: '\(nonce)'
-          });
+          postNative(nativeStringify(message));
           return true;
         } catch (_) {
           if (claimedGesture === gestureSequence) { claimedGesture = -1; }
           return false;
         }
       }
+
+      function forwardCTA(value) {
+        var url = resolvedURL(value);
+        if (!url) { return false; }
+        return claimGesture({
+          type: 'SIMULA_CTA_OPEN',
+          url: url,
+          activation_nonce: activationNonce
+        });
+      }
+
+    \(storeAPI)
 
       window.open = function() {
         if (arguments.length > 0 && forwardCTA(arguments[0])) { return null; }
@@ -503,37 +557,148 @@ private func waitForNativeAdDisplayFrame() async {
 enum WebViewForwardedMessage {
     case page(String)
     case userActivatedCTA(URL)
+    case userActivatedStoreOpen
+    case storeOverlayShow
+    case storeDismiss
+}
+
+let creativeBridgeMaxMessageUTF16Characters = 64 * 1024
+let creativeBridgeCapabilityKey = "__simulaSdkCapability"
+
+func authenticatedCreativeBridgeMessage(_ message: String, expectedCapability: String) -> String? {
+    guard message.utf16.count <= creativeBridgeMaxMessageUTF16Characters,
+          let data = message.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          root[creativeBridgeCapabilityKey] as? String == expectedCapability else {
+        return nil
+    }
+    return message
+}
+
+func creativeRootGuardScriptSource() -> String {
+    """
+    var isTop = window === window.top;
+    var isDirectSrcdoc = false;
+    if (!isTop) {
+      try {
+        isDirectSrcdoc = window.parent === window.top && window.frameElement &&
+          window.frameElement.hasAttribute('srcdoc') &&
+          window.frameElement === window.top.document.querySelector('iframe[srcdoc]') &&
+          String(window.location.href) === 'about:srcdoc';
+      } catch (_) {}
+    }
+    if (!isTop && !isDirectSrcdoc) { return; }
+    """
+}
+
+func creativeBridgeRelayScriptSource(capability: String) -> String {
+    """
+    (function() {
+      'use strict';
+      \(creativeRootGuardScriptSource())
+      var bridgeCapability = '\(capability)';
+      var nativeHandler = window.webkit && window.webkit.messageHandlers
+        ? window.webkit.messageHandlers.simulaSDK
+        : null;
+      var nativePost = nativeHandler && typeof nativeHandler.postMessage === 'function'
+        ? nativeHandler.postMessage.bind(nativeHandler)
+        : null;
+      var nativeStringify = JSON.stringify.bind(JSON);
+      var nativeParse = JSON.parse.bind(JSON);
+      function isCreativeRootSource(source) {
+        if (source === window) { return true; }
+        if (!isTop) { return false; }
+        var frame;
+        try { frame = document.querySelector('iframe[srcdoc]'); }
+        catch (_) { return false; }
+        if (!frame || frame.contentWindow !== source) { return false; }
+        try { return String(source.location.href) === 'about:srcdoc'; }
+        catch (_) { return false; }
+      }
+      window.addEventListener('message', function(event) {
+        if (!nativePost || !event || event.isTrusted !== true ||
+            !isCreativeRootSource(event.source)) { return; }
+        try {
+          var envelope = typeof event.data === 'string' ? nativeParse(event.data) : event.data;
+          if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) { return; }
+          // Replies and pushes belong to the creative. SDK-internal diagnostics do not: consume
+          // them before later page listeners can observe them or throw and create an error loop.
+          if (envelope.__simulaSdkResponse) { return; }
+          if (envelope.type === 'SIMULA_JS_ERROR' || envelope.type === 'SIMULA_AD_HEIGHT') {
+            if (typeof event.stopImmediatePropagation === 'function') {
+              event.stopImmediatePropagation();
+            }
+          }
+          var serialized = nativeStringify(envelope);
+          if (!serialized || serialized.charAt(0) !== '{') { return; }
+          nativePost('{"\(creativeBridgeCapabilityKey)":' + nativeStringify(bridgeCapability) +
+            ',' + serialized.substring(1));
+        } catch (_) {}
+      });
+    })();
+    """
+}
+
+func creativeErrorCaptureScriptSource() -> String {
+    """
+    (function() {
+      'use strict';
+      \(creativeRootGuardScriptSource())
+      window.addEventListener('error', function(e) {
+        try {
+          window.postMessage({
+            type: 'SIMULA_JS_ERROR',
+            message: (e && e.message) ? String(e.message) : 'error',
+            line: (e && e.lineno) ? e.lineno : 0
+          }, '*');
+        } catch (_) {}
+      });
+    })();
+    """
 }
 
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
     private(set) var userActivationNonce = UUID().uuidString
+    private(set) var bridgeCapability = UUID().uuidString
     var onMessage: ((WebViewForwardedMessage) -> Void)?
 
-    func rotateUserActivationNonce() {
+    func rotatePresentationCapabilities() {
         userActivationNonce = UUID().uuidString
+        bridgeCapability = UUID().uuidString
     }
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        let body: String?
-        if let value = message.body as? String {
-            body = value
-        } else if let dict = message.body as? [String: Any],
-                  let data = try? JSONSerialization.data(withJSONObject: dict) {
-            body = String(data: data, encoding: .utf8)
-        } else {
-            body = nil
+        guard let body = message.body as? String,
+              body.utf16.count <= creativeBridgeMaxMessageUTF16Characters else { return }
+        switch CreativeStoreMessage.authenticate(body, expectedNonce: userActivationNonce) {
+        case .open:
+            onMessage?(.userActivatedStoreOpen)
+            return
+        case .showOverlay:
+            onMessage?(.storeOverlayShow)
+            return
+        case .dismiss:
+            onMessage?(.storeDismiss)
+            return
+        case .rejected:
+            return
+        case .notMessage:
+            break
         }
-        guard let body else { return }
         switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
         case .accepted(let url):
             onMessage?(.userActivatedCTA(url))
         case .rejected:
             return
         case .notMessage:
-            onMessage?(.page(body))
+            guard let authenticated = authenticatedCreativeBridgeMessage(
+                body,
+                expectedCapability: bridgeCapability
+            ) else { return }
+            onMessage?(.page(authenticated))
         }
     }
 }
@@ -623,39 +788,20 @@ final class WebViewPool {
         }
     }
 
-    /// Forwards `window.postMessage` payloads to the native message handler.
-    /// Installed once per web view at creation time.
-    private static let postMessageScript = WKUserScript(
-        source: """
-        window.addEventListener('message', function(event) {
-            // The SDK delivers query responses back via window.postMessage carrying this
-            // marker; don't forward those to native (they're for the creative, not us).
-            if (event.data && event.data.__simulaSdkResponse) { return; }
-            if (event.data && typeof event.data === 'string') {
-                window.webkit.messageHandlers.simulaSDK.postMessage(event.data);
-            } else if (event.data && typeof event.data === 'object') {
-                window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify(event.data));
-            }
-        });
-        """,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-    )
+    /// Seals `window.postMessage` payloads from the top or direct srcdoc creative root before they
+    /// reach the stable native message handler. Reinstalled with fresh presentation capabilities.
+    private static func postMessageScript(capability: String) -> WKUserScript {
+        WKUserScript(
+            source: creativeBridgeRelayScriptSource(capability: capability),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
 
     /// Forwards creative JS errors (`window.onerror`) to native via the same `simulaSDK` handler, where
     /// the coordinator records them as telemetry. Document-start so early errors are caught too.
     private static let errorCaptureScript = WKUserScript(
-        source: """
-        window.addEventListener('error', function(e) {
-            try {
-                window.webkit.messageHandlers.simulaSDK.postMessage(JSON.stringify({
-                    type: 'SIMULA_JS_ERROR',
-                    message: (e && e.message) ? String(e.message) : 'error',
-                    line: (e && e.lineno) ? e.lineno : 0
-                }));
-            } catch (_) {}
-        });
-        """,
+        source: creativeErrorCaptureScriptSource(),
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false
     )
@@ -665,19 +811,24 @@ final class WebViewPool {
     /// suppressed synchronously and forwarded as a structured message over the existing bridge.
     /// The per-WebView nonce and bound native handler are captured before creative code runs. Direct
     /// page calls to the public handler therefore cannot forge a billable activation message.
-    private static func userActivationScript(nonce: String) -> WKUserScript {
+    private static func userActivationScript(nonce: String, exposesStoreAPI: Bool) -> WKUserScript {
         WKUserScript(
-            source: creativeUserActivationScriptSource(nonce: nonce),
+            source: creativeUserActivationScriptSource(nonce: nonce, exposesStoreAPI: exposesStoreAPI),
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         )
     }
 
-    static func installUserScripts(on controller: WKUserContentController, nonce: String) {
+    static func installUserScripts(
+        on controller: WKUserContentController,
+        nonce: String,
+        bridgeCapability: String,
+        exposesStoreAPI: Bool = false
+    ) {
         controller.removeAllUserScripts()
-        controller.addUserScript(postMessageScript)
+        controller.addUserScript(postMessageScript(capability: bridgeCapability))
         controller.addUserScript(errorCaptureScript)
-        controller.addUserScript(userActivationScript(nonce: nonce))
+        controller.addUserScript(userActivationScript(nonce: nonce, exposesStoreAPI: exposesStoreAPI))
     }
 
     private func makePooled() -> Pooled {
@@ -687,7 +838,12 @@ final class WebViewPool {
 
         let controller = WKUserContentController()
         controller.add(forwarder, name: WebViewPool.messageHandlerName)
-        WebViewPool.installUserScripts(on: controller, nonce: forwarder.userActivationNonce)
+        WebViewPool.installUserScripts(
+            on: controller,
+            nonce: forwarder.userActivationNonce,
+            bridgeCapability: forwarder.bridgeCapability,
+            exposesStoreAPI: false
+        )
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
@@ -770,7 +926,8 @@ final class WebViewPool {
     func acquire(
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (WebViewForwardedMessage) -> Void,
-        surface: String? = nil
+        surface: String? = nil,
+        exposesStoreAPI: Bool = false
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
         // Drop any prewarmed views whose storage policy no longer matches the
@@ -783,10 +940,12 @@ final class WebViewPool {
         let reusedWarm = idle.last != nil
         let pooled = idle.popLast() ?? makePooled()
 
-        pooled.forwarder.rotateUserActivationNonce()
+        pooled.forwarder.rotatePresentationCapabilities()
         Self.installUserScripts(
             on: pooled.webView.configuration.userContentController,
-            nonce: pooled.forwarder.userActivationNonce
+            nonce: pooled.forwarder.userActivationNonce,
+            bridgeCapability: pooled.forwarder.bridgeCapability,
+            exposesStoreAPI: exposesStoreAPI
         )
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate

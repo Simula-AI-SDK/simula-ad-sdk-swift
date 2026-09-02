@@ -183,9 +183,19 @@ final class StoreProductPresentationTests: XCTestCase {
         window.rootViewController = root
         window.makeKeyAndVisible()
         CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
+        var presentedController: UIViewController?
+        CreativeCTARouter.setViewControllerPresenterForTesting { controller in
+            presentedController = controller
+            return true
+        }
+        UIView.setAnimationsEnabled(false)
         defer {
             root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
+            UIView.setAnimationsEnabled(true)
             CreativeCTARouter.resetExternalPresentationStateForTesting()
         }
         XCTAssertFalse(window.isHidden)
@@ -206,7 +216,7 @@ final class StoreProductPresentationTests: XCTestCase {
 
         await Task.yield()
         XCTAssertTrue(
-            root.presentedViewController is SKStoreProductViewController,
+            presentedController is SKStoreProductViewController,
             "default StoreOpen must present SKStoreProductViewController on a live foreground window"
         )
         XCTAssertEqual(outcomes, [AttributionRouteOutcome(
@@ -214,6 +224,102 @@ final class StoreProductPresentationTests: XCTestCase {
             success: true,
             failureClass: nil
         )])
+    }
+
+    @MainActor
+    func testOwnedProductDismissIgnoresStaleOwnerAndBalancesCleanupOnce() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
+        var presentedController: UIViewController?
+        CreativeCTARouter.setViewControllerPresenterForTesting { controller in
+            presentedController = controller
+            return true
+        }
+        UIView.setAnimationsEnabled(false)
+        let owner = StoreProductOwnershipToken()
+        let stale = StoreProductOwnershipToken()
+        var dismissNotifications = 0
+        let dismissed = expectation(description: "owned store product dismissed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetDidDismiss,
+            object: nil,
+            queue: .main
+        ) { _ in
+            dismissNotifications += 1
+            dismissed.fulfill()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            UIView.setAnimationsEnabled(true)
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+
+        XCTAssertTrue(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: owner
+        ))
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: stale)
+        await Task.yield()
+        XCTAssertTrue(presentedController is SKStoreProductViewController)
+        XCTAssertEqual(dismissNotifications, 0)
+
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: owner)
+        XCTAssertFalse(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: stale
+        ))
+        await fulfillment(of: [dismissed], timeout: 2)
+        XCTAssertEqual(dismissNotifications, 1)
+    }
+
+    @MainActor
+    func testInteractiveProductDismissRunsOwnedCleanup() async throws {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        CreativeCTARouter.setPresentationRootForTesting { root }
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
+        UIView.setAnimationsEnabled(false)
+        let dismissed = expectation(description: "interactive store product dismissed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetDidDismiss,
+            object: nil,
+            queue: .main
+        ) { _ in dismissed.fulfill() }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            UIView.setAnimationsEnabled(true)
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+
+        XCTAssertTrue(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: StoreProductOwnershipToken()
+        ))
+        let storeVC = try XCTUnwrap(root.presentedViewController as? SKStoreProductViewController)
+        let presentationController = try XCTUnwrap(storeVC.presentationController)
+        let presentationDelegate = try XCTUnwrap(presentationController.delegate)
+
+        storeVC.dismiss(animated: false)
+        presentationDelegate.presentationControllerDidDismiss?(presentationController)
+
+        await fulfillment(of: [dismissed], timeout: 2)
     }
 }
 #endif

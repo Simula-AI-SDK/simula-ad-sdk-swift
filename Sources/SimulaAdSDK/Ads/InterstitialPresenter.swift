@@ -285,8 +285,9 @@ private struct CreativeInterstitialView: View {
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
-    @State private var skOverlayOwnership: SKOverlayOwnershipToken?
+    @State private var skOverlayState = SKOverlayPresentationState<SKOverlayOwnershipToken>()
     @State private var skOverlayTask: Task<Void, Never>?
+    @State private var skOverlayResolutionStarted = false
 
     // Custom-rendered interstitial view-through attribution. Enabled SKOverlay serves are excluded
     // until those two surfaces receive distinct signed impression identifiers from the backend.
@@ -419,11 +420,7 @@ private struct CreativeInterstitialView: View {
             storePromptTask = nil
             skOverlayTask?.cancel()
             skOverlayTask = nil
-            // Tear the install banner down with the ad so it doesn't leak into the host app.
-            if let skOverlayOwnership, #available(iOS 14.0, *) {
-                SKOverlayPresenter.dismiss(ownershipToken: skOverlayOwnership)
-                self.skOverlayOwnership = nil
-            }
+            dismissSKOverlay()
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
             clickHandoffs.reset()
@@ -441,6 +438,7 @@ private struct CreativeInterstitialView: View {
             storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
+            presentRequestedSKOverlayIfNeeded()
             startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { notification in
@@ -449,6 +447,7 @@ private struct CreativeInterstitialView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
             guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
+            presentRequestedSKOverlayIfNeeded()
             startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
@@ -534,6 +533,9 @@ private struct CreativeInterstitialView: View {
             onAttributionRouteOutcome: { outcome in
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
+            onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
+            onStoreDismissRequest: { dismissSKOverlay() },
+            storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
@@ -798,6 +800,7 @@ private struct CreativeInterstitialView: View {
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
+            storeProductOwnership: attributionRouteLifecycle.storeProductOwnership,
             execution: execution
         )
     }
@@ -865,22 +868,28 @@ private struct CreativeInterstitialView: View {
     /// / `delayed` present automatically (after the optional `delay_seconds`); `onClick` waits for
     /// the CTA tap. iOS 14+ only — below that the config is simply ignored.
     private func startSKOverlay() {
-        guard let config = response.adBehavior?.skoverlay, config.enabled, resolvedAppID == nil else { return }
+        guard let config = response.adBehavior?.skoverlay, config.enabled,
+              resolvedAppID == nil, !skOverlayResolutionStarted,
+              !skOverlayState.suppressPending else { return }
         guard #available(iOS 14.0, *) else { return }
+        skOverlayResolutionStarted = true
         CreativeCTARouter.resolveAppStoreID(
             trackingUrl: response.trackingUrl,
             destination: response.destinationKind,
             storeUrl: response.iosStoreUrl
         ) { id in
+            guard !skOverlayState.suppressPending else { return }
             resolvedAppID = id
-            if config.timing == .duringPlay || config.timing == .delayed {
+            if skOverlayState.creativePresentationRequested {
+                presentSKOverlay(config: config)
+            } else if config.timing == .duringPlay || config.timing == .delayed {
                 scheduleSKOverlayPresent(config: config)
             }
         }
     }
 
     private func scheduleSKOverlayPresent(config: SKOverlayConfig) {
-        guard skOverlayOwnership == nil, resolvedAppID != nil else { return }
+        guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID != nil) else { return }
         skOverlayTask?.cancel()
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         skOverlayTask = Task { await runSKOverlayPresent(config: config) }
@@ -900,7 +909,8 @@ private struct CreativeInterstitialView: View {
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
     /// link) safely no-ops with sampled telemetry.
     private func presentSKOverlay(config: SKOverlayConfig) {
-        guard skOverlayOwnership == nil, let appID = resolvedAppID, !appID.isEmpty else {
+        guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID?.isEmpty == false),
+              let appID = resolvedAppID else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
                 Telemetry.shared.recordOperation(
                     name: "skoverlay_skipped",
@@ -915,18 +925,48 @@ private struct CreativeInterstitialView: View {
               UIApplication.shared.applicationState == .active,
               originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
-        skOverlayOwnership = SKOverlayPresenter.present(
+        guard let ownership = SKOverlayPresenter.present(
             appID: appID,
             config: config,
             attribution: response.skanAttribution,
             originatingScene: originatingScene
-        )
+        ) else { return }
+        if !skOverlayState.install(ownership) {
+            SKOverlayPresenter.dismiss(ownershipToken: ownership)
+        }
     }
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).
     private func presentSKOverlayOnClickIfNeeded() {
         guard let config = response.adBehavior?.skoverlay, config.enabled, config.timing == .onClick else { return }
+        // If StoreOpen also selects SKStoreProductViewController, the sheet takes foreground while
+        // this scene-owned overlay remains behind it. Both server-selected StoreKit surfaces retain
+        // exact ownership and are independently dismissible.
         presentSKOverlay(config: config)
+    }
+
+    private func showSKOverlayFromCreative() {
+        guard let config = response.adBehavior?.skoverlay, config.enabled,
+              skOverlayState.requestCreativePresentation() else { return }
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        startSKOverlay()
+        presentRequestedSKOverlayIfNeeded()
+    }
+
+    private func presentRequestedSKOverlayIfNeeded() {
+        guard skOverlayState.creativePresentationRequested,
+              resolvedAppID?.isEmpty == false,
+              let config = response.adBehavior?.skoverlay, config.enabled else { return }
+        presentSKOverlay(config: config)
+    }
+
+    private func dismissSKOverlay() {
+        skOverlayTask?.cancel()
+        skOverlayTask = nil
+        let ownership = skOverlayState.dismiss()
+        guard let ownership, #available(iOS 14.0, *) else { return }
+        SKOverlayPresenter.dismiss(ownershipToken: ownership)
     }
 
 }
