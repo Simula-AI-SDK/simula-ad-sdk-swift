@@ -579,7 +579,8 @@ private struct CreativeInterstitialView: View {
             makeImpression: {
                 // SKOverlay currently shares this serve's nonce. Avoid registering both surfaces
                 // until its attribution tuple is split from the custom creative's tuple.
-                guard response.adBehavior?.skoverlay?.enabled != true,
+                guard !skOverlayState.creativePresentationRequested,
+                      response.adBehavior?.skoverlay?.enabled != true,
                       response.destinationKind == .appstore,
                       let appID = CreativeCTARouter.appStoreID(fromString: response.iosStoreUrl)
                 else { return nil }
@@ -868,7 +869,8 @@ private struct CreativeInterstitialView: View {
     /// / `delayed` present automatically (after the optional `delay_seconds`); `onClick` waits for
     /// the CTA tap. iOS 14+ only — below that the config is simply ignored.
     private func startSKOverlay() {
-        guard let config = response.adBehavior?.skoverlay, config.enabled,
+        let config = response.adBehavior?.skoverlay
+        guard config?.enabled == true || skOverlayState.creativePresentationRequested,
               resolvedAppID == nil, !skOverlayResolutionStarted,
               !skOverlayState.suppressPending else { return }
         guard #available(iOS 14.0, *) else { return }
@@ -881,8 +883,9 @@ private struct CreativeInterstitialView: View {
             guard !skOverlayState.suppressPending else { return }
             resolvedAppID = id
             if skOverlayState.creativePresentationRequested {
-                presentSKOverlay(config: config)
-            } else if config.timing == .duringPlay || config.timing == .delayed {
+                presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: config))
+            } else if let config, config.enabled,
+                      config.timing == .duringPlay || config.timing == .delayed {
                 scheduleSKOverlayPresent(config: config)
             }
         }
@@ -946,8 +949,8 @@ private struct CreativeInterstitialView: View {
     }
 
     private func showSKOverlayFromCreative() {
-        guard let config = response.adBehavior?.skoverlay, config.enabled,
-              skOverlayState.requestCreativePresentation() else { return }
+        guard skOverlayState.requestCreativePresentation() else { return }
+        endSKANViewThroughImpression()
         skOverlayTask?.cancel()
         skOverlayTask = nil
         startSKOverlay()
@@ -956,9 +959,8 @@ private struct CreativeInterstitialView: View {
 
     private func presentRequestedSKOverlayIfNeeded() {
         guard skOverlayState.creativePresentationRequested,
-              resolvedAppID?.isEmpty == false,
-              let config = response.adBehavior?.skoverlay, config.enabled else { return }
-        presentSKOverlay(config: config)
+              resolvedAppID?.isEmpty == false else { return }
+        presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: response.adBehavior?.skoverlay))
     }
 
     private func dismissSKOverlay() {

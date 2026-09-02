@@ -90,4 +90,41 @@ final class ViewThroughImpressionLifecycleStateTests: XCTestCase {
         XCTAssertTrue(state.didAttemptStart)
         XCTAssertNil(state.impression)
     }
+
+    func testCreativeOverlayRequestEndsStartedImpressionAndPreventsRestart() {
+        var viewThrough = ViewThroughImpressionLifecycleState<NSObject>()
+        var overlay = SKOverlayPresentationState<String>()
+        let impression = NSObject()
+        var ended: NSObject?
+
+        viewThrough.markCreativeReady()
+        viewThrough.start(makeImpression: { impression }) { _ in }
+        XCTAssertTrue(overlay.requestCreativePresentation())
+        viewThrough.end { ended = $0 }
+        viewThrough.start(makeImpression: { NSObject() }) { _ in XCTFail("restarted after overlay request") }
+
+        XCTAssertTrue(ended === impression)
+        XCTAssertTrue(viewThrough.didEnd)
+        XCTAssertNil(viewThrough.impression)
+    }
+
+    func testCreativeOverlayDismissBeforeViewThroughStillPreventsLateConstruction() {
+        var viewThrough = ViewThroughImpressionLifecycleState<NSObject>()
+        var overlay = SKOverlayPresentationState<String>()
+        var constructions = 0
+
+        viewThrough.markCreativeReady()
+        XCTAssertTrue(overlay.requestCreativePresentation())
+        viewThrough.end { _ in XCTFail("ended an impression that never started") }
+        XCTAssertNil(overlay.dismiss())
+        XCTAssertFalse(overlay.creativePresentationRequested)
+        viewThrough.start(makeImpression: {
+            constructions += 1
+            return NSObject()
+        }) { _ in XCTFail("started after overlay request") }
+
+        XCTAssertEqual(constructions, 0)
+        XCTAssertTrue(viewThrough.didEnd)
+        XCTAssertNil(viewThrough.impression)
+    }
 }

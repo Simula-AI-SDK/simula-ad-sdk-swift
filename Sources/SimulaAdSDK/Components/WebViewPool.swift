@@ -658,6 +658,11 @@ func creativeErrorCaptureScriptSource() -> String {
 }
 
 final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
+    private static let storeBridgeLogger = Logger(
+        subsystem: "ad.simula.sdk",
+        category: "StoreBridge"
+    )
+
     private(set) var userActivationNonce = UUID().uuidString
     private(set) var bridgeCapability = UUID().uuidString
     var onMessage: ((WebViewForwardedMessage) -> Void)?
@@ -678,6 +683,7 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
             onMessage?(.userActivatedStoreOpen)
             return
         case .showOverlay:
+            Self.storeBridgeLogger.info("SKOverlay bridge message authenticated")
             onMessage?(.storeOverlayShow)
             return
         case .dismiss:
