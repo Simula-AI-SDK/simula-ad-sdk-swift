@@ -640,7 +640,7 @@ final class CreativeClickURLTests: XCTestCase {
             destination: .appstore,
             storeUrl: "https://apps.apple.com/app/id456"
         ))
-        XCTAssertFalse(hasTrustedCreativeStoreDestination(
+        XCTAssertTrue(hasTrustedCreativeStoreDestination(
             trackingUrl: "https://tracker.example/click",
             destination: .appstore,
             storeUrl: nil

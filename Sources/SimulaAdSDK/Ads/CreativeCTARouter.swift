@@ -249,6 +249,7 @@ final class AttributionRouteLifecycle: @unchecked Sendable {
     private var active = false
     let automaticRoutes = AutomaticRouteCoordinator()
     let automaticRouteScope = AnyHashable(UUID())
+    let storeProductOwnership = StoreProductOwnershipToken()
 
     func activate() {
         lock.lock(); active = true; lock.unlock()
@@ -898,7 +899,7 @@ func hasTrustedCreativeStoreDestination(
     storeUrl: String?
 ) -> Bool {
     guard destination == .appstore else { return false }
-    return validatedDirectAppStoreURL(trackingUrl) != nil
+    return validatedTopLevelAttributionURL(trackingUrl) != nil
         || validatedDirectAppStoreURL(storeUrl) != nil
 }
 

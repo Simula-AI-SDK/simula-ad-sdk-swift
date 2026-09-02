@@ -242,7 +242,6 @@ private struct CreativeInterstitialView: View {
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onRequestDismiss: () -> Void
-    private let storeProductOwnership = StoreProductOwnershipToken()
 
     /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
     /// the ad — tracked separately and reconciled in `reconcileGate()`. The ad lives in a stand-alone
@@ -524,7 +523,7 @@ private struct CreativeInterstitialView: View {
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
             onStoreDismissRequest: { dismissSKOverlay() },
-            storeProductOwnershipToken: storeProductOwnership,
+            storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
@@ -786,7 +785,7 @@ private struct CreativeInterstitialView: View {
             storeOpen: response.adBehavior?.storeOpen ?? .skstoreproduct,
             storeUrl: response.iosStoreUrl,
             attribution: response.skanAttribution,
-            storeProductOwnership: storeProductOwnership,
+            storeProductOwnership: attributionRouteLifecycle.storeProductOwnership,
             execution: execution
         )
     }

@@ -20,7 +20,8 @@ final class CreativeUserActivationTests: XCTestCase {
         if let navigatorCheck, let fallbackCheck {
             XCTAssertLessThan(navigatorCheck.lowerBound, fallbackCheck.lowerBound)
         }
-        XCTAssertTrue(source.contains("activation_nonce: 'nonce'"))
+        XCTAssertTrue(source.contains("var activationNonce = 'nonce'"))
+        XCTAssertTrue(source.contains("activation_nonce: activationNonce"))
     }
 
     func testGeneratedScriptExposesStablePayloadFreeStoreAPI() {
@@ -34,6 +35,7 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
         XCTAssertFalse(source.contains("function openStore(value"))
+        XCTAssertFalse(source.contains("activation_nonce: 'nonce'"))
     }
 
     func testOpenStoreSharesWindowOpenGestureClaimWhileDismissDoesNotClaim() {

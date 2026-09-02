@@ -251,7 +251,6 @@ private struct RewardedGameView: View {
     /// Fired once, ~2s after begin-to-render (foreground time), for the billable IMPRESSION + PAID.
     let onImpression: () -> Void
     let onFinish: (Bool, Double) -> Void
-    private let storeProductOwnership = StoreProductOwnershipToken()
 
     /// The timer runs only while the app is foregrounded AND no in-app store/Safari sheet covers the
     /// playable — tracked separately and reconciled in `reconcileTimer()`. The playable lives in a
@@ -576,7 +575,7 @@ private struct RewardedGameView: View {
                 if outcome.success { storeExit?.recordStoreOpen("cta") }
             },
             onStoreDismissRequest: { dismissSKOverlay() },
-            storeProductOwnershipToken: storeProductOwnership,
+            storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
             clickBeaconImpressionId: impressionId,
             bridge: bridge,
@@ -598,7 +597,7 @@ private struct RewardedGameView: View {
             storeOpen: storeOpen,
             storeUrl: storeUrl,
             attribution: attribution,
-            storeProductOwnership: storeProductOwnership,
+            storeProductOwnership: attributionRouteLifecycle.storeProductOwnership,
             execution: execution
         )
     }

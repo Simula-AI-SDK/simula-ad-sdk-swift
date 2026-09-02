@@ -890,7 +890,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 _ = routeClaimedClick(userActivated: true, route: route)
                 return
             case .userActivatedStoreOpen:
-                guard hasTrustedCreativeStoreDestination(
+                guard bridge != nil, !externalClickOnly,
+                      hasTrustedCreativeStoreDestination(
                     trackingUrl: ctaTrackingUrl,
                     destination: ctaDestination,
                     storeUrl: ctaStoreUrl
@@ -902,6 +903,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 )
                 return
             case .storeDismiss:
+                guard bridge != nil, !externalClickOnly else { return }
                 cancelPendingStoreRoute()
                 CreativeCTARouter.dismissStoreProduct(ownershipToken: storeProductOwnership)
                 onStoreDismissRequest?()

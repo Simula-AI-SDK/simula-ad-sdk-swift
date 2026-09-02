@@ -196,6 +196,7 @@ struct CreativeUserActivationState: Equatable {
 func creativeUserActivationScriptSource(nonce: String) -> String {
     """
     (function() {
+      var activationNonce = '\(nonce)';
       var originalOpen = window.open;
       var nativeHandler = window.webkit && window.webkit.messageHandlers
         ? window.webkit.messageHandlers.simulaSDK
@@ -338,14 +339,14 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
         return claimGesture({
           type: 'SIMULA_CTA_OPEN',
           url: url,
-          activation_nonce: '\(nonce)'
+          activation_nonce: activationNonce
         });
       }
 
       function openStore() {
         return claimGesture({
           type: 'SIMULA_INTERNAL_STORE_OPEN',
-          activation_nonce: '\(nonce)'
+          activation_nonce: activationNonce
         });
       }
 
@@ -354,7 +355,7 @@ func creativeUserActivationScriptSource(nonce: String) -> String {
         try {
           postNative({
             type: 'SIMULA_INTERNAL_STORE_DISMISS',
-            activation_nonce: '\(nonce)'
+            activation_nonce: activationNonce
           });
           return true;
         } catch (_) { return false; }
