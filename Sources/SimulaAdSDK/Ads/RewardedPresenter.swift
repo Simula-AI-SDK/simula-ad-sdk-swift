@@ -260,6 +260,12 @@ private struct RewardedGameView: View {
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
     /// per 1 s accrual tick — `closeProgress` below is the instantaneous truth used to anchor it.
     @State private var closeProgressAnim: Double = 0
+    /// Bumped on every pause; keyed into `CloseButtonView`'s `.id()` so pausing discards the
+    /// in-flight linear fill animation along with the old view identity. SwiftUI animations are
+    /// additive and a non-animated write alone cannot cancel a running delta — without this the
+    /// fill jumps backwards when a store sheet pauses the timer, and repeated pause/resume cycles
+    /// stack deltas until the displayed fill pins at zero.
+    @State private var closeGateGeneration = 0
     @State private var rewardEarned = false
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
@@ -328,6 +334,8 @@ private struct RewardedGameView: View {
                 progress: closeProgressAnim,
                 onClose: { finish(earned: true) }
             )
+            // Identity keyed to the pause generation — see `closeGateGeneration`.
+            .id(closeGateGeneration)
             .animation(.default, value: rewardEarned)
 
             // Mid-ad store prompt — appears at half the play-to-earn gate and is removed the instant
@@ -540,7 +548,10 @@ private struct RewardedGameView: View {
             // Freeze the animated fill at the true elapsed fraction so it stops gliding while paused
             // (disable the implicit animation so it doesn't tween toward the frozen value).
             var tx = Transaction(); tx.disablesAnimations = true
-            withTransaction(tx) { closeProgressAnim = closeProgress }
+            withTransaction(tx) {
+                closeProgressAnim = closeProgress
+                closeGateGeneration += 1
+            }
         }
     }
 
