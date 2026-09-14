@@ -918,6 +918,9 @@ public struct FallbackAd: Sendable {
     /// Whether the server removed this fallback HTML's legacy click beacon and assigned click
     /// counting to the SDK. Client support is checked separately at the point of use.
     public let nativeClickBeaconV1Enabled: Bool
+    /// Per-screen close configuration resolved from this fallback item's `ad_behavior.close`.
+    /// Legacy construction receives the fallback contract defaults.
+    public let closeBehavior: CloseBehavior
 
     public init(
         adId: String,
@@ -928,7 +931,8 @@ public struct FallbackAd: Sendable {
             adId: adId,
             iframeUrl: iframeUrl,
             html: html,
-            nativeClickBeaconV1Enabled: false
+            nativeClickBeaconV1Enabled: false,
+            closeBehavior: .fallbackDefault
         )
     }
 
@@ -936,13 +940,29 @@ public struct FallbackAd: Sendable {
         adId: String,
         iframeUrl: String,
         html: String? = nil,
-        nativeClickBeaconV1Enabled: Bool
+        nativeClickBeaconV1Enabled: Bool,
+        closeBehavior: CloseBehavior = CloseBehavior(
+            delaySeconds: 5,
+            treatment: .countdownCircle
+        )
     ) {
         self.adId = adId
         self.iframeUrl = iframeUrl
         self.html = html
         self.nativeClickBeaconV1Enabled = nativeClickBeaconV1Enabled
+        self.closeBehavior = closeBehavior
     }
+}
+
+/// Only usable End Screen 1 may visually advance. Every final/later screen closes, even when its
+/// own payload requests `forward`.
+func resolvedFallbackCloseAction(
+    configured: CloseAction,
+    usableIndex: Int,
+    usableCount: Int
+) -> CloseAction {
+    guard usableIndex == 0, usableCount > 1 else { return .closeX }
+    return configured
 }
 
 /// Wire payload from `GET /load/fallbacks/{impression_id}` — every ad screen linked to
@@ -966,9 +986,13 @@ struct FallbackAdsAPIResponse: Decodable {
     }
 
     var resolvedAds: [FallbackAd] {
-        ads.compactMap { item in
-            let html = (item.html?.isEmpty == false) ? item.html : nil
-            let url = (item.iframeUrl?.isEmpty == false) ? item.iframeUrl : nil
+        let usableAds = ads.compactMap { item -> FallbackAd? in
+            let html = item.html?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? item.html
+                : nil
+            let url = item.iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? item.iframeUrl
+                : nil
             guard html != nil || url != nil else { return nil }
             return FallbackAd(
                 adId: item.adId ?? "",
@@ -976,7 +1000,23 @@ struct FallbackAdsAPIResponse: Decodable {
                 html: html,
                 nativeClickBeaconV1Enabled: item.nativeClickBeaconV1Enabled
                     ?? nativeClickBeaconV1Enabled
-                    ?? false
+                    ?? false,
+                closeBehavior: item.closeBehavior
+            )
+        }
+        return usableAds.enumerated().map { index, ad in
+            FallbackAd(
+                adId: ad.adId,
+                iframeUrl: ad.iframeUrl,
+                html: ad.html,
+                nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+                closeBehavior: ad.closeBehavior.replacingAction(
+                    resolvedFallbackCloseAction(
+                        configured: ad.closeBehavior.action,
+                        usableIndex: index,
+                        usableCount: usableAds.count
+                    )
+                )
             )
         }
     }
@@ -987,12 +1027,14 @@ struct FallbackAdItem: Decodable {
     let html: String?
     let iframeUrl: String?
     let nativeClickBeaconV1Enabled: Bool?
+    let closeBehavior: CloseBehavior
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
         case html
         case iframeUrl = "iframe_url"
         case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
+        case adBehavior = "ad_behavior"
     }
 
     init(from decoder: Decoder) throws {
@@ -1001,6 +1043,39 @@ struct FallbackAdItem: Decodable {
         self.html = try? c.decode(String.self, forKey: .html)
         self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
         self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
+        self.closeBehavior = (try? c.decode(FallbackAdBehavior.self, forKey: .adBehavior).close)
+            ?? .fallbackDefault
+    }
+}
+
+private struct FallbackAdBehavior: Decodable {
+    let close: CloseBehavior
+
+    enum CodingKeys: String, CodingKey { case close }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.close = (try? c.decode(FallbackCloseBehavior.self, forKey: .close).resolved)
+            ?? .fallbackDefault
+    }
+}
+
+private struct FallbackCloseBehavior: Decodable {
+    let resolved: CloseBehavior
+
+    enum CodingKeys: String, CodingKey {
+        case delaySeconds = "delay_seconds"
+        case treatment, position, action
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.resolved = CloseBehavior(
+            delaySeconds: (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 5,
+            treatment: .fallbackFrom(try? c.decode(String.self, forKey: .treatment)),
+            position: .from(try? c.decode(String.self, forKey: .position)),
+            action: .from(try? c.decode(String.self, forKey: .action))
+        )
     }
 }
 

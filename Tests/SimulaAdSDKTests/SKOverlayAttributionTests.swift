@@ -57,6 +57,34 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertFalse(state.canPresent(hasResolvedAppID: true))
     }
 
+    func testCreativeRequestedOverlayDoesNotRequireExperimentConfig() {
+        let config = creativeRequestedSKOverlayConfig(from: nil)
+
+        XCTAssertTrue(config.enabled)
+        XCTAssertEqual(config.timing, .onClick)
+        XCTAssertEqual(config.delaySeconds, 0)
+        XCTAssertEqual(config.position, .bottom)
+        XCTAssertTrue(config.dismissible)
+    }
+
+    func testCreativeRequestedOverlayIgnoresExperimentEnableAndTiming() {
+        let experiment = SKOverlayConfig(
+            enabled: false,
+            timing: .delayed,
+            delaySeconds: 30,
+            position: .bottomRaised,
+            dismissible: false
+        )
+
+        let config = creativeRequestedSKOverlayConfig(from: experiment)
+
+        XCTAssertTrue(config.enabled)
+        XCTAssertEqual(config.timing, .onClick)
+        XCTAssertEqual(config.delaySeconds, 0)
+        XCTAssertEqual(config.position, .bottomRaised)
+        XCTAssertFalse(config.dismissible)
+    }
+
     private func attribution(_ skanFields: String) throws -> AdAttribution {
         let json = """
         {"campaign_token":"camp_tok","provider_token":"prov_tok","skan":{\(skanFields)}}

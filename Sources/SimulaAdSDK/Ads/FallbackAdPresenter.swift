@@ -437,6 +437,7 @@ final class FallbackAdPresenter {
             adId: ad.adId,
             html: ad.html,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            closeBehavior: ad.closeBehavior,
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,

@@ -59,6 +59,7 @@ import SwiftUI
 import WebKit
 import StoreKit
 import SafariServices
+import os
 
 internal func identicalNonNilObjects<T: AnyObject>(_ lhs: T?, _ rhs: T?) -> Bool {
     guard let lhs, let rhs else { return false }
@@ -522,6 +523,11 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     @preconcurrency
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        private static let storeBridgeLogger = Logger(
+            subsystem: "ad.simula.sdk",
+            category: "StoreBridge"
+        )
+
         var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
@@ -925,6 +931,21 @@ struct WebViewRepresentable: UIViewRepresentable {
                 return
             case .storeOverlayShow:
                 guard bridge != nil, !externalClickOnly else { return }
+                let surface: String
+                switch telemetryAdFormat {
+                case "interstitial": surface = "interstitial"
+                case "rewarded": surface = "rewarded"
+                default: surface = "unknown"
+                }
+                Self.storeBridgeLogger.info(
+                    "SKOverlay bridge trigger received; surface=\(surface, privacy: .public)"
+                )
+                Telemetry.shared.recordOperation(
+                    name: "skoverlay_bridge_trigger",
+                    durationMs: 0,
+                    success: true,
+                    breadcrumb: "surface=\(surface)"
+                )
                 onStoreOverlayShowRequest?()
                 return
             case .storeDismiss:
