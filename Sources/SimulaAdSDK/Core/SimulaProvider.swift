@@ -59,6 +59,12 @@ func resolvePrivacyConfig(
 /// @EnvironmentObject var simula: SimulaProvider
 /// ```
 public final class SimulaProvider: ObservableObject {
+    typealias SessionCreation = @MainActor (
+        _ primaryUserID: String?,
+        _ privacy: ConsentSnapshot
+    ) async -> String?
+    typealias ForegroundSessionPreparation = @MainActor () async -> Void
+
     // MARK: - Configuration (set once at init)
 
     /// The API key for authenticating with Simula services
@@ -71,7 +77,11 @@ public final class SimulaProvider: ObservableObject {
     /// remain inert so a SwiftUI construction mismatch cannot send requests through mixed keys.
     let isProcessApiKeyCompatible: Bool
     private let processEffectsEnabled: Bool
-    var canMakeRequests: Bool { isProcessApiKeyCompatible }
+    private let injectedSessionCreation: SessionCreation?
+    private let foregroundSessionPreparation: ForegroundSessionPreparation
+    var canMakeRequests: Bool {
+        isProcessApiKeyCompatible && (processEffectsEnabled || injectedSessionCreation != nil)
+    }
 
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
@@ -108,6 +118,8 @@ public final class SimulaProvider: ObservableObject {
     /// first request is always built after privacy/telemetry/singleton warm-up have run, even
     /// for a host that drives a raw provider without ever calling `start()`.
     private var startupTask: Task<Void, Never>?
+    private var startupCompleted = false
+    private var foregroundRefreshPending = false
 
     // MARK: - Session State
 
@@ -202,7 +214,9 @@ public final class SimulaProvider: ObservableObject {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         telemetryEnabled: Bool = true,
-        activeProviderRegistry: ActiveSimulaProviderRegistry? = nil
+        activeProviderRegistry: ActiveSimulaProviderRegistry? = nil,
+        sessionCreation: SessionCreation? = nil,
+        foregroundSessionPreparation: @escaping ForegroundSessionPreparation = {}
     ) {
         self.init(
             apiKey: apiKey,
@@ -214,7 +228,9 @@ public final class SimulaProvider: ObservableObject {
             adContext: nil,
             apiKeyOwnership: apiKeyOwnership,
             processEffectsEnabled: false,
-            activeProviderRegistry: activeProviderRegistry
+            activeProviderRegistry: activeProviderRegistry,
+            sessionCreation: sessionCreation,
+            foregroundSessionPreparation: foregroundSessionPreparation
         )
     }
 
@@ -228,7 +244,9 @@ public final class SimulaProvider: ObservableObject {
         adContext: SimulaAdContext?,
         apiKeyOwnership: ProcessApiKeyOwnership,
         processEffectsEnabled: Bool,
-        activeProviderRegistry: ActiveSimulaProviderRegistry?
+        activeProviderRegistry: ActiveSimulaProviderRegistry?,
+        sessionCreation: SessionCreation? = nil,
+        foregroundSessionPreparation: ForegroundSessionPreparation? = nil
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
@@ -238,6 +256,11 @@ public final class SimulaProvider: ObservableObject {
             reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
         )
         self.processEffectsEnabled = processEffectsEnabled
+        self.injectedSessionCreation = sessionCreation
+        self.foregroundSessionPreparation = foregroundSessionPreparation ?? {
+            await SimulaPrivacy.shared.refreshAdvertisingTrackingForSession()
+        }
+        self.startupCompleted = !processEffectsEnabled
         self.activeProviderRegistry = activeProviderRegistry
         self.matchingPrimaryUserID = primaryUserID
         self.telemetryIdentitySource = TelemetryIdentitySource(apiKey: apiKey, primaryUserId: primaryUserID)
@@ -258,6 +281,13 @@ public final class SimulaProvider: ObservableObject {
         }
 
         SDKInitializationOrigin.shared.markEntry()
+
+        #if os(iOS)
+        // Process-wide and telemetry-independent. One observer follows aggregate application state
+        // and resolves the authoritative live provider only when a real background -> active cycle
+        // completes, avoiding one observer and one request per SwiftUI provider instance.
+        installProcessApplicationSessionLifecycleObserver()
+        #endif
 
         // Establish the one shared quiet-window deadline during the cheap init path. This performs
         // no I/O and never waits; recovery sends, telemetry, ATT/IDFA, and IPv4 work await it later.
@@ -370,7 +400,15 @@ public final class SimulaProvider: ObservableObject {
         )
         // Phase 3: warm the session. Ungated variant — this task IS the startup gate
         // (`ensureSession` awaits its completion), so the task must END here.
+        // A background -> active transition observed during startup is satisfied by the creation
+        // below. If it arrived after this request started, the lifecycle handler has already
+        // superseded it with a replacement task using the current process state.
+        if foregroundRefreshPending {
+            foregroundRefreshPending = false
+            await foregroundSessionPreparation()
+        }
         _ = await ensureSessionCoalesced()
+        startupCompleted = true
     }
 
     /// Off-main startup phase (named method — see the task-shape note in TelemetryManager).
@@ -518,7 +556,7 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func ensureSession() async -> String? {
-        guard canMakeRequests, processEffectsEnabled else { return nil }
+        guard canMakeRequests else { return nil }
         start()
         if let startupTask { await startupTask.value }
         return await ensureSessionCoalesced()
@@ -533,9 +571,12 @@ public final class SimulaProvider: ObservableObject {
         // resync retries onto the replacement, instead of returning a premature nil while a session
         // is still being created.
         while true {
-            if let sessionId, !sessionId.isEmpty { return sessionId }
+            // An in-flight foreground refresh outranks the cached id. This makes every immediate
+            // ad/session caller coalesce with the refresh rather than racing ahead with stale state.
+            // Otherwise a settled cached id remains the fast path.
+            if sessionTask == nil, let sessionId, !sessionId.isEmpty { return sessionId }
 
-            // Await the in-flight creation — an existing one (coalesce) or a fresh one we start.
+            // Await the in-flight creation/refresh, or start an initial creation when no id exists.
             // `awaitedGeneration` is that creation's generation: sessionTask and sessionGeneration are
             // only ever set together (in startSessionCreation / resyncSession, synchronously), so
             // reading them here with no intervening await yields a consistent pair.
@@ -596,12 +637,19 @@ public final class SimulaProvider: ObservableObject {
         ppidAtCreation: String?,
         snapshot: ConsentSnapshot
     ) async -> String? {
-        let resolved = await Self.runSessionCreation(
-            api: api, apiKey: apiKey, devMode: devMode, ppid: ppidAtCreation, snapshot: snapshot
-        )
+        let resolved: String?
+        if let injectedSessionCreation {
+            resolved = await injectedSessionCreation(ppidAtCreation, snapshot)
+        } else {
+            resolved = await Self.runSessionCreation(
+                api: api, apiKey: apiKey, devMode: devMode, ppid: ppidAtCreation, snapshot: snapshot
+            )
+        }
         if let resolved, sessionGeneration == generation {
-            sessionId = resolved
+            // Set the identity before publishing the id. `sessionId` is the observable commit point,
+            // so synchronous subscribers and resumed task waiters see the same/new pair together.
             sessionUserID = ppidAtCreation
+            sessionId = resolved
             // A login/switch that fired WHILE this session was being created couldn't reconcile
             // (sessionId was still nil when updatePrimaryUserID ran, so reconcileServerPpid
             // no-oped). Now that the session exists, drive it to the current ppid if it diverged
@@ -627,6 +675,56 @@ public final class SimulaProvider: ObservableObject {
             )
         }
         return resolved
+    }
+
+    /// Installs the refresh task synchronously from the application notification callback. Keeping
+    /// the old pair published until success makes foregrounding fail-safe; putting the task in
+    /// `sessionTask` before returning makes subsequent ad callers await the same POST.
+    @MainActor
+    func beginForegroundSessionRefresh() {
+        guard canMakeRequests else { return }
+        start()
+
+        if !startupCompleted {
+            foregroundRefreshPending = true
+            // If startup's POST began before the app became active, replace it so the surviving
+            // request is genuinely initiated after the transition. `ensureSessionCoalesced` loops
+            // onto this generation, preserving startup gating without a self-await cycle.
+            if sessionTask != nil {
+                replaceSessionCreationPreservingPublishedSession()
+            }
+            return
+        }
+
+        replaceSessionCreationPreservingPublishedSession()
+    }
+
+    @MainActor
+    private func replaceSessionCreationPreservingPublishedSession() {
+        sessionGeneration &+= 1
+        sessionTask?.cancel()
+        sessionTask = nil
+        _ = startForegroundSessionCreation()
+    }
+
+    @MainActor
+    private func startForegroundSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
+        let task = Task<String?, Never> { @MainActor [weak self] in
+            guard let self else { return nil }
+            await self.foregroundSessionPreparation()
+            guard self.sessionGeneration == generation else { return nil }
+            let snapshot = SimulaPrivacy.shared.currentSnapshot
+            let ppid = self.telemetryIdentitySource.identity().primaryUserId
+            return await self.createAndPublishSession(
+                generation: generation,
+                ppidAtCreation: ppid,
+                snapshot: snapshot
+            )
+        }
+        sessionTask = task
+        return (task, generation)
     }
 
     /// Session-creation task body (named method — see the task-shape note in TelemetryManager).
@@ -668,11 +766,12 @@ public final class SimulaProvider: ObservableObject {
     /// latest consent signals. Triggered when the consent store changes.
     @MainActor
     private func resyncSession() async {
-        sessionId = nil
         // Clear the tracked identity together with the id it belonged to, so a frequency-cap check
         // during the resync window never pairs the (now-invalidated) old id with a stale identity —
-        // the recreated session sets both again atomically.
+        // the recreated session sets both again atomically. Identity is cleared before the observable
+        // id commit point so synchronous subscribers cannot see an invalid pair.
         sessionUserID = nil
+        sessionId = nil
         // Invalidate any in-flight creation UP FRONT (bump before cancel): a task already past its
         // network call would otherwise still satisfy its generation guard and publish a session built
         // from the now-stale consent snapshot. Bumping first guarantees that guard fails. Cancelling
