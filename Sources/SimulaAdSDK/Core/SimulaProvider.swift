@@ -64,6 +64,7 @@ public final class SimulaProvider: ObservableObject {
         _ privacy: ConsentSnapshot
     ) async -> String?
     typealias ForegroundSessionPreparation = @MainActor () async -> Void
+    typealias PrivacySnapshotProvider = @MainActor () -> ConsentSnapshot
 
     // MARK: - Configuration (set once at init)
 
@@ -79,6 +80,7 @@ public final class SimulaProvider: ObservableObject {
     private let processEffectsEnabled: Bool
     private let injectedSessionCreation: SessionCreation?
     private let foregroundSessionPreparation: ForegroundSessionPreparation
+    private let privacySnapshotProvider: PrivacySnapshotProvider
     var canMakeRequests: Bool {
         isProcessApiKeyCompatible && (processEffectsEnabled || injectedSessionCreation != nil)
     }
@@ -216,7 +218,8 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool = true,
         activeProviderRegistry: ActiveSimulaProviderRegistry? = nil,
         sessionCreation: SessionCreation? = nil,
-        foregroundSessionPreparation: @escaping ForegroundSessionPreparation = {}
+        foregroundSessionPreparation: @escaping ForegroundSessionPreparation = {},
+        privacySnapshotProvider: @escaping PrivacySnapshotProvider = { ConsentSnapshot() }
     ) {
         self.init(
             apiKey: apiKey,
@@ -230,7 +233,8 @@ public final class SimulaProvider: ObservableObject {
             processEffectsEnabled: false,
             activeProviderRegistry: activeProviderRegistry,
             sessionCreation: sessionCreation,
-            foregroundSessionPreparation: foregroundSessionPreparation
+            foregroundSessionPreparation: foregroundSessionPreparation,
+            privacySnapshotProvider: privacySnapshotProvider
         )
     }
 
@@ -246,7 +250,8 @@ public final class SimulaProvider: ObservableObject {
         processEffectsEnabled: Bool,
         activeProviderRegistry: ActiveSimulaProviderRegistry?,
         sessionCreation: SessionCreation? = nil,
-        foregroundSessionPreparation: ForegroundSessionPreparation? = nil
+        foregroundSessionPreparation: ForegroundSessionPreparation? = nil,
+        privacySnapshotProvider: PrivacySnapshotProvider? = nil
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
@@ -259,6 +264,9 @@ public final class SimulaProvider: ObservableObject {
         self.injectedSessionCreation = sessionCreation
         self.foregroundSessionPreparation = foregroundSessionPreparation ?? {
             await SimulaPrivacy.shared.refreshAdvertisingTrackingForSession()
+        }
+        self.privacySnapshotProvider = privacySnapshotProvider ?? {
+            SimulaPrivacy.shared.currentSnapshot
         }
         self.startupCompleted = !processEffectsEnabled
         self.activeProviderRegistry = activeProviderRegistry
@@ -324,12 +332,9 @@ public final class SimulaProvider: ObservableObject {
             // state triggers exactly one /session/create instead of a race.
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] current in
-                guard let self else { return }
-                let impact = classifyPrivacyChange(from: self.observedPrivacySnapshot, to: current)
-                self.observedPrivacySnapshot = current
-                guard impact.requiresSessionResync else { return }
-                // Single-call task closure — see the task-shape note in TelemetryManager.
-                Task { @MainActor in await self.handlePrivacyChange(impact) }
+                MainActor.assumeIsolated {
+                    self?.handlePrivacySnapshotChange(current)
+                }
             }
             .store(in: &cancellables)
 
@@ -406,6 +411,7 @@ public final class SimulaProvider: ObservableObject {
         if foregroundRefreshPending {
             foregroundRefreshPending = false
             await foregroundSessionPreparation()
+            _ = consumeForegroundPrivacySnapshot(privacySnapshotProvider())
         }
         _ = await ensureSessionCoalesced()
         startupCompleted = true
@@ -498,10 +504,30 @@ public final class SimulaProvider: ObservableObject {
         }
     }
 
-    /// Task body for the privacy-change reaction (named method — see the task-shape note in
-    /// TelemetryManager): reset WebViews only for storage-policy changes, then re-sync the session.
+    /// Records each delivered privacy value before deciding whether the current server session must
+    /// be replaced. Foreground refreshes advance the same marker when they consume a fresh snapshot,
+    /// so the subscriber's delayed delivery cannot recreate an already-refreshed session.
     @MainActor
-    private func handlePrivacyChange(_ impact: PrivacyChangeImpact) async {
+    func handlePrivacySnapshotChange(_ current: ConsentSnapshot) {
+        let impact = classifyPrivacyChange(from: observedPrivacySnapshot, to: current)
+        observedPrivacySnapshot = current
+        resetWebViewsIfNeeded(impact)
+        guard impact.requiresSessionResync else { return }
+        invalidateSessionForPrivacyChange()
+    }
+
+    /// Marks a privacy value as consumed by the foreground request already being installed. This
+    /// suppresses only the delayed duplicate delivery; a newer value still invalidates the request.
+    @MainActor
+    private func consumeForegroundPrivacySnapshot(_ current: ConsentSnapshot) -> PrivacyChangeImpact {
+        let impact = classifyPrivacyChange(from: observedPrivacySnapshot, to: current)
+        observedPrivacySnapshot = current
+        resetWebViewsIfNeeded(impact)
+        return impact
+    }
+
+    @MainActor
+    private func resetWebViewsIfNeeded(_ impact: PrivacyChangeImpact) {
         #if os(iOS)
         if impact.requiresWebViewReset {
             // The storage policy flipped (TCF Purpose 1 / GDPR); drop views whose data store no
@@ -510,7 +536,6 @@ public final class SimulaProvider: ObservableObject {
             NativeAdWebViewStore.shared.invalidateAllSessions()
         }
         #endif
-        await resyncSession()
     }
 
     // MARK: - Session Management
@@ -582,13 +607,16 @@ public final class SimulaProvider: ObservableObject {
             // reading them here with no intervening await yields a consistent pair.
             let taskToAwait: Task<String?, Never>
             let awaitedGeneration: Int
+            let startedHere: Bool
             if let existing = sessionTask {
                 taskToAwait = existing
                 awaitedGeneration = sessionGeneration
+                startedHere = false
             } else {
                 let created = startSessionCreation()
                 taskToAwait = created.task
                 awaitedGeneration = created.generation
+                startedHere = true
             }
 
             _ = await taskToAwait.value
@@ -601,6 +629,7 @@ public final class SimulaProvider: ObservableObject {
             // attempt is retried by the NEXT call, and return whatever it published (a genuine nil on
             // failure is never re-created within this same call).
             sessionTask = nil
+            if sessionId == nil, !startedHere { continue }
             return sessionId
         }
     }
@@ -611,7 +640,7 @@ public final class SimulaProvider: ObservableObject {
     /// current session — so every awaiter observes consistent state the moment it resolves.
     @MainActor
     private func startSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
-        let snapshot = SimulaPrivacy.shared.currentSnapshot
+        let snapshot = privacySnapshotProvider()
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
         // session's true identity (used to detect a stale session after a mid-session change).
         // Deliberately read at scheduling (not when the task runs): the created session represents
@@ -715,13 +744,21 @@ public final class SimulaProvider: ObservableObject {
             guard let self else { return nil }
             await self.foregroundSessionPreparation()
             guard self.sessionGeneration == generation else { return nil }
-            let snapshot = SimulaPrivacy.shared.currentSnapshot
+            let snapshot = self.privacySnapshotProvider()
+            // Consume the refreshed value before the debounced publisher delivers the same change.
+            // That delivery then becomes a no-op instead of clearing this foreground session.
+            let privacyImpact = self.consumeForegroundPrivacySnapshot(snapshot)
             let ppid = self.telemetryIdentitySource.identity().primaryUserId
-            return await self.createAndPublishSession(
+            let resolved = await self.createAndPublishSession(
                 generation: generation,
                 ppidAtCreation: ppid,
                 snapshot: snapshot
             )
+            if resolved == nil, privacyImpact.requiresSessionResync,
+               self.sessionGeneration == generation {
+                self.invalidateSessionForPrivacyChange()
+            }
+            return resolved
         }
         sessionTask = task
         return (task, generation)
@@ -762,10 +799,11 @@ public final class SimulaProvider: ObservableObject {
         }
     }
 
-    /// Invalidates the current session and recreates it so the backend sees the
-    /// latest consent signals. Triggered when the consent store changes.
+    /// Invalidates the current session synchronously with privacy observation. Starting the
+    /// replacement in the same MainActor turn prevents a foreground request from publishing between
+    /// marker advancement and generation invalidation.
     @MainActor
-    private func resyncSession() async {
+    private func invalidateSessionForPrivacyChange() {
         // Clear the tracked identity together with the id it belonged to, so a frequency-cap check
         // during the resync window never pairs the (now-invalidated) old id with a stale identity —
         // the recreated session sets both again atomically. Identity is cleared before the observable
@@ -779,7 +817,9 @@ public final class SimulaProvider: ObservableObject {
         sessionGeneration &+= 1
         sessionTask?.cancel()
         sessionTask = nil
-        await ensureSession()
+        if startupCompleted {
+            _ = startSessionCreation()
+        }
     }
 
     // MARK: - Consent Updates

@@ -155,10 +155,41 @@ final class SessionForegroundRefreshTests: XCTestCase {
         XCTAssertEqual(result, "session-new")
     }
 
+    func testForegroundRefreshConsumesPrivacyChangeBeforeDebouncedDelivery() async {
+        let creator = ControlledSessionCreator()
+        var snapshot = ConsentSnapshot()
+        let changed = ConsentSnapshot(
+            hasPrivacyConsent: true,
+            advertisingId: "new-idfa",
+            attStatus: 3
+        )
+        let provider = makeProvider(
+            primaryUserID: "user-a",
+            creator: creator,
+            privacySnapshotProvider: { snapshot }
+        )
+        _ = await provider.ensureSession()
+
+        snapshot = changed
+        provider.beginForegroundSessionRefresh()
+        await creator.waitForCallCount(2)
+        creator.resolveNext("session-new")
+        let refreshed = await provider.ensureSession()
+        XCTAssertEqual(refreshed, "session-new")
+
+        provider.handlePrivacySnapshotChange(changed)
+        for _ in 0..<3 { await Task.yield() }
+
+        XCTAssertEqual(creator.callCount, 2)
+        XCTAssertEqual(creator.snapshots.last, changed)
+        XCTAssertEqual(provider.sessionId, "session-new")
+    }
+
     private func makeProvider(
         primaryUserID: String,
         creator: ControlledSessionCreator,
-        foregroundSessionPreparation: @escaping SimulaProvider.ForegroundSessionPreparation = {}
+        foregroundSessionPreparation: @escaping SimulaProvider.ForegroundSessionPreparation = {},
+        privacySnapshotProvider: @escaping SimulaProvider.PrivacySnapshotProvider = { ConsentSnapshot() }
     ) -> SimulaProvider {
         SimulaProvider(
             testApiKey: "session-refresh-key",
@@ -167,7 +198,8 @@ final class SessionForegroundRefreshTests: XCTestCase {
             sessionCreation: { ppid, privacy in
                 await creator.create(primaryUserID: ppid, privacy: privacy)
             },
-            foregroundSessionPreparation: foregroundSessionPreparation
+            foregroundSessionPreparation: foregroundSessionPreparation,
+            privacySnapshotProvider: privacySnapshotProvider
         )
     }
 }
@@ -199,12 +231,13 @@ private final class ControlledForegroundPreparation {
 @MainActor
 private final class ControlledSessionCreator {
     private(set) var callCount = 0
+    private(set) var snapshots: [ConsentSnapshot] = []
     private var continuations: [CheckedContinuation<String?, Never>] = []
     private var callCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func create(primaryUserID: String?, privacy: ConsentSnapshot) async -> String? {
         _ = primaryUserID
-        _ = privacy
+        snapshots.append(privacy)
         callCount += 1
         if callCount == 1 { return "session-old" }
         let ready = callCountWaiters.filter { $0.0 <= callCount }
