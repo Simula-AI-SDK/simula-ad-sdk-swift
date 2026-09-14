@@ -349,6 +349,7 @@ private struct CreativeInterstitialView: View {
                 treatment: closeConfig.treatment,
                 position: closeConfig.position,
                 progressBarColor: closeConfig.progressBarColor,
+                action: closeConfig.action,
                 isRewardCopy: isRewardCopy,
                 enabled: canDismissFullscreen(
                     dismissUnlocked: closeEnabled,
@@ -997,6 +998,7 @@ struct CloseButtonView: View {
     let treatment: CloseTreatment
     let position: ClosePosition
     let progressBarColor: String
+    let action: CloseAction
     /// `true` → "Reward in X"; `false` → "Close in X" (only used by `rewardOrCloseLabel`).
     let isRewardCopy: Bool
     let enabled: Bool
@@ -1083,7 +1085,7 @@ struct CloseButtonView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Close")
+            .accessibilityLabel(action == .forward ? "Next ad" : "Close")
         } else {
             switch treatment {
             case .hidden, .progressBar:
@@ -1108,7 +1110,7 @@ struct CloseButtonView: View {
     /// The circular "X" glyph — a gray / translucent dark circle with a white X (compact
     /// style), rather than an opaque white circle.
     private var closeGlyph: some View {
-        Image(systemName: "xmark")
+        Image(systemName: action == .forward ? "chevron.right" : "xmark")
             .font(.system(size: glyphSize, weight: .bold))
             .foregroundColor(.white)
             .frame(width: circleSize, height: circleSize)

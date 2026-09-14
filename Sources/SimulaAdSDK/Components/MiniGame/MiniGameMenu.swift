@@ -229,6 +229,7 @@ public struct MiniGameMenu: View {
                     adId: fallbackAd.adId,
                     html: fallbackAd.html,
                     nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled,
+                    closeBehavior: fallbackAd.closeBehavior,
                     telemetryServeId: currentServeId
                 )
                 .id(fallbackAdIndex)
