@@ -409,6 +409,13 @@ public final class SimulaPrivacy: ObservableObject {
         scheduleAdvertisingRefresh(alwaysCheckStatus: true)
     }
 
+    /// Refresh the foreground ATT/IDFA snapshot and wait until the coalesced read settles before
+    /// building a new session request. The read remains launch-gated and fail-soft internally.
+    func refreshAdvertisingTrackingForSession() async {
+        refreshAdvertisingTrackingOnForeground()
+        await waitForAdvertisingRefreshIdleForTests()
+    }
+
     private func runScheduledAdvertisingRefresh(generation: Int) async {
         defer { finishAutomaticRefreshTask() }
         await launchGate.waitUntilSettled()

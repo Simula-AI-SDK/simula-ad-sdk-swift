@@ -57,6 +57,14 @@ final class ActiveSimulaProviderRegistry: @unchecked Sendable {
         guard let provider else { return .none }
         return provider.matchesCoreConfiguration(configuration) ? .adopt(provider) : .conflict
     }
+
+    func providers() -> [SimulaProvider] {
+        lock.lock()
+        bindings.removeAll { $0.provider == nil }
+        let providers = bindings.compactMap(\.provider)
+        lock.unlock()
+        return providers
+    }
 }
 
 let processActiveSimulaProviderRegistry = ActiveSimulaProviderRegistry()
