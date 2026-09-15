@@ -99,6 +99,13 @@ public struct MiniGameMenu: View {
     // Post-game ad screens (`GET /load/fallbacks/{serveId}`), revealed one per close tap.
     @State private var fallbackAds: [FallbackAd] = []
     @State private var fallbackAdIndex = 0
+    @State private var fallbackVideoPlayer: FullscreenVideoPlayer?
+    @State private var fallbackFailureAdvanceState = FallbackFailureAdvanceState()
+    @State private var fallbackClickHandoffPending = false
+    @State private var fallbackPresentationBlocked = false
+    #if os(iOS)
+    @State private var fallbackVideoTokens: [Int: FullscreenVideoPreparationToken] = [:]
+    #endif
     @State private var currentServeId: String?
     @State private var showGameIframe = false
     @State private var showAdOverlay = false
@@ -221,15 +228,23 @@ public struct MiniGameMenu: View {
             // Ad Overlay (full-screen cover) — shows the current fallback screen; `.id` gives
             // each revealed screen fresh overlay state (countdown, web view).
             if showAdOverlay, let fallbackAd = fallbackAds.indices.contains(fallbackAdIndex) ? fallbackAds[fallbackAdIndex] : nil {
+                let renderedIndex = fallbackAdIndex
                 AdOverlayView(
-                    iframeUrl: fallbackAd.iframeUrl,
-                    onClose: { handleAdIframeClose() },
+                    ad: fallbackAd,
+                    onClose: { handleAdIframeClose(from: renderedIndex) },
+                    onCreativeFailure: { handleFallbackCreativeFailure(from: renderedIndex) },
+                    videoPlayer: fallbackVideoPlayer,
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
                     playableBorderColor: theme.resolvedPlayableBorderColor,
                     adId: fallbackAd.adId,
-                    html: fallbackAd.html,
                     nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled,
-                    telemetryServeId: currentServeId
+                    telemetryServeId: currentServeId,
+                    onClickHandoffPendingChanged: {
+                        updateFallbackClickHandoff($0, renderedIndex: renderedIndex)
+                    },
+                    onPresentationBlockedChanged: {
+                        updateFallbackPresentationBlocker($0, renderedIndex: renderedIndex)
+                    }
                 )
                 .id(fallbackAdIndex)
                 .transition(.identity)
@@ -344,6 +359,7 @@ public struct MiniGameMenu: View {
         .animation(.easeInOut(duration: 0.2), value: showGameIframe)
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         .task(id: isOpen) { await loadCatalogIfOpen() }
+        .onDisappear { releaseCurrentFallbackVideo() }
     }
 
     /// Task body for the menu-open catalog load (named method — see the task-shape note in
@@ -556,6 +572,12 @@ public struct MiniGameMenu: View {
         adFetched = false
         fallbackAds = []
         fallbackAdIndex = 0
+        resetFallbackAdvanceState()
+        #if os(iOS)
+        fallbackVideoTokens.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
+        fallbackVideoTokens.removeAll()
+        fallbackVideoPlayer = nil
+        #endif
         currentServeId = nil
     }
 
@@ -596,21 +618,106 @@ public struct MiniGameMenu: View {
         if !ads.isEmpty {
             fallbackAds = ads
             fallbackAdIndex = 0
+            resetFallbackAdvanceState()
+            prepareCurrentFallbackVideo()
             adFetched = true
             showAdOverlay = true
         }
         adLoading = false
     }
 
-    private func handleAdIframeClose() {
+    private func handleAdIframeClose(from renderedIndex: Int) {
+        guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
         // Reveal the next fetched ad screen on each close tap; close after the last one.
+        #if os(iOS)
+        FullscreenVideoPreparationPool.shared.release(fallbackVideoTokens.removeValue(forKey: fallbackAdIndex))
+        fallbackVideoPlayer = nil
+        #endif
+        resetFallbackAdvanceState()
         if fallbackAdIndex + 1 < fallbackAds.count {
             fallbackAdIndex += 1
+            prepareCurrentFallbackVideo()
         } else {
             showAdOverlay = false
             fallbackAds = []
             fallbackAdIndex = 0
         }
+    }
+
+    private func handleFallbackCreativeFailure(from renderedIndex: Int) {
+        guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
+        guard fallbackFailureAdvanceState.request(
+            index: renderedIndex,
+            blocked: fallbackClickHandoffPending || fallbackPresentationBlocked
+        ) else { return }
+        handleAdIframeClose(from: renderedIndex)
+    }
+
+    private func updateFallbackClickHandoff(_ pending: Bool, renderedIndex: Int) {
+        guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
+        fallbackClickHandoffPending = pending
+        completeDeferredFallbackFailureIfPossible(renderedIndex: renderedIndex)
+    }
+
+    private func updateFallbackPresentationBlocker(_ blocked: Bool, renderedIndex: Int) {
+        guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
+        fallbackPresentationBlocked = blocked
+        completeDeferredFallbackFailureIfPossible(renderedIndex: renderedIndex)
+    }
+
+    private func completeDeferredFallbackFailureIfPossible(renderedIndex: Int) {
+        guard !fallbackClickHandoffPending, !fallbackPresentationBlocked,
+              let pendingIndex = fallbackFailureAdvanceState.blockersDidClear(
+                  currentIndex: renderedIndex
+              ) else { return }
+        handleAdIframeClose(from: pendingIndex)
+    }
+
+    private func resetFallbackAdvanceState() {
+        fallbackFailureAdvanceState.clear()
+        fallbackClickHandoffPending = false
+        fallbackPresentationBlocked = false
+    }
+
+    private func prepareCurrentFallbackVideo() {
+        #if os(iOS)
+        prepareFallbackVideos(around: fallbackAdIndex)
+        guard fallbackAds.indices.contains(fallbackAdIndex),
+              case .video(let url, let posterURL) = fallbackAds[fallbackAdIndex].creativeContent else {
+            fallbackVideoPlayer = nil
+            return
+        }
+        guard let token = fallbackVideoTokens[fallbackAdIndex] else {
+            fallbackVideoPlayer = nil
+            return
+        }
+        fallbackVideoPlayer = FullscreenVideoPreparationPool.shared.claim(
+            token,
+            url: url,
+            posterURL: posterURL
+        )
+        #endif
+    }
+
+    private func releaseCurrentFallbackVideo() {
+        #if os(iOS)
+        fallbackVideoTokens.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
+        fallbackVideoTokens.removeAll()
+        fallbackVideoPlayer = nil
+        #endif
+    }
+
+    private func prepareFallbackVideos(around index: Int) {
+        #if os(iOS)
+        for candidate in index...(index + 1) where fallbackAds.indices.contains(candidate) {
+            guard fallbackVideoTokens[candidate] == nil,
+                  case .video(let url, let posterURL) = fallbackAds[candidate].creativeContent else { continue }
+            fallbackVideoTokens[candidate] = FullscreenVideoPreparationPool.shared.prepare(
+                url: url,
+                posterURL: posterURL
+            )
+        }
+        #endif
     }
 
     private func loadCatalog() async {

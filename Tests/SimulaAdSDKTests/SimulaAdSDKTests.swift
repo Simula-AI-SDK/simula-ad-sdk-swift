@@ -845,9 +845,13 @@ final class SimulaAdSDKTests: XCTestCase {
         #if os(iOS)
         XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, true)
         XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, true)
+        XCTAssertEqual(obj["video_v1"] as? Bool, true)
+        XCTAssertEqual(DeviceCapabilities.current.dictionary["video_v1"] as? Bool, true)
         #else
         XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, false)
         XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, false)
+        XCTAssertEqual(obj["video_v1"] as? Bool, false)
+        XCTAssertEqual(DeviceCapabilities.current.dictionary["video_v1"] as? Bool, false)
         #endif
     }
 
@@ -984,10 +988,10 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testRewardedInitHappyPath() throws {
-        let json = #"{"impression_id":"imp_1","iframe_url":"https://x/play","prewarm_sk_product":true,"ad_behavior":{"close":{"delay_seconds":30}}}"#
+        let json = #"{"impression_id":"imp_1","rendered_html":"<html/>","prewarm_sk_product":true,"ad_behavior":{"close":{"delay_seconds":30}}}"#
         let r = try decodeRewardedInit(json)
         XCTAssertEqual(r.impressionId, "imp_1")
-        XCTAssertEqual(r.iframeUrl, "https://x/play")
+        XCTAssertEqual(r.htmlCreative, "<html/>")
         // The play-to-earn gate now rides on `ad_behavior.close.delay_seconds` (no top-level field).
         XCTAssertEqual(r.adBehavior?.close.delaySeconds, 30)
         XCTAssertTrue(r.prewarmSKProduct)
@@ -996,7 +1000,7 @@ final class SimulaAdSDKTests: XCTestCase {
     func testRewardedInitMissingFieldsFallBackToDefaults() throws {
         // Tolerant decode: a partial payload must not fail the whole decode. Legacy
         // `serve_id`/`ad_id` keys are unknown now and must be ignored, not remapped.
-        let r = try decodeRewardedInit(#"{"iframe_url":"https://x/p","serve_id":"srv_2","ad_id":"a"}"#)
+        let r = try decodeRewardedInit(#"{"rendered_html":"<html/>","serve_id":"srv_2","ad_id":"a"}"#)
         XCTAssertEqual(r.impressionId, "")   // missing → ""
         XCTAssertNil(r.adBehavior)           // absent `ad_behavior` → nil → no gate, no store prompt
         XCTAssertFalse(r.prewarmSKProduct)
@@ -1011,17 +1015,15 @@ final class SimulaAdSDKTests: XCTestCase {
     func testFallbacksResponseDecodesScreensInOrder() throws {
         let json = """
         {"impression_id":"imp_1","ads":[
-          {"ad_id":"a1","html":"<html>1</html>","iframe_url":"https://i/1"},
-          {"ad_id":"a2","html":"<html>2</html>","iframe_url":"https://i/2"}
+          {"ad_id":"a1","rendered_html":"<html>1</html>"},
+          {"ad_id":"a2","html":"<html>2</html>"}
         ]}
         """
         let r = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data(json))
         XCTAssertEqual(r.impressionId, "imp_1")
         XCTAssertEqual(r.ads.count, 2)
         XCTAssertEqual(r.ads[0].adId, "a1")
-        XCTAssertEqual(r.ads[0].iframeUrl, "https://i/1")
-        // html is the preferred creative source rendered by AdOverlayView.
-        XCTAssertEqual(r.ads[0].html, "<html>1</html>")
+        XCTAssertEqual(r.ads[0].renderedHtml, "<html>1</html>")
         XCTAssertEqual(r.ads[1].adId, "a2")
     }
 
@@ -1035,7 +1037,7 @@ final class SimulaAdSDKTests: XCTestCase {
 
         let partial = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data(#"{"ads":[{"ad_id":"a1"}]}"#))
         XCTAssertEqual(partial.ads[0].adId, "a1")
-        XCTAssertNil(partial.ads[0].iframeUrl)
+        XCTAssertNil(partial.ads[0].renderedHtml)
         XCTAssertNil(partial.ads[0].html)
     }
 

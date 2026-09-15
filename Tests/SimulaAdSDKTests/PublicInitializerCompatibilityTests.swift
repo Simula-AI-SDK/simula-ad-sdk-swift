@@ -1,0 +1,57 @@
+import XCTest
+@testable import SimulaAdSDK
+
+final class PublicInitializerCompatibilityTests: XCTestCase {
+    func testLegacyDeviceCapabilitiesInitializerSymbolsRemainCallable() {
+        let four: (String, Bool, String, Bool) -> DeviceCapabilities =
+            DeviceCapabilities.init(osVersion:storekitAvailable:skanVersion:adAttributionKitAvailable:)
+        let five: (String, Bool, String, Bool, Bool) -> DeviceCapabilities =
+            DeviceCapabilities.init(osVersion:storekitAvailable:skanVersion:adAttributionKitAvailable:nativeClickBeaconV1:)
+        XCTAssertFalse(four("17", true, "4.0", false).videoV1)
+        XCTAssertFalse(five("17", true, "4.0", false, true).videoV1)
+    }
+
+    func testLegacyCreativeInitializerSymbolRemainsCallable() {
+        let initializer: (String, String?, AdUnitType) -> Creative =
+            Creative.init(type:bundleUrl:adUnitType:)
+        let creative = initializer("playable", "https://bundle", .rewarded)
+        XCTAssertNil(creative.url)
+        XCTAssertNil(creative.posterUrl)
+    }
+
+    func testLegacyRewardedRequestInitializerSymbolsRemainCallable() {
+        let basic: (String, String, String?, String?, String?, String?, SimulaAdContext?) -> RewardedInitRequest =
+            RewardedInitRequest.init(adUnitId:sessionId:charId:charName:charImage:charDesc:context:)
+        let metadata: (String, String, String?, String?, String?, String?, SimulaAdContext?, [String: String]?) -> RewardedInitRequest =
+            RewardedInitRequest.init(adUnitId:sessionId:charId:charName:charImage:charDesc:context:metadata:)
+        XCTAssertEqual(basic("u", "s", nil, nil, nil, nil, nil).adUnitId, "u")
+        XCTAssertEqual(metadata("u", "s", nil, nil, nil, nil, nil, ["k": "v"]).metadata, ["k": "v"])
+    }
+
+    func testLegacyAdLoadRequestInitializerSymbolsRemainCallable() {
+        let capabilities = DeviceCapabilities(
+            osVersion: "17",
+            storekitAvailable: true,
+            skanVersion: "4.0",
+            adAttributionKitAvailable: false
+        )
+        let basic: (String, String, String?, String?, String?, String?, SimulaAdContext?, DeviceCapabilities) -> AdLoadRequest =
+            AdLoadRequest.init(adUnitId:sessionId:charId:charName:charImage:charDesc:context:capabilities:)
+        let metadata: (String, String, String?, String?, String?, String?, SimulaAdContext?, [String: String]?, DeviceCapabilities) -> AdLoadRequest =
+            AdLoadRequest.init(adUnitId:sessionId:charId:charName:charImage:charDesc:context:metadata:capabilities:)
+        XCTAssertEqual(basic("u", "s", nil, nil, nil, nil, nil, capabilities).adUnitId, "u")
+        XCTAssertEqual(metadata("u", "s", nil, nil, nil, nil, nil, ["k": "v"], capabilities).metadata, ["k": "v"])
+    }
+
+    func testLegacyRewardedResponseInitializerSymbolRemainsCallable() {
+        let initializer: (
+            String, String, String, String, String?, String?, AdBehavior?, AdAttribution?, Double, Bool
+        ) -> RewardedInitResponse = RewardedInitResponse.init(
+            impressionId:iframeUrl:renderedHtml:destination:trackingUrl:iosStoreUrl:
+            adBehavior:skanAttribution:bidAmt:prewarmSKProduct:
+        )
+        let response = initializer("i", "legacy", "<html/>", "web", nil, nil, nil, nil, 1, false)
+        XCTAssertNil(response.creative)
+        XCTAssertEqual(response.renderedHtml, "<html/>")
+    }
+}

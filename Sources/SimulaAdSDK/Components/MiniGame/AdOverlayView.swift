@@ -92,7 +92,7 @@ struct AdOverlayScreenMountCoordinator {
 
 // MARK: - AdOverlayView
 
-/// Full-screen overlay that displays an ad iframe after a minigame session.
+/// Full-screen overlay that displays one server-rendered HTML or native video fallback.
 /// Translates Kotlin's `AdIframeOverlay` composable from `MiniGameMenu.kt`.
 ///
 /// Features:
@@ -103,17 +103,18 @@ struct AdOverlayScreenMountCoordinator {
 /// - Bottom sheet mode support (uses last game height/border color)
 /// - Status bar hiding when full screen or near full screen
 public struct AdOverlayView: View {
-    let iframeUrl: String
+    let ad: FallbackAd
     let onClose: () -> Void
+    var onCreativeFailure: (() -> Void)? = nil
+    var videoPlayer: FullscreenVideoPlayer? = nil
+    var admission: FullscreenPresentationAdmission? = nil
+    var admissionOwner = FullscreenVisualSurfaceToken()
     /// Height from the last game session (if bottom sheet mode). nil = fullscreen.
     var playableHeightDp: CGFloat?
     /// Border color for bottom sheet drag handle area.
     var playableBorderColor: String = "#262626"
     /// Impression id this overlay reports against (the ad that led here). Empty hides the info button.
     var adId: String = ""
-    /// Inline end-screen html (preferred over `iframeUrl` when present): the `<iframe srcdoc>` blob from
-    /// `/load/fallbacks`, rendered with `iframeUrl` as the base origin for creative resources.
-    var html: String? = nil
     /// Server-owned assignment for this fallback. False means the HTML retains click counting.
     var nativeClickBeaconV1Enabled: Bool = false
     /// Measurement context for this fallback surface. The fallback ad id remains the event identity;
@@ -125,6 +126,8 @@ public struct AdOverlayView: View {
     var onAdClick: ((ClickInteraction) -> Void)? = nil
     /// Mirrors deferred route ownership to imperative fallback presenters for a defensive close guard.
     var onClickHandoffPendingChanged: ((Bool) -> Void)? = nil
+    /// Mirrors external-sheet/background blockers so failure cannot tear down a route's presenter.
+    var onPresentationBlockedChanged: ((Bool) -> Void)? = nil
     /// The primary serve's CTA routing context — with a raw store link, the end screen's CTA opens
     /// the in-app store sheet deterministically (tracker fired in the background) instead of
     /// resolving the tracker's redirect chain. Defaults preserve today's behavior (declarative menu).
@@ -168,6 +171,10 @@ public struct AdOverlayView: View {
     /// Foreground time accrued toward the 5s gate, in ms. The countdown advances only while running,
     /// and resumes from this on return so backgrounded / store-sheet time is never counted.
     @State private var accumulatedMs: Double = 0
+    @State private var videoGate = VideoPlaybackGate(configuredDelay: 5)
+    @State private var videoFailureHandled = false
+    @State private var videoStartRecorded = false
+    @State private var closing = false
     /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
     /// the ad. This overlay lives in a stand-alone `UIWindow` where SwiftUI's `\.scenePhase` doesn't
     /// track the app lifecycle, so foreground state comes from `UIApplication` notifications.
@@ -196,6 +203,14 @@ public struct AdOverlayView: View {
             return (playableHeightDp ?? 0) >= screenHeight * 0.95
         }
         return true
+    }
+
+    private var closeAlignment: Alignment {
+        switch ad.adBehavior.close.position {
+        case .topRight: return .topTrailing
+        case .topLeft: return .topLeading
+        case .bottomLeft: return .bottomLeading
+        }
     }
 
     public var body: some View {
@@ -229,32 +244,12 @@ public struct AdOverlayView: View {
                     ZStack {
                         Color.black
 
-                        // Ad creative: prefer inline HTML, retaining the iframe origin for its resources;
-                        // otherwise load the URL directly. Server ownership separately controls beacons.
-                        // ctaDestination/ctaStoreUrl route its CTA deterministically when known.
-                        if let html, !html.isEmpty {
+                        if ad.mediaType == .playable, let html = ad.renderedHtml {
                             WebViewRepresentable(
                                 htmlString: html,
-                                baseURL: URL(string: iframeUrl),
                                 onNavigationFinished: { markPageFinished() },
-                                onNavigationFailed: { _ in markPageFailed() },
-                                onAdClick: { handleAdClick($0) },
-                                onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
-                                attributionRouteLifecycle: activeRouteLifecycle,
-                                clickSource: .fallbackCTA,
-                                clickBeaconImpressionId: nativeClickBeaconImpressionId,
-                                attribution: attribution,
-                                ctaTrackingUrl: ctaTrackingUrl,
-                                ctaDestination: ctaDestination,
-                                ctaStoreOpen: ctaStoreOpen,
-                                ctaStoreUrl: ctaStoreUrl
-                            )
-                            .allowsHitTesting(!clickHandoffPending)
-                        } else if let url = URL(string: iframeUrl) {
-                            WebViewRepresentable(
-                                url: url,
-                                onNavigationFinished: { markPageFinished() },
-                                onNavigationFailed: { _ in markPageFailed() },
+                                onNavigationFailed: { _ in markPageFailedAndAdvance() },
+                                onWebContentProcessTerminated: { markPageFailedAndAdvance() },
                                 onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
                                 attributionRouteLifecycle: activeRouteLifecycle,
@@ -268,6 +263,23 @@ public struct AdOverlayView: View {
                             )
                             .allowsHitTesting(!clickHandoffPending)
                         }
+
+                        #if os(iOS)
+                        if ad.mediaType == .video, let videoPlayer {
+                            FullscreenVideoSurface(
+                                videoPlayer: videoPlayer,
+                                onTap: { handleVideoClick() },
+                                onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
+                                controlsEnabled: pageFinished
+                            )
+                                .allowsHitTesting(!clickHandoffPending)
+                                .onReceive(videoPlayer.$status) { handleVideoStatus($0, player: videoPlayer) }
+                                .onReceive(videoPlayer.$playedSeconds) { updateVideoGate(player: videoPlayer, played: $0) }
+                                .onReceive(videoPlayer.$duration) { _ in
+                                    updateVideoGate(player: videoPlayer, played: videoPlayer.playedSeconds)
+                                }
+                        }
+                        #endif
 
                         if !adPageReady {
                             ZStack {
@@ -279,59 +291,9 @@ public struct AdOverlayView: View {
                             }
                         }
 
-                        // Close button / countdown ring — top right
-                        VStack {
-                            HStack {
-                                Spacer()
-                                if adCountdown <= 0 {
-                                    // Compact close button, matching the interstitial/rewarded default
-                                    // (a ~16pt dark-translucent circle with a white X). Visible glyph
-                                    // stays small; the hit area is a full 44pt touch target.
-                                    Button(action: requestClose) {
-                                        Image(systemName: "xmark")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundColor(.white)
-                                            .frame(width: 16, height: 16)
-                                            .background(
-                                                Circle()
-                                                    .fill(Color.black.opacity(0.5))
-                                            )
-                                            .frame(width: 44, height: 44)
-                                            .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(CloseButtonStyle())
-                                    .disabled(clickHandoffPending)
-                                    .padding(.top, 8)
-                                    .padding(.trailing, 8)
-                                    .accessibilityLabel("Close ad")
-                                } else {
-                                    // Countdown ring, sized to the same compact footprint (16pt circle
-                                    // centered in the same 44pt frame so nothing jumps when it unlocks).
-                                    ZStack {
-                                        Circle()
-                                            .fill(Color.black.opacity(0.4))
-                                            .frame(width: 16, height: 16)
-
-                                        Circle()
-                                            .trim(from: 0, to: ringProgress)
-                                            .stroke(
-                                                Color.white,
-                                                style: StrokeStyle(lineWidth: 2, lineCap: .round)
-                                            )
-                                            .frame(width: 12, height: 12)
-                                            .rotationEffect(.degrees(-90))
-
-                                        Text("\(adCountdown)")
-                                            .font(.system(size: 9, weight: .bold))
-                                            .foregroundColor(.white)
-                                    }
-                                    .frame(width: 44, height: 44)
-                                    .padding(.top, 8)
-                                    .padding(.trailing, 8)
-                                }
-                            }
-                            Spacer()
-                        }
+                        fallbackCloseControl
+                            .padding(8)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: closeAlignment)
                     }
                     .frame(maxWidth: .infinity)
                     // Full-screen ads inset the creative + close button below the top safe area
@@ -365,6 +327,7 @@ public struct AdOverlayView: View {
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
+            admission?.setBlocked(!appForegrounded || storeSheetPresented)
             if screenMountCoordinator.scheduleIfNeeded() {
                 // Let the outer lifecycle modifier finish installing its notification subscriptions
                 // before an automatic store sheet can synchronously publish will-present.
@@ -384,7 +347,7 @@ public struct AdOverlayView: View {
             }
             if !hasLoadableCreative {
                 startCurrentCreativeLoadIfNeeded()
-                markPageFailed()
+                markPageFailedAndAdvance()
             } else {
                 startCurrentCreativeLoadIfNeeded()
                 beginPresentationIfReady()
@@ -400,6 +363,10 @@ public struct AdOverlayView: View {
             countdownTask?.cancel()
             countdownTask = nil
             updateClickHandoffPending(false)
+            admission?.visualBecameUnavailable(owner: admissionOwner)
+            #if os(iOS)
+            videoPlayer?.setPresentationBlocked(true)
+            #endif
         }
         .onChange(of: creativeIdentity) { _ in
             startCurrentCreativeLoadIfNeeded()
@@ -407,10 +374,30 @@ public struct AdOverlayView: View {
         // Pause the countdown while the app is backgrounded OR an in-app store/Safari sheet covers the
         // ad; resume only when both clear, so it can't elapse off-screen. (iOS-only; no-op elsewhere.)
         .modifier(AdCountdownLifecycle(
-            onBackground: { appForegrounded = false; reconcileCountdown() },
-            onForeground: { appForegrounded = true; reconcileCountdown() },
-            onSheetPresent: { storeSheetPresented = true; reconcileCountdown() },
-            onSheetDismiss: { storeSheetPresented = false; reconcileCountdown() }
+            onBackground: {
+                appForegrounded = false
+                admission?.setBlocked(true)
+                onPresentationBlockedChanged?(true)
+                reconcileCountdown()
+            },
+            onForeground: {
+                appForegrounded = true
+                admission?.setBlocked(storeSheetPresented)
+                onPresentationBlockedChanged?(storeSheetPresented)
+                reconcileCountdown()
+            },
+            onSheetPresent: {
+                storeSheetPresented = true
+                admission?.setBlocked(true)
+                onPresentationBlockedChanged?(true)
+                reconcileCountdown()
+            },
+            onSheetDismiss: {
+                storeSheetPresented = false
+                admission?.setBlocked(!appForegrounded)
+                onPresentationBlockedChanged?(!appForegrounded)
+                reconcileCountdown()
+            }
         ))
     }
 
@@ -427,6 +414,8 @@ public struct AdOverlayView: View {
     private var activeRouteLifecycle: AttributionRouteLifecycle {
         routeLifecycle ?? localRouteLifecycle
     }
+
+    private var videoTelemetryAdFormat: String { "\(telemetryAdFormat)_fallback" }
 
     private func handleAdClick(_ interaction: ClickInteraction) {
         accountFallbackClick(
@@ -469,23 +458,64 @@ public struct AdOverlayView: View {
     }
 
     private func requestClose() {
+        guard ad.mediaType != .video || pageFinished else { return }
+        guard appForegrounded, !storeSheetPresented else { return }
         guard canDismissFullscreen(
             dismissUnlocked: adCountdown <= 0,
             clickHandoffPending: clickHandoffPending
         ) else { return }
+        closing = true
+        admission?.visualBecameUnavailable(owner: admissionOwner)
         onClose()
     }
 
+    @ViewBuilder
+    private var fallbackCloseControl: some View {
+        if adCountdown <= 0 {
+            Button(action: requestClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 16, height: 16)
+                    .background(Circle().fill(Color.black.opacity(0.5)))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(CloseButtonStyle())
+            .disabled(clickHandoffPending)
+            .accessibilityLabel("Close ad")
+        } else if ad.adBehavior.close.treatment == .countdownCircle {
+            ZStack {
+                Circle()
+                    .fill(Color.black.opacity(0.4))
+                    .frame(width: 16, height: 16)
+                Circle()
+                    .trim(from: 0, to: ringProgress)
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .frame(width: 12, height: 12)
+                    .rotationEffect(.degrees(-90))
+                Text("\(adCountdown)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 44, height: 44)
+        }
+    }
+
     private var hasLoadableCreative: Bool {
-        if let html, !html.isEmpty { return true }
-        return URL(string: iframeUrl) != nil
+        guard ad.creativeContent != nil else { return false }
+        #if os(iOS)
+        return ad.mediaType != .video || videoPlayer != nil
+        #else
+        return ad.mediaType != .video
+        #endif
     }
 
     private var creativeIdentity: String {
-        if let html, !html.isEmpty {
-            return "html:\(iframeUrl):\(html.hashValue)"
+        if ad.mediaType == .video {
+            return "video:\(ad.url?.hashValue ?? 0)"
         }
-        return "url:\(iframeUrl)"
+        return "html:\(ad.renderedHtml?.hashValue ?? 0)"
     }
 
     /// Starts one watchdog for the current creative. Ten seconds is deliberately longer than the
@@ -507,11 +537,14 @@ public struct AdOverlayView: View {
         adPageFailed = false
         pageFinished = false
         loadTimedOut = false
-        adCountdown = 5
+        let closeDelay = ad.adBehavior.close.delaySeconds
+        adCountdown = ad.mediaType == .video ? max(1, closeDelay) : closeDelay
         ringProgress = 0
         accumulatedMs = 0
+        videoGate = VideoPlaybackGate(configuredDelay: TimeInterval(closeDelay))
 
         let generation = loadCoordinator.beginLoad()
+        if ad.mediaType == .video { return }
         loadWatchdogTask = Task { await runLoadWatchdog(generation: generation) }
     }
 
@@ -523,21 +556,18 @@ public struct AdOverlayView: View {
         if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
         loadWatchdogTask = nil
         loadTimedOut = true
-        adPageReady = true
-        adPageFailed = false
-        countdownTask?.cancel()
-        countdownTask = nil
-        adCountdown = 0
-        ringProgress = 1
+        markPageFailedAndAdvance()
     }
 
     private func markPageFinished() {
+        guard hasAppeared, !closing else { return }
         startCurrentCreativeLoadIfNeeded()
         guard !adPageFailed, loadCoordinator.finishCurrentLoad() else { return }
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
         adPageReady = true
         pageFinished = true
+        admission?.visualBecameReady(owner: admissionOwner)
         beginPresentationIfReady()
     }
 
@@ -559,6 +589,14 @@ public struct AdOverlayView: View {
         applyTerminalPageFailure()
     }
 
+    private func markPageFailedAndAdvance() {
+        guard hasAppeared, !videoFailureHandled else { return }
+        videoFailureHandled = true
+        markPageFailed()
+        admission?.visualBecameUnavailable(owner: admissionOwner)
+        onCreativeFailure?()
+    }
+
     private func applyTerminalPageFailure() {
         adPageReady = false
         adPageFailed = true
@@ -570,6 +608,12 @@ public struct AdOverlayView: View {
 
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
     private func reconcileCountdown() {
+        #if os(iOS)
+        if let videoPlayer, ad.mediaType == .video {
+            videoPlayer.setPresentationBlocked(!appForegrounded || storeSheetPresented)
+            return
+        }
+        #endif
         if hasAppeared && pageFinished && !adPageFailed && !loadTimedOut
             && appForegrounded && !storeSheetPresented {
             startCountdown()
@@ -582,7 +626,12 @@ public struct AdOverlayView: View {
     private func startCountdown() {
         // Start exactly once; a re-`onAppear`, resume, or a SwiftUI double-fire must not restart it.
         guard countdownTask == nil else { return }
-        let totalMs: Double = 5_000
+        let totalMs = Double(ad.adBehavior.close.delaySeconds) * 1_000
+        guard totalMs > 0 else {
+            adCountdown = 0
+            ringProgress = 1
+            return
+        }
         guard accumulatedMs < totalMs else {
             adCountdown = 0
             ringProgress = 1
@@ -615,6 +664,117 @@ public struct AdOverlayView: View {
         adCountdown = 0
         ringProgress = 1
     }
+
+    #if os(iOS)
+    private func handleVideoStatus(_ status: FullscreenVideoStatus, player: FullscreenVideoPlayer) {
+        switch status {
+        case .ready, .paused:
+            updateVideoGate(player: player, played: player.playedSeconds)
+        case .playing:
+            updateVideoGate(player: player, played: player.playedSeconds)
+        case .ended:
+            guard pageFinished else {
+                handleVideoStatus(.failed(.playbackFailed), player: player)
+                return
+            }
+            updateVideoGate(player: player, played: player.playedSeconds, ended: true)
+            Telemetry.shared.recordLifecycle(
+                stage: FullscreenVideoTelemetryStage.complete, adFormat: videoTelemetryAdFormat,
+                adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
+                serveId: telemetryServeId
+            )
+        case .failed(let reason):
+            guard !videoFailureHandled else { return }
+            videoFailureHandled = true
+            _ = loadCoordinator.failCurrentLoad()
+            admission?.visualBecameUnavailable(owner: admissionOwner)
+            applyTerminalPageFailure()
+            Telemetry.shared.recordLifecycle(
+                stage: FullscreenVideoTelemetryStage.fail, adFormat: videoTelemetryAdFormat,
+                adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
+                serveId: telemetryServeId, errorCode: reason.rawValue
+            )
+            Telemetry.shared.recordError(
+                signature: "video:playback_failed",
+                errorCode: reason.rawValue,
+                breadcrumb: "surface=\(videoTelemetryAdFormat)"
+            )
+            onCreativeFailure?()
+        case .preparing:
+            break
+        }
+    }
+
+    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
+        guard hasAppeared, !closing, !videoFailureHandled, !pageFinished else { return }
+        _ = loadCoordinator.finishCurrentLoad()
+        adPageReady = true
+        pageFinished = true
+        admission?.visualBecameReady(owner: admissionOwner)
+        if !videoStartRecorded {
+            videoStartRecorded = true
+            Telemetry.shared.recordLifecycle(
+                stage: FullscreenVideoTelemetryStage.start, adFormat: videoTelemetryAdFormat,
+                adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
+                serveId: telemetryServeId
+            )
+        }
+        updateVideoGate(player: player, played: player.playedSeconds)
+        beginPresentationIfReady()
+    }
+
+    private func updateVideoGate(
+        player: FullscreenVideoPlayer,
+        played: TimeInterval,
+        ended: Bool = false
+    ) {
+        guard pageFinished else { return }
+        videoGate.update(duration: player.duration, played: played, ended: ended)
+        ringProgress = CGFloat(videoGate.progress)
+        adCountdown = videoGate.secondsRemaining
+    }
+
+    private func handleVideoClick() {
+        guard pageFinished, !clickHandoffPending, activeRouteLifecycle.isActive else { return }
+        guard let automaticUserHandoff = activeRouteLifecycle.automaticRoutes.beginUserHandoff(
+            scope: activeRouteLifecycle.automaticRouteScope
+        ) else { return }
+        let interaction = ClickInteraction(source: .fallbackCTA)
+        updateClickHandoffPending(true)
+        handleAdClick(interaction)
+        ClickHandoffPersistence.wait(
+            interaction: interaction,
+            beaconImpressionId: nativeClickBeaconImpressionId
+        ) {
+            DispatchQueue.main.async {
+                let execution = AttributionRouteExecution(
+                    originatingScene: nil,
+                    isActive: { activeRouteLifecycle.isActive && hasAppeared },
+                    allowsDetachedDeterministicAttribution: true,
+                    survivesPresentationTeardownAfterBegin: true,
+                    onUIHandoffReleased: { updateClickHandoffPending(false) },
+                    onOutcome: { _ in }
+                )
+                routeCommittedUserHandoff(
+                    coordinator: activeRouteLifecycle.automaticRoutes,
+                    handoff: automaticUserHandoff,
+                    scope: activeRouteLifecycle.automaticRouteScope,
+                    execution: execution
+                ) { execution in
+                    CreativeCTARouter.open(
+                        trackingUrl: ctaTrackingUrl,
+                        destination: ctaDestination,
+                        storeOpen: ctaStoreOpen,
+                        storeUrl: ctaStoreUrl,
+                        attribution: attribution,
+                        storeProductOwnership: activeRouteLifecycle.storeProductOwnership,
+                        execution: execution
+                    )
+                }
+            }
+        }
+    }
+    #endif
 }
 
 func fallbackNativeClickBeaconImpressionId(
