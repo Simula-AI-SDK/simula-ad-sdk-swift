@@ -520,22 +520,51 @@ public enum AdUnitType: Sendable, Equatable {
     }
 }
 
-/// The creative descriptor (`creative` node). `adUnitType` drives format-aware close copy; the
-/// playable `bundleUrl`/`type` carry render metadata. Decoding is tolerant.
+/// Tolerant creative discriminator shared by primary and fallback renderers. Unknown or missing
+/// values remain playable so old HTML payloads keep rendering.
+enum CreativeMediaType: String, Sendable, Equatable {
+    case playable
+    case video
+
+    static func from(_ raw: String?) -> CreativeMediaType {
+        normalizeBehaviorToken(raw) == "video" ? .video : .playable
+    }
+}
+
+/// The creative descriptor (`creative` node). `adUnitType` drives format-aware close copy;
+/// `url`/`posterUrl` describe a native video when `type == "video"`. Decoding is tolerant.
 public struct Creative: Sendable, Equatable, Decodable {
     public let type: String
     public let bundleUrl: String?
+    public let url: String?
+    public let posterUrl: String?
     public let adUnitType: AdUnitType
 
     public init(type: String = "", bundleUrl: String? = nil, adUnitType: AdUnitType = .interstitial) {
+        self.init(type: type, bundleUrl: bundleUrl, url: nil, posterUrl: nil, adUnitType: adUnitType)
+    }
+
+    public init(
+        type: String = "",
+        bundleUrl: String? = nil,
+        url: String?,
+        posterUrl: String?,
+        adUnitType: AdUnitType = .interstitial
+    ) {
         self.type = type
         self.bundleUrl = bundleUrl
+        self.url = url
+        self.posterUrl = posterUrl
         self.adUnitType = adUnitType
     }
+
+    var mediaType: CreativeMediaType { .from(type) }
 
     enum CodingKeys: String, CodingKey {
         case type
         case bundleUrl = "bundle_url"
+        case url
+        case posterUrl = "poster_url"
         case adUnitType = "ad_unit_type"
     }
 
@@ -543,6 +572,8 @@ public struct Creative: Sendable, Equatable, Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.type = (try? c.decode(String.self, forKey: .type)) ?? ""
         self.bundleUrl = try? c.decode(String.self, forKey: .bundleUrl)
+        self.url = try? c.decode(String.self, forKey: .url)
+        self.posterUrl = try? c.decode(String.self, forKey: .posterUrl)
         self.adUnitType = .from(try? c.decode(String.self, forKey: .adUnitType))
     }
 }
@@ -1161,9 +1192,8 @@ public struct NativeAdRequest: Encodable, Sendable {
 }
 
 /// Response for `POST /load/native` (backend `CaiNativeResponse`). Tolerant decode (missing keys →
-/// safe defaults). A flat envelope mirroring the imperative ``AdLoadResponse``: the creative
-/// (`iframe_url` + `rendered_html`) and the click-through params (`destination`, `tracking_url`) sit
-/// at the top level — the creative was previously nested under a camelCase `adResponse`.
+/// safe defaults). Native playable creatives require server-rendered `rendered_html`; legacy
+/// `iframe_url` remains decoded for source compatibility but is never considered renderable.
 public struct NativeAdResponse: Decodable, Sendable {
     public let impressionId: String?
     public let adInserted: Bool
@@ -1180,7 +1210,7 @@ public struct NativeAdResponse: Decodable, Sendable {
     /// responses. Drives the deterministic CTA route for the native card (see `openNativeCTA`);
     /// nil when the campaign has no raw store link.
     public let iosStoreUrl: String?
-    /// Raw mountable-creative fields; use ``iframeURL`` / ``renderedHTML`` for the trimmed accessors.
+    /// Legacy wire field retained for source compatibility. Rendering never uses it.
     public let iframeUrl: String?
     public let renderedHtml: String?
     /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
@@ -1249,18 +1279,18 @@ public struct NativeAdResponse: Decodable, Sendable {
         self.skanAttribution = skanAttribution
     }
 
-    /// The creative URL to mount; the fallback when no inline html is present. nil on a no-fill.
+    /// Legacy accessor retained for source compatibility. It is not a render source.
     public var iframeURL: String? {
         iframeUrl?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
-    /// The `<iframe srcdoc=…>` wrapper to mount inline — preferred over `iframeURL` when present; nil otherwise.
+    /// The server-rendered HTML document to mount inline.
     public var renderedHTML: String? {
         renderedHtml?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
-    /// True when there's a mountable creative to render.
-    public var hasCreative: Bool { adInserted && (iframeURL != nil || renderedHTML != nil) }
+    /// True when server-rendered HTML is available. `iframe_url` alone is intentionally no-fill.
+    public var hasCreative: Bool { adInserted && renderedHTML != nil }
 }
 
 /// Estimated per-impression revenue for a served ad, in a standard `AdValue` shape so it's a drop-in for

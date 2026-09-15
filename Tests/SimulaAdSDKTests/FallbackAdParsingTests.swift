@@ -22,7 +22,7 @@ final class FallbackAdParsingTests: XCTestCase {
     }
 
     func testTrueResponseOwnershipAppliesToEveryAd() throws {
-        let ads = try decode(#"{"native_click_beacon_v1_enabled":true,"ads":[{"ad_id":"a","html":"a"},{"ad_id":"b","iframe_url":"https://example.com"}]}"#)
+        let ads = try decode(#"{"native_click_beacon_v1_enabled":true,"ads":[{"ad_id":"a","html":"a"},{"ad_id":"b","rendered_html":"b"}]}"#)
         XCTAssertEqual(ads.map(\.nativeClickBeaconV1Enabled), [true, true])
     }
 
@@ -34,5 +34,15 @@ final class FallbackAdParsingTests: XCTestCase {
     func testTrueItemOverrideWinsOverFalseResponseOwnership() throws {
         let ads = try decode(#"{"native_click_beacon_v1_enabled":false,"ads":[{"ad_id":"a","html":"a","native_click_beacon_v1_enabled":true}]}"#)
         XCTAssertEqual(ads.map(\.nativeClickBeaconV1Enabled), [true])
+    }
+
+    func testIframeOnlyFallbackIsDropped() throws {
+        let ads = try decode(#"{"ads":[{"ad_id":"a","iframe_url":"https://example.com"}]}"#)
+        XCTAssertTrue(ads.isEmpty)
+    }
+
+    func testRenderedHtmlWinsOverLegacyHtml() throws {
+        let ads = try decode(#"{"ads":[{"ad_id":"a","rendered_html":"new","html":"old"}]}"#)
+        XCTAssertEqual(ads.first?.renderedHtml, "new")
     }
 }

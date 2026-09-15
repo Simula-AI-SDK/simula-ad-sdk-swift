@@ -415,12 +415,12 @@ final class AttributionRouteExecution {
     func complete(_ route: () -> Bool) {
         guard case .running(let path) = state else { return }
         state = .finished
-        releaseUIHandoff()
         let presentationActive = presentationIsActive()
         let canCompleteCommittedRoute = !presentationActive
             && survivesPresentationTeardownAfterBegin
             && canCompleteAfterPresentationTeardown()
         guard presentationActive || canCompleteCommittedRoute else {
+            releaseUIHandoff()
             onOutcome(AttributionRouteOutcome(
                 path: path,
                 success: false,
@@ -429,6 +429,10 @@ final class AttributionRouteExecution {
             return
         }
         let success = route()
+        // StoreKit/Safari routes synchronously publish their will-present blocker from `route`.
+        // Release only afterwards so a pending creative failure cannot tear down its source window
+        // in the gap between persistence completion and sheet registration.
+        releaseUIHandoff()
         onOutcome(AttributionRouteOutcome(
             path: path,
             success: success,

@@ -1712,6 +1712,7 @@ struct WebViewRepresentable: NSViewRepresentable {
     var onNavigationCommitted: (() -> Void)?
     var onNavigationFinished: (() -> Void)?
     var onNavigationFailed: ((Error) -> Void)?
+    var onWebContentProcessTerminated: (() -> Void)?
     var onMessageReceived: ((String) -> Void)?
     /// Accepted for signature parity with the iOS variant (the imperative HTML
     /// creative is iOS-only, so these are unused on macOS).
@@ -1734,6 +1735,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
+        onWebContentProcessTerminated: (() -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
@@ -1753,6 +1755,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         self.onNavigationCommitted = onNavigationCommitted
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
+        self.onWebContentProcessTerminated = onWebContentProcessTerminated
         self.onMessageReceived = onMessageReceived
         self.onAdClick = onAdClick
         self.onClickHandoffPendingChanged = onClickHandoffPendingChanged
@@ -1774,6 +1777,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         onNavigationCommitted: (() -> Void)? = nil,
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: ((Error) -> Void)? = nil,
+        onWebContentProcessTerminated: (() -> Void)? = nil,
         onMessageReceived: ((String) -> Void)? = nil,
         onAdClick: (() -> Void)?,
         onClickHandoffPendingChanged: ((Bool) -> Void)? = nil,
@@ -1792,6 +1796,7 @@ struct WebViewRepresentable: NSViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onWebContentProcessTerminated: onWebContentProcessTerminated,
             onMessageReceived: onMessageReceived,
             onAdClick: onAdClick.map { callback in { _ in callback() } },
             onClickHandoffPendingChanged: onClickHandoffPendingChanged,
@@ -1854,6 +1859,7 @@ struct WebViewRepresentable: NSViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onWebContentProcessTerminated: onWebContentProcessTerminated,
             onMessageReceived: onMessageReceived
         )
     }
@@ -1862,6 +1868,7 @@ struct WebViewRepresentable: NSViewRepresentable {
         var onNavigationCommitted: (() -> Void)?
         var onNavigationFinished: (() -> Void)?
         var onNavigationFailed: ((Error) -> Void)?
+        var onWebContentProcessTerminated: (() -> Void)?
         var onMessageReceived: ((String) -> Void)?
         var currentURL: URL?
         var currentHTML: String?
@@ -1873,11 +1880,13 @@ struct WebViewRepresentable: NSViewRepresentable {
             onNavigationCommitted: (() -> Void)?,
             onNavigationFinished: (() -> Void)?,
             onNavigationFailed: ((Error) -> Void)?,
+            onWebContentProcessTerminated: (() -> Void)?,
             onMessageReceived: ((String) -> Void)?
         ) {
             self.onNavigationCommitted = onNavigationCommitted
             self.onNavigationFinished = onNavigationFinished
             self.onNavigationFailed = onNavigationFailed
+            self.onWebContentProcessTerminated = onWebContentProcessTerminated
             self.onMessageReceived = onMessageReceived
         }
 
@@ -1914,6 +1923,11 @@ struct WebViewRepresentable: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             onNavigationFailed?(error)
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            onWebContentProcessTerminated?()
+            onNavigationFailed?(NSError(domain: "SimulaWebView", code: NSURLErrorCannotDecodeContentData))
         }
 
         func webView(
