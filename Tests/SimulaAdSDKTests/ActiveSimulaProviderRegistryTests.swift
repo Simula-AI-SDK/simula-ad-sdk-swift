@@ -27,28 +27,23 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
         )
     }
 
-    func testLatestSameKeyProviderWithConflictingCoreConfigIsRejected() {
+    func testDeclarativeProviderIsAdoptedWhenOnlyLaterDevModeDiffers() {
         let registry = ActiveSimulaProviderRegistry()
         let ownership = ProcessApiKeyOwnership()
         let requested = coreConfiguration()
-        _ = makeProvider(configuration: requested, ownership: ownership, registry: registry)
-        let conflicting = SimulaProviderCoreConfiguration(
+        let declarative = makeProvider(configuration: requested, ownership: ownership, registry: registry)
+        let imperative = SimulaProviderCoreConfiguration(
             apiKey: requested.apiKey,
             devMode: true,
             primaryUserID: requested.primaryUserID,
             hasPrivacyConsent: requested.hasPrivacyConsent,
             telemetryEnabled: requested.telemetryEnabled
         )
-        let latest = makeProvider(
-            configuration: conflicting,
-            ownership: ownership,
-            registry: registry
-        )
-        withExtendedLifetime(latest) {
-            guard case .conflict = registry.resolve(requested) else {
-                return XCTFail("latest conflicting provider must block split initialization")
-            }
+
+        guard case .adopt(let adopted) = registry.resolve(imperative) else {
+            return XCTFail("the active provider must own the process devMode")
         }
+        XCTAssertTrue(adopted === declarative)
     }
 
     func testNestedProviderDeinitRestoresPreviousActiveProvider() {
@@ -95,6 +90,37 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
         }
 
         XCTAssertTrue(selected === adopted)
+        XCTAssertFalse(created)
+    }
+
+    func testProviderViewReusesSharedProviderWhenOnlyDevModeDiffers() {
+        let registry = ActiveSimulaProviderRegistry()
+        let ownership = ProcessApiKeyOwnership()
+        let activeConfiguration = coreConfiguration()
+        let shared = makeProvider(
+            configuration: activeConfiguration,
+            ownership: ownership,
+            registry: registry
+        )
+        let viewConfiguration = SimulaProviderCoreConfiguration(
+            apiKey: activeConfiguration.apiKey,
+            devMode: !activeConfiguration.devMode,
+            primaryUserID: activeConfiguration.primaryUserID,
+            hasPrivacyConsent: activeConfiguration.hasPrivacyConsent,
+            telemetryEnabled: activeConfiguration.telemetryEnabled
+        )
+        var created = false
+
+        let selected = selectSimulaProvider(shared: shared, configuration: viewConfiguration) {
+            created = true
+            return self.makeProvider(
+                configuration: viewConfiguration,
+                ownership: ownership,
+                registry: registry
+            )
+        }
+
+        XCTAssertTrue(selected === shared)
         XCTAssertFalse(created)
     }
 

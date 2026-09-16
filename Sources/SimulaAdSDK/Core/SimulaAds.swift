@@ -107,18 +107,11 @@ public enum SimulaAds {
             return false
         }
 
-        // Freeze the backend before any API singleton or durable store can be touched. A later
-        // conflicting entry is rejected so one process never mixes production and staging state.
-        guard processAPIEnvironmentSelection.claim(devMode: devMode).isCompatible else {
-            return false
-        }
-
-        guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
-            return false
-        }
-
         // First valid initialization wins so already-created ads keep their session.
-        guard shared == nil else {
+        if shared != nil {
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             Telemetry.shared.recordDuplicateInitialize()
             return false
         }
@@ -131,18 +124,28 @@ public enum SimulaAds {
             telemetryEnabled: telemetryEnabled
         )
 
-        // Keep this call cheap: it runs on the main thread, typically during app launch. The
-        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up) is deferred to `provider.start()`.
+        // Keep this call cheap: it runs on the main thread, typically during app launch. A live
+        // declarative provider owns the process configuration, including devMode/backend selection,
+        // so an imperative entry with only a different devMode adopts it rather than going inert.
+        // With no provider, freeze the requested backend before touching API/durable infrastructure.
         let provider: SimulaProvider
         switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
         case .adopt(let active):
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = active
             provider.updateConsent(resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy))
             if let adContext { provider.updateContext(adContext) }
         case .conflict:
             return false
         case .none:
+            guard processAPIEnvironmentSelection.claim(devMode: devMode).isCompatible else {
+                return false
+            }
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = SimulaProvider(
                 apiKey: apiKey,
                 devMode: devMode,

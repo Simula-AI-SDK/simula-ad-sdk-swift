@@ -347,7 +347,13 @@ public final class SimulaProvider: ObservableObject {
     }
 
     func matchesCoreConfiguration(_ configuration: SimulaProviderCoreConfiguration) -> Bool {
-        coreConfiguration == configuration
+        // devMode is process-owned and first-wins because dev artifacts also use it to select the
+        // backend. A mixed imperative/declarative integration must reuse the active provider rather
+        // than constructing an inert provider merely because the later entry used the default.
+        apiKey == configuration.apiKey
+            && matchingPrimaryUserID == configuration.primaryUserID
+            && hasPrivacyConsent == configuration.hasPrivacyConsent
+            && telemetryEnabled == configuration.telemetryEnabled
     }
 
     // MARK: - Deferred startup

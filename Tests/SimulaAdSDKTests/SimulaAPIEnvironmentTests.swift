@@ -57,7 +57,10 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
     }
 
     func testDirectCreateSessionClaimsStagingBeforeConstructingURL() async throws {
-        #if SIMULA_DEV_ARTIFACT
+        try XCTSkipIf(
+            !SimulaArtifactEnvironmentPolicy.current.allowsStaging,
+            "stable artifacts intentionally compile without the staging endpoint"
+        )
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(allowsStaging: true)
         )
@@ -76,7 +79,6 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
             SessionEnvironmentURLProtocol.requests.first?.url?.host,
             "simula-api-staging-701226639755.us-central1.run.app"
         )
-        #endif
     }
 
     func testDirectCreateSessionConflictPerformsNoRequest() async throws {
