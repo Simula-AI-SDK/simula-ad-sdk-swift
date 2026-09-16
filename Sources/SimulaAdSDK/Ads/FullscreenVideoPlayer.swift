@@ -53,18 +53,34 @@ struct VideoPlaybackGate: Equatable, Sendable {
 }
 
 struct VideoVisiblePlaybackClock: Equatable, Sendable {
+    private var firstFrameAdmitted = false
     private(set) var firstFrameMediaTime: TimeInterval?
+    private var lastMediaTime: TimeInterval?
     private(set) var playedSeconds: TimeInterval = 0
 
     mutating func admitFirstFrame(mediaTime: TimeInterval) {
-        guard firstFrameMediaTime == nil, mediaTime.isFinite else { return }
-        firstFrameMediaTime = max(0, mediaTime)
+        guard !firstFrameAdmitted else { return }
+        firstFrameAdmitted = true
+        guard mediaTime.isFinite else { return }
+        let baseline = max(0, mediaTime)
+        firstFrameMediaTime = baseline
+        lastMediaTime = baseline
         playedSeconds = 0
     }
 
     mutating func update(mediaTime: TimeInterval) -> TimeInterval {
-        guard let firstFrameMediaTime, mediaTime.isFinite else { return playedSeconds }
-        playedSeconds = max(playedSeconds, max(0, mediaTime - firstFrameMediaTime))
+        guard firstFrameAdmitted, mediaTime.isFinite else { return playedSeconds }
+        let sample = max(0, mediaTime)
+        guard let lastMediaTime else {
+            firstFrameMediaTime = sample
+            self.lastMediaTime = sample
+            return playedSeconds
+        }
+        if sample >= lastMediaTime {
+            let total = playedSeconds + (sample - lastMediaTime)
+            playedSeconds = total.isFinite ? total : .greatestFiniteMagnitude
+        }
+        self.lastMediaTime = sample
         return playedSeconds
     }
 }
@@ -817,14 +833,30 @@ final class FullscreenVideoPreparationPool {
     }
 
     private var entries: [FullscreenVideoPreparationToken: Entry] = [:]
-    private let retentionPolicy = VideoPreparationRetentionPolicy(
-        capacity: maxPreparedPlayers,
-        retention: preparedRetention
-    )
+    private let capacity: Int
+    private let retention: TimeInterval
+    private let retentionPolicy: VideoPreparationRetentionPolicy
 
-    func prepare(url: URL, posterURL: URL?) -> FullscreenVideoPreparationToken {
+    convenience init() {
+        self.init(capacity: Self.maxPreparedPlayers, retention: Self.preparedRetention)
+    }
+
+    convenience init(capacity: Int) {
+        self.init(capacity: capacity, retention: Self.preparedRetention)
+    }
+
+    init(capacity: Int, retention: TimeInterval) {
+        self.capacity = max(0, capacity)
+        self.retention = max(0, retention)
+        self.retentionPolicy = VideoPreparationRetentionPolicy(
+            capacity: max(0, capacity),
+            retention: max(0, retention)
+        )
+    }
+
+    func prepare(url: URL, posterURL: URL?) -> FullscreenVideoPreparationToken? {
+        guard makeRoomForPlayer() else { return nil }
         let token = FullscreenVideoPreparationToken()
-        guard makeRoomForPlayer() else { return token }
         let player = FullscreenVideoPlayer(url: url, posterURL: posterURL)
         entries[token] = Entry(
             url: url,
@@ -887,7 +919,7 @@ final class FullscreenVideoPreparationPool {
 
     private func makeRoomForPlayer() -> Bool {
         purgeExpired()
-        while entries.count >= Self.maxPreparedPlayers {
+        while entries.count >= capacity {
             let policyEntries = entries.map {
                 VideoPreparationRetentionPolicy.Entry(
                     id: $0.key.id,
@@ -922,12 +954,12 @@ final class FullscreenVideoPreparationPool {
         let work = DispatchWorkItem { [weak self] in self?.expire(token) }
         entry.expiry = work
         entries[token] = entry
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.preparedRetention, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + retention, execute: work)
     }
 
     private func expire(_ token: FullscreenVideoPreparationToken) {
         guard let entry = entries[token], !entry.active,
-              ProcessInfo.processInfo.systemUptime - entry.lastTouched >= Self.preparedRetention else { return }
+              ProcessInfo.processInfo.systemUptime - entry.lastTouched >= retention else { return }
         release(token)
     }
 }
@@ -996,6 +1028,31 @@ final class FullscreenVideoPreparationOwnership {
             FullscreenVideoPreparationPool.shared.release(token)
         }
     }
+}
+
+enum FullscreenVideoPreparationReservation {
+    case notRequired
+    case reserved(FullscreenVideoPreparationOwnership)
+    case unavailable
+}
+
+@MainActor
+func reserveFullscreenVideoPreparation(
+    for creative: FullscreenCreativeContent
+) -> FullscreenVideoPreparationReservation {
+    reserveFullscreenVideoPreparation(for: creative) { url, posterURL in
+        FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: posterURL)
+    }
+}
+
+@MainActor
+func reserveFullscreenVideoPreparation(
+    for creative: FullscreenCreativeContent,
+    prepare: (URL, URL?) -> FullscreenVideoPreparationToken?
+) -> FullscreenVideoPreparationReservation {
+    guard case .video(let url, let posterURL) = creative else { return .notRequired }
+    guard let token = prepare(url, posterURL) else { return .unavailable }
+    return .reserved(FullscreenVideoPreparationOwnership(token: token))
 }
 
 final class VideoLayerView: UIView {

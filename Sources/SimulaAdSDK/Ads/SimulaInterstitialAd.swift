@@ -395,13 +395,14 @@ public final class SimulaInterstitialAd {
             }
             #if os(iOS)
             releasePreparedVideo()
-            if case .video(let url, let posterURL) = creative {
-                preparedVideoOwnership = FullscreenVideoPreparationOwnership(
-                    token: FullscreenVideoPreparationPool.shared.prepare(
-                        url: url,
-                        posterURL: posterURL
-                    )
-                )
+            switch reserveFullscreenVideoPreparation(for: creative) {
+            case .notRequired:
+                break
+            case .reserved(let ownership):
+                preparedVideoOwnership = ownership
+            case .unavailable:
+                failLoad(.noFill)
+                return
             }
             #endif
             Telemetry.shared.setExperiment(experimentId: response.experiment?.experimentId, variantId: response.experiment?.variantId)

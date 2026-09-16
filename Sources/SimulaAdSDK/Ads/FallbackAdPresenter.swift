@@ -70,10 +70,20 @@ final class FallbackPrefetchOwnership {
 #if os(iOS)
 @MainActor
 func prepareUpcomingFallbackVideos(_ ads: [FallbackAd]) -> [Int: FullscreenVideoPreparationToken] {
+    prepareUpcomingFallbackVideos(ads) { url, posterURL in
+        FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: posterURL)
+    }
+}
+
+@MainActor
+func prepareUpcomingFallbackVideos(
+    _ ads: [FallbackAd],
+    prepare: (URL, URL?) -> FullscreenVideoPreparationToken?
+) -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
     for (index, ad) in ads.prefix(2).enumerated() {
         guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
-        prepared[index] = FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: posterURL)
+        prepared[index] = prepare(url, posterURL)
     }
     return prepared
 }

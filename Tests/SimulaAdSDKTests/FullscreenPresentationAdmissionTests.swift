@@ -560,6 +560,29 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         clock.admitFirstFrame(mediaTime: 4)
         XCTAssertEqual(clock.update(mediaTime: 4.5), 0.5, accuracy: 0.001)
         XCTAssertEqual(clock.update(mediaTime: 4.25), 0.5, accuracy: 0.001)
+        XCTAssertEqual(clock.update(mediaTime: 4.5), 0.75, accuracy: 0.001)
+    }
+
+    func testNonfiniteFirstFrameAnchorsAtFirstLaterFinitePeriodicSample() {
+        for invalidFirstFrame in [Double.nan, .infinity, -.infinity] {
+            var clock = VideoVisiblePlaybackClock()
+            clock.admitFirstFrame(mediaTime: invalidFirstFrame)
+            XCTAssertNil(clock.firstFrameMediaTime)
+            XCTAssertEqual(clock.update(mediaTime: .infinity), 0)
+            XCTAssertEqual(clock.update(mediaTime: 8), 0)
+            XCTAssertEqual(clock.firstFrameMediaTime, 8)
+            XCTAssertEqual(clock.update(mediaTime: 8.75), 0.75, accuracy: 0.001)
+        }
+    }
+
+    func testLateFiniteAnchorPreservesVisibleCompletionAcrossBackwardSeek() {
+        var clock = VideoVisiblePlaybackClock()
+        clock.admitFirstFrame(mediaTime: .nan)
+        XCTAssertEqual(clock.update(mediaTime: 5), 0)
+        XCTAssertEqual(clock.update(mediaTime: 6), 1)
+        XCTAssertEqual(clock.update(mediaTime: 2), 1)
+        XCTAssertEqual(clock.update(mediaTime: 2.5), 1.5)
+        XCTAssertEqual(clock.update(mediaTime: 3), 2)
     }
 
     func testFirstFrameDeadlineFailsOnceAndCannotAdmitAfterTimeout() {
@@ -1052,11 +1075,63 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertFalse(shouldReusePreparedVideoPlayer(status: .ready, isStopped: true, isActive: false))
     }
 
+    func testIndefiniteFirstFrameAnchorsAtFirstFinitePeriodicSample() {
+        var clock = VideoVisiblePlaybackClock()
+        clock.admitFirstFrame(mediaTime: CMTime.indefinite.seconds)
+        XCTAssertNil(clock.firstFrameMediaTime)
+        XCTAssertEqual(clock.update(mediaTime: 12), 0)
+        XCTAssertEqual(clock.update(mediaTime: 12.5), 0.5, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testPreparationPoolReturnsNilWhenEveryBoundedSlotIsActive() throws {
+        let pool = FullscreenVideoPreparationPool(capacity: 2)
+        let firstURL = URL(fileURLWithPath: "/dev/null/first")
+        let secondURL = URL(fileURLWithPath: "/dev/null/second")
+        let firstToken = try XCTUnwrap(pool.prepare(url: firstURL, posterURL: nil))
+        let secondToken = try XCTUnwrap(pool.prepare(url: secondURL, posterURL: nil))
+        let firstPlayer = try XCTUnwrap(pool.claim(firstToken, url: firstURL, posterURL: nil))
+        let secondPlayer = try XCTUnwrap(pool.claim(secondToken, url: secondURL, posterURL: nil))
+
+        XCTAssertNil(pool.prepare(url: URL(fileURLWithPath: "/dev/null/third"), posterURL: nil))
+        XCTAssertFalse(firstPlayer.isStopped)
+        XCTAssertFalse(secondPlayer.isStopped)
+
+        pool.release(firstToken)
+        pool.release(secondToken)
+    }
+
+    @MainActor
+    func testZeroCapacityPreparationPoolReturnsNoToken() {
+        let pool = FullscreenVideoPreparationPool(capacity: 0)
+        XCTAssertNil(pool.prepare(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil))
+    }
+
+    @MainActor
+    func testVideoLoadPreparationOutcomeIsUnavailableBeforeLoadSuccess() {
+        let video = FullscreenCreativeContent.video(
+            url: URL(fileURLWithPath: "/dev/null"),
+            posterURL: nil
+        )
+        guard case .unavailable = reserveFullscreenVideoPreparation(
+            for: video,
+            prepare: { _, _ in nil }
+        ) else { return XCTFail("Expected unavailable video reservation") }
+
+        guard case .notRequired = reserveFullscreenVideoPreparation(
+            for: .playable(html: "<html/>"),
+            prepare: { _, _ in
+                XCTFail("HTML must not reserve video capacity")
+                return nil
+            }
+        ) else { return XCTFail("Expected no video reservation requirement") }
+    }
+
     @MainActor
     func testStoppedPreparedPlayerIsEvictedAndClaimReturnsFreshPlayer() throws {
         let url = URL(fileURLWithPath: "/dev/null")
         let pool = FullscreenVideoPreparationPool.shared
-        let token = pool.prepare(url: url, posterURL: nil)
+        let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil))
         let first = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
         first.stop()
         pool.returnToPrepared(token)
@@ -1077,7 +1152,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         }
 
         let url = URL(fileURLWithPath: "/dev/null")
-        let token = FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil)
+        let token = try XCTUnwrap(FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil))
         var ownerDeinitialized = false
         var owner: AdOwner? = AdOwner { ownerDeinitialized = true }
         let preparation = FullscreenVideoPreparationOwnership(token: token)
@@ -1101,7 +1176,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     @MainActor
     func testFailedPresentationReturnsClaimedPreparationToAdOwnership() throws {
         let url = URL(fileURLWithPath: "/dev/null")
-        let token = FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil)
+        let token = try XCTUnwrap(FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil))
         let preparation = FullscreenVideoPreparationOwnership(token: token)
         let player = try XCTUnwrap(preparation.claim(url: url, posterURL: nil))
         XCTAssertTrue(preparation.transferToPresentation())
@@ -1117,7 +1192,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     func testFallbackPreparedTokenReleasePreventsPlayerReuse() throws {
         let url = URL(fileURLWithPath: "/dev/null")
         let pool = FullscreenVideoPreparationPool.shared
-        let token = pool.prepare(url: url, posterURL: nil)
+        let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil))
         let first = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
         pool.returnToPrepared(token)
         releasePreparedFallbackVideos(in: .content([], preparedVideos: [0: token]))

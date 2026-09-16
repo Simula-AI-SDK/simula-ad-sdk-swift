@@ -497,6 +497,23 @@ final class CreativeVideoTests: XCTestCase {
 
     #if os(iOS)
     @MainActor
+    func testFallbackVideoPreparationRemainsBestEffortAfterCapacityRejection() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"}]}"#
+        )
+        let secondToken = FullscreenVideoPreparationToken()
+        var attempts = 0
+
+        let prepared = prepareUpcomingFallbackVideos(ads) { _, _ in
+            attempts += 1
+            return attempts == 2 ? secondToken : nil
+        }
+
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(prepared, [1: secondToken])
+    }
+
+    @MainActor
     func testPlayerExposesAdmittedFirstFrameForSurfaceRecreation() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
         XCTAssertFalse(player.hasAdmittedFirstVisualFrame)
