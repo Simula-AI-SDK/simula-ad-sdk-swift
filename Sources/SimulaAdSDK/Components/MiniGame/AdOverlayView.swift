@@ -90,6 +90,75 @@ struct AdOverlayScreenMountCoordinator {
     }
 }
 
+struct PendingFirstFrameHandoff<Token: Hashable> {
+    private(set) var accepting = true
+    private(set) var active: Token?
+    private(set) var pending: Token?
+    private(set) var admitted: Token?
+    private(set) var terminal: Token?
+
+    mutating func activate(_ token: Token) {
+        accepting = true
+        guard active != token else { return }
+        active = token
+        pending = nil
+        admitted = nil
+        terminal = nil
+    }
+
+    mutating func receive(_ token: Token, parentAppeared: Bool) -> Bool {
+        guard accepting else { return false }
+        if active == nil { active = token }
+        guard active == token, admitted != token, terminal != token else { return false }
+        guard parentAppeared else {
+            pending = token
+            return false
+        }
+        pending = nil
+        admitted = token
+        return true
+    }
+
+    mutating func replay(_ token: Token) -> Bool {
+        guard active == token, pending == token, admitted != token, terminal != token else {
+            return false
+        }
+        pending = nil
+        admitted = token
+        return true
+    }
+
+    mutating func fail(_ token: Token) -> Bool {
+        guard accepting else { return false }
+        if active == nil { active = token }
+        guard active == token else { return false }
+        pending = nil
+        admitted = nil
+        terminal = token
+        return true
+    }
+
+    func isTerminal(_ token: Token) -> Bool { terminal == token }
+
+    mutating func clearPending() {
+        pending = nil
+        admitted = nil
+    }
+
+    mutating func invalidate() {
+        accepting = false
+        active = nil
+        pending = nil
+        admitted = nil
+        terminal = nil
+    }
+}
+
+private struct AdOverlayVideoSurfaceIdentity: Hashable {
+    let creative: String
+    let player: ObjectIdentifier
+}
+
 // MARK: - AdOverlayView
 
 /// Full-screen overlay that displays one server-rendered HTML or native video fallback.
@@ -156,6 +225,7 @@ public struct AdOverlayView: View {
     @State private var loadCoordinator = AdOverlayLoadCoordinator()
     @State private var loadWatchdogTask: Task<Void, Never>?
     @State private var screenMountCoordinator = AdOverlayScreenMountCoordinator()
+    @State private var firstFrameHandoff = PendingFirstFrameHandoff<AdOverlayVideoSurfaceIdentity>()
     @State private var clickHandoffPending = false
     @State private var localRouteLifecycle = AttributionRouteLifecycle()
     /// Countdown seconds remaining (starts at 5)
@@ -172,6 +242,7 @@ public struct AdOverlayView: View {
     @State private var videoGate = VideoPlaybackGate(configuredDelay: 5)
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
+    @State private var videoCompleteRecorded = false
     @State private var closing = false
     /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
     /// the ad. This overlay lives in a stand-alone `UIWindow` where SwiftUI's `\.scenePhase` doesn't
@@ -347,7 +418,13 @@ public struct AdOverlayView: View {
                 markPageFailedAndAdvance()
             } else {
                 startCurrentCreativeLoadIfNeeded()
+                #if os(iOS)
+                if !replayPendingVideoFirstFrameIfNeeded() {
+                    beginPresentationIfReady()
+                }
+                #else
                 beginPresentationIfReady()
+                #endif
             }
         }
         .onDisappear {
@@ -357,6 +434,7 @@ public struct AdOverlayView: View {
             loadWatchdogTask?.cancel()
             loadWatchdogTask = nil
             loadCoordinator.cancel()
+            firstFrameHandoff.invalidate()
             countdownTask?.cancel()
             countdownTask = nil
             updateClickHandoffPending(false)
@@ -462,9 +540,11 @@ public struct AdOverlayView: View {
         case .ignore:
             return
         case .requestFailureAdvance:
+            firstFrameHandoff.invalidate()
             if let onCreativeFailure { onCreativeFailure() }
             else { onClose() }
         case .close:
+            firstFrameHandoff.invalidate()
             closing = true
             onClose()
         }
@@ -524,6 +604,22 @@ public struct AdOverlayView: View {
     /// user indefinitely. Identity + generation checks make every cancelled/replaced timer harmless.
     private func startCurrentCreativeLoadIfNeeded() {
         let identityChanged = loadedCreativeIdentity != creativeIdentity
+        #if os(iOS)
+        if ad.mediaType == .video, let videoPlayer,
+           let identity = videoSurfaceIdentity(for: videoPlayer) {
+            firstFrameHandoff.activate(identity)
+            if firstFrameHandoff.isTerminal(identity) { return }
+        } else {
+            firstFrameHandoff.invalidate()
+        }
+        #else
+        firstFrameHandoff.invalidate()
+        #endif
+        if identityChanged {
+            videoFailureHandled = false
+            videoStartRecorded = false
+            videoCompleteRecorded = false
+        }
         guard identityChanged || loadCoordinator.isIdle
                 || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading
                     && !loadCoordinator.isTimedOut) else {
@@ -597,6 +693,7 @@ public struct AdOverlayView: View {
     }
 
     private func applyTerminalPageFailure() {
+        firstFrameHandoff.clearPending()
         adPageReady = false
         adPageFailed = true
         countdownTask?.cancel()
@@ -672,18 +769,18 @@ public struct AdOverlayView: View {
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard pageFinished else {
+            guard let identity = videoSurfaceIdentity(for: player) else { return }
+            if firstFrameHandoff.pending == identity { return }
+            guard pageFinished, firstFrameHandoff.admitted == identity else {
                 handleVideoStatus(.failed(.playbackFailed), player: player)
                 return
             }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.complete, adFormat: videoTelemetryAdFormat,
-                adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
-                serveId: telemetryServeId
-            )
+            recordVideoCompleteIfNeeded()
         case .failed(let reason):
             guard !videoFailureHandled else { return }
+            guard let identity = videoSurfaceIdentity(for: player),
+                  firstFrameHandoff.fail(identity) else { return }
             videoFailureHandled = true
             _ = loadCoordinator.failCurrentLoad()
             applyTerminalPageFailure()
@@ -704,8 +801,30 @@ public struct AdOverlayView: View {
     }
 
     private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
-        guard hasAppeared, !closing, !videoFailureHandled, !pageFinished else { return }
-        _ = loadCoordinator.finishCurrentLoad()
+        guard !closing, !videoFailureHandled, !pageFinished,
+              let identity = videoSurfaceIdentity(for: player) else { return }
+        guard firstFrameHandoff.receive(identity, parentAppeared: hasAppeared) else { return }
+        _ = admitVideoFirstFrame(player: player, identity: identity)
+    }
+
+    private func replayPendingVideoFirstFrameIfNeeded() -> Bool {
+        guard hasAppeared, !closing, !videoFailureHandled, !pageFinished,
+              let player = videoPlayer,
+              let identity = videoSurfaceIdentity(for: player),
+              firstFrameHandoff.replay(identity) else { return false }
+        return admitVideoFirstFrame(player: player, identity: identity)
+    }
+
+    private func admitVideoFirstFrame(
+        player: FullscreenVideoPlayer,
+        identity: AdOverlayVideoSurfaceIdentity
+    ) -> Bool {
+        guard hasAppeared, !closing, !videoFailureHandled, !pageFinished,
+              videoSurfaceIdentity(for: player) == identity,
+              loadCoordinator.finishCurrentLoad() else {
+            firstFrameHandoff.invalidate()
+            return false
+        }
         adPageReady = true
         pageFinished = true
         if !videoStartRecorded {
@@ -716,8 +835,21 @@ public struct AdOverlayView: View {
                 serveId: telemetryServeId
             )
         }
-        updateVideoGate(player: player, played: player.playedSeconds)
+        let ended = player.status == .ended
+        updateVideoGate(player: player, played: player.playedSeconds, ended: ended)
+        if ended { recordVideoCompleteIfNeeded() }
         beginPresentationIfReady()
+        return true
+    }
+
+    private func videoSurfaceIdentity(
+        for player: FullscreenVideoPlayer
+    ) -> AdOverlayVideoSurfaceIdentity? {
+        guard ad.mediaType == .video, videoPlayer === player else { return nil }
+        return AdOverlayVideoSurfaceIdentity(
+            creative: creativeIdentity,
+            player: ObjectIdentifier(player)
+        )
     }
 
     private func updateVideoGate(
@@ -725,10 +857,21 @@ public struct AdOverlayView: View {
         played: TimeInterval,
         ended: Bool = false
     ) {
-        guard pageFinished else { return }
+        guard pageFinished, let identity = videoSurfaceIdentity(for: player),
+              firstFrameHandoff.admitted == identity else { return }
         videoGate.update(duration: player.duration, played: played, ended: ended)
         ringProgress = CGFloat(videoGate.progress)
         adCountdown = videoGate.secondsRemaining
+    }
+
+    private func recordVideoCompleteIfNeeded() {
+        guard !videoCompleteRecorded else { return }
+        videoCompleteRecorded = true
+        Telemetry.shared.recordLifecycle(
+            stage: FullscreenVideoTelemetryStage.complete, adFormat: videoTelemetryAdFormat,
+            adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
+            serveId: telemetryServeId
+        )
     }
 
     private func handleVideoClick() {
