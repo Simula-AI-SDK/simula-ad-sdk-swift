@@ -44,6 +44,65 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.reason, .creativeCompleted)
     }
 
+    func testVideoClaimFailureConsumesReadyBeforeCallbackAndAllowsReentrantLoad() {
+        enum OwnerState: Equatable { case ready, idle, loading }
+        var state = OwnerState.ready
+        var callbackObserved: OwnerState?
+
+        consumeReadyAdBeforeDisplayFailure(
+            transitionToIdle: { state = .idle },
+            notifyFailure: {
+                callbackObserved = state
+                state = .loading
+            }
+        )
+
+        XCTAssertEqual(callbackObserved, .idle)
+        XCTAssertEqual(state, .loading)
+    }
+
+    func testRewardedHTMLReadinessBudgetUsesSafetyFloorAndCloseDelay() {
+        XCTAssertEqual(
+            RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0).budget,
+            rewardedHTMLReadinessSafetySeconds
+        )
+        XCTAssertEqual(RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 30).budget, 30)
+    }
+
+    func testHungRewardedHTMLFailsOnceAtForegroundDeadline() {
+        var state = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0)
+        XCTAssertEqual(state.reconcile(now: 0, eligible: true), .schedule(10))
+        XCTAssertEqual(state.deadlineFired(now: 10), .fail)
+        XCTAssertTrue(state.completed)
+        XCTAssertEqual(state.deadlineFired(now: 20), .none)
+    }
+
+    func testSlowRewardedHTMLGetsConfiguredCloseDelayBeforeFailure() {
+        var state = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 30)
+        XCTAssertEqual(state.reconcile(now: 0, eligible: true), .schedule(30))
+        XCTAssertEqual(state.reconcile(now: 10, eligible: false), .cancel)
+        XCTAssertEqual(state.elapsed, 10)
+        XCTAssertEqual(state.reconcile(now: 10, eligible: true), .schedule(20))
+        XCTAssertEqual(state.deadlineFired(now: 30), .fail)
+    }
+
+    func testRewardedHTMLReadyBeforeDeadlineCancelsFailure() {
+        var state = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0)
+        XCTAssertEqual(state.reconcile(now: 0, eligible: true), .schedule(10))
+        XCTAssertEqual(state.complete(now: 4), .cancel)
+        XCTAssertTrue(state.completed)
+        XCTAssertEqual(state.deadlineFired(now: 10), .none)
+    }
+
+    func testRewardedHTMLReadinessDeadlineExcludesBackgroundTime() {
+        var state = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0)
+        XCTAssertEqual(state.reconcile(now: 0, eligible: true), .schedule(10))
+        XCTAssertEqual(state.reconcile(now: 4, eligible: false), .cancel)
+        XCTAssertEqual(state.elapsed, 4)
+        XCTAssertEqual(state.reconcile(now: 100, eligible: true), .schedule(6))
+        XCTAssertEqual(state.deadlineFired(now: 106), .fail)
+    }
+
     func testHTMLRewardGateWaitsForPrimaryCreativeReadiness() {
         XCTAssertFalse(shouldRunRewardedHTMLGate(
             primaryCreativeReady: false,

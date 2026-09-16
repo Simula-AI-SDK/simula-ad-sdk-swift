@@ -290,6 +290,7 @@ private struct RewardedGameView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var primaryCreativeReady = false
+    @State private var htmlReadinessDeadline: RewardedHTMLReadinessDeadlineState
     @State private var terminalState = DeferredTerminalState<RewardedTerminalOutcome>()
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
@@ -308,6 +309,7 @@ private struct RewardedGameView: View {
     @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
+    @State private var htmlReadinessTask: Task<Void, Never>?
     @State private var resolvedAppID: String?
     @State private var skOverlayState = SKOverlayPresentationState<SKOverlayOwnershipToken>()
     @State private var skOverlayTask: Task<Void, Never>?
@@ -356,6 +358,9 @@ private struct RewardedGameView: View {
         self.onFinish = onFinish
         _videoGate = State(initialValue: VideoPlaybackGate(
             configuredDelay: TimeInterval(close?.delaySeconds ?? 0)
+        ))
+        _htmlReadinessDeadline = State(initialValue: RewardedHTMLReadinessDeadlineState(
+            configuredCloseDelay: TimeInterval(close?.delaySeconds ?? 0)
         ))
     }
 
@@ -455,6 +460,12 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
+            applyHTMLReadinessDeadline(
+                htmlReadinessDeadline.reconcile(
+                    now: ProcessInfo.processInfo.systemUptime,
+                    eligible: false
+                )
+            )
             gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             if videoPlayer != nil { admission.visualBecameUnavailable(owner: admissionOwner) }
             dismissSKOverlay()
@@ -553,6 +564,45 @@ private struct RewardedGameView: View {
 
     // MARK: Timer
 
+    /// HTML readiness is allowed at least ten foreground seconds (Android parity), extended to the
+    /// configured close delay for heavy playables. Background and SDK-owned sheets pause this budget.
+    private func reconcileHTMLReadinessDeadline() {
+        let action = htmlReadinessDeadline.reconcile(
+            now: ProcessInfo.processInfo.systemUptime,
+            eligible: videoPlayer == nil && visible && !primaryCreativeReady && !videoFailureHandled
+                && appForegrounded && !storeSheetPresented
+        )
+        applyHTMLReadinessDeadline(action)
+    }
+
+    private func applyHTMLReadinessDeadline(_ action: RewardedHTMLReadinessDeadlineAction) {
+        switch action {
+        case .none:
+            break
+        case .schedule(let delay):
+            htmlReadinessTask = Task { await runHTMLReadinessDeadline(after: delay) }
+        case .cancel:
+            htmlReadinessTask?.cancel()
+            htmlReadinessTask = nil
+        case .fail:
+            htmlReadinessTask?.cancel()
+            htmlReadinessTask = nil
+            handlePlayableFailure("readiness_timeout")
+        }
+    }
+
+    @MainActor
+    private func runHTMLReadinessDeadline(after delay: TimeInterval) async {
+        let nanos = delay * 1_000_000_000
+        guard nanos.isFinite, nanos > 0, nanos < Double(UInt64.max) else { return }
+        do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
+        if Task.isCancelled { return }
+        htmlReadinessTask = nil
+        applyHTMLReadinessDeadline(
+            htmlReadinessDeadline.deadlineFired(now: ProcessInfo.processInfo.systemUptime)
+        )
+    }
+
     private func startTimer() {
         guard videoPlayer == nil, timerTask == nil, primaryCreativeReady else { return }
         // A zero/negative gate is earned immediately (no gate).
@@ -613,6 +663,7 @@ private struct RewardedGameView: View {
     /// Runs the play-to-earn timer only while foreground-active and no in-app store sheet covers the
     /// playable.
     private func reconcileTimer() {
+        reconcileHTMLReadinessDeadline()
         let blocked = !appForegrounded || storeSheetPresented
         if let videoPlayer {
             videoPlayer.setPresentationBlocked(blocked)
@@ -679,6 +730,9 @@ private struct RewardedGameView: View {
 
     private func handlePlayableFailure(_ reason: String) {
         guard !videoFailureHandled else { return }
+        applyHTMLReadinessDeadline(
+            htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
+        )
         videoFailureHandled = true
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "rewarded", adUnitId: nil,
@@ -689,6 +743,9 @@ private struct RewardedGameView: View {
 
     private func handlePlayableReady() {
         guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
+        applyHTMLReadinessDeadline(
+            htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
+        )
         primaryCreativeReady = true
         reconcileTimer()
     }

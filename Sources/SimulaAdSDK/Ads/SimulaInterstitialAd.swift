@@ -529,13 +529,17 @@ public final class SimulaInterstitialAd {
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
-        if case .video(let url, let posterURL)? = response.creativeContent,
-           let ownership = preparedVideoOwnership {
-            guard let player = ownership.claim(url: url, posterURL: posterURL),
+        if response.creative?.mediaType == .video {
+            guard case .video(let url, let posterURL)? = response.creativeContent,
+                  let ownership = preparedVideoOwnership,
+                  let player = ownership.claim(url: url, posterURL: posterURL),
                   ownership.transferToPresentation() else {
                 releasePreparedVideo()
                 admission.stop()
-                failDisplay(.notReady)
+                consumeReadyAdBeforeDisplayFailure(
+                    transitionToIdle: { state = .idle },
+                    notifyFailure: { failDisplay(.notReady) }
+                )
                 return
             }
             preparedVideoOwnership = nil

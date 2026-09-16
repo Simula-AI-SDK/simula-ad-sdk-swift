@@ -173,6 +173,53 @@ final class CreativeClickURLTests: XCTestCase {
         ))
     }
 
+    func testFailedFallbackVideoCloseRequestsDeferredAdvanceBeforeFirstFrame() {
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: false,
+                storeSheetPresented: true,
+                dismissUnlocked: true,
+                clickHandoffPending: true
+            ),
+            .requestFailureAdvance
+        )
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: false,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: false
+            ),
+            .ignore
+        )
+    }
+
+    func testRepeatedFailedVideoCloseWhileBlockedAdvancesExactlyOnceAfterBlockersClear() {
+        var state = FallbackFailureAdvanceState()
+        XCTAssertFalse(state.request(index: 1, blocked: true))
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: true
+            ),
+            .requestFailureAdvance
+        )
+        XCTAssertFalse(state.request(index: 1, blocked: true))
+        XCTAssertEqual(state.blockersDidClear(currentIndex: 1), 1)
+        XCTAssertNil(state.blockersDidClear(currentIndex: 1))
+    }
+
     func testFallbackClickAccountingKeepsTelemetryAndPublisherWhenServerOwnsNoBeacon() {
         let capable = DeviceCapabilities(
             osVersion: "test", storekitAvailable: true, skanVersion: "4.0",

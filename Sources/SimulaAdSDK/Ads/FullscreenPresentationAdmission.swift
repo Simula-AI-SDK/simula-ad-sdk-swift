@@ -125,6 +125,78 @@ struct RewardCompletionState: Equatable, Sendable {
     }
 }
 
+func consumeReadyAdBeforeDisplayFailure(
+    transitionToIdle: () -> Void,
+    notifyFailure: () -> Void
+) {
+    transitionToIdle()
+    notifyFailure()
+}
+
+let rewardedHTMLReadinessSafetySeconds: TimeInterval = 10
+
+enum RewardedHTMLReadinessDeadlineAction: Equatable, Sendable {
+    case none
+    case schedule(TimeInterval)
+    case cancel
+    case fail
+}
+
+struct RewardedHTMLReadinessDeadlineState: Sendable {
+    let budget: TimeInterval
+    private var clock = FullscreenGateClock()
+    private(set) var scheduled = false
+    private(set) var completed = false
+
+    init(configuredCloseDelay: TimeInterval) {
+        let closeDelay = configuredCloseDelay.isFinite ? max(0, configuredCloseDelay) : 0
+        budget = max(rewardedHTMLReadinessSafetySeconds, closeDelay)
+    }
+
+    var elapsed: TimeInterval { clock.elapsed }
+
+    mutating func reconcile(now: TimeInterval, eligible: Bool) -> RewardedHTMLReadinessDeadlineAction {
+        guard !completed else { return .none }
+        if eligible {
+            clock.resume(at: now)
+            let remaining = clock.remaining(total: budget)
+            guard remaining > 0 else {
+                scheduled = false
+                completed = true
+                return .fail
+            }
+            guard !scheduled else { return .none }
+            scheduled = true
+            return .schedule(remaining)
+        }
+
+        clock.pause(at: now, total: budget)
+        guard scheduled else { return .none }
+        scheduled = false
+        return .cancel
+    }
+
+    mutating func complete(now: TimeInterval) -> RewardedHTMLReadinessDeadlineAction {
+        guard !completed else { return .none }
+        clock.pause(at: now, total: budget)
+        completed = true
+        guard scheduled else { return .none }
+        scheduled = false
+        return .cancel
+    }
+
+    mutating func deadlineFired(now: TimeInterval) -> RewardedHTMLReadinessDeadlineAction {
+        guard scheduled, !completed else { return .none }
+        scheduled = false
+        clock.pause(at: now, total: budget)
+        guard clock.remaining(total: budget) <= 0 else {
+            return reconcile(now: now, eligible: true)
+        }
+        completed = true
+        return .fail
+    }
+}
+
 func shouldRunRewardedHTMLGate(
     primaryCreativeReady: Bool,
     appForegrounded: Bool,

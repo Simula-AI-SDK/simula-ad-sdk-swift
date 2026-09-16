@@ -450,14 +450,24 @@ public struct AdOverlayView: View {
     }
 
     private func requestClose() {
-        guard ad.mediaType != .video || pageFinished else { return }
-        guard appForegrounded, !storeSheetPresented else { return }
-        guard canDismissFullscreen(
+        switch fallbackCloseRequestAction(
+            isVideo: ad.mediaType == .video,
+            pageFinished: pageFinished,
+            terminalFailure: adPageFailed,
+            appForegrounded: appForegrounded,
+            storeSheetPresented: storeSheetPresented,
             dismissUnlocked: adCountdown <= 0,
             clickHandoffPending: clickHandoffPending
-        ) else { return }
-        closing = true
-        onClose()
+        ) {
+        case .ignore:
+            return
+        case .requestFailureAdvance:
+            if let onCreativeFailure { onCreativeFailure() }
+            else { onClose() }
+        case .close:
+            closing = true
+            onClose()
+        }
     }
 
     @ViewBuilder
@@ -769,6 +779,31 @@ public struct AdOverlayView: View {
         }
     }
     #endif
+}
+
+enum FallbackCloseRequestAction: Equatable, Sendable {
+    case ignore
+    case requestFailureAdvance
+    case close
+}
+
+func fallbackCloseRequestAction(
+    isVideo: Bool,
+    pageFinished: Bool,
+    terminalFailure: Bool,
+    appForegrounded: Bool,
+    storeSheetPresented: Bool,
+    dismissUnlocked: Bool,
+    clickHandoffPending: Bool
+) -> FallbackCloseRequestAction {
+    if terminalFailure { return .requestFailureAdvance }
+    guard !isVideo || pageFinished,
+          appForegrounded, !storeSheetPresented,
+          canDismissFullscreen(
+              dismissUnlocked: dismissUnlocked,
+              clickHandoffPending: clickHandoffPending
+          ) else { return .ignore }
+    return .close
 }
 
 func canBeginFallbackVideoClick(

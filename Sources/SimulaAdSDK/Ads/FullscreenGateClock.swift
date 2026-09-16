@@ -2,7 +2,7 @@ import Foundation
 
 private let fullscreenGateBoundaryTolerance: TimeInterval = 1e-9
 
-struct FullscreenGateClock {
+struct FullscreenGateClock: Sendable {
     private(set) var elapsed: TimeInterval = 0
     private var resumedAt: TimeInterval?
 
