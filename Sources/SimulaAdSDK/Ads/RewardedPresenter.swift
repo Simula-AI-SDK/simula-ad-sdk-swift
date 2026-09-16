@@ -15,6 +15,7 @@ final class RewardedPresenter {
     private var window: UIWindow?
     private var creativeBridge: CreativeBridge?
     private var videoPlayer: FullscreenVideoPlayer?
+    private var videoPreparationOwnership: FullscreenVideoPreparationOwnership?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
     private var onClose: ((Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void)?
@@ -41,6 +42,7 @@ final class RewardedPresenter {
         apiKey: String,
         renderedHtml: String = "",
         videoPlayer: FullscreenVideoPlayer? = nil,
+        videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -65,6 +67,7 @@ final class RewardedPresenter {
         self.presentationLease = presentationLease
         self.onClose = onClose
         self.videoPlayer = videoPlayer
+        self.videoPreparationOwnership = videoPreparationOwnership
 
         // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
         // orientation lock, and device/audio/orientation queries. Owned here so the orientation
@@ -131,6 +134,7 @@ final class RewardedPresenter {
         apiKey: String,
         renderedHtml: String = "",
         videoPlayer: FullscreenVideoPlayer? = nil,
+        videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -151,6 +155,7 @@ final class RewardedPresenter {
             apiKey: apiKey,
             renderedHtml: renderedHtml,
             videoPlayer: videoPlayer,
+            videoPreparationOwnership: videoPreparationOwnership,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -185,8 +190,15 @@ final class RewardedPresenter {
         let bridge = creativeBridge
         creativeBridge = nil
         bridge?.stop()
-        videoPlayer?.stop()
+        let player = videoPlayer
         videoPlayer = nil
+        let videoPreparationOwnership = videoPreparationOwnership
+        self.videoPreparationOwnership = nil
+        if videoPreparationOwnership == nil {
+            player?.stop()
+        } else {
+            _ = videoPreparationOwnership?.releaseFromPresentation()
+        }
         window = nil
         originalKeyWindow = nil
         let callback = onClose

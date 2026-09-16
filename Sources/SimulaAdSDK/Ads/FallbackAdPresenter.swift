@@ -500,6 +500,15 @@ final class FallbackAdPresenter {
     private func adView(at index: Int) -> AnyView {
         guard ads.indices.contains(index) else { return loadingView() }
         let ad = ads[index]
+        let videoRoute = ad.mediaType == .video ? fallbackVideoCTARoute(
+            ad: ad,
+            parentTrackingUrl: ctaTrackingUrl,
+            parentDestination: ctaDestination,
+            parentStoreOpen: ctaStoreOpen,
+            parentStoreUrl: ctaStoreUrl,
+            allowsParentFallback: true
+        ) : nil
+        let usesVideoRoute = ad.mediaType == .video
         currentRouteLifecycle?.deactivate()
         let routeLifecycle = AttributionRouteLifecycle()
         currentRouteLifecycle = routeLifecycle
@@ -532,11 +541,11 @@ final class FallbackAdPresenter {
                     self.completePendingCreativeFailureIfPossible(at: index)
                 }
             },
-            ctaTrackingUrl: ctaTrackingUrl,
-            ctaDestination: ctaDestination,
-            ctaStoreOpen: ctaStoreOpen,
-            ctaStoreUrl: ctaStoreUrl,
-            attribution: attribution,
+            ctaTrackingUrl: usesVideoRoute ? videoRoute?.trackingUrl : ctaTrackingUrl,
+            ctaDestination: usesVideoRoute ? (videoRoute?.destination ?? .appstore) : ctaDestination,
+            ctaStoreOpen: usesVideoRoute ? (videoRoute?.storeOpen ?? .skstoreproduct) : ctaStoreOpen,
+            ctaStoreUrl: usesVideoRoute ? videoRoute?.storeUrl : ctaStoreUrl,
+            attribution: usesVideoRoute && videoRoute?.source != .parent ? nil : attribution,
             routeLifecycle: routeLifecycle,
             onScreenMounted: { [weak self] in
                 guard let self, canHandleFallbackScreenCallback(

@@ -75,6 +75,7 @@ final class InterstitialPresenter {
     private var window: UIWindow?
     private var creativeBridge: CreativeBridge?
     private var videoPlayer: FullscreenVideoPlayer?
+    private var videoPreparationOwnership: FullscreenVideoPreparationOwnership?
     private var onClose: ((FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so
@@ -99,6 +100,7 @@ final class InterstitialPresenter {
         apiKey: String,
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
+        videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
@@ -114,6 +116,7 @@ final class InterstitialPresenter {
         self.presentationLease = presentationLease
         self.onClose = onClose
         self.videoPlayer = videoPlayer
+        self.videoPreparationOwnership = videoPreparationOwnership
 
         // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
         // hosting controller + window created below.
@@ -163,6 +166,7 @@ final class InterstitialPresenter {
         apiKey: String,
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
+        videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
         onClick: @escaping () -> Void,
@@ -172,6 +176,7 @@ final class InterstitialPresenter {
             apiKey: apiKey,
             response: response,
             videoPlayer: videoPlayer,
+            videoPreparationOwnership: videoPreparationOwnership,
             admission: admission,
             onWillPresent: onWillPresent,
             onClick: { _ in onClick() },
@@ -193,8 +198,15 @@ final class InterstitialPresenter {
         let bridge = creativeBridge
         creativeBridge = nil
         bridge?.stop()
-        videoPlayer?.stop()
+        let player = videoPlayer
         videoPlayer = nil
+        let videoPreparationOwnership = videoPreparationOwnership
+        self.videoPreparationOwnership = nil
+        if videoPreparationOwnership == nil {
+            player?.stop()
+        } else {
+            _ = videoPreparationOwnership?.releaseFromPresentation()
+        }
         window = nil
         originalKeyWindow = nil
         let callback = onClose

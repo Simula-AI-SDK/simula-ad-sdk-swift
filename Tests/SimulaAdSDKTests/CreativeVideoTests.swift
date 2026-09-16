@@ -77,6 +77,61 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(ad.adBehavior.close.position, .topLeft)
     }
 
+    func testFallbackRouteFieldsDecodeTolerantly() throws {
+        let ads = try decodeFallbacks(#"{"ads":[{"ad_id":"v","type":"video","url":"https://cdn.example/v.mp4","destination":"web","tracking_url":"https://tracker.example/click","ios_store_url":"https://apps.apple.com/app/id123456","android_store_url":"https://play.google.com/store/apps/details?id=example"}]}"#)
+        let ad = try XCTUnwrap(ads.first)
+
+        XCTAssertEqual(ad.destination, "web")
+        XCTAssertEqual(ad.destinationKind, .web)
+        XCTAssertEqual(ad.trackingUrl, "https://tracker.example/click")
+        XCTAssertEqual(ad.iosStoreUrl, "https://apps.apple.com/app/id123456")
+        XCTAssertEqual(ad.androidStoreUrl, "https://play.google.com/store/apps/details?id=example")
+
+        let malformed = try decodeFallbacks(#"{"ads":[{"type":"video","url":"https://cdn.example/v.mp4","destination":4,"tracking_url":false,"ios_store_url":[],"android_store_url":{}}]}"#)
+        XCTAssertNil(malformed.first?.destination)
+        XCTAssertNil(malformed.first?.trackingUrl)
+        XCTAssertNil(malformed.first?.iosStoreUrl)
+        XCTAssertNil(malformed.first?.androidStoreUrl)
+    }
+
+    func testFallbackVideoUsesValidItemRouteBeforeParentRoute() throws {
+        let ad = try XCTUnwrap(try decodeFallbacks(#"{"ads":[{"type":"video","url":"https://cdn.example/v.mp4","destination":"web","tracking_url":"https://item.example/click"}]}"#).first)
+        let route = fallbackVideoCTARoute(
+            ad: ad,
+            parentTrackingUrl: "https://parent.example/click",
+            parentDestination: .appstore,
+            allowsParentFallback: true
+        )
+
+        XCTAssertEqual(route?.source, .item)
+        XCTAssertEqual(route?.destination, .web)
+        XCTAssertEqual(route?.trackingUrl, "https://item.example/click")
+    }
+
+    func testInvalidItemRouteDoesNotFallBackToParent() throws {
+        let ad = try XCTUnwrap(try decodeFallbacks(#"{"ads":[{"type":"video","url":"https://cdn.example/v.mp4","destination":"web","tracking_url":"file:///invalid"}]}"#).first)
+
+        XCTAssertNil(fallbackVideoCTARoute(
+            ad: ad,
+            parentTrackingUrl: "https://parent.example/click",
+            parentDestination: .appstore,
+            allowsParentFallback: true
+        ))
+    }
+
+    func testAbsentItemRouteFallsBackOnlyForImperativePresentation() throws {
+        let ad = try XCTUnwrap(try decodeFallbacks(#"{"ads":[{"type":"video","url":"https://cdn.example/v.mp4"}]}"#).first)
+        let imperative = fallbackVideoCTARoute(
+            ad: ad,
+            parentTrackingUrl: "https://parent.example/click",
+            parentDestination: .appstore,
+            allowsParentFallback: true
+        )
+
+        XCTAssertEqual(imperative?.source, .parent)
+        XCTAssertNil(fallbackVideoCTARoute(ad: ad, allowsParentFallback: false))
+    }
+
     func testFallbackDefaultsAndUnknownTypeUsePlayableHTML() throws {
         let ads = try decodeFallbacks(#"{"ads":[{"ad_id":"a","type":"future","rendered_html":"new","html":"old"}]}"#)
         let ad = try XCTUnwrap(ads.first)
@@ -96,11 +151,12 @@ final class CreativeVideoTests: XCTestCase {
     }
 
     func testFallbackDecodeIsLossyAndPreservesOriginalStageIndex() throws {
-        let ads = try decodeFallbacks(#"{"ads":[42,{"type":"video","url":"file:///bad"},{"ad_id":"ok","rendered_html":"<html/>"}]}"#)
+        let ads = try decodeFallbacks(#"{"ads":[42,{"type":"video","url":"file:///bad"},{"ad_id":"ok","rendered_html":"<html/>","tracking_url":"https://item.example/click"}]}"#)
         let ad = try XCTUnwrap(ads.first)
         XCTAssertEqual(ads.count, 1)
         XCTAssertEqual(ad.adId, "ok")
         XCTAssertEqual(ad.sourceIndex, 2)
+        XCTAssertEqual(ad.trackingUrl, "https://item.example/click")
         XCTAssertNil(AutoStoreRedirectTrigger.endScreenTrigger(forFallbackIndex: ad.sourceIndex))
     }
 

@@ -924,6 +924,57 @@ func hasRoutableVideoDestination(
     return validatedTopLevelAttributionURL(trackingUrl) != nil
 }
 
+struct FallbackVideoCTARoute: Equatable, Sendable {
+    enum Source: Equatable, Sendable {
+        case item
+        case parent
+    }
+
+    let trackingUrl: String?
+    let destination: AdDestination
+    let storeOpen: StoreOpen
+    let storeUrl: String?
+    let source: Source
+}
+
+func fallbackVideoCTARoute(
+    ad: FallbackAd,
+    parentTrackingUrl: String? = nil,
+    parentDestination: AdDestination = .appstore,
+    parentStoreOpen: StoreOpen = .skstoreproduct,
+    parentStoreUrl: String? = nil,
+    allowsParentFallback: Bool
+) -> FallbackVideoCTARoute? {
+    if ad.hasItemRoutingFields {
+        guard hasRoutableVideoDestination(
+            trackingUrl: ad.trackingUrl,
+            destination: ad.destinationKind,
+            storeUrl: ad.iosStoreUrl
+        ) else { return nil }
+        return FallbackVideoCTARoute(
+            trackingUrl: ad.trackingUrl,
+            destination: ad.destinationKind,
+            storeOpen: ad.adBehavior.storeOpen,
+            storeUrl: ad.iosStoreUrl,
+            source: .item
+        )
+    }
+
+    guard allowsParentFallback,
+          hasRoutableVideoDestination(
+              trackingUrl: parentTrackingUrl,
+              destination: parentDestination,
+              storeUrl: parentStoreUrl
+          ) else { return nil }
+    return FallbackVideoCTARoute(
+        trackingUrl: parentTrackingUrl,
+        destination: parentDestination,
+        storeOpen: parentStoreOpen,
+        storeUrl: parentStoreUrl,
+        source: .parent
+    )
+}
+
 enum CreativeRoutePlan: Equatable {
     case directStore(url: URL, appID: String, storeOpen: StoreOpen)
     case trackerWithStore(

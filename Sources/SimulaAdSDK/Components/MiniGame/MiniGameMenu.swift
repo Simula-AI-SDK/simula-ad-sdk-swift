@@ -229,6 +229,9 @@ public struct MiniGameMenu: View {
             // each revealed screen fresh overlay state (countdown, web view).
             if showAdOverlay, let fallbackAd = fallbackAds.indices.contains(fallbackAdIndex) ? fallbackAds[fallbackAdIndex] : nil {
                 let renderedIndex = fallbackAdIndex
+                let videoRoute = fallbackAd.mediaType == .video
+                    ? fallbackVideoCTARoute(ad: fallbackAd, allowsParentFallback: false)
+                    : nil
                 AdOverlayView(
                     ad: fallbackAd,
                     onClose: { handleAdIframeClose(from: renderedIndex) },
@@ -244,7 +247,11 @@ public struct MiniGameMenu: View {
                     },
                     onPresentationBlockedChanged: {
                         updateFallbackPresentationBlocker($0, renderedIndex: renderedIndex)
-                    }
+                    },
+                    ctaTrackingUrl: videoRoute?.trackingUrl,
+                    ctaDestination: videoRoute?.destination ?? .appstore,
+                    ctaStoreOpen: videoRoute?.storeOpen ?? .skstoreproduct,
+                    ctaStoreUrl: videoRoute?.storeUrl
                 )
                 .id(fallbackAdIndex)
                 .transition(.identity)

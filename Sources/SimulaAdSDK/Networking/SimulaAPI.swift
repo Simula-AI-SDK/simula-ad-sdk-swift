@@ -1152,6 +1152,10 @@ public struct FallbackAd: Sendable {
     public let url: String?
     public let posterUrl: String?
     public let adBehavior: AdBehavior
+    public let destination: String?
+    public let trackingUrl: String?
+    public let iosStoreUrl: String?
+    public let androidStoreUrl: String?
     /// Whether the server removed this fallback HTML's legacy click beacon and assigned click
     /// counting to the SDK. Client support is checked separately at the point of use.
     public let nativeClickBeaconV1Enabled: Bool
@@ -1169,7 +1173,11 @@ public struct FallbackAd: Sendable {
             url: nil,
             posterUrl: nil,
             adBehavior: fallbackAdBehavior(nil),
-            nativeClickBeaconV1Enabled: false
+            nativeClickBeaconV1Enabled: false,
+            destination: nil,
+            trackingUrl: nil,
+            iosStoreUrl: nil,
+            androidStoreUrl: nil
         )
     }
 
@@ -1187,6 +1195,10 @@ public struct FallbackAd: Sendable {
         self.url = nil
         self.posterUrl = nil
         self.adBehavior = fallbackAdBehavior(nil)
+        self.destination = nil
+        self.trackingUrl = nil
+        self.iosStoreUrl = nil
+        self.androidStoreUrl = nil
         self.nativeClickBeaconV1Enabled = nativeClickBeaconV1Enabled
     }
 
@@ -1198,7 +1210,11 @@ public struct FallbackAd: Sendable {
         url: String?,
         posterUrl: String?,
         adBehavior: AdBehavior?,
-        nativeClickBeaconV1Enabled: Bool
+        nativeClickBeaconV1Enabled: Bool,
+        destination: String? = nil,
+        trackingUrl: String? = nil,
+        iosStoreUrl: String? = nil,
+        androidStoreUrl: String? = nil
     ) {
         self.adId = adId
         self.sourceIndex = max(0, sourceIndex)
@@ -1208,11 +1224,23 @@ public struct FallbackAd: Sendable {
         self.url = url
         self.posterUrl = posterUrl
         self.adBehavior = fallbackAdBehavior(adBehavior)
+        self.destination = destination
+        self.trackingUrl = trackingUrl
+        self.iosStoreUrl = iosStoreUrl
+        self.androidStoreUrl = androidStoreUrl
         self.nativeClickBeaconV1Enabled = nativeClickBeaconV1Enabled
     }
 
     public var html: String? { renderedHtml }
+    public var destinationKind: AdDestination {
+        AdDestination(rawValue: destination ?? "") ?? .appstore
+    }
     var mediaType: CreativeMediaType { .from(type) }
+    var hasItemRoutingFields: Bool {
+        [destination, trackingUrl, iosStoreUrl, androidStoreUrl].contains {
+            $0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
+    }
     var creativeContent: FullscreenCreativeContent? {
         if mediaType == .video {
             guard let url = validatedCreativeURL(url) else { return nil }
@@ -1276,7 +1304,11 @@ struct FallbackAdsAPIResponse: Decodable {
                 adBehavior: item.adBehavior,
                 nativeClickBeaconV1Enabled: item.nativeClickBeaconV1Enabled
                     ?? nativeClickBeaconV1Enabled
-                    ?? false
+                    ?? false,
+                destination: item.destination,
+                trackingUrl: item.trackingUrl,
+                iosStoreUrl: item.iosStoreUrl,
+                androidStoreUrl: item.androidStoreUrl
             )
             return ad.creativeContent == nil ? nil : ad
         }
@@ -1293,6 +1325,10 @@ struct FallbackAdItem: Decodable {
     let posterUrl: String?
     let adBehavior: AdBehavior?
     let nativeClickBeaconV1Enabled: Bool?
+    let destination: String?
+    let trackingUrl: String?
+    let iosStoreUrl: String?
+    let androidStoreUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
@@ -1302,6 +1338,10 @@ struct FallbackAdItem: Decodable {
         case posterUrl = "poster_url"
         case adBehavior = "ad_behavior"
         case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
+        case destination
+        case trackingUrl = "tracking_url"
+        case iosStoreUrl = "ios_store_url"
+        case androidStoreUrl = "android_store_url"
     }
 
     init(from decoder: Decoder) throws {
@@ -1314,6 +1354,10 @@ struct FallbackAdItem: Decodable {
         self.posterUrl = try? c.decode(String.self, forKey: .posterUrl)
         self.adBehavior = (try? c.decode(FallbackAdBehaviorPayload.self, forKey: .adBehavior))?.behavior
         self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
+        self.destination = try? c.decode(String.self, forKey: .destination)
+        self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
+        self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
+        self.androidStoreUrl = try? c.decode(String.self, forKey: .androidStoreUrl)
     }
 }
 

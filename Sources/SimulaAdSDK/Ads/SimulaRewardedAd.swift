@@ -155,7 +155,7 @@ public final class SimulaRewardedAd {
     private var presenter: RewardedPresenter?
     /// At most one primary video player is retained and begins AVFoundation preparation as soon as
     /// the response URL is known, before the publisher receives `rewardedDidLoad`.
-    private var preparedVideoToken: FullscreenVideoPreparationToken?
+    private var preparedVideoOwnership: FullscreenVideoPreparationOwnership?
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
     /// post-game ad flow).
     private var fallbackPresenter: FallbackAdPresenter?
@@ -178,10 +178,8 @@ public final class SimulaRewardedAd {
 
     deinit {
         #if os(iOS)
-        let token = preparedVideoToken
         let fallbackResult = prefetchedFallbacks
         DispatchQueue.main.async {
-            FullscreenVideoPreparationPool.shared.release(token)
             releasePreparedFallbackVideos(in: fallbackResult)
         }
         #endif
@@ -321,9 +319,11 @@ public final class SimulaRewardedAd {
             #if os(iOS)
             releasePreparedVideo()
             if case .video(let url, let posterURL) = creative {
-                preparedVideoToken = FullscreenVideoPreparationPool.shared.prepare(
-                    url: url,
-                    posterURL: posterURL
+                preparedVideoOwnership = FullscreenVideoPreparationOwnership(
+                    token: FullscreenVideoPreparationPool.shared.prepare(
+                        url: url,
+                        posterURL: posterURL
+                    )
                 )
             }
             #endif
@@ -453,26 +453,29 @@ public final class SimulaRewardedAd {
             }
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
+        let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
         if case .video(let url, let posterURL)? = response.creativeContent,
-           let preparedVideoToken {
-            presentationVideoPlayer = FullscreenVideoPreparationPool.shared.claim(
-                preparedVideoToken,
-                url: url,
-                posterURL: posterURL
-            )
-            guard presentationVideoPlayer != nil else {
+           let ownership = preparedVideoOwnership {
+            guard let player = ownership.claim(url: url, posterURL: posterURL),
+                  ownership.transferToPresentation() else {
+                releasePreparedVideo()
                 admission.stop()
                 failDisplay(.notReady)
                 return
             }
+            preparedVideoOwnership = nil
+            presentationVideoPlayer = player
+            presentationVideoOwnership = ownership
         } else {
             presentationVideoPlayer = nil
+            presentationVideoOwnership = nil
         }
         let didPresent = presenter.present(
             impressionId: response.impressionId,
             apiKey: provider.apiKey,
             renderedHtml: response.renderedHtml,
             videoPlayer: presentationVideoPlayer,
+            videoPreparationOwnership: presentationVideoOwnership,
             admission: admission,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,
@@ -617,8 +620,9 @@ public final class SimulaRewardedAd {
 
         guard didPresent else {
             admission.stop()
-            if let preparedVideoToken {
-                FullscreenVideoPreparationPool.shared.returnToPrepared(preparedVideoToken)
+            if let presentationVideoOwnership,
+               presentationVideoOwnership.returnToAdAfterPresentationFailure() {
+                preparedVideoOwnership = presentationVideoOwnership
             }
             // Couldn't present (no window scene). Keep the loaded ad so the host can
             // retry; report DISPLAY_FAILED without a bogus DISPLAYED/CLOSED. `state`
@@ -885,8 +889,8 @@ public final class SimulaRewardedAd {
 
     #if os(iOS)
     private func releasePreparedVideo() {
-        FullscreenVideoPreparationPool.shared.release(preparedVideoToken)
-        preparedVideoToken = nil
+        _ = preparedVideoOwnership?.releaseFromAd()
+        preparedVideoOwnership = nil
     }
     #endif
 

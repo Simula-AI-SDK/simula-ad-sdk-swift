@@ -19,6 +19,16 @@ final class PublicInitializerCompatibilityTests: XCTestCase {
         XCTAssertNil(creative.posterUrl)
     }
 
+    func testLegacyFallbackInitializerSymbolsRemainCallable() {
+        let legacy: (String, String, String?) -> FallbackAd =
+            FallbackAd.init(adId:iframeUrl:html:)
+        let beaconAware: (String, String, String?, Bool) -> FallbackAd =
+            FallbackAd.init(adId:iframeUrl:html:nativeClickBeaconV1Enabled:)
+
+        XCTAssertNil(legacy("a", "legacy", "<html/>").trackingUrl)
+        XCTAssertTrue(beaconAware("b", "legacy", "<html/>", true).nativeClickBeaconV1Enabled)
+    }
+
     func testLegacyRewardedRequestInitializerSymbolsRemainCallable() {
         let basic: (String, String, String?, String?, String?, String?, SimulaAdContext?) -> RewardedInitRequest =
             RewardedInitRequest.init(adUnitId:sessionId:charId:charName:charImage:charDesc:context:)

@@ -564,6 +564,53 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
+    func testAdOwnerDeinitCannotReleaseTransferredActivePresentation() throws {
+        final class AdOwner {
+            var preparation: FullscreenVideoPreparationOwnership?
+            let onDeinit: () -> Void
+
+            init(onDeinit: @escaping () -> Void) { self.onDeinit = onDeinit }
+            deinit { onDeinit() }
+        }
+
+        let url = URL(fileURLWithPath: "/dev/null")
+        let token = FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil)
+        var ownerDeinitialized = false
+        var owner: AdOwner? = AdOwner { ownerDeinitialized = true }
+        let preparation = FullscreenVideoPreparationOwnership(token: token)
+        owner?.preparation = preparation
+        let player = try XCTUnwrap(preparation.claim(url: url, posterURL: nil))
+        XCTAssertTrue(preparation.transferToPresentation())
+
+        owner?.preparation = nil
+        owner = nil
+
+        XCTAssertTrue(ownerDeinitialized)
+        XCTAssertEqual(preparation.state, .presentation)
+        XCTAssertFalse(player.isStopped)
+        XCTAssertFalse(preparation.releaseFromAd())
+        XCTAssertFalse(player.isStopped)
+        XCTAssertTrue(preparation.releaseFromPresentation())
+        XCTAssertTrue(player.isStopped)
+        XCTAssertFalse(preparation.releaseFromPresentation(), "presentation teardown releases exactly once")
+    }
+
+    @MainActor
+    func testFailedPresentationReturnsClaimedPreparationToAdOwnership() throws {
+        let url = URL(fileURLWithPath: "/dev/null")
+        let token = FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: nil)
+        let preparation = FullscreenVideoPreparationOwnership(token: token)
+        let player = try XCTUnwrap(preparation.claim(url: url, posterURL: nil))
+        XCTAssertTrue(preparation.transferToPresentation())
+
+        XCTAssertTrue(preparation.returnToAdAfterPresentationFailure())
+        XCTAssertEqual(preparation.state, .ad)
+        XCTAssertFalse(player.isStopped)
+        XCTAssertTrue(preparation.releaseFromAd())
+        XCTAssertTrue(player.isStopped)
+    }
+
+    @MainActor
     func testFallbackPreparedTokenReleasePreventsPlayerReuse() throws {
         let url = URL(fileURLWithPath: "/dev/null")
         let pool = FullscreenVideoPreparationPool.shared

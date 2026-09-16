@@ -784,6 +784,72 @@ final class FullscreenVideoPreparationPool {
     }
 }
 
+@MainActor
+final class FullscreenVideoPreparationOwnership {
+    enum State: Equatable {
+        case ad
+        case claimed
+        case presentation
+        case released
+    }
+
+    let token: FullscreenVideoPreparationToken
+    private(set) var state = State.ad
+
+    init(token: FullscreenVideoPreparationToken) {
+        self.token = token
+    }
+
+    func claim(url: URL, posterURL: URL?) -> FullscreenVideoPlayer? {
+        guard state == .ad else { return nil }
+        guard let player = FullscreenVideoPreparationPool.shared.claim(
+            token,
+            url: url,
+            posterURL: posterURL
+        ) else { return nil }
+        state = .claimed
+        return player
+    }
+
+    func transferToPresentation() -> Bool {
+        guard state == .claimed else { return false }
+        state = .presentation
+        return true
+    }
+
+    func returnToAdAfterPresentationFailure() -> Bool {
+        guard state == .presentation else { return false }
+        FullscreenVideoPreparationPool.shared.returnToPrepared(token)
+        state = .ad
+        return true
+    }
+
+    func releaseFromAd() -> Bool {
+        guard state == .ad || state == .claimed else { return false }
+        release()
+        return true
+    }
+
+    func releaseFromPresentation() -> Bool {
+        guard state == .presentation else { return false }
+        release()
+        return true
+    }
+
+    private func release() {
+        FullscreenVideoPreparationPool.shared.release(token)
+        state = .released
+    }
+
+    deinit {
+        guard state != .released else { return }
+        let token = token
+        DispatchQueue.main.async {
+            FullscreenVideoPreparationPool.shared.release(token)
+        }
+    }
+}
+
 private final class VideoLayerView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 

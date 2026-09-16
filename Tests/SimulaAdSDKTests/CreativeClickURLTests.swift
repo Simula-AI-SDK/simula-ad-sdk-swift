@@ -110,6 +110,69 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertEqual(publisher, [interaction])
     }
 
+    func testItemRoutedFallbackVideoEnqueuesOneDurableClick() {
+        let ad = FallbackAd(
+            adId: "fallback-video",
+            sourceIndex: 0,
+            renderedHtml: nil,
+            type: "video",
+            url: "https://cdn.example/video.mp4",
+            posterUrl: nil,
+            adBehavior: nil,
+            nativeClickBeaconV1Enabled: true,
+            destination: "web",
+            trackingUrl: "https://item.example/click"
+        )
+        XCTAssertNotNil(fallbackVideoCTARoute(ad: ad, allowsParentFallback: false))
+        let capable = DeviceCapabilities(
+            osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
+            adAttributionKitAvailable: true, nativeClickBeaconV1: true
+        )
+        let interaction = ClickInteraction(id: "item-route", source: .fallbackCTA)
+        var telemetryCount = 0
+        var beaconCount = 0
+        var publisherCount = 0
+
+        accountFallbackClick(
+            adId: ad.adId,
+            interaction: interaction,
+            capabilities: capable,
+            nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            adFormat: "rewarded",
+            adUnitId: "unit",
+            serveId: "parent",
+            recordTelemetry: { _, _ in telemetryCount += 1 },
+            enqueueBeacon: { claim, _ in
+                XCTAssertEqual(claim.interactionId, interaction.id)
+                beaconCount += 1
+            },
+            notifyPublisher: { _ in publisherCount += 1 }
+        )
+
+        XCTAssertEqual(telemetryCount, 1)
+        XCTAssertEqual(beaconCount, 1)
+        XCTAssertEqual(publisherCount, 1)
+    }
+
+    func testFallbackVideoWithoutRouteCannotBeginClickAccounting() {
+        XCTAssertFalse(canBeginFallbackVideoClick(
+            pageFinished: true,
+            clickHandoffPending: false,
+            routeActive: true,
+            trackingUrl: nil,
+            destination: .appstore,
+            storeUrl: nil
+        ))
+        XCTAssertTrue(canBeginFallbackVideoClick(
+            pageFinished: true,
+            clickHandoffPending: false,
+            routeActive: true,
+            trackingUrl: "https://item.example/click",
+            destination: .web,
+            storeUrl: nil
+        ))
+    }
+
     func testFallbackClickAccountingKeepsTelemetryAndPublisherWhenServerOwnsNoBeacon() {
         let capable = DeviceCapabilities(
             osVersion: "test", storekitAvailable: true, skanVersion: "4.0",

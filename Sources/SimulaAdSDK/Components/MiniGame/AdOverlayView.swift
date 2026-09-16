@@ -722,12 +722,14 @@ public struct AdOverlayView: View {
     }
 
     private func handleVideoClick() {
-        guard pageFinished, !clickHandoffPending, activeRouteLifecycle.isActive,
-              hasRoutableVideoDestination(
-                  trackingUrl: ctaTrackingUrl,
-                  destination: ctaDestination,
-                  storeUrl: ctaStoreUrl
-              ) else { return }
+        guard canBeginFallbackVideoClick(
+            pageFinished: pageFinished,
+            clickHandoffPending: clickHandoffPending,
+            routeActive: activeRouteLifecycle.isActive,
+            trackingUrl: ctaTrackingUrl,
+            destination: ctaDestination,
+            storeUrl: ctaStoreUrl
+        ) else { return }
         guard let automaticUserHandoff = activeRouteLifecycle.automaticRoutes.beginUserHandoff(
             scope: activeRouteLifecycle.automaticRouteScope
         ) else { return }
@@ -767,6 +769,21 @@ public struct AdOverlayView: View {
         }
     }
     #endif
+}
+
+func canBeginFallbackVideoClick(
+    pageFinished: Bool,
+    clickHandoffPending: Bool,
+    routeActive: Bool,
+    trackingUrl: String?,
+    destination: AdDestination,
+    storeUrl: String?
+) -> Bool {
+    pageFinished && !clickHandoffPending && routeActive && hasRoutableVideoDestination(
+        trackingUrl: trackingUrl,
+        destination: destination,
+        storeUrl: storeUrl
+    )
 }
 
 func fallbackNativeClickBeaconImpressionId(
