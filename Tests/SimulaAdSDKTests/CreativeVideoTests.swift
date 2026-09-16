@@ -444,6 +444,10 @@ final class CreativeVideoTests: XCTestCase {
         state.parentAccepted()
         XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
 
+        state.setPresentationActive(false)
+        state.setPresentationActive(true)
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+
         state.surfaceDidDisappear()
         state.setPresentationActive(true)
         state.surfaceDidAppear()
