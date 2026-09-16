@@ -503,6 +503,126 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
+    func testInterstitialAdmissionDoesNotRetainAdButAccountingSurvives() throws {
+        var recorded: [(String, FullscreenPresentationAccountingSnapshot)] = []
+        var beacons: [(String, FullscreenPresentationAccountingSnapshot)] = []
+        var publisherCallbacks = 0
+        var autoPreloads = 0
+        let sink = FullscreenPresentationAccountingSink(
+            recordDisplayed: { recorded.append(("displayed", $0)) },
+            recordImpression: { recorded.append(("impression", $0)) },
+            enqueueShown: { beacons.append(("shown", $0)) },
+            enqueueSeen: { beacons.append(("seen", $0)) }
+        )
+        var ad: SimulaInterstitialAd? = SimulaInterstitialAd(adUnitId: "interstitial-unit")
+        weak var weakAd = ad
+        let owner = WeakFullscreenPresentationOwner(try XCTUnwrap(ad))
+        let callbacks = fullscreenPresentationAccountingCallbacks(
+            owner: owner,
+            snapshot: FullscreenPresentationAccountingSnapshot(
+                adFormat: "interstitial",
+                adUnitId: "interstitial-unit",
+                adId: "interstitial-impression",
+                serveId: "interstitial-impression",
+                adValue: .fromBidCpm(5),
+                metadata: ["surface": "test"],
+                showStartNanos: DispatchTime.now().uptimeNanoseconds
+            ),
+            sink: sink,
+            notifyDisplayed: { _ in publisherCallbacks += 1 },
+            notifyDisplayFailed: { _ in publisherCallbacks += 1 },
+            notifyImpression: { _, _ in publisherCallbacks += 1 }
+        )
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: callbacks.onDisplayed,
+            onDisplayFailed: callbacks.onDisplayFailed,
+            onImpression: callbacks.onImpression
+        )
+        let closeAndPreload = { [owner] in
+            guard owner.value != nil else { return }
+            publisherCallbacks += 1
+            autoPreloads += 1
+        }
+
+        ad = nil
+        XCTAssertNil(weakAd)
+
+        admission.presentationDidSucceed()
+        admission.presentationDidSucceed()
+        callbacks.onImpression()
+        callbacks.onDisplayFailed()
+        closeAndPreload()
+
+        XCTAssertEqual(recorded.map(\.0), ["displayed", "impression"])
+        XCTAssertEqual(beacons.map(\.0), ["shown", "seen"])
+        XCTAssertEqual(recorded.last?.1.adValue, .fromBidCpm(5))
+        XCTAssertEqual(beacons.last?.1.metadata, ["surface": "test"])
+        XCTAssertEqual(publisherCallbacks, 0)
+        XCTAssertEqual(autoPreloads, 0)
+        admission.stop()
+    }
+
+    @MainActor
+    func testRewardedAdmissionDoesNotRetainAdButAccountingSurvives() throws {
+        var recorded: [(String, FullscreenPresentationAccountingSnapshot)] = []
+        var beacons: [(String, FullscreenPresentationAccountingSnapshot)] = []
+        var publisherCallbacks = 0
+        var autoPreloads = 0
+        let sink = FullscreenPresentationAccountingSink(
+            recordDisplayed: { recorded.append(("displayed", $0)) },
+            recordImpression: { recorded.append(("impression", $0)) },
+            enqueueShown: { beacons.append(("shown", $0)) },
+            enqueueSeen: { beacons.append(("seen", $0)) }
+        )
+        var ad: SimulaRewardedAd? = SimulaRewardedAd(adUnitId: "rewarded-unit")
+        weak var weakAd = ad
+        let owner = WeakFullscreenPresentationOwner(try XCTUnwrap(ad))
+        let callbacks = fullscreenPresentationAccountingCallbacks(
+            owner: owner,
+            snapshot: FullscreenPresentationAccountingSnapshot(
+                adFormat: "rewarded",
+                adUnitId: "rewarded-unit",
+                adId: "rewarded-impression",
+                serveId: nil,
+                adValue: .fromBidCpm(7),
+                metadata: ["surface": "test"],
+                showStartNanos: DispatchTime.now().uptimeNanoseconds
+            ),
+            sink: sink,
+            notifyDisplayed: { _ in publisherCallbacks += 1 },
+            notifyDisplayFailed: { _ in publisherCallbacks += 1 },
+            notifyImpression: { _, _ in publisherCallbacks += 1 }
+        )
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: callbacks.onDisplayed,
+            onDisplayFailed: callbacks.onDisplayFailed,
+            onImpression: callbacks.onImpression
+        )
+        let closeAndPreload = { [owner] in
+            guard owner.value != nil else { return }
+            publisherCallbacks += 1
+            autoPreloads += 1
+        }
+
+        ad = nil
+        XCTAssertNil(weakAd)
+
+        admission.presentationDidSucceed()
+        admission.presentationDidSucceed()
+        callbacks.onImpression()
+        callbacks.onDisplayFailed()
+        closeAndPreload()
+
+        XCTAssertEqual(recorded.map(\.0), ["displayed", "impression"])
+        XCTAssertEqual(beacons.map(\.0), ["shown", "seen"])
+        XCTAssertNil(recorded.last?.1.serveId)
+        XCTAssertEqual(recorded.last?.1.adValue, .fromBidCpm(7))
+        XCTAssertEqual(publisherCallbacks, 0)
+        XCTAssertEqual(autoPreloads, 0)
+        admission.stop()
+    }
+
+    @MainActor
     func testPresentationFinishEmitsOnlyNoDisplayFailure() {
         var displayed = 0
         var failed = 0

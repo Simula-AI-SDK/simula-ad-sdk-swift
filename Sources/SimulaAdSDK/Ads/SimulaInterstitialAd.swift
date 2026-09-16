@@ -495,37 +495,33 @@ public final class SimulaInterstitialAd {
         let presenter = InterstitialPresenter()
         let clickAdUnitId = adUnitId
         showStartNanos = DispatchTime.now().uptimeNanoseconds
-        let admission = FullscreenPresentationAdmission(
-            onDisplayed: { [self] in
-                Telemetry.shared.recordLifecycle(
-                    stage: "displayed", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.impressionId, serveId: response.impressionId,
-                    durationMs: self.msSince(self.showStartNanos), errorCode: nil
-                )
-                self.delegate?.interstitialDidDisplay(self)
-                AdBeaconManager.shared.enqueue(
-                    impressionId: response.impressionId,
-                    action: "shown",
-                    adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId
-                )
+        let presentationOwner = WeakFullscreenPresentationOwner(self)
+        let accountingCallbacks = fullscreenPresentationAccountingCallbacks(
+            owner: presentationOwner,
+            snapshot: FullscreenPresentationAccountingSnapshot(
+                adFormat: Self.adFormat,
+                adUnitId: adUnitId,
+                adId: response.impressionId,
+                serveId: response.impressionId,
+                adValue: response.adValue,
+                metadata: metadata,
+                showStartNanos: showStartNanos
+            ),
+            notifyDisplayed: { owner in
+                owner.delegate?.interstitialDidDisplay(owner)
             },
-            onDisplayFailed: { [self] in
-                self.failDisplay(.noFill)
+            notifyDisplayFailed: { owner in
+                owner.failDisplay(.noFill)
             },
-            onImpression: { [self] in
-                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
-                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
-                self.delegate?.interstitialDidRecordImpression(self)
-                self.delegate?.interstitialDidPay(self, value: response.adValue)
-                AdBeaconManager.shared.enqueue(
-                    impressionId: response.impressionId,
-                    action: "seen",
-                    adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId,
-                    metadata: metadata
-                )
+            notifyImpression: { owner, adValue in
+                owner.delegate?.interstitialDidRecordImpression(owner)
+                owner.delegate?.interstitialDidPay(owner, value: adValue)
             }
+        )
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: accountingCallbacks.onDisplayed,
+            onDisplayFailed: accountingCallbacks.onDisplayFailed,
+            onImpression: accountingCallbacks.onImpression
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
@@ -761,16 +757,19 @@ public final class SimulaInterstitialAd {
         )
 
         let presenter = InterstitialPresenter()
+        let previewAdValue = response.adValue
         let admission = FullscreenPresentationAdmission(
-            onDisplayed: { [self] in
+            onDisplayed: { [weak self] in
+                guard let self else { return }
                 self.delegate?.interstitialDidDisplay(self)
             },
-            onDisplayFailed: { [self] in
-                self.failDisplay(.noFill)
+            onDisplayFailed: { [weak self] in
+                self?.failDisplay(.noFill)
             },
-            onImpression: { [self] in
+            onImpression: { [weak self] in
+                guard let self else { return }
                 self.delegate?.interstitialDidRecordImpression(self)
-                self.delegate?.interstitialDidPay(self, value: response.adValue)
+                self.delegate?.interstitialDidPay(self, value: previewAdValue)
             }
         )
         let didPresent = presenter.present(

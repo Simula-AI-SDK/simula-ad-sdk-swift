@@ -242,6 +242,114 @@ struct FullscreenVisualSurfaceToken: Hashable, Sendable {
     init(id: UUID = UUID()) { self.id = id }
 }
 
+final class WeakFullscreenPresentationOwner<Owner: AnyObject> {
+    weak var value: Owner?
+
+    init(_ value: Owner) {
+        self.value = value
+    }
+}
+
+struct FullscreenPresentationAccountingSnapshot {
+    let adFormat: String
+    let adUnitId: String
+    let adId: String
+    let serveId: String?
+    let adValue: AdValue
+    let metadata: [String: String]?
+    let showStartNanos: UInt64
+
+    var showDurationMs: Int? {
+        guard showStartNanos != 0 else { return nil }
+        return Int((DispatchTime.now().uptimeNanoseconds &- showStartNanos) / 1_000_000)
+    }
+}
+
+struct FullscreenPresentationAccountingSink {
+    let recordDisplayed: (FullscreenPresentationAccountingSnapshot) -> Void
+    let recordImpression: (FullscreenPresentationAccountingSnapshot) -> Void
+    let enqueueShown: (FullscreenPresentationAccountingSnapshot) -> Void
+    let enqueueSeen: (FullscreenPresentationAccountingSnapshot) -> Void
+
+    static let live = FullscreenPresentationAccountingSink(
+        recordDisplayed: { snapshot in
+            Telemetry.shared.recordLifecycle(
+                stage: "displayed",
+                adFormat: snapshot.adFormat,
+                adUnitId: snapshot.adUnitId,
+                adId: snapshot.adId,
+                serveId: snapshot.serveId,
+                durationMs: snapshot.showDurationMs,
+                errorCode: nil
+            )
+        },
+        recordImpression: { snapshot in
+            Telemetry.shared.recordLifecycle(
+                stage: "impression",
+                adFormat: snapshot.adFormat,
+                adUnitId: snapshot.adUnitId,
+                adId: snapshot.adId,
+                serveId: snapshot.serveId
+            )
+            Telemetry.shared.recordLifecycle(
+                stage: "paid",
+                adFormat: snapshot.adFormat,
+                adUnitId: snapshot.adUnitId,
+                adId: snapshot.adId,
+                serveId: snapshot.serveId
+            )
+        },
+        enqueueShown: { snapshot in
+            AdBeaconManager.shared.enqueue(
+                impressionId: snapshot.adId,
+                action: "shown",
+                adFormat: snapshot.adFormat,
+                adUnitId: snapshot.adUnitId
+            )
+        },
+        enqueueSeen: { snapshot in
+            AdBeaconManager.shared.enqueue(
+                impressionId: snapshot.adId,
+                action: "seen",
+                adFormat: snapshot.adFormat,
+                adUnitId: snapshot.adUnitId,
+                metadata: snapshot.metadata
+            )
+        }
+    )
+}
+
+struct FullscreenPresentationAccountingCallbacks {
+    let onDisplayed: () -> Void
+    let onDisplayFailed: () -> Void
+    let onImpression: () -> Void
+}
+
+func fullscreenPresentationAccountingCallbacks<Owner: AnyObject>(
+    owner: WeakFullscreenPresentationOwner<Owner>,
+    snapshot: FullscreenPresentationAccountingSnapshot,
+    sink: FullscreenPresentationAccountingSink = .live,
+    notifyDisplayed: @escaping (Owner) -> Void,
+    notifyDisplayFailed: @escaping (Owner) -> Void,
+    notifyImpression: @escaping (Owner, AdValue) -> Void
+) -> FullscreenPresentationAccountingCallbacks {
+    FullscreenPresentationAccountingCallbacks(
+        onDisplayed: {
+            sink.recordDisplayed(snapshot)
+            if let owner = owner.value { notifyDisplayed(owner) }
+            sink.enqueueShown(snapshot)
+        },
+        onDisplayFailed: {
+            if let owner = owner.value { notifyDisplayFailed(owner) }
+        },
+        onImpression: {
+            sink.recordImpression(snapshot)
+            if let owner = owner.value { notifyImpression(owner, snapshot.adValue) }
+            sink.enqueueSeen(snapshot)
+        }
+    )
+}
+
 #if os(iOS)
 import UIKit
 

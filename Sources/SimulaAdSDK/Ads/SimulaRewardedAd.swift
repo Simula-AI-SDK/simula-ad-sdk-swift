@@ -420,37 +420,33 @@ public final class SimulaRewardedAd {
         // with `self == nil` — and must still be able to enqueue an earned reward.
         let salvageSessionId = sessionId
         let salvageAdUnitId = adUnitId
-        let admission = FullscreenPresentationAdmission(
-            onDisplayed: { [self] in
-                Telemetry.shared.recordLifecycle(
-                    stage: "displayed", adFormat: Self.adFormat, adUnitId: self.adUnitId,
-                    adId: response.impressionId, serveId: nil,
-                    durationMs: self.msSince(self.showStartNanos), errorCode: nil
-                )
-                self.delegate?.rewardedDidDisplay(self)
-                AdBeaconManager.shared.enqueue(
-                    impressionId: response.impressionId,
-                    action: "shown",
-                    adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId
-                )
+        let presentationOwner = WeakFullscreenPresentationOwner(self)
+        let accountingCallbacks = fullscreenPresentationAccountingCallbacks(
+            owner: presentationOwner,
+            snapshot: FullscreenPresentationAccountingSnapshot(
+                adFormat: Self.adFormat,
+                adUnitId: adUnitId,
+                adId: response.impressionId,
+                serveId: nil,
+                adValue: response.adValue,
+                metadata: metadata,
+                showStartNanos: showStartNanos
+            ),
+            notifyDisplayed: { owner in
+                owner.delegate?.rewardedDidDisplay(owner)
             },
-            onDisplayFailed: { [self] in
-                self.failDisplay(.noFill)
+            notifyDisplayFailed: { owner in
+                owner.failDisplay(.noFill)
             },
-            onImpression: { [self] in
-                Telemetry.shared.recordLifecycle(stage: "impression", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
-                Telemetry.shared.recordLifecycle(stage: "paid", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
-                self.delegate?.rewardedDidRecordImpression(self)
-                self.delegate?.rewardedDidPay(self, value: response.adValue)
-                AdBeaconManager.shared.enqueue(
-                    impressionId: response.impressionId,
-                    action: "seen",
-                    adFormat: Self.adFormat,
-                    adUnitId: self.adUnitId,
-                    metadata: metadata
-                )
+            notifyImpression: { owner, adValue in
+                owner.delegate?.rewardedDidRecordImpression(owner)
+                owner.delegate?.rewardedDidPay(owner, value: adValue)
             }
+        )
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: accountingCallbacks.onDisplayed,
+            onDisplayFailed: accountingCallbacks.onDisplayFailed,
+            onImpression: accountingCallbacks.onImpression
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
@@ -697,16 +693,19 @@ public final class SimulaRewardedAd {
         let duration = max(0, durationSeconds)
 
         let presenter = RewardedPresenter()
+        let previewAdValue = AdValue.fromBidCpm(0)
         let admission = FullscreenPresentationAdmission(
-            onDisplayed: { [self] in
+            onDisplayed: { [weak self] in
+                guard let self else { return }
                 self.delegate?.rewardedDidDisplay(self)
             },
-            onDisplayFailed: { [self] in
-                self.failDisplay(.noFill)
+            onDisplayFailed: { [weak self] in
+                self?.failDisplay(.noFill)
             },
-            onImpression: { [self] in
+            onImpression: { [weak self] in
+                guard let self else { return }
                 self.delegate?.rewardedDidRecordImpression(self)
-                self.delegate?.rewardedDidPay(self, value: AdValue.fromBidCpm(0))
+                self.delegate?.rewardedDidPay(self, value: previewAdValue)
             }
         )
         let didPresent = presenter.present(
