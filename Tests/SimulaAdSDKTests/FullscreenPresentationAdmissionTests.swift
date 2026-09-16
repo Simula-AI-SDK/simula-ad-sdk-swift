@@ -394,8 +394,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     func testVideoDisappearReappearBeforeImpressionResumesRemainingDwellWithoutRedisplay() {
-        let player = NSObject()
-        let identity = ObjectIdentifier(player)
         var state = FullscreenVisualAdmissionState()
         var displayed = 0
         var shown = 0
@@ -410,14 +408,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         state.visualBecameUnavailable()
         XCTAssertFalse(state.accrueImpression(deltaMs: 1_000, thresholdMs: 1_000))
 
-        XCTAssertTrue(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: true,
-            playerFirstFrameAdmitted: true,
-            admittedPlayerIdentity: identity,
-            currentPlayerIdentity: identity,
-            status: .playing,
-            isStopped: false
-        ))
         if state.visualBecameReady() {
             displayed += 1
             shown += 1
@@ -435,8 +425,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     func testVideoDisappearReappearAfterImpressionDoesNotRepeatAccounting() {
-        let player = NSObject()
-        let identity = ObjectIdentifier(player)
         var state = FullscreenVisualAdmissionState()
         var displayed = 0
         var impressions = 0
@@ -444,14 +432,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         if state.visualBecameReady() { displayed += 1 }
         if state.accrueImpression(deltaMs: 1_000, thresholdMs: 1_000) { impressions += 1 }
         state.visualBecameUnavailable()
-        XCTAssertTrue(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: true,
-            playerFirstFrameAdmitted: true,
-            admittedPlayerIdentity: identity,
-            currentPlayerIdentity: identity,
-            status: .paused,
-            isStopped: false
-        ))
         if state.visualBecameReady() { displayed += 1 }
         if state.accrueImpression(deltaMs: 1_000, thresholdMs: 1_000) { impressions += 1 }
 
@@ -461,22 +441,12 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     func testVideoReappearanceWhileInactiveStaysBlockedUntilForeground() {
-        let player = NSObject()
-        let identity = ObjectIdentifier(player)
         var state = FullscreenVisualAdmissionState()
 
         XCTAssertTrue(state.visualBecameReady())
         XCTAssertFalse(state.accrueImpression(deltaMs: 400, thresholdMs: 1_000))
         state.visualBecameUnavailable()
         state.setBlocked(true)
-        XCTAssertTrue(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: true,
-            playerFirstFrameAdmitted: true,
-            admittedPlayerIdentity: identity,
-            currentPlayerIdentity: identity,
-            status: .ready,
-            isStopped: false
-        ))
         XCTAssertFalse(state.visualBecameReady())
         XCTAssertFalse(state.accrueImpression(deltaMs: 600, thresholdMs: 1_000))
         XCTAssertEqual(state.accruedImpressionMs, 400)
@@ -493,10 +463,10 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             (.ended, false),
             (.paused, true),
         ] {
-            XCTAssertFalse(shouldReadmitFullscreenVideoVisual(
-                primaryCreativeReady: true,
-                playerFirstFrameAdmitted: true,
-                admittedPlayerIdentity: identity,
+            XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
+                presentationActive: true,
+                failureHandled: false,
+                callbackPlayerIdentity: identity,
                 currentPlayerIdentity: identity,
                 status: status,
                 isStopped: stopped
@@ -508,26 +478,10 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         let admittedPlayer = NSObject()
         let replacementPlayer = NSObject()
 
-        XCTAssertFalse(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: true,
-            playerFirstFrameAdmitted: true,
-            admittedPlayerIdentity: ObjectIdentifier(admittedPlayer),
-            currentPlayerIdentity: ObjectIdentifier(replacementPlayer),
-            status: .playing,
-            isStopped: false
-        ))
-        XCTAssertFalse(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: false,
-            playerFirstFrameAdmitted: false,
-            admittedPlayerIdentity: nil,
-            currentPlayerIdentity: ObjectIdentifier(replacementPlayer),
-            status: .playing,
-            isStopped: false
-        ))
-        XCTAssertFalse(shouldReadmitFullscreenVideoVisual(
-            primaryCreativeReady: true,
-            playerFirstFrameAdmitted: false,
-            admittedPlayerIdentity: ObjectIdentifier(replacementPlayer),
+        XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
+            presentationActive: true,
+            failureHandled: false,
+            callbackPlayerIdentity: ObjectIdentifier(admittedPlayer),
             currentPlayerIdentity: ObjectIdentifier(replacementPlayer),
             status: .playing,
             isStopped: false
@@ -819,6 +773,36 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         clock.now = 50.7
         admission.setApplicationActive(false)
 
+        XCTAssertEqual(impressions, 1)
+        admission.stop()
+    }
+
+    @MainActor
+    func testInactiveOnAppearBlocksBeforeReadmissionNearImpressionThreshold() {
+        let clock = TestUptime(0)
+        let owner = FullscreenVisualSurfaceToken()
+        var impressions = 0
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: {},
+            onImpression: { impressions += 1 },
+            impressionDelayMs: 1_000,
+            tickNanos: 60_000_000_000,
+            uptime: { clock.now },
+            initialApplicationActive: true
+        )
+
+        admission.visualBecameReady(owner: owner)
+        clock.now = 0.99
+        admission.visualBecameUnavailable(owner: owner)
+        clock.now = 100
+        admission.setBlocked(true)
+        admission.visualBecameReady(owner: owner)
+        clock.now = 200
+        admission.setBlocked(false)
+        XCTAssertEqual(impressions, 0)
+
+        clock.now = 200.02
+        admission.setBlocked(true)
         XCTAssertEqual(impressions, 1)
         admission.stop()
     }

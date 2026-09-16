@@ -337,6 +337,8 @@ public struct AdOverlayView: View {
                         if ad.mediaType == .video, let videoPlayer {
                             FullscreenVideoSurface(
                                 videoPlayer: videoPlayer,
+                                presentationActive: hasAppeared && !closing
+                                    && appForegrounded && !storeSheetPresented,
                                 onTap: { handleVideoClick() },
                                 onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
                                 controlsEnabled: pageFinished
@@ -391,11 +393,11 @@ public struct AdOverlayView: View {
         .hideStatusBar(shouldHideStatusBar)
         .onAppear {
             activeRouteLifecycle.activate()
-            hasAppeared = true
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
+            hasAppeared = true
             if screenMountCoordinator.scheduleIfNeeded() {
                 // Let the outer lifecycle modifier finish installing its notification subscriptions
                 // before an automatic store sheet can synchronously publish will-present.
@@ -800,11 +802,12 @@ public struct AdOverlayView: View {
         }
     }
 
-    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
-        guard !closing, !videoFailureHandled, !pageFinished,
-              let identity = videoSurfaceIdentity(for: player) else { return }
-        guard firstFrameHandoff.receive(identity, parentAppeared: hasAppeared) else { return }
-        _ = admitVideoFirstFrame(player: player, identity: identity)
+    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) -> Bool {
+        guard !closing, !videoFailureHandled,
+              let identity = videoSurfaceIdentity(for: player) else { return false }
+        if pageFinished { return firstFrameHandoff.admitted == identity }
+        guard firstFrameHandoff.receive(identity, parentAppeared: hasAppeared) else { return false }
+        return admitVideoFirstFrame(player: player, identity: identity)
     }
 
     private func replayPendingVideoFirstFrameIfNeeded() -> Bool {

@@ -458,14 +458,14 @@ final class FullscreenPresentationAdmission {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            DispatchQueue.main.async { self?.setApplicationActive(false) }
+            MainActor.assumeIsolated { self?.setApplicationActive(false) }
         })
         lifecycleObservers.append(center.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            DispatchQueue.main.async { self?.setApplicationActive(true) }
+            MainActor.assumeIsolated { self?.setApplicationActive(true) }
         })
     }
 

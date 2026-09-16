@@ -393,48 +393,101 @@ final class CreativeVideoTests: XCTestCase {
         let playerID = ObjectIdentifier(player)
 
         XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
-            viewAppeared: false,
-            visible: true,
+            presentationActive: false,
             failureHandled: false,
-            primaryCreativeReady: false,
             callbackPlayerIdentity: playerID,
-            currentPlayerIdentity: playerID
+            currentPlayerIdentity: playerID,
+            status: .playing,
+            isStopped: false
         ))
         XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
-            viewAppeared: true,
-            visible: true,
+            presentationActive: true,
             failureHandled: false,
-            primaryCreativeReady: false,
             callbackPlayerIdentity: playerID,
-            currentPlayerIdentity: ObjectIdentifier(replacement)
+            currentPlayerIdentity: ObjectIdentifier(replacement),
+            status: .playing,
+            isStopped: false
         ))
         XCTAssertTrue(shouldAcceptFullscreenVideoFirstFrameCallback(
-            viewAppeared: true,
-            visible: true,
+            presentationActive: true,
             failureHandled: false,
-            primaryCreativeReady: false,
             callbackPlayerIdentity: playerID,
+            currentPlayerIdentity: playerID,
+            status: .playing,
+            isStopped: false
+        ))
+    }
+
+    func testLayerReadinessBeforeAppearanceIsRetainedAndReplayed() {
+        let player = NSObject()
+        let identity = ObjectIdentifier(player)
+        var state = VideoSurfaceFirstFrameHandoffState()
+
+        state.layerBecameReady(playerIdentity: identity, currentPlayerIdentity: identity)
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        state.setPresentationActive(true)
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        state.surfaceDidAppear()
+        XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        state.parentAccepted()
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+    }
+
+    func testSameReadySurfaceReplaysParentHandoffOncePerAppearance() {
+        let player = NSObject()
+        let identity = ObjectIdentifier(player)
+        var state = VideoSurfaceFirstFrameHandoffState()
+        state.layerBecameReady(playerIdentity: identity, currentPlayerIdentity: identity)
+        state.setPresentationActive(true)
+        state.surfaceDidAppear()
+        XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        state.parentAccepted()
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+
+        state.surfaceDidDisappear()
+        state.setPresentationActive(true)
+        state.surfaceDidAppear()
+        XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        state.parentAccepted()
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+    }
+
+    func testStaleLayerReadinessCannotTransferToReplacementSurface() {
+        let player = NSObject()
+        let replacement = NSObject()
+        let playerID = ObjectIdentifier(player)
+        let replacementID = ObjectIdentifier(replacement)
+        var state = VideoSurfaceFirstFrameHandoffState()
+        state.layerBecameReady(playerIdentity: playerID, currentPlayerIdentity: playerID)
+        state.setPresentationActive(true)
+        state.surfaceDidAppear()
+
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: replacementID))
+        state.layerBecameReady(playerIdentity: playerID, currentPlayerIdentity: replacementID)
+        XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: replacementID))
+        state.layerBecameReady(playerIdentity: replacementID, currentPlayerIdentity: replacementID)
+        XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: replacementID))
+    }
+
+    func testRecreatedVideoSurfaceStaysHiddenUntilItsOwnLayerIsReady() {
+        let player = NSObject()
+        let playerID = ObjectIdentifier(player)
+        XCTAssertFalse(videoSurfaceShowsFirstFrame(
+            localPlayerIdentity: nil,
             currentPlayerIdentity: playerID
         ))
     }
 
-    func testRecreatedVideoSurfaceShowsAlreadyAdmittedPlayerFrame() {
+    func testRecreatedVideoSurfaceShowsAfterItsOwnLayerReadiness() {
         let player = NSObject()
         let replacement = NSObject()
-        XCTAssertFalse(videoSurfaceShowsFirstFrame(
-            localPlayerIdentity: nil,
-            currentPlayerIdentity: ObjectIdentifier(player),
-            playerFirstFrameAdmitted: false
-        ))
         XCTAssertTrue(videoSurfaceShowsFirstFrame(
-            localPlayerIdentity: nil,
-            currentPlayerIdentity: ObjectIdentifier(player),
-            playerFirstFrameAdmitted: true
+            localPlayerIdentity: ObjectIdentifier(player),
+            currentPlayerIdentity: ObjectIdentifier(player)
         ))
         XCTAssertFalse(videoSurfaceShowsFirstFrame(
             localPlayerIdentity: ObjectIdentifier(player),
-            currentPlayerIdentity: ObjectIdentifier(replacement),
-            playerFirstFrameAdmitted: false
+            currentPlayerIdentity: ObjectIdentifier(replacement)
         ))
     }
 
@@ -446,6 +499,33 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertTrue(player.admitFirstVisualFrame())
         XCTAssertTrue(player.hasAdmittedFirstVisualFrame)
         XCTAssertFalse(player.admitFirstVisualFrame())
+        player.stop()
+    }
+
+    @MainActor
+    func testNeverReadyLayerTimesOutOnlyWhilePresentationIsActive() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        let view = VideoLayerView(frame: .zero)
+        var timeouts = 0
+        view.install(
+            player: player.player,
+            presentationActive: false,
+            onFirstFrame: {},
+            onReadinessTimeout: { timeouts += 1 }
+        )
+        view.fireCurrentReadinessDeadline()
+        XCTAssertEqual(timeouts, 0)
+
+        view.install(
+            player: player.player,
+            presentationActive: true,
+            onFirstFrame: {},
+            onReadinessTimeout: { timeouts += 1 }
+        )
+        view.fireCurrentReadinessDeadline()
+        view.fireCurrentReadinessDeadline()
+        XCTAssertEqual(timeouts, 1)
+        view.uninstall()
         player.stop()
     }
     #endif

@@ -204,34 +204,19 @@ func shouldReusePreparedVideoPlayer(
     !isStopped && !isActive && status.reusableForPreparedClaim
 }
 
-func shouldReadmitFullscreenVideoVisual(
-    primaryCreativeReady: Bool,
-    playerFirstFrameAdmitted: Bool,
-    admittedPlayerIdentity: ObjectIdentifier?,
-    currentPlayerIdentity: ObjectIdentifier,
+func shouldAcceptFullscreenVideoFirstFrameCallback(
+    presentationActive: Bool,
+    failureHandled: Bool,
+    callbackPlayerIdentity: ObjectIdentifier,
+    currentPlayerIdentity: ObjectIdentifier?,
     status: FullscreenVideoStatus,
     isStopped: Bool
 ) -> Bool {
-    primaryCreativeReady
-        && playerFirstFrameAdmitted
-        && admittedPlayerIdentity == currentPlayerIdentity
+    presentationActive
+        && !failureHandled
+        && callbackPlayerIdentity == currentPlayerIdentity
         && !status.isTerminal
         && !isStopped
-}
-
-func shouldAcceptFullscreenVideoFirstFrameCallback(
-    viewAppeared: Bool,
-    visible: Bool,
-    failureHandled: Bool,
-    primaryCreativeReady: Bool,
-    callbackPlayerIdentity: ObjectIdentifier,
-    currentPlayerIdentity: ObjectIdentifier?
-) -> Bool {
-    viewAppeared
-        && visible
-        && !failureHandled
-        && !primaryCreativeReady
-        && callbackPlayerIdentity == currentPlayerIdentity
 }
 
 func shouldAcceptVideoLayerReadyCallback(
@@ -255,10 +240,50 @@ func shouldAcceptVideoLayerReadyCallback(
 
 func videoSurfaceShowsFirstFrame(
     localPlayerIdentity: ObjectIdentifier?,
-    currentPlayerIdentity: ObjectIdentifier,
-    playerFirstFrameAdmitted: Bool
+    currentPlayerIdentity: ObjectIdentifier
 ) -> Bool {
-    localPlayerIdentity == currentPlayerIdentity || playerFirstFrameAdmitted
+    localPlayerIdentity == currentPlayerIdentity
+}
+
+struct VideoSurfaceFirstFrameHandoffState: Equatable {
+    private(set) var readyLayerPlayerIdentity: ObjectIdentifier?
+    private(set) var surfaceAppeared = false
+    private(set) var presentationActive = false
+    private(set) var parentNotifiedForAppearance = false
+
+    mutating func layerBecameReady(
+        playerIdentity: ObjectIdentifier,
+        currentPlayerIdentity: ObjectIdentifier
+    ) {
+        guard playerIdentity == currentPlayerIdentity else { return }
+        readyLayerPlayerIdentity = playerIdentity
+    }
+
+    mutating func surfaceDidAppear() {
+        surfaceAppeared = true
+        parentNotifiedForAppearance = false
+    }
+
+    mutating func surfaceDidDisappear() {
+        surfaceAppeared = false
+        presentationActive = false
+        parentNotifiedForAppearance = false
+    }
+
+    mutating func setPresentationActive(_ active: Bool) {
+        presentationActive = active
+    }
+
+    func shouldAttemptParentHandoff(currentPlayerIdentity: ObjectIdentifier) -> Bool {
+        surfaceAppeared
+            && presentationActive
+            && !parentNotifiedForAppearance
+            && readyLayerPlayerIdentity == currentPlayerIdentity
+    }
+
+    mutating func parentAccepted() {
+        parentNotifiedForAppearance = true
+    }
 }
 
 func shouldShowVideoStorePrompt(enabled: Bool, reachedMidpoint: Bool, dismissUnlocked: Bool) -> Bool {
@@ -419,6 +444,10 @@ final class FullscreenVideoPlayer: ObservableObject {
             DispatchQueue.main.async { [weak self] in self?.completePendingEndAfterFirstFrame() }
         }
         return true
+    }
+
+    func surfaceReadinessTimedOut() {
+        fail(.firstFrameTimeout)
     }
 
     func stop() {
@@ -970,25 +999,49 @@ final class FullscreenVideoPreparationOwnership {
 }
 
 final class VideoLayerView: UIView {
+    static let readinessTimeout: TimeInterval = 10
+
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
     private var readyObservation: NSKeyValueObservation?
     private weak var installedPlayer: AVPlayer?
     private var firstFrameReported = false
     private var installationGeneration: UInt64 = 0
+    private var presentationActive = false
+    private var readinessDeadline = VideoFirstFrameDeadlineState()
+    private var readinessTimeoutWorkItem: DispatchWorkItem?
+    private var onFirstFrame: (() -> Void)?
+    private var onReadinessTimeout: (() -> Void)?
 
-    func install(player: AVPlayer?, onFirstFrame: @escaping () -> Void) {
+    func install(
+        player: AVPlayer?,
+        presentationActive: Bool,
+        onFirstFrame: @escaping () -> Void,
+        onReadinessTimeout: @escaping () -> Void
+    ) {
         guard let playerLayer = layer as? AVPlayerLayer else { return }
         playerLayer.videoGravity = .resizeAspect
-        guard installedPlayer !== player else { return }
+        self.presentationActive = presentationActive
+        self.onFirstFrame = onFirstFrame
+        self.onReadinessTimeout = onReadinessTimeout
+        guard installedPlayer !== player else {
+            reconcileReadinessDeadline()
+            return
+        }
         installationGeneration &+= 1
         let generation = installationGeneration
         readyObservation?.invalidate()
         readyObservation = nil
+        readinessTimeoutWorkItem?.cancel()
+        readinessTimeoutWorkItem = nil
+        readinessDeadline = VideoFirstFrameDeadlineState()
         installedPlayer = player
         firstFrameReported = false
         playerLayer.player = player
-        guard let player else { return }
+        guard let player else {
+            reconcileReadinessDeadline()
+            return
+        }
         let playerIdentity = ObjectIdentifier(player)
         readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
             guard layer.isReadyForDisplay else { return }
@@ -1006,37 +1059,90 @@ final class VideoLayerView: UIView {
                           isReadyForDisplay: observedLayer.isReadyForDisplay,
                           firstFrameReported: self.firstFrameReported
                       ) else { return }
+                guard self.readinessDeadline.admit() else { return }
                 self.firstFrameReported = true
                 self.readyObservation?.invalidate()
                 self.readyObservation = nil
-                onFirstFrame()
+                self.readinessTimeoutWorkItem?.cancel()
+                self.readinessTimeoutWorkItem = nil
+                self.onFirstFrame?()
             }
         }
+        reconcileReadinessDeadline()
     }
 
     func uninstall() {
         installationGeneration &+= 1
+        presentationActive = false
+        readinessDeadline.fail()
         readyObservation?.invalidate()
         readyObservation = nil
+        readinessTimeoutWorkItem?.cancel()
+        readinessTimeoutWorkItem = nil
         installedPlayer = nil
         firstFrameReported = false
+        onFirstFrame = nil
+        onReadinessTimeout = nil
         (layer as? AVPlayerLayer)?.player = nil
+    }
+
+    func fireCurrentReadinessDeadline() {
+        readinessDeadlineFired(generation: installationGeneration)
+    }
+
+    private func reconcileReadinessDeadline() {
+        guard presentationActive, installedPlayer != nil, !firstFrameReported else {
+            readinessDeadline.pause()
+            readinessTimeoutWorkItem?.cancel()
+            readinessTimeoutWorkItem = nil
+            return
+        }
+        guard readinessDeadline.arm() else { return }
+        let generation = installationGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.readinessDeadlineFired(generation: generation)
+        }
+        readinessTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.readinessTimeout,
+            execute: workItem
+        )
+    }
+
+    private func readinessDeadlineFired(generation: UInt64) {
+        readinessTimeoutWorkItem?.cancel()
+        readinessTimeoutWorkItem = nil
+        guard generation == installationGeneration, presentationActive,
+              readinessDeadline.timeout() else { return }
+        onReadinessTimeout?()
     }
 }
 
 private struct VideoLayerRepresentable: UIViewRepresentable {
     let player: AVPlayer
+    let presentationActive: Bool
     let onFirstFrame: () -> Void
+    let onReadinessTimeout: () -> Void
 
     func makeUIView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
         view.backgroundColor = .black
-        view.install(player: player, onFirstFrame: onFirstFrame)
+        view.install(
+            player: player,
+            presentationActive: presentationActive,
+            onFirstFrame: onFirstFrame,
+            onReadinessTimeout: onReadinessTimeout
+        )
         return view
     }
 
     func updateUIView(_ view: VideoLayerView, context: Context) {
-        view.install(player: player, onFirstFrame: onFirstFrame)
+        view.install(
+            player: player,
+            presentationActive: presentationActive,
+            onFirstFrame: onFirstFrame,
+            onReadinessTimeout: onReadinessTimeout
+        )
     }
 
     static func dismantleUIView(_ view: VideoLayerView, coordinator: ()) {
@@ -1046,16 +1152,16 @@ private struct VideoLayerRepresentable: UIViewRepresentable {
 
 struct FullscreenVideoSurface: View {
     @ObservedObject var videoPlayer: FullscreenVideoPlayer
+    let presentationActive: Bool
     let onTap: () -> Void
-    let onFirstFrame: () -> Void
+    let onFirstFrame: () -> Bool
     let controlsEnabled: Bool
-    @State private var firstFramePlayerIdentity: ObjectIdentifier?
+    @State private var firstFrameHandoff = VideoSurfaceFirstFrameHandoffState()
 
     private var showsFirstFrame: Bool {
         videoSurfaceShowsFirstFrame(
-            localPlayerIdentity: firstFramePlayerIdentity,
-            currentPlayerIdentity: ObjectIdentifier(videoPlayer),
-            playerFirstFrameAdmitted: videoPlayer.hasAdmittedFirstVisualFrame
+            localPlayerIdentity: firstFrameHandoff.readyLayerPlayerIdentity,
+            currentPlayerIdentity: ObjectIdentifier(videoPlayer)
         )
     }
 
@@ -1071,13 +1177,19 @@ struct FullscreenVideoSurface: View {
                 }
             }
 
-            VideoLayerRepresentable(player: videoPlayer.player) {
-                let playerIdentity = ObjectIdentifier(videoPlayer)
-                guard firstFramePlayerIdentity != playerIdentity else { return }
-                guard videoPlayer.admitFirstVisualFrame() else { return }
-                firstFramePlayerIdentity = playerIdentity
-                onFirstFrame()
-            }
+            VideoLayerRepresentable(
+                player: videoPlayer.player,
+                presentationActive: presentationActive,
+                onFirstFrame: {
+                    let playerIdentity = ObjectIdentifier(videoPlayer)
+                    firstFrameHandoff.layerBecameReady(
+                        playerIdentity: playerIdentity,
+                        currentPlayerIdentity: playerIdentity
+                    )
+                    attemptParentHandoff()
+                },
+                onReadinessTimeout: { videoPlayer.surfaceReadinessTimedOut() }
+            )
             .opacity(showsFirstFrame ? 1 : 0)
 
             Color.clear
@@ -1119,11 +1231,28 @@ struct FullscreenVideoSurface: View {
         }
         .background(Color.black)
         .onAppear {
-            if videoPlayer.hasAdmittedFirstVisualFrame {
-                firstFramePlayerIdentity = ObjectIdentifier(videoPlayer)
-            }
+            firstFrameHandoff.setPresentationActive(presentationActive)
+            firstFrameHandoff.surfaceDidAppear()
+            attemptParentHandoff()
             videoPlayer.play()
         }
+        .onDisappear {
+            firstFrameHandoff.surfaceDidDisappear()
+        }
+        .onChange(of: presentationActive) { active in
+            firstFrameHandoff.setPresentationActive(active)
+            attemptParentHandoff()
+        }
+    }
+
+    private func attemptParentHandoff() {
+        let playerIdentity = ObjectIdentifier(videoPlayer)
+        guard firstFrameHandoff.shouldAttemptParentHandoff(
+            currentPlayerIdentity: playerIdentity
+        ) else { return }
+        guard videoPlayer.hasAdmittedFirstVisualFrame || videoPlayer.admitFirstVisualFrame() else { return }
+        guard onFirstFrame() else { return }
+        firstFrameHandoff.parentAccepted()
     }
 }
 #else

@@ -358,6 +358,9 @@ private struct CreativeInterstitialView: View {
     /// (compact, always-available top-right X) so ads without `ad_behavior` still get a small close.
     private var closeConfig: CloseBehavior { response.adBehavior?.close ?? CloseBehavior() }
     private var clickHandoffPending: Bool { clickHandoffs.isPending }
+    private var presentationActive: Bool {
+        viewAppeared && visible && appForegrounded && !storeSheetPresented
+    }
 
     var body: some View {
         ZStack {
@@ -415,11 +418,10 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            appForegrounded = UIApplication.shared.applicationState == .active
+            admission.setBlocked(storeSheetPresented || !appForegrounded)
             viewAppeared = true
             attributionRouteLifecycle.activate()
-            appForegrounded = UIApplication.shared.applicationState == .active
-            readmitVideoVisualIfNeeded()
-            admission.setBlocked(storeSheetPresented || !appForegrounded)
             if storeExit == nil {
                 storeExit = StoreExitTracker(
                     adId: response.impressionId,
@@ -618,6 +620,7 @@ private struct CreativeInterstitialView: View {
     private func videoCreativeView(_ player: FullscreenVideoPlayer) -> some View {
         FullscreenVideoSurface(
             videoPlayer: player,
+            presentationActive: presentationActive,
             onTap: { handleVideoClick() },
             onFirstFrame: { handleVideoFirstFrame(player: player) },
             controlsEnabled: canUseVideoControls(
@@ -665,15 +668,23 @@ private struct CreativeInterstitialView: View {
         }
     }
 
-    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
+    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) -> Bool {
         guard shouldAcceptFullscreenVideoFirstFrameCallback(
-            viewAppeared: viewAppeared,
-            visible: visible,
+            presentationActive: presentationActive,
             failureHandled: videoFailureHandled,
-            primaryCreativeReady: primaryCreativeReady,
             callbackPlayerIdentity: ObjectIdentifier(player),
-            currentPlayerIdentity: videoPlayer.map(ObjectIdentifier.init)
-        ) else { return }
+            currentPlayerIdentity: videoPlayer.map(ObjectIdentifier.init),
+            status: player.status,
+            isStopped: player.isStopped
+        ) else { return false }
+        if primaryCreativeReady {
+            guard admittedVideoPlayerIdentity == ObjectIdentifier(player),
+                  player.hasAdmittedFirstVisualFrame else { return false }
+            if !admission.visualIsActive {
+                admission.visualBecameReady(owner: admissionOwner)
+            }
+            return true
+        }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         handleSKANCreativeReady()
@@ -687,20 +698,7 @@ private struct CreativeInterstitialView: View {
             )
         }
         fireAutoStoreRedirectIfCloseShown()
-    }
-
-    private func readmitVideoVisualIfNeeded() {
-        guard viewAppeared, visible, !videoFailureHandled, !admission.visualIsActive,
-              let videoPlayer,
-              shouldReadmitFullscreenVideoVisual(
-                  primaryCreativeReady: primaryCreativeReady,
-                  playerFirstFrameAdmitted: videoPlayer.hasAdmittedFirstVisualFrame,
-                  admittedPlayerIdentity: admittedVideoPlayerIdentity,
-                  currentPlayerIdentity: ObjectIdentifier(videoPlayer),
-                  status: videoPlayer.status,
-                  isStopped: videoPlayer.isStopped
-              ) else { return }
-        admission.visualBecameReady(owner: admissionOwner)
+        return true
     }
 
     private func updateVideoGate(
