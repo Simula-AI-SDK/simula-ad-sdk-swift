@@ -125,6 +125,49 @@ struct RewardCompletionState: Equatable, Sendable {
     }
 }
 
+struct RewardedEarlyCompletionState: Equatable, Sendable {
+    private(set) var pending = false
+    private(set) var consumed = false
+    private(set) var failed = false
+
+    mutating func receive(
+        signaled: Bool,
+        primaryCreativeReady: Bool,
+        rewardEarned: Bool
+    ) -> Bool {
+        guard signaled, !failed, !consumed else { return false }
+        guard !rewardEarned else {
+            consumed = true
+            pending = false
+            return false
+        }
+        pending = true
+        return consumeIfReady(primaryCreativeReady: primaryCreativeReady)
+    }
+
+    mutating func primaryCreativeBecameReady(rewardEarned: Bool) -> Bool {
+        guard !failed, !consumed else { return false }
+        guard !rewardEarned else {
+            consumed = true
+            pending = false
+            return false
+        }
+        return consumeIfReady(primaryCreativeReady: true)
+    }
+
+    mutating func primaryCreativeFailed() {
+        pending = false
+        failed = true
+    }
+
+    private mutating func consumeIfReady(primaryCreativeReady: Bool) -> Bool {
+        guard pending, primaryCreativeReady else { return false }
+        pending = false
+        consumed = true
+        return true
+    }
+}
+
 func consumeReadyAdBeforeDisplayFailure(
     transitionToIdle: () -> Void,
     notifyFailure: () -> Void

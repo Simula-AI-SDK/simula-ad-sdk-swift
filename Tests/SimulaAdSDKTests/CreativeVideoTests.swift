@@ -201,4 +201,24 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertTrue(gate.isUnlocked)
         XCTAssertEqual(gate.earnedCompletionReason, .durationElapsed)
     }
+
+    func testInterstitialFirstFrameSnapshotUnlocksZeroDelayImmediately() {
+        var gate = VideoPlaybackGate(configuredDelay: 0)
+
+        gate.update(duration: 20, played: 0)
+
+        XCTAssertTrue(gate.isUnlocked)
+        XCTAssertEqual(gate.progress, 1)
+        XCTAssertEqual(gate.secondsRemaining, 0)
+    }
+
+    func testInterstitialFirstFrameSnapshotPreservesKnownPositiveGateProgress() {
+        var gate = VideoPlaybackGate(configuredDelay: 5)
+
+        gate.update(duration: 20, played: 2)
+
+        XCTAssertFalse(gate.isUnlocked)
+        XCTAssertEqual(gate.progress, 0.4, accuracy: 0.001)
+        XCTAssertEqual(gate.secondsRemaining, 3)
+    }
 }

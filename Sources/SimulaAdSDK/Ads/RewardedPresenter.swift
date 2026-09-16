@@ -303,6 +303,7 @@ private struct RewardedGameView: View {
     /// stack deltas until the displayed fill pins at zero.
     @State private var closeGateGeneration = 0
     @State private var rewardCompletion = RewardCompletionState()
+    @State private var earlyCompletion = RewardedEarlyCompletionState()
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
@@ -512,11 +513,12 @@ private struct RewardedGameView: View {
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
         // reward and reveal the close button immediately, bypassing the play timer.
         .onReceive(bridge.$earlyComplete) { earlyComplete in
-            guard earlyComplete, primaryCreativeReady, !rewardEarned else { return }
-            timerTask?.cancel()
-            timerTask = nil
-            gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
-            earnReward(reason: .creativeCompleted)
+            guard earlyCompletion.receive(
+                signaled: earlyComplete,
+                primaryCreativeReady: primaryCreativeReady,
+                rewardEarned: rewardEarned
+            ) else { return }
+            applyEarlyCompletion()
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
         // (here, when the reward is earned and the reward/close pill becomes a close button).
@@ -628,6 +630,13 @@ private struct RewardedGameView: View {
         timerTask = Task { await runPlayTimer() }
     }
 
+    private func applyEarlyCompletion() {
+        timerTask?.cancel()
+        timerTask = nil
+        gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
+        earnReward(reason: .creativeCompleted)
+    }
+
     /// Play-to-earn timer task body (named method — see the task-shape note in TelemetryManager).
     @MainActor
     private func runPlayTimer() async {
@@ -730,6 +739,7 @@ private struct RewardedGameView: View {
 
     private func handlePlayableFailure(_ reason: String) {
         guard !videoFailureHandled else { return }
+        earlyCompletion.primaryCreativeFailed()
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
@@ -743,10 +753,14 @@ private struct RewardedGameView: View {
 
     private func handlePlayableReady() {
         guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
+        primaryCreativeReady = true
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
-        primaryCreativeReady = true
+        if earlyCompletion.primaryCreativeBecameReady(rewardEarned: rewardEarned) {
+            applyEarlyCompletion()
+            return
+        }
         reconcileTimer()
     }
 

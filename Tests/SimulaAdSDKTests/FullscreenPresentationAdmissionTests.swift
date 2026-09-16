@@ -44,6 +44,92 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.reason, .creativeCompleted)
     }
 
+    func testEarlyCompleteBeforeReadinessLatchesThenEarnsCreativeReason() {
+        var early = RewardedEarlyCompletionState()
+        var reward = RewardCompletionState()
+
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: false,
+            rewardEarned: reward.earned
+        ))
+        XCTAssertTrue(early.pending)
+        XCTAssertFalse(reward.earned)
+        if early.primaryCreativeBecameReady(rewardEarned: reward.earned) {
+            reward.earn(reason: .creativeCompleted)
+        }
+
+        XCTAssertTrue(early.consumed)
+        XCTAssertTrue(reward.earned)
+        XCTAssertEqual(reward.reason, .creativeCompleted)
+    }
+
+    func testEarlyCompleteDuplicateSignalsApplyExactlyOnce() {
+        var early = RewardedEarlyCompletionState()
+
+        XCTAssertTrue(early.receive(
+            signaled: true,
+            primaryCreativeReady: true,
+            rewardEarned: false
+        ))
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: true,
+            rewardEarned: false
+        ))
+        XCTAssertFalse(early.primaryCreativeBecameReady(rewardEarned: false))
+    }
+
+    func testEarlyCompleteIsDiscardedWhenPrimaryFailsBeforeReadiness() {
+        var early = RewardedEarlyCompletionState()
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: false,
+            rewardEarned: false
+        ))
+
+        early.primaryCreativeFailed()
+
+        XCTAssertTrue(early.failed)
+        XCTAssertFalse(early.pending)
+        XCTAssertFalse(early.primaryCreativeBecameReady(rewardEarned: false))
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: true,
+            rewardEarned: false
+        ))
+    }
+
+    func testPendingEarlyCompleteWinsOverZeroAndPositiveHTMLGates() {
+        for gateDuration in [0.0, 30.0] {
+            var early = RewardedEarlyCompletionState()
+            var reward = RewardCompletionState()
+            XCTAssertFalse(early.receive(
+                signaled: true,
+                primaryCreativeReady: false,
+                rewardEarned: false
+            ))
+
+            if early.primaryCreativeBecameReady(rewardEarned: reward.earned) {
+                reward.earn(reason: .creativeCompleted)
+            } else if let reason = rewardedHTMLGateCompletionReason(
+                primaryCreativeReady: true,
+                actualElapsedPlayTime: 0,
+                gateDuration: gateDuration
+            ) {
+                reward.earn(reason: reason)
+            }
+
+            XCTAssertEqual(reward.reason, .creativeCompleted)
+            XCTAssertFalse(shouldRunRewardedHTMLGate(
+                primaryCreativeReady: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                rewardEarned: reward.earned
+            ))
+        }
+    }
+
     func testVideoClaimFailureConsumesReadyBeforeCallbackAndAllowsReentrantLoad() {
         enum OwnerState: Equatable { case ready, idle, loading }
         var state = OwnerState.ready

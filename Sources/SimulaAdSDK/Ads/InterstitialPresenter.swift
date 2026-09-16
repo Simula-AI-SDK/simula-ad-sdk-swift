@@ -614,7 +614,7 @@ private struct CreativeInterstitialView: View {
         FullscreenVideoSurface(
             videoPlayer: player,
             onTap: { handleVideoClick() },
-            onFirstFrame: { handleVideoFirstFrame() },
+            onFirstFrame: { handleVideoFirstFrame(player: player) },
             controlsEnabled: canUseVideoControls(
                 firstFrameAdmitted: primaryCreativeReady,
                 displayAdmitted: admission.hasAdmittedDisplay
@@ -660,11 +660,12 @@ private struct CreativeInterstitialView: View {
         }
     }
 
-    private func handleVideoFirstFrame() {
+    private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
         guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
         primaryCreativeReady = true
         handleSKANCreativeReady()
         admission.visualBecameReady(owner: admissionOwner)
+        updateVideoGate(player: player, played: player.playedSeconds)
         if !videoStartRecorded {
             videoStartRecorded = true
             Telemetry.shared.recordLifecycle(
