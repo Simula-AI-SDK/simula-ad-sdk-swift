@@ -28,6 +28,19 @@ final class PublicInitializerCompatibilityTests: XCTestCase {
         XCTAssertEqual(metadata("u", "s", nil, nil, nil, nil, nil, ["k": "v"]).metadata, ["k": "v"])
     }
 
+    func testVerifyRewardRequestInitializerSymbolsRemainCallable() {
+        let legacy: (String, String, Double, String) -> VerifyRewardRequest =
+            VerifyRewardRequest.init(serveId:sessionId:elapsedPlayTime:adUnitId:)
+        let reasonAware: (String, String, Double, String, RewardCompletionReason?) -> VerifyRewardRequest =
+            VerifyRewardRequest.init(serveId:sessionId:elapsedPlayTime:adUnitId:completionReason:)
+
+        XCTAssertNil(legacy("serve", "session", 1, "unit").completionReason)
+        XCTAssertEqual(
+            reasonAware("serve", "session", 1, "unit", .creativeCompleted).completionReason,
+            .creativeCompleted
+        )
+    }
+
     func testLegacyAdLoadRequestInitializerSymbolsRemainCallable() {
         let capabilities = DeviceCapabilities(
             osVersion: "17",

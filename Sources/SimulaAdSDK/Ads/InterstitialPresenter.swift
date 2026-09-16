@@ -51,8 +51,6 @@ let fullscreenImpressionDelayMs: Double = 2_000
 /// Poll cadence for the foreground impression timer — fine enough to land the 2s mark within ~1 frame,
 /// coarse enough to stay negligible. Shared by the interstitial and rewarded presenters.
 let impressionTickNanos: UInt64 = 200_000_000
-let fullscreenCreativeReadinessTimeoutNanos: UInt64 = 10_000_000_000
-
 private func recordInterstitialSKANViewThroughOperation(name: String, error: Error?) {
     Telemetry.shared.recordOperation(
         name: name,
@@ -288,7 +286,6 @@ private struct CreativeInterstitialView: View {
     @State private var videoStartRecorded = false
     @State private var primaryCreativeReady = false
     @State private var terminalState = DeferredTerminalState<Bool>()
-    @State private var creativeReadinessTask: Task<Void, Never>?
 
     // Mid-ad store prompt (`store_prompt`) — a tappable badge shown from `closeTime / 2` until the
     // real close button appears.
@@ -405,7 +402,8 @@ private struct CreativeInterstitialView: View {
         .hideStatusBar(true)
         .onAppear {
             attributionRouteLifecycle.activate()
-            admission.setBlocked(UIApplication.shared.applicationState != .active || storeSheetPresented)
+            appForegrounded = UIApplication.shared.applicationState == .active
+            admission.setBlocked(storeSheetPresented)
             if storeExit == nil {
                 storeExit = StoreExitTracker(
                     adId: response.impressionId,
@@ -413,8 +411,7 @@ private struct CreativeInterstitialView: View {
                     adUnitId: response.adUnitId
                 )
             }
-            startGate()
-            startCreativeReadinessDeadline()
+            reconcileGate()
             startStorePromptTrigger()
             startSKOverlay()
             // PLAYABLE_END: if the close button is already available (delay 0), fire immediately.
@@ -425,15 +422,13 @@ private struct CreativeInterstitialView: View {
             attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
             gateTask = nil
-            creativeReadinessTask?.cancel()
-            creativeReadinessTask = nil
             if let close = response.adBehavior?.close {
                 gateClock.pause(
                     at: ProcessInfo.processInfo.systemUptime,
                     total: TimeInterval(close.delaySeconds)
                 )
             }
-            admission.visualBecameUnavailable(owner: admissionOwner)
+            if videoPlayer != nil { admission.visualBecameUnavailable(owner: admissionOwner) }
             storePromptTask?.cancel()
             storePromptTask = nil
             videoPlayer?.setPresentationBlocked(true)
@@ -446,14 +441,14 @@ private struct CreativeInterstitialView: View {
         }
         // Pause the close countdown while the app is backgrounded OR an in-app store/Safari sheet
         // covers the ad; resume only when both clear, so the gate can't elapse off-screen.
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             endSKANViewThroughImpressionIfStarted()
             appForegrounded = false
             admission.setBlocked(true)
             storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             admission.setBlocked(storeSheetPresented)
             storeExit?.onReturn() // returned from an .external store/browser jump
@@ -586,11 +581,8 @@ private struct CreativeInterstitialView: View {
 
     private func handlePlayableFailure(_ reason: String) {
         guard !videoFailureHandled else { return }
-        creativeReadinessTask?.cancel()
-        creativeReadinessTask = nil
         videoFailureHandled = true
         handleSKANCreativeFailure()
-        admission.visualBecameUnavailable(owner: admissionOwner)
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "interstitial", adUnitId: response.adUnitId,
             adId: response.impressionId, serveId: response.impressionId, errorCode: reason
@@ -600,24 +592,9 @@ private struct CreativeInterstitialView: View {
 
     private func handlePlayableReady() {
         guard visible, !videoFailureHandled else { return }
-        creativeReadinessTask?.cancel()
-        creativeReadinessTask = nil
         primaryCreativeReady = true
         handleSKANCreativeReady()
-        admission.visualBecameReady(owner: admissionOwner)
         fireAutoStoreRedirectIfCloseShown()
-    }
-
-    private func startCreativeReadinessDeadline() {
-        guard videoPlayer == nil, creativeReadinessTask == nil, !primaryCreativeReady else { return }
-        creativeReadinessTask = Task { await runCreativeReadinessDeadline() }
-    }
-
-    @MainActor
-    private func runCreativeReadinessDeadline() async {
-        do { try await Task.sleep(nanoseconds: fullscreenCreativeReadinessTimeoutNanos) } catch { return }
-        guard !Task.isCancelled, !primaryCreativeReady else { return }
-        handlePlayableFailure("readiness_timeout")
     }
 
     @ViewBuilder
@@ -645,10 +622,7 @@ private struct CreativeInterstitialView: View {
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady else {
-                handleVideoStatus(.failed(.playbackFailed), player: player)
-                return
-            }
+            guard primaryCreativeReady else { return }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             Telemetry.shared.recordLifecycle(
                 stage: FullscreenVideoTelemetryStage.complete, adFormat: "interstitial", adUnitId: response.adUnitId,
@@ -740,7 +714,12 @@ private struct CreativeInterstitialView: View {
         guard canUseVideoControls(
             firstFrameAdmitted: primaryCreativeReady,
             displayAdmitted: admission.hasAdmittedDisplay
-        ), !clickHandoffs.isPending, visible else { return }
+        ), !clickHandoffs.isPending, visible,
+           hasRoutableVideoDestination(
+               trackingUrl: response.trackingUrl,
+               destination: response.destinationKind,
+               storeUrl: response.iosStoreUrl
+           ) else { return }
         guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
             scope: attributionRouteLifecycle.automaticRouteScope
         ) else { return }
@@ -791,7 +770,7 @@ private struct CreativeInterstitialView: View {
     private func handleSKANCreativeFailure() {
         skanViewThrough.markCreativeNotReady()
         endSKANViewThroughImpression()
-        admission.visualBecameUnavailable(owner: admissionOwner)
+        if videoPlayer != nil { admission.visualBecameUnavailable(owner: admissionOwner) }
     }
 
     private func handleSKANRendererTermination() {

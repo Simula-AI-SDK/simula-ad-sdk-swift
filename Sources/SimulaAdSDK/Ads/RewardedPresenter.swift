@@ -17,7 +17,7 @@ final class RewardedPresenter {
     private var videoPlayer: FullscreenVideoPlayer?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
-    private var onClose: ((Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void)?
+    private var onClose: ((Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so the
     /// host regains touch/keyboard focus (a new key window doesn't auto-revert).
@@ -54,7 +54,7 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
-        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
+        onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         guard presentationLease == nil else { return false }
         let presentationLease = FullscreenPresentationRegistry.shared.claim()
@@ -91,8 +91,12 @@ final class RewardedPresenter {
             previewHTML: previewHTML,
             bridge: bridge,
             onClick: onClick,
-            onFinish: { [weak self] earned, elapsed in
-                self?.dismiss(earned: earned, elapsedPlayTime: elapsed)
+            onFinish: { [weak self] earned, elapsed, completionReason in
+                self?.dismiss(
+                    earned: earned,
+                    elapsedPlayTime: elapsed,
+                    completionReason: completionReason
+                )
             }
         )
 
@@ -140,7 +144,7 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
         onClick: @escaping () -> Void,
-        onClose: @escaping (Bool, Double, FullscreenPresentationLease, UIWindow?) -> Void
+        onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         present(
             impressionId: impressionId,
@@ -168,7 +172,11 @@ final class RewardedPresenter {
     /// callback can bring up the post-close fallback ad window (from a background prefetch, ready
     /// synchronously) on top of this still-visible window before it's hidden. Tearing down first
     /// flashed the app behind during the handoff.
-    private func dismiss(earned: Bool, elapsedPlayTime: Double) {
+    private func dismiss(
+        earned: Bool,
+        elapsedPlayTime: Double,
+        completionReason: RewardCompletionReason?
+    ) {
         // Capture the window refs and clear `self`'s references BEFORE invoking the callback: the
         // callback nils the owner's reference to this presenter, so `self` may be deallocated by
         // the time it returns. Operate on the locals afterwards instead of touching `self`.
@@ -190,7 +198,7 @@ final class RewardedPresenter {
         retainedWhilePresenting = nil
         if let presentationLease {
             if let callback {
-                callback(earned, elapsedPlayTime, presentationLease, hostKeyWindow)
+                callback(earned, elapsedPlayTime, completionReason, presentationLease, hostKeyWindow)
             } else {
                 presentationLease.finishPostCloseTeardown()
             }
@@ -254,7 +262,7 @@ private struct RewardedGameView: View {
     let bridge: CreativeBridge
     /// Fired on a user-gesture CTA / store-prompt tap (the CLICKED signal); parity with the interstitial.
     let onClick: (ClickInteraction) -> Void
-    let onFinish: (Bool, Double) -> Void
+    let onFinish: (Bool, Double, RewardCompletionReason?) -> Void
 
     /// The timer runs only while the app is foregrounded AND no in-app store/Safari sheet covers the
     /// playable — tracked separately and reconciled in `reconcileTimer()`. The playable lives in a
@@ -271,7 +279,6 @@ private struct RewardedGameView: View {
     @State private var videoStartRecorded = false
     @State private var primaryCreativeReady = false
     @State private var terminalState = DeferredTerminalState<RewardedTerminalOutcome>()
-    @State private var creativeReadinessTask: Task<Void, Never>?
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
     /// per 1 s accrual tick — `closeProgress` below is the instantaneous truth used to anchor it.
@@ -282,7 +289,7 @@ private struct RewardedGameView: View {
     /// fill jumps backwards when a store sheet pauses the timer, and repeated pause/resume cycles
     /// stack deltas until the displayed fill pins at zero.
     @State private var closeGateGeneration = 0
-    @State private var rewardEarned = false
+    @State private var rewardCompletion = RewardCompletionState()
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
@@ -313,7 +320,7 @@ private struct RewardedGameView: View {
         previewHTML: String?,
         bridge: CreativeBridge,
         onClick: @escaping (ClickInteraction) -> Void,
-        onFinish: @escaping (Bool, Double) -> Void
+        onFinish: @escaping (Bool, Double, RewardCompletionReason?) -> Void
     ) {
         self.impressionId = impressionId
         self.apiKey = apiKey
@@ -360,6 +367,7 @@ private struct RewardedGameView: View {
     }
 
     private var clickHandoffPending: Bool { clickHandoffs.isPending }
+    private var rewardEarned: Bool { rewardCompletion.earned }
 
     var body: some View {
         ZStack {
@@ -423,9 +431,10 @@ private struct RewardedGameView: View {
         .hideStatusBar(true)
         .onAppear {
             attributionRouteLifecycle.activate()
-            admission.setBlocked(UIApplication.shared.applicationState != .active || storeSheetPresented)
+            appForegrounded = UIApplication.shared.applicationState == .active
+            admission.setBlocked(storeSheetPresented)
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
-            startCreativeReadinessDeadline()
+            reconcileTimer()
             startSKOverlay()
             // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
             fireAutoStoreRedirectIfCloseShown()
@@ -434,10 +443,8 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
-            creativeReadinessTask?.cancel()
-            creativeReadinessTask = nil
             gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
-            admission.visualBecameUnavailable(owner: admissionOwner)
+            if videoPlayer != nil { admission.visualBecameUnavailable(owner: admissionOwner) }
             dismissSKOverlay()
             storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
@@ -446,13 +453,13 @@ private struct RewardedGameView: View {
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             appForegrounded = false
             admission.setBlocked(true)
             storeExit?.onAway()
             reconcileTimer()
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             admission.setBlocked(storeSheetPresented)
             storeExit?.onReturn()
@@ -486,7 +493,7 @@ private struct RewardedGameView: View {
             timerTask?.cancel()
             timerTask = nil
             gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
-            rewardEarned = true
+            earnReward(reason: .creativeCompleted)
         }
         // PLAYABLE_END (auto_store_redirect): open the store the moment the close button appears
         // (here, when the reward is earned and the reward/close pill becomes a close button).
@@ -535,17 +542,21 @@ private struct RewardedGameView: View {
     // MARK: Timer
 
     private func startTimer() {
-        guard videoPlayer == nil, timerTask == nil else { return }
+        guard videoPlayer == nil, timerTask == nil, primaryCreativeReady else { return }
         // A zero/negative gate is earned immediately (no gate).
-        guard gateSeconds > 0 else {
-            rewardEarned = true
+        if let reason = rewardedHTMLGateCompletionReason(
+            primaryCreativeReady: primaryCreativeReady,
+            actualElapsedPlayTime: gateClock.elapsed,
+            gateDuration: gateDuration
+        ) {
+            earnReward(reason: reason)
             return
         }
         // Glide the bar/ring fill linearly to full over the remaining gate. The monotonic clock keeps
         // fractional elapsed time so pausing for StoreKit cannot snap the indicator to a prior second.
         let remaining = gateClock.remaining(total: gateDuration)
         guard remaining > 0 else {
-            rewardEarned = true
+            earnReward(reason: .durationElapsed)
             return
         }
         gateClock.resume(at: ProcessInfo.processInfo.systemUptime)
@@ -573,12 +584,17 @@ private struct RewardedGameView: View {
     }
 
     private func applyElapsedPlayTime() {
+        guard primaryCreativeReady else { return }
         // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
         if gateClock.elapsed >= gateDuration / 2, !storePromptVisible {
             withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
         }
-        if gateClock.elapsed >= gateDuration {
-            rewardEarned = true
+        if let reason = rewardedHTMLGateCompletionReason(
+            primaryCreativeReady: primaryCreativeReady,
+            actualElapsedPlayTime: gateClock.elapsed,
+            gateDuration: gateDuration
+        ) {
+            earnReward(reason: reason)
         }
     }
 
@@ -589,7 +605,14 @@ private struct RewardedGameView: View {
         if let videoPlayer {
             videoPlayer.setPresentationBlocked(blocked)
         } else if !blocked {
-            if !rewardEarned { startTimer() }
+            if shouldRunRewardedHTMLGate(
+                primaryCreativeReady: primaryCreativeReady,
+                appForegrounded: appForegrounded,
+                storeSheetPresented: storeSheetPresented,
+                rewardEarned: rewardEarned
+            ) {
+                startTimer()
+            }
         } else {
             timerTask?.cancel()
             timerTask = nil
@@ -644,10 +667,7 @@ private struct RewardedGameView: View {
 
     private func handlePlayableFailure(_ reason: String) {
         guard !videoFailureHandled else { return }
-        creativeReadinessTask?.cancel()
-        creativeReadinessTask = nil
         videoFailureHandled = true
-        admission.visualBecameUnavailable(owner: admissionOwner)
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "rewarded", adUnitId: nil,
             adId: impressionId, serveId: nil, errorCode: reason
@@ -657,23 +677,8 @@ private struct RewardedGameView: View {
 
     private func handlePlayableReady() {
         guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
-        creativeReadinessTask?.cancel()
-        creativeReadinessTask = nil
         primaryCreativeReady = true
-        admission.visualBecameReady(owner: admissionOwner)
-        startTimer()
-    }
-
-    private func startCreativeReadinessDeadline() {
-        guard videoPlayer == nil, creativeReadinessTask == nil, !primaryCreativeReady else { return }
-        creativeReadinessTask = Task { await runCreativeReadinessDeadline() }
-    }
-
-    @MainActor
-    private func runCreativeReadinessDeadline() async {
-        do { try await Task.sleep(nanoseconds: fullscreenCreativeReadinessTimeoutNanos) } catch { return }
-        guard !Task.isCancelled, !primaryCreativeReady else { return }
-        handlePlayableFailure("readiness_timeout")
+        reconcileTimer()
     }
 
     @ViewBuilder
@@ -700,10 +705,7 @@ private struct RewardedGameView: View {
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady else {
-                handleVideoStatus(.failed(.playbackFailed), player: player)
-                return
-            }
+            guard primaryCreativeReady else { return }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             Telemetry.shared.recordLifecycle(
                 stage: FullscreenVideoTelemetryStage.complete, adFormat: "rewarded", adUnitId: nil,
@@ -757,17 +759,26 @@ private struct RewardedGameView: View {
         ), !storePromptVisible {
             withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
         }
-        if primaryCreativeReady, videoGate.isUnlocked {
-            rewardEarned = true
+        if primaryCreativeReady, let reason = videoGate.earnedCompletionReason {
+            earnReward(reason: reason)
             storePromptVisible = false
         }
+    }
+
+    private func earnReward(reason: RewardCompletionReason) {
+        rewardCompletion.earn(reason: reason)
     }
 
     private func handleVideoClick() {
         guard canUseVideoControls(
             firstFrameAdmitted: primaryCreativeReady,
             displayAdmitted: admission.hasAdmittedDisplay
-        ), !clickHandoffs.isPending, visible else { return }
+        ), !clickHandoffs.isPending, visible,
+           hasRoutableVideoDestination(
+               trackingUrl: trackingUrl,
+               destination: destination,
+               storeUrl: storeUrl
+           ) else { return }
         guard let automaticUserHandoff = attributionRouteLifecycle.automaticRoutes.beginUserHandoff(
             scope: attributionRouteLifecycle.automaticRouteScope
         ) else { return }
@@ -969,26 +980,19 @@ private struct RewardedGameView: View {
             dismissUnlocked: earned,
             clickHandoffPending: clickHandoffPending
         ) else { return }
-        requestTerminal(earned: earned, failOpen: false)
+        requestTerminal(earned: earned)
     }
 
     private func requestCreativeFailure() {
-        requestTerminal(
-            earned: earnedRewardAfterPrimaryFailure(primaryVisuallyReady: primaryCreativeReady),
-            failOpen: primaryCreativeReady
-        )
+        requestTerminal(earned: rewardEarned)
     }
 
-    private func requestTerminal(earned: Bool, failOpen: Bool) {
-        let elapsed: TimeInterval
-        if let videoPlayer {
-            elapsed = failOpen
-                ? max(videoPlayer.playedSeconds, videoGate.gateDuration ?? gateDuration)
-                : videoPlayer.playedSeconds
-        } else {
-            elapsed = failOpen ? max(gateClock.elapsed, gateDuration) : gateClock.elapsed
-        }
-        let outcome = RewardedTerminalOutcome(earned: earned, elapsedPlayTime: elapsed)
+    private func requestTerminal(earned: Bool) {
+        let outcome = rewardedTerminalOutcome(
+            earned: earned,
+            actualElapsedPlayTime: videoPlayer?.playedSeconds ?? gateClock.elapsed,
+            completionReason: rewardCompletion.reason
+        )
         guard let admitted = terminalState.request(outcome, blocked: terminalBlocked) else { return }
         performTerminal(admitted)
     }
@@ -1010,7 +1014,7 @@ private struct RewardedGameView: View {
         admission.visualBecameUnavailable(owner: admissionOwner)
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
-            onFinish(outcome.earned, outcome.elapsedPlayTime)
+            onFinish(outcome.earned, outcome.elapsedPlayTime, outcome.completionReason)
         }
     }
 }

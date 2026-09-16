@@ -1090,6 +1090,26 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(obj?["serve_id"] as? String, "srv_1")
         XCTAssertEqual(obj?["session_id"] as? String, "sess_9")
         XCTAssertEqual(obj?["elapsed_play_time"] as? Double, 31.5)
+        XCTAssertNil(obj?["completion_reason"])
+    }
+
+    func testVerifyRewardRequestEncodesExactCompletionReasonValues() throws {
+        let cases: [(RewardCompletionReason, String)] = [
+            (.durationElapsed, "duration_elapsed"),
+            (.videoCompleted, "video_completed"),
+            (.creativeCompleted, "creative_completed"),
+        ]
+
+        for (reason, expected) in cases {
+            let body = VerifyRewardRequest(
+                serveId: "srv_1",
+                sessionId: "sess_9",
+                elapsedPlayTime: 31.5,
+                completionReason: reason
+            )
+            let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+            XCTAssertEqual(obj?["completion_reason"] as? String, expected)
+        }
     }
 
     // MARK: - Idempotent verify response

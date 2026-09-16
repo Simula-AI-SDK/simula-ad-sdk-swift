@@ -1389,25 +1389,50 @@ private struct FallbackAdBehaviorPayload: Decodable {
 }
 
 /// Request body for POST /minigames/verify-reward.
+public enum RewardCompletionReason: String, Codable, Sendable {
+    case durationElapsed = "duration_elapsed"
+    case videoCompleted = "video_completed"
+    case creativeCompleted = "creative_completed"
+}
+
 public struct VerifyRewardRequest: Encodable, Sendable {
     public let serveId: String
     public let sessionId: String
     public let elapsedPlayTime: Double
     /// Sent alongside serve_id so the SSV reward callback can resolve/validate the ad unit off the body.
     public let adUnitId: String
+    public let completionReason: RewardCompletionReason?
 
     enum CodingKeys: String, CodingKey {
         case serveId = "serve_id"
         case sessionId = "session_id"
         case elapsedPlayTime = "elapsed_play_time"
         case adUnitId = "ad_unit_id"
+        case completionReason = "completion_reason"
     }
 
     public init(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String = "") {
+        self.init(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            completionReason: nil
+        )
+    }
+
+    public init(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String = "",
+        completionReason: RewardCompletionReason?
+    ) {
         self.serveId = serveId
         self.sessionId = sessionId
         self.elapsedPlayTime = elapsedPlayTime
         self.adUnitId = adUnitId
+        self.completionReason = completionReason
     }
 }
 
@@ -1917,6 +1942,22 @@ public final class SimulaAPI: @unchecked Sendable {
         elapsedPlayTime: Double,
         adUnitId: String = ""
     ) async throws -> VerifyRewardResponse {
+        try await verifyReward(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            completionReason: nil
+        )
+    }
+
+    public func verifyReward(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String = "",
+        completionReason: RewardCompletionReason?
+    ) async throws -> VerifyRewardResponse {
         guard let url = URL(string: "\(API_BASE_URL)/minigames/verify-reward") else {
             throw SimulaAPIError.invalidURL
         }
@@ -1925,7 +1966,13 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
-            VerifyRewardRequest(serveId: serveId, sessionId: sessionId, elapsedPlayTime: elapsedPlayTime, adUnitId: adUnitId)
+            VerifyRewardRequest(
+                serveId: serveId,
+                sessionId: sessionId,
+                elapsedPlayTime: elapsedPlayTime,
+                adUnitId: adUnitId,
+                completionReason: completionReason
+            )
         )
 
         let (data, response) = try await session.data(for: request)

@@ -107,8 +107,6 @@ public struct AdOverlayView: View {
     let onClose: () -> Void
     var onCreativeFailure: (() -> Void)? = nil
     var videoPlayer: FullscreenVideoPlayer? = nil
-    var admission: FullscreenPresentationAdmission? = nil
-    var admissionOwner = FullscreenVisualSurfaceToken()
     /// Height from the last game session (if bottom sheet mode). nil = fullscreen.
     var playableHeightDp: CGFloat?
     /// Border color for bottom sheet drag handle area.
@@ -327,7 +325,6 @@ public struct AdOverlayView: View {
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
             #endif
-            admission?.setBlocked(!appForegrounded || storeSheetPresented)
             if screenMountCoordinator.scheduleIfNeeded() {
                 // Let the outer lifecycle modifier finish installing its notification subscriptions
                 // before an automatic store sheet can synchronously publish will-present.
@@ -363,7 +360,6 @@ public struct AdOverlayView: View {
             countdownTask?.cancel()
             countdownTask = nil
             updateClickHandoffPending(false)
-            admission?.visualBecameUnavailable(owner: admissionOwner)
             #if os(iOS)
             videoPlayer?.setPresentationBlocked(true)
             #endif
@@ -376,25 +372,21 @@ public struct AdOverlayView: View {
         .modifier(AdCountdownLifecycle(
             onBackground: {
                 appForegrounded = false
-                admission?.setBlocked(true)
                 onPresentationBlockedChanged?(true)
                 reconcileCountdown()
             },
             onForeground: {
                 appForegrounded = true
-                admission?.setBlocked(storeSheetPresented)
                 onPresentationBlockedChanged?(storeSheetPresented)
                 reconcileCountdown()
             },
             onSheetPresent: {
                 storeSheetPresented = true
-                admission?.setBlocked(true)
                 onPresentationBlockedChanged?(true)
                 reconcileCountdown()
             },
             onSheetDismiss: {
                 storeSheetPresented = false
-                admission?.setBlocked(!appForegrounded)
                 onPresentationBlockedChanged?(!appForegrounded)
                 reconcileCountdown()
             }
@@ -465,7 +457,6 @@ public struct AdOverlayView: View {
             clickHandoffPending: clickHandoffPending
         ) else { return }
         closing = true
-        admission?.visualBecameUnavailable(owner: admissionOwner)
         onClose()
     }
 
@@ -567,7 +558,6 @@ public struct AdOverlayView: View {
         loadWatchdogTask = nil
         adPageReady = true
         pageFinished = true
-        admission?.visualBecameReady(owner: admissionOwner)
         beginPresentationIfReady()
     }
 
@@ -593,7 +583,6 @@ public struct AdOverlayView: View {
         guard hasAppeared, !videoFailureHandled else { return }
         videoFailureHandled = true
         markPageFailed()
-        admission?.visualBecameUnavailable(owner: admissionOwner)
         onCreativeFailure?()
     }
 
@@ -687,7 +676,6 @@ public struct AdOverlayView: View {
             guard !videoFailureHandled else { return }
             videoFailureHandled = true
             _ = loadCoordinator.failCurrentLoad()
-            admission?.visualBecameUnavailable(owner: admissionOwner)
             applyTerminalPageFailure()
             Telemetry.shared.recordLifecycle(
                 stage: FullscreenVideoTelemetryStage.fail, adFormat: videoTelemetryAdFormat,
@@ -710,7 +698,6 @@ public struct AdOverlayView: View {
         _ = loadCoordinator.finishCurrentLoad()
         adPageReady = true
         pageFinished = true
-        admission?.visualBecameReady(owner: admissionOwner)
         if !videoStartRecorded {
             videoStartRecorded = true
             Telemetry.shared.recordLifecycle(
@@ -735,7 +722,12 @@ public struct AdOverlayView: View {
     }
 
     private func handleVideoClick() {
-        guard pageFinished, !clickHandoffPending, activeRouteLifecycle.isActive else { return }
+        guard pageFinished, !clickHandoffPending, activeRouteLifecycle.isActive,
+              hasRoutableVideoDestination(
+                  trackingUrl: ctaTrackingUrl,
+                  destination: ctaDestination,
+                  storeUrl: ctaStoreUrl
+              ) else { return }
         guard let automaticUserHandoff = activeRouteLifecycle.automaticRoutes.beginUserHandoff(
             scope: activeRouteLifecycle.automaticRouteScope
         ) else { return }
@@ -864,8 +856,8 @@ private struct AdCountdownLifecycle: ViewModifier {
     func body(content: Content) -> some View {
         #if os(iOS)
         content
-            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in onBackground() }
-            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in onForeground() }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in onBackground() }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in onForeground() }
             .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in onSheetPresent() }
             .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in onSheetDismiss() }
         #else

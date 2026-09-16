@@ -128,11 +128,21 @@ final class CreativeVideoTests: XCTestCase {
         gate.update(duration: 8, played: 8)
         XCTAssertTrue(gate.isUnlocked)
         XCTAssertEqual(gate.secondsRemaining, 0)
+        XCTAssertEqual(gate.earnedCompletionReason, .videoCompleted)
     }
 
     func testVideoEndUnlocksEvenBeforeGate() {
         var gate = VideoPlaybackGate(configuredDelay: 30)
         gate.update(duration: 20, played: 2, ended: true)
         XCTAssertTrue(gate.isUnlocked)
+        XCTAssertEqual(gate.earnedCompletionReason, .videoCompleted)
+    }
+
+    func testVideoConfiguredGateUsesDurationElapsedReason() {
+        var gate = VideoPlaybackGate(configuredDelay: 5)
+        gate.update(duration: 20, played: 5)
+
+        XCTAssertTrue(gate.isUnlocked)
+        XCTAssertEqual(gate.earnedCompletionReason, .durationElapsed)
     }
 }

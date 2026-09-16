@@ -510,34 +510,48 @@ public final class SimulaRewardedAd {
                 )
                 if let self { self.delegate?.rewardedDidClick(self) }
             },
-            onClose: { [weak self] earned, elapsedPlayTime, presentationLease, originalKeyWindow in
+            onClose: { [weak self] earned, elapsedPlayTime, completionReason, presentationLease, originalKeyWindow in
                 guard let self else {
-                    admission.finish()
-                    // The host destroyed this ad object while the playable was up (the presenter
-                    // self-retains, so the unit stayed on screen). Delegates and fallback screens
-                    // die with the object, but an earned reward must not — enqueue the durable,
-                    // idempotent verification directly (parity with Android's teardown salvage).
-                    let outcome = FallbackOutcome.hostUnavailable
-                    SimulaRewardedAd.recordFallbackOutcome(
-                        outcome,
-                        adUnitId: salvageAdUnitId,
-                        impressionId: response.impressionId
-                    )
-                    SimulaRewardedAd.salvageReward(
-                        earned: outcome.shouldVerifyEarnedReward(earned),
-                        impressionId: response.impressionId,
-                        sessionId: salvageSessionId,
-                        elapsedPlayTime: elapsedPlayTime,
-                        configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0,
-                        adUnitId: salvageAdUnitId
-                    )
+                    let terminalOutcome = admission.finish()
+                    if terminalOutcome == .closed {
+                        // The host destroyed this ad object while the playable was up. Preserve only
+                        // a reward that the creative had genuinely earned before teardown.
+                        let outcome = FallbackOutcome.hostUnavailable
+                        SimulaRewardedAd.recordFallbackOutcome(
+                            outcome,
+                            adUnitId: salvageAdUnitId,
+                            impressionId: response.impressionId
+                        )
+                        SimulaRewardedAd.salvageReward(
+                            earned: outcome.shouldVerifyEarnedReward(earned),
+                            impressionId: response.impressionId,
+                            sessionId: salvageSessionId,
+                            elapsedPlayTime: elapsedPlayTime,
+                            completionReason: completionReason,
+                            adUnitId: salvageAdUnitId
+                        )
+                    }
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
                 self.presenter = nil
                 self.releasePreparedVideo()
                 self.state = .idle
-                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                guard let terminalOutcome = admission.finish() else {
+                    presentationLease.finishPostCloseTeardown()
+                    return
+                }
+                let postPrimaryPolicy = FullscreenPostPrimaryPolicy(
+                    terminalOutcome: terminalOutcome,
+                    earnedReward: earned
+                )
+                guard postPrimaryPolicy.presentsFallbacks else {
+                    presentationLease.finishPostCloseTeardown()
+                    return
+                }
+                if postPrimaryPolicy.notifiesPublisherClose {
+                    Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: nil)
+                }
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
@@ -548,17 +562,18 @@ public final class SimulaRewardedAd {
                 self.presentFallbackAds(
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
-                    admission: admission,
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
-                        admission.finish()
                         SimulaRewardedAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: salvageAdUnitId,
                             impressionId: response.impressionId
                         )
-                        let verifyEarned = outcome.shouldVerifyEarnedReward(earned)
+                        let verifyEarned = outcome.shouldVerifyEarnedReward(
+                            postPrimaryPolicy.verifiesEarnedReward
+                        )
+                        guard postPrimaryPolicy.notifiesPublisherClose else { return }
                         guard let self else {
                             // The host destroyed this ad object during the fallback screens (they
                             // self-retain and stay up): still salvage the earned reward.
@@ -567,7 +582,7 @@ public final class SimulaRewardedAd {
                                 impressionId: response.impressionId,
                                 sessionId: salvageSessionId,
                                 elapsedPlayTime: elapsedPlayTime,
-                                configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0,
+                                completionReason: completionReason,
                                 adUnitId: salvageAdUnitId
                             )
                             return
@@ -575,7 +590,12 @@ public final class SimulaRewardedAd {
                         // CLOSE fires after fallback delivery terminates (after the last screen for
                         // `.completed`), then reward earn/verification — preserving event order.
                         self.delegate?.rewardedDidClose(self)
-                        self.handleClose(response: response, earned: verifyEarned, elapsedPlayTime: elapsedPlayTime)
+                        self.handleClose(
+                            response: response,
+                            earned: verifyEarned,
+                            elapsedPlayTime: elapsedPlayTime,
+                            completionReason: completionReason
+                        )
                         // Auto-preload the next ad only now that the WHOLE unit is closed (Android
                         // parity). Preloading at playable close made the next LOADED land BEFORE
                         // CLOSED whenever fallback screens were up — inverting the publisher-visible
@@ -609,6 +629,7 @@ public final class SimulaRewardedAd {
 
         state = .showing(response, metadata: metadata)
         self.presenter = presenter
+        if presentationVideoPlayer == nil { admission.presentationDidSucceed() }
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
         // instant the minigame closes — fetching after close left a gap that flashed the screen behind.
         // GET /load/fallbacks is side-effect-free (no impression tracking), so this reports nothing early.
@@ -695,9 +716,9 @@ public final class SimulaRewardedAd {
                 guard let self else { return }
                 self.delegate?.rewardedDidClick(self)
             },
-            onClose: { [weak self] earned, _, presentationLease, _ in
+            onClose: { [weak self] earned, _, _, presentationLease, _ in
                 defer { presentationLease.finishPostCloseTeardown() }
-                admission.finish()
+                guard admission.finish() == .closed else { return }
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
@@ -715,6 +736,7 @@ public final class SimulaRewardedAd {
         // Track a synthetic showing state so a second showPreview is a no-op.
         state = .showing(RewardedInitResponse(impressionId: "", iframeUrl: ""), metadata: nil)
         self.presenter = presenter
+        admission.presentationDidSucceed()
         // Preview is local-only: deliberately no `trackImpression`.
         #else
         failDisplay(.unsupportedPlatform)
@@ -726,11 +748,15 @@ public final class SimulaRewardedAd {
     /// On a qualifying dismiss: fire EARNED_REWARD, then enqueue a durable, idempotent
     /// server verification. The completion routes the token / failure back to the
     /// delegate on the main thread.
-    private func handleClose(response: RewardedInitResponse, earned: Bool, elapsedPlayTime: Double) {
+    private func handleClose(
+        response: RewardedInitResponse,
+        earned: Bool,
+        elapsedPlayTime: Double,
+        completionReason: RewardCompletionReason?
+    ) {
         guard let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
             earned: earned,
-            actualElapsedPlayTime: elapsedPlayTime,
-            configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0
+            actualElapsedPlayTime: elapsedPlayTime
         ), let sessionId = self.sessionId, !sessionId.isEmpty else { return }
 
         Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.impressionId, serveId: nil)
@@ -740,6 +766,7 @@ public final class SimulaRewardedAd {
             impressionId: response.impressionId,
             sessionId: sessionId,
             elapsedPlayTime: verificationElapsedPlayTime,
+            completionReason: completionReason,
             adUnitId: adUnitId,
             ad: self
         )
@@ -755,19 +782,19 @@ public final class SimulaRewardedAd {
         impressionId: String,
         sessionId: String?,
         elapsedPlayTime: Double,
-        configuredDelaySeconds: Int,
+        completionReason: RewardCompletionReason?,
         adUnitId: String
     ) {
         guard let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
             earned: earned,
-            actualElapsedPlayTime: elapsedPlayTime,
-            configuredDelaySeconds: configuredDelaySeconds
+            actualElapsedPlayTime: elapsedPlayTime
         ), let sessionId, !sessionId.isEmpty, !impressionId.isEmpty else { return }
         Telemetry.shared.recordLifecycle(stage: "reward_salvaged_on_teardown", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId, serveId: nil)
         enqueueVerification(
             impressionId: impressionId,
             sessionId: sessionId,
             elapsedPlayTime: verificationElapsedPlayTime,
+            completionReason: completionReason,
             adUnitId: adUnitId,
             ad: nil
         )
@@ -797,6 +824,7 @@ public final class SimulaRewardedAd {
         impressionId: String,
         sessionId: String,
         elapsedPlayTime: Double,
+        completionReason: RewardCompletionReason?,
         adUnitId: String,
         ad: SimulaRewardedAd?
     ) {
@@ -812,7 +840,8 @@ public final class SimulaRewardedAd {
             serveId: impressionId,
             sessionId: sessionId,
             elapsedPlayTime: elapsedPlayTime,
-            adUnitId: adUnitId
+            adUnitId: adUnitId,
+            completionReason: completionReason
         ) { [weak ad] result in
             let verifyMs = Int((DispatchTime.now().uptimeNanoseconds &- verifyStartNanos) / 1_000_000)
             switch result {
@@ -970,16 +999,13 @@ public final class SimulaRewardedAd {
     private func presentFallbackAds(
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         let ready = prefetchedFallbacks
         let prefetch = fallbackPrefetch
-        if ready == nil, prefetch != nil {
-            fallbackPrefetchOwnership?.consumedByLoadingPresenter = true
-        }
+        let prefetchOwnership = fallbackPrefetchOwnership
         fallbackPrefetchToken = nil
         fallbackPrefetchOwnership = nil
         prefetchedFallbacks = nil
@@ -989,7 +1015,6 @@ public final class SimulaRewardedAd {
                 ready,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -997,9 +1022,9 @@ public final class SimulaRewardedAd {
         } else if let prefetch {
             presentFallbackLoadingWindow(
                 prefetch: prefetch,
+                ownership: prefetchOwnership,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -1016,7 +1041,6 @@ public final class SimulaRewardedAd {
         _ result: FallbackFetchResult,
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -1028,7 +1052,6 @@ public final class SimulaRewardedAd {
                 preparedVideos: preparedVideos,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -1048,9 +1071,9 @@ public final class SimulaRewardedAd {
     /// resolves it asynchronously. The fallback presenter self-retains if the ad object is released.
     private func presentFallbackLoadingWindow(
         prefetch: Task<FallbackFetchResult, Never>,
+        ownership: FallbackPrefetchOwnership?,
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -1071,7 +1094,6 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
-            admission: admission,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1079,10 +1101,12 @@ public final class SimulaRewardedAd {
             onFallbackFinished(outcome)
         }
         guard let generation else {
+            ownership?.transferToLoadingPresenter(windowInstalled: false)
             onFallbackFinished(.presentationUnavailable)
             presentationLease.finishPostCloseTeardown()
             return
         }
+        ownership?.transferToLoadingPresenter(windowInstalled: true)
         fallbackPresenter = presenter
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch, generation: generation) }
@@ -1107,7 +1131,6 @@ public final class SimulaRewardedAd {
         preparedVideos: [Int: FullscreenVideoPreparationToken],
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -1136,7 +1159,6 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
-            admission: admission,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil

@@ -59,7 +59,12 @@ enum FallbackFetchResult: Sendable {
 
 @MainActor
 final class FallbackPrefetchOwnership {
-    var consumedByLoadingPresenter = false
+    private(set) var consumedByLoadingPresenter = false
+
+    func transferToLoadingPresenter(windowInstalled: Bool) {
+        guard windowInstalled else { return }
+        consumedByLoadingPresenter = true
+    }
 }
 
 #if os(iOS)
@@ -243,7 +248,6 @@ final class FallbackAdPresenter {
     private var clickHandoffIndex: Int?
     private var presentationBlockedIndex: Int?
     private var failureAdvanceState = FallbackFailureAdvanceState()
-    private var admission: FullscreenPresentationAdmission?
     /// Retain only process-pooled preparation tokens for the current and immediately-next fallback.
     private var videoPreparations: [Int: FullscreenVideoPreparationToken] = [:]
 
@@ -264,7 +268,6 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
-        admission: FullscreenPresentationAdmission? = nil,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -285,7 +288,6 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
-            admission: admission,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -311,7 +313,6 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
-        admission: FullscreenPresentationAdmission? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
@@ -332,7 +333,6 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
-            admission: admission,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -365,7 +365,6 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String,
         telemetryAdUnitId: String?,
         telemetryServeId: String?,
-        admission: FullscreenPresentationAdmission?,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -387,7 +386,6 @@ final class FallbackAdPresenter {
         self.telemetryAdFormat = telemetryAdFormat
         self.telemetryAdUnitId = telemetryAdUnitId
         self.telemetryServeId = telemetryServeId
-        self.admission = admission
         self.presentationLease = presentationLease
         isLoading = startsLoading
         if !startsLoading { loadingGeneration = nil }
@@ -510,7 +508,6 @@ final class FallbackAdPresenter {
             onClose: { [weak self] in self?.advance(from: index) },
             onCreativeFailure: { [weak self] in self?.advanceAfterCreativeFailure(from: index) },
             videoPlayer: claimedVideoPlayer(at: index),
-            admission: admission,
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
             telemetryAdFormat: telemetryAdFormat,
@@ -650,7 +647,6 @@ final class FallbackAdPresenter {
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
         failureAdvanceState.clear()
-        admission = nil
         videoPreparations.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
         videoPreparations.removeAll()
         currentRouteLifecycle?.deactivate()

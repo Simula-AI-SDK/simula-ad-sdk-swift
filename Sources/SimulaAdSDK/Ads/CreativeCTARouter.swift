@@ -915,6 +915,15 @@ func hasTrustedCreativeStoreDestination(
         || validatedDirectAppStoreURL(storeUrl) != nil
 }
 
+func hasRoutableVideoDestination(
+    trackingUrl: String?,
+    destination: AdDestination,
+    storeUrl: String?
+) -> Bool {
+    if destination == .appstore, validatedDirectAppStoreURL(storeUrl) != nil { return true }
+    return validatedTopLevelAttributionURL(trackingUrl) != nil
+}
+
 enum CreativeRoutePlan: Equatable {
     case directStore(url: URL, appID: String, storeOpen: StoreOpen)
     case trackerWithStore(

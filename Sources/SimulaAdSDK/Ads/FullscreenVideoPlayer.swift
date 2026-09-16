@@ -44,6 +44,12 @@ struct VideoPlaybackGate: Equatable, Sendable {
         guard let duration else { return false }
         return played >= duration / 2
     }
+
+    var earnedCompletionReason: RewardCompletionReason? {
+        guard isUnlocked else { return nil }
+        if played >= configuredDelay { return .durationElapsed }
+        return .videoCompleted
+    }
 }
 
 struct VideoVisiblePlaybackClock: Equatable, Sendable {
@@ -67,6 +73,7 @@ struct VideoFirstFrameDeadlineState: Equatable, Sendable {
     private(set) var armed = false
     private(set) var admitted = false
     private(set) var failed = false
+    private(set) var pendingEnd = false
 
     mutating func arm() -> Bool {
         guard !armed, !admitted, !failed else { return false }
@@ -89,6 +96,7 @@ struct VideoFirstFrameDeadlineState: Equatable, Sendable {
         guard armed, !admitted, !failed else { return false }
         armed = false
         failed = true
+        pendingEnd = false
         return true
     }
 
@@ -96,6 +104,19 @@ struct VideoFirstFrameDeadlineState: Equatable, Sendable {
         guard !admitted else { return }
         armed = false
         failed = true
+        pendingEnd = false
+    }
+
+    mutating func deferEndUntilFrame() -> Bool {
+        guard !admitted, !failed, !pendingEnd else { return false }
+        pendingEnd = true
+        return true
+    }
+
+    mutating func consumePendingEnd() -> Bool {
+        guard admitted, pendingEnd, !failed else { return false }
+        pendingEnd = false
+        return true
     }
 }
 
@@ -105,16 +126,6 @@ func shouldShowVideoStorePrompt(enabled: Bool, reachedMidpoint: Bool, dismissUnl
 
 func canUseVideoControls(firstFrameAdmitted: Bool, displayAdmitted: Bool) -> Bool {
     firstFrameAdmitted && displayAdmitted
-}
-
-func reconciledCompletedVideoTime(
-    playedSeconds: TimeInterval,
-    finalPosition: TimeInterval,
-    duration: TimeInterval?
-) -> TimeInterval {
-    let position = finalPosition.isFinite ? max(0, finalPosition) : 0
-    let assetDuration = duration.flatMap { $0.isFinite ? max(0, $0) : nil } ?? 0
-    return max(playedSeconds, position, assetDuration)
 }
 
 enum FullscreenVideoTelemetryStage {
@@ -130,7 +141,7 @@ struct FullscreenVideoPreparationToken: Hashable, Sendable {
 
 struct VideoPreparationRetentionPolicy: Equatable, Sendable {
     struct Entry: Equatable, Sendable {
-        let id: String
+        let id: UUID
         let active: Bool
         let lastTouched: TimeInterval
     }
@@ -138,11 +149,11 @@ struct VideoPreparationRetentionPolicy: Equatable, Sendable {
     let capacity: Int
     let retention: TimeInterval
 
-    func expiredEntryIDs(_ entries: [Entry], now: TimeInterval) -> [String] {
+    func expiredEntryIDs(_ entries: [Entry], now: TimeInterval) -> [UUID] {
         entries.filter { !$0.active && now - $0.lastTouched >= retention }.map(\.id)
     }
 
-    func evictionCandidate(_ entries: [Entry]) -> String? {
+    func evictionCandidate(_ entries: [Entry]) -> UUID? {
         guard entries.count >= max(1, capacity) else { return nil }
         return entries.filter { !$0.active }.min { $0.lastTouched < $1.lastTouched }?.id
     }
@@ -169,17 +180,50 @@ enum FullscreenVideoStatus: Equatable {
     case paused
     case ended
     case failed(FullscreenVideoFailure)
+
+    var reusableForPreparedClaim: Bool {
+        switch self {
+        case .preparing, .ready, .paused:
+            return true
+        case .playing, .ended, .failed:
+            return false
+        }
+    }
+}
+
+func shouldReusePreparedVideoPlayer(
+    status: FullscreenVideoStatus,
+    isStopped: Bool,
+    isActive: Bool
+) -> Bool {
+    !isStopped && !isActive && status.reusableForPreparedClaim
+}
+
+enum VideoInterruptionEndAction: Equatable {
+    case resume
+    case stayPaused
+    case reconcile
+}
+
+func videoInterruptionEndAction(
+    pausedByInterruption: Bool,
+    userInfo: [AnyHashable: Any]?
+) -> VideoInterruptionEndAction {
+    guard pausedByInterruption else { return .reconcile }
+    return videoInterruptionShouldResume(userInfo) ? .resume : .stayPaused
 }
 
 @MainActor
 final class FullscreenVideoPlayer: ObservableObject {
     static let preparationTimeout: TimeInterval = 10
     static let firstFrameTimeout: TimeInterval = 10
+    static let pendingEndFrameGrace: TimeInterval = 0.5
 
     @Published private(set) var status: FullscreenVideoStatus = .preparing
     @Published private(set) var duration: TimeInterval?
     @Published private(set) var playedSeconds: TimeInterval = 0
     @Published private(set) var isMuted = true
+    @Published private(set) var requiresUserResume = false
 
     let player: AVPlayer
     let posterURL: URL?
@@ -193,11 +237,12 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var preparationTimeoutWorkItem: DispatchWorkItem?
     private var playbackTimeoutWorkItem: DispatchWorkItem?
     private var firstFrameTimeoutWorkItem: DispatchWorkItem?
+    private var pendingEndGraceWorkItem: DispatchWorkItem?
     private var visiblePlaybackClock = VideoVisiblePlaybackClock()
     private var firstFrameDeadline = VideoFirstFrameDeadlineState()
     private var wantsPlayback = false
     private var presentationBlocked = false
-    private var appActive = true
+    private var appActive = UIApplication.shared.applicationState == .active
     private var audioInterrupted = false
     private var interruptionPausedPlayback = false
     private var stopped = false
@@ -211,13 +256,14 @@ final class FullscreenVideoPlayer: ObservableObject {
         player.isMuted = true
         player.actionAtItemEnd = .pause
         installObservers()
-        schedulePreparationTimeout()
+        if appActive { schedulePreparationTimeout() }
     }
 
     deinit {
         preparationTimeoutWorkItem?.cancel()
         playbackTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem?.cancel()
+        pendingEndGraceWorkItem?.cancel()
         itemStatusObservation?.invalidate()
         durationObservation?.invalidate()
         timeControlObservation?.invalidate()
@@ -229,6 +275,13 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     func play() {
         guard !stopped else { return }
+        wantsPlayback = true
+        reconcilePlayback()
+    }
+
+    func resumeAfterInterruption() {
+        guard !stopped, requiresUserResume else { return }
+        requiresUserResume = false
         wantsPlayback = true
         reconcilePlayback()
     }
@@ -250,8 +303,13 @@ final class FullscreenVideoPlayer: ObservableObject {
         guard firstFrameDeadline.admit() else { return false }
         firstFrameTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem = nil
+        pendingEndGraceWorkItem?.cancel()
+        pendingEndGraceWorkItem = nil
         visiblePlaybackClock.admitFirstFrame(mediaTime: player.currentTime().seconds)
         playedSeconds = 0
+        if firstFrameDeadline.pendingEnd {
+            DispatchQueue.main.async { [weak self] in self?.completePendingEndAfterFirstFrame() }
+        }
         return true
     }
 
@@ -259,6 +317,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         guard !stopped else { return }
         stopped = true
         wantsPlayback = false
+        requiresUserResume = false
         firstFrameDeadline.fail()
         preparationTimeoutWorkItem?.cancel()
         preparationTimeoutWorkItem = nil
@@ -266,6 +325,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         playbackTimeoutWorkItem = nil
         firstFrameTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem = nil
+        pendingEndGraceWorkItem?.cancel()
+        pendingEndGraceWorkItem = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         removeObservers()
@@ -300,7 +361,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             queue: .main
         ) { [weak self] _ in DispatchQueue.main.async { self?.fail(.playbackFailed) } })
         notificationObservers.append(center.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification,
+            forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in DispatchQueue.main.async { self?.setAppActive(false) } })
@@ -334,6 +395,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     private func schedulePreparationTimeout() {
+        guard preparationTimeoutWorkItem == nil, status == .preparing, appActive else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.preparationTimedOut()
         }
@@ -413,21 +475,31 @@ final class FullscreenVideoPlayer: ObservableObject {
     private func handleEnded() {
         guard !stopped, !isFailed else { return }
         guard firstFrameDeadline.admitted else {
-            fail(.firstFrameTimeout)
+            guard firstFrameDeadline.deferEndUntilFrame() else { return }
+            wantsPlayback = false
+            player.pause()
+            schedulePendingEndGraceIfNeeded()
             return
         }
+        completeEnded()
+    }
+
+    private func completePendingEndAfterFirstFrame() {
+        guard firstFrameDeadline.consumePendingEnd() else { return }
+        completeEnded()
+    }
+
+    private func completeEnded() {
+        guard !stopped, !isFailed, status != .ended else { return }
         let finalPosition = player.currentTime().seconds
-        _ = visiblePlaybackClock.update(mediaTime: finalPosition)
-        playedSeconds = reconciledCompletedVideoTime(
-            playedSeconds: playedSeconds,
-            finalPosition: finalPosition,
-            duration: duration
-        )
+        playedSeconds = visiblePlaybackClock.update(mediaTime: finalPosition)
         wantsPlayback = false
         playbackTimeoutWorkItem?.cancel()
         playbackTimeoutWorkItem = nil
         firstFrameTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem = nil
+        pendingEndGraceWorkItem?.cancel()
+        pendingEndGraceWorkItem = nil
         status = .ended
     }
 
@@ -440,6 +512,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         playbackTimeoutWorkItem = nil
         firstFrameTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem = nil
+        pendingEndGraceWorkItem?.cancel()
+        pendingEndGraceWorkItem = nil
         wantsPlayback = false
         player.pause()
         status = .failed(reason)
@@ -447,6 +521,12 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     private func setAppActive(_ active: Bool) {
         appActive = active
+        if active {
+            schedulePreparationTimeout()
+        } else {
+            preparationTimeoutWorkItem?.cancel()
+            preparationTimeoutWorkItem = nil
+        }
         reconcilePlayback()
     }
 
@@ -460,23 +540,46 @@ final class FullscreenVideoPlayer: ObservableObject {
             reconcilePlayback()
         case .ended:
             audioInterrupted = false
-            let shouldResume = interruptionPausedPlayback
+            let action = videoInterruptionEndAction(
+                pausedByInterruption: interruptionPausedPlayback,
+                userInfo: notification.userInfo
+            )
             interruptionPausedPlayback = false
-            if !shouldResume {
-                reconcilePlayback()
-            } else if videoInterruptionShouldResume(notification.userInfo) {
-                reconcilePlayback()
-            } else {
-                fail(.playbackFailed)
-            }
+            applyInterruptionEndAction(action)
         @unknown default:
             break
         }
     }
 
+    func applyInterruptionEndAction(_ action: VideoInterruptionEndAction) {
+        guard !stopped else { return }
+        switch action {
+        case .reconcile:
+            reconcilePlayback()
+        case .resume:
+            requiresUserResume = false
+            reconcilePlayback()
+        case .stayPaused:
+            wantsPlayback = false
+            requiresUserResume = true
+            reconcilePlayback()
+        }
+    }
+
     private func reconcilePlayback() {
         guard !stopped, !isFailed, status != .ended else { return }
-        let canPlay = wantsPlayback && appActive && !presentationBlocked && !audioInterrupted
+        if firstFrameDeadline.pendingEnd {
+            if appActive && !presentationBlocked && !audioInterrupted {
+                schedulePendingEndGraceIfNeeded()
+            } else {
+                pendingEndGraceWorkItem?.cancel()
+                pendingEndGraceWorkItem = nil
+            }
+            player.pause()
+            return
+        }
+        let canPlay = wantsPlayback && !requiresUserResume && appActive
+            && !presentationBlocked && !audioInterrupted
             && item.status == .readyToPlay && duration != nil
         if canPlay {
             scheduleFirstFrameTimeoutIfNeeded()
@@ -526,6 +629,23 @@ final class FullscreenVideoPlayer: ObservableObject {
         guard firstFrameDeadline.timeout() else { return }
         fail(.firstFrameTimeout)
     }
+
+    private func schedulePendingEndGraceIfNeeded() {
+        guard firstFrameDeadline.pendingEnd, pendingEndGraceWorkItem == nil,
+              appActive, !presentationBlocked, !audioInterrupted else { return }
+        let workItem = DispatchWorkItem { [weak self] in self?.pendingEndGraceTimedOut() }
+        pendingEndGraceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.pendingEndFrameGrace,
+            execute: workItem
+        )
+    }
+
+    private func pendingEndGraceTimedOut() {
+        pendingEndGraceWorkItem = nil
+        guard firstFrameDeadline.pendingEnd, !firstFrameDeadline.admitted else { return }
+        fail(.firstFrameTimeout)
+    }
 }
 
 func videoInterruptionShouldResume(_ userInfo: [AnyHashable: Any]?) -> Bool {
@@ -549,6 +669,10 @@ final class FullscreenVideoPreparationPool {
     }
 
     private var entries: [FullscreenVideoPreparationToken: Entry] = [:]
+    private let retentionPolicy = VideoPreparationRetentionPolicy(
+        capacity: maxPreparedPlayers,
+        retention: preparedRetention
+    )
 
     func prepare(url: URL, posterURL: URL?) -> FullscreenVideoPreparationToken {
         let token = FullscreenVideoPreparationToken()
@@ -571,8 +695,13 @@ final class FullscreenVideoPreparationPool {
         url: URL,
         posterURL: URL?
     ) -> FullscreenVideoPlayer? {
-        if var entry = entries[token], entry.url == url,
-           entry.posterURL == posterURL, !entry.player.isStopped {
+        if entries[token]?.active == true { return nil }
+        if var entry = entries[token], entry.url == url, entry.posterURL == posterURL,
+           shouldReusePreparedVideoPlayer(
+               status: entry.player.status,
+               isStopped: entry.player.isStopped,
+               isActive: entry.active
+           ) {
             entry.expiry?.cancel()
             entry.expiry = nil
             entry.active = true
@@ -611,9 +740,15 @@ final class FullscreenVideoPreparationPool {
     private func makeRoomForPlayer() -> Bool {
         purgeExpired()
         while entries.count >= Self.maxPreparedPlayers {
-            guard let candidate = entries
-                .filter({ !$0.value.active })
-                .min(by: { $0.value.lastTouched < $1.value.lastTouched })?.key else { return false }
+            let policyEntries = entries.map {
+                VideoPreparationRetentionPolicy.Entry(
+                    id: $0.key.id,
+                    active: $0.value.active,
+                    lastTouched: $0.value.lastTouched
+                )
+            }
+            guard let candidateID = retentionPolicy.evictionCandidate(policyEntries),
+                  let candidate = entries.keys.first(where: { $0.id == candidateID }) else { return false }
             release(candidate)
         }
         return true
@@ -621,9 +756,15 @@ final class FullscreenVideoPreparationPool {
 
     private func purgeExpired() {
         let now = ProcessInfo.processInfo.systemUptime
-        let expired = entries.compactMap { token, entry in
-            !entry.active && now - entry.lastTouched >= Self.preparedRetention ? token : nil
+        let policyEntries = entries.map {
+            VideoPreparationRetentionPolicy.Entry(
+                id: $0.key.id,
+                active: $0.value.active,
+                lastTouched: $0.value.lastTouched
+            )
         }
+        let expiredIDs = Set(retentionPolicy.expiredEntryIDs(policyEntries, now: now))
+        let expired = entries.keys.filter { expiredIDs.contains($0.id) }
         expired.forEach { release($0) }
     }
 
@@ -733,6 +874,18 @@ struct FullscreenVideoSurface: View {
                 .onTapGesture {
                     if controlsEnabled { onTap() }
                 }
+                .allowsHitTesting(!videoPlayer.requiresUserResume)
+
+            if videoPlayer.requiresUserResume {
+                Button(action: { videoPlayer.resumeAfterInterruption() }) {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 56, weight: .semibold))
+                        .foregroundColor(.white)
+                        .background(Circle().fill(Color.black.opacity(0.55)))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Resume ad video")
+            }
 
             VStack {
                 Spacer()

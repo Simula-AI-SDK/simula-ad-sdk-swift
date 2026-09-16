@@ -580,19 +580,32 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
-                    admission.finish()
-                    SimulaInterstitialAd.recordFallbackOutcome(
-                        .hostUnavailable,
-                        adUnitId: clickAdUnitId,
-                        impressionId: response.impressionId
-                    )
+                    let terminalOutcome = admission.finish()
+                    if terminalOutcome == .closed {
+                        SimulaInterstitialAd.recordFallbackOutcome(
+                            .hostUnavailable,
+                            adUnitId: clickAdUnitId,
+                            impressionId: response.impressionId
+                        )
+                    }
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
                 self.presenter = nil
                 self.releasePreparedVideo()
                 self.state = .idle
-                Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
+                guard let terminalOutcome = admission.finish() else {
+                    presentationLease.finishPostCloseTeardown()
+                    return
+                }
+                let postPrimaryPolicy = FullscreenPostPrimaryPolicy(terminalOutcome: terminalOutcome)
+                guard postPrimaryPolicy.presentsFallbacks else {
+                    presentationLease.finishPostCloseTeardown()
+                    return
+                }
+                if postPrimaryPolicy.notifiesPublisherClose {
+                    Telemetry.shared.recordLifecycle(stage: "closed", adFormat: Self.adFormat, adUnitId: self.adUnitId, adId: response.impressionId, serveId: response.impressionId)
+                }
                 // Show the fallback ad screens on close (parity with the minigame post-game flow).
                 // Uses the background prefetch started at display time, so there's no fetch-after-close gap.
                 // END_SCREEN_N auto_store_redirect opens the primary ad's store at the matching index.
@@ -601,17 +614,15 @@ public final class SimulaInterstitialAd {
                 self.presentFallbackAds(
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
-                    admission: admission,
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
-                        admission.finish()
                         SimulaInterstitialAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: clickAdUnitId,
                             impressionId: response.impressionId
                         )
-                        guard let self else { return }
+                        guard let self, postPrimaryPolicy.notifiesPublisherClose else { return }
                         self.delegate?.interstitialDidClose(self)
                         // Auto-preload the next ad only now that the WHOLE unit is closed (Android
                         // parity). Preloading at creative close made the next LOADED land BEFORE
@@ -647,6 +658,7 @@ public final class SimulaInterstitialAd {
         // Only now is the ad actually on screen.
         state = .showing(response, metadata: metadata)
         self.presenter = presenter
+        if presentationVideoPlayer == nil { admission.presentationDidSucceed() }
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
         // instant the user closes — fetching after close left a gap that flashed the screen behind.
         // GET /load/fallbacks is side-effect-free (no impression tracking), so this reports nothing early.
@@ -763,7 +775,7 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, _ in
                 defer { presentationLease.finishPostCloseTeardown() }
-                admission.finish()
+                guard admission.finish() == .closed else { return }
                 guard let self else { return }
                 self.presenter = nil
                 self.state = .idle
@@ -778,6 +790,7 @@ public final class SimulaInterstitialAd {
         }
         state = .showing(response, metadata: nil)
         self.presenter = presenter
+        admission.presentationDidSucceed()
         // Preview is local-only: deliberately no `trackImpression`.
         #else
         failDisplay(.unsupportedPlatform)
@@ -926,16 +939,13 @@ public final class SimulaInterstitialAd {
     private func presentFallbackAds(
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         let ready = prefetchedFallbacks
         let prefetch = fallbackPrefetch
-        if ready == nil, prefetch != nil {
-            fallbackPrefetchOwnership?.consumedByLoadingPresenter = true
-        }
+        let prefetchOwnership = fallbackPrefetchOwnership
         fallbackPrefetchToken = nil
         fallbackPrefetchOwnership = nil
         prefetchedFallbacks = nil
@@ -945,7 +955,6 @@ public final class SimulaInterstitialAd {
                 ready,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -953,9 +962,9 @@ public final class SimulaInterstitialAd {
         } else if let prefetch {
             presentFallbackLoadingWindow(
                 prefetch: prefetch,
+                ownership: prefetchOwnership,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -972,7 +981,6 @@ public final class SimulaInterstitialAd {
         _ result: FallbackFetchResult,
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -984,7 +992,6 @@ public final class SimulaInterstitialAd {
                 preparedVideos: preparedVideos,
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
-                admission: admission,
                 originalKeyWindow: originalKeyWindow,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
@@ -1004,9 +1011,9 @@ public final class SimulaInterstitialAd {
     /// resolves it asynchronously. The fallback presenter self-retains if the ad object is released.
     private func presentFallbackLoadingWindow(
         prefetch: Task<FallbackFetchResult, Never>,
+        ownership: FallbackPrefetchOwnership?,
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -1027,7 +1034,6 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
-            admission: admission,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1035,10 +1041,12 @@ public final class SimulaInterstitialAd {
             onFallbackFinished(outcome)
         }
         guard let generation else {
+            ownership?.transferToLoadingPresenter(windowInstalled: false)
             onFallbackFinished(.presentationUnavailable)
             presentationLease.finishPostCloseTeardown()
             return
         }
+        ownership?.transferToLoadingPresenter(windowInstalled: true)
         fallbackPresenter = presenter
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         Task { await Self.awaitPrefetchAndResolve(presenter: presenter, prefetch: prefetch, generation: generation) }
@@ -1065,7 +1073,6 @@ public final class SimulaInterstitialAd {
         preparedVideos: [Int: FullscreenVideoPreparationToken],
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
-        admission: FullscreenPresentationAdmission,
         originalKeyWindow: UIWindow?,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
@@ -1093,7 +1100,6 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
-            admission: admission,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil
