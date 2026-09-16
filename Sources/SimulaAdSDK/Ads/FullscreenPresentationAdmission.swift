@@ -80,6 +80,19 @@ func earnedRewardAfterPrimaryFailure(primaryVisuallyReady: Bool) -> Bool {
     primaryVisuallyReady
 }
 
+/// Backend verification validates against the configured reward gate even when a legitimate
+/// client-side completion path unlocks earlier (short video, creative completion, or fail-open).
+/// Measured playback remains unchanged everywhere else.
+func rewardVerificationElapsedPlayTime(
+    earned: Bool,
+    actualElapsedPlayTime: TimeInterval,
+    configuredDelaySeconds: Int
+) -> TimeInterval? {
+    guard earned else { return nil }
+    let measured = actualElapsedPlayTime.isFinite ? max(0, actualElapsedPlayTime) : 0
+    return max(measured, TimeInterval(max(0, configuredDelaySeconds)))
+}
+
 struct FullscreenVisualSurfaceToken: Hashable, Sendable {
     fileprivate let id: UUID
     init(id: UUID = UUID()) { self.id = id }

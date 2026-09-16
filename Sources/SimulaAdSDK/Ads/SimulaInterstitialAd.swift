@@ -329,6 +329,10 @@ public final class SimulaInterstitialAd {
             break // nothing held — proceed
         }
 
+        // This load now owns attribution. Clear the prior serve before any session, no-fill, or
+        // transport-failure telemetry can be recorded; a renderable response replaces it below.
+        Telemetry.shared.setExperiment(experimentId: nil, variantId: nil)
+
         // Supersede any in-flight load / discard any ready ad, then start fresh.
         loadTask?.cancel()
         #if os(iOS)

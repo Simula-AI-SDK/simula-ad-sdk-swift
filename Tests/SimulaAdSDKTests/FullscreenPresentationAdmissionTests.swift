@@ -10,6 +10,60 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(earnedRewardAfterPrimaryFailure(primaryVisuallyReady: true))
     }
 
+    func testConfiguredGateVerificationPreservesActualPlaybackAboveRequirement() {
+        XCTAssertEqual(
+            rewardVerificationElapsedPlayTime(
+                earned: true,
+                actualElapsedPlayTime: 34.5,
+                configuredDelaySeconds: 30
+            ),
+            34.5
+        )
+    }
+
+    func testShortVideoCompletionVerificationClampsToConfiguredGate() {
+        XCTAssertEqual(
+            rewardVerificationElapsedPlayTime(
+                earned: true,
+                actualElapsedPlayTime: 8,
+                configuredDelaySeconds: 30
+            ),
+            30
+        )
+    }
+
+    func testEarlyCompleteVerificationClampsToConfiguredGate() {
+        XCTAssertEqual(
+            rewardVerificationElapsedPlayTime(
+                earned: true,
+                actualElapsedPlayTime: 2.25,
+                configuredDelaySeconds: 30
+            ),
+            30
+        )
+    }
+
+    func testPostFirstFrameFailOpenVerificationClampsToConfiguredGate() {
+        XCTAssertEqual(
+            rewardVerificationElapsedPlayTime(
+                earned: true,
+                actualElapsedPlayTime: 0.5,
+                configuredDelaySeconds: 30
+            ),
+            30
+        )
+    }
+
+    func testPreEarnedOutcomeNeverProducesVerificationEvidence() {
+        XCTAssertNil(
+            rewardVerificationElapsedPlayTime(
+                earned: false,
+                actualElapsedPlayTime: 30,
+                configuredDelaySeconds: 30
+            )
+        )
+    }
+
     func testTerminalWaitsForClickHandoffAndCompletesExactlyOnce() {
         let outcome = RewardedTerminalOutcome(earned: true, elapsedPlayTime: 5)
         var state = DeferredTerminalState<RewardedTerminalOutcome>()

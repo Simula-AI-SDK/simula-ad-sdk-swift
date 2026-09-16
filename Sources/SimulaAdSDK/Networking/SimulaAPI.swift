@@ -991,6 +991,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// SKAdNetwork / App Analytics attribution tokens (`skan_attribution` node, a response-root sibling
     /// of `ad_behavior`). `nil` when omitted → the StoreKit surfaces open un-attributed. See `AdAttribution`.
     public let skanAttribution: AdAttribution?
+    /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
+    public let experiment: Experiment?
     /// Cleared bid (estimated CPM) for this serve — see ``AdLoadResponse/bidAmt``. Drives ``adValue``.
     public let bidAmt: Double
 
@@ -1027,6 +1029,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case prewarmSKProduct = "prewarm_sk_product"
         case adBehavior = "ad_behavior"
         case skanAttribution = "skan_attribution"
+        case experiment
         case bidAmt = "bid_amt"
     }
 
@@ -1042,6 +1045,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.prewarmSKProduct = (try? c.decode(Bool.self, forKey: .prewarmSKProduct)) ?? false
         self.adBehavior = try? c.decode(AdBehavior.self, forKey: .adBehavior)
         self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
+        self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
 
@@ -1068,6 +1072,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
             iosStoreUrl: iosStoreUrl,
             adBehavior: adBehavior,
             skanAttribution: skanAttribution,
+            experiment: nil,
             bidAmt: bidAmt,
             prewarmSKProduct: prewarmSKProduct
         )
@@ -1086,6 +1091,36 @@ public struct RewardedInitResponse: Decodable, Sendable {
         bidAmt: Double = 0,
         prewarmSKProduct: Bool = false
     ) {
+        self.init(
+            impressionId: impressionId,
+            iframeUrl: iframeUrl,
+            renderedHtml: renderedHtml,
+            creative: creative,
+            destination: destination,
+            trackingUrl: trackingUrl,
+            iosStoreUrl: iosStoreUrl,
+            adBehavior: adBehavior,
+            skanAttribution: skanAttribution,
+            experiment: nil,
+            bidAmt: bidAmt,
+            prewarmSKProduct: prewarmSKProduct
+        )
+    }
+
+    public init(
+        impressionId: String,
+        iframeUrl: String = "",
+        renderedHtml: String = "",
+        creative: Creative?,
+        destination: String = AdDestination.appstore.rawValue,
+        trackingUrl: String? = nil,
+        iosStoreUrl: String? = nil,
+        adBehavior: AdBehavior? = nil,
+        skanAttribution: AdAttribution? = nil,
+        experiment: Experiment?,
+        bidAmt: Double = 0,
+        prewarmSKProduct: Bool = false
+    ) {
         self.impressionId = impressionId
         self.iframeUrl = iframeUrl
         self.renderedHtml = renderedHtml
@@ -1095,6 +1130,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.iosStoreUrl = iosStoreUrl
         self.adBehavior = adBehavior
         self.skanAttribution = skanAttribution
+        self.experiment = experiment
         self.bidAmt = bidAmt
         self.prewarmSKProduct = prewarmSKProduct
     }

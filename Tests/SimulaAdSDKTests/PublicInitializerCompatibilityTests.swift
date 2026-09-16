@@ -43,15 +43,34 @@ final class PublicInitializerCompatibilityTests: XCTestCase {
         XCTAssertEqual(metadata("u", "s", nil, nil, nil, nil, nil, ["k": "v"], capabilities).metadata, ["k": "v"])
     }
 
-    func testLegacyRewardedResponseInitializerSymbolRemainsCallable() {
-        let initializer: (
+    func testRewardedResponseInitializerSymbolsRemainCallable() {
+        let legacy: (
             String, String, String, String, String?, String?, AdBehavior?, AdAttribution?, Double, Bool
         ) -> RewardedInitResponse = RewardedInitResponse.init(
             impressionId:iframeUrl:renderedHtml:destination:trackingUrl:iosStoreUrl:
             adBehavior:skanAttribution:bidAmt:prewarmSKProduct:
         )
-        let response = initializer("i", "legacy", "<html/>", "web", nil, nil, nil, nil, 1, false)
-        XCTAssertNil(response.creative)
-        XCTAssertEqual(response.renderedHtml, "<html/>")
+        let creative: (
+            String, String, String, Creative?, String, String?, String?, AdBehavior?, AdAttribution?, Double, Bool
+        ) -> RewardedInitResponse = RewardedInitResponse.init(
+            impressionId:iframeUrl:renderedHtml:creative:destination:trackingUrl:iosStoreUrl:
+            adBehavior:skanAttribution:bidAmt:prewarmSKProduct:
+        )
+        let experiment: (
+            String, String, String, Creative?, String, String?, String?, AdBehavior?, AdAttribution?, Experiment?, Double, Bool
+        ) -> RewardedInitResponse = RewardedInitResponse.init(
+            impressionId:iframeUrl:renderedHtml:creative:destination:trackingUrl:iosStoreUrl:
+            adBehavior:skanAttribution:experiment:bidAmt:prewarmSKProduct:
+        )
+        let legacyResponse = legacy("i", "legacy", "<html/>", "web", nil, nil, nil, nil, 1, false)
+        let creativeResponse = creative("i", "legacy", "<html/>", nil, "web", nil, nil, nil, nil, 1, false)
+        let assignment = Experiment(experimentId: "exp", variantId: "variant")
+        let experimentResponse = experiment(
+            "i", "legacy", "<html/>", nil, "web", nil, nil, nil, nil, assignment, 1, false
+        )
+        XCTAssertNil(legacyResponse.creative)
+        XCTAssertNil(creativeResponse.experiment)
+        XCTAssertEqual(legacyResponse.renderedHtml, "<html/>")
+        XCTAssertEqual(experimentResponse.experiment, assignment)
     }
 }

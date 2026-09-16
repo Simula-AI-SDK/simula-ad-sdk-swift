@@ -988,13 +988,16 @@ final class SimulaAdSDKTests: XCTestCase {
     }
 
     func testRewardedInitHappyPath() throws {
-        let json = #"{"impression_id":"imp_1","rendered_html":"<html/>","prewarm_sk_product":true,"ad_behavior":{"close":{"delay_seconds":30}}}"#
+        let json = #"{"impression_id":"imp_1","rendered_html":"<html/>","prewarm_sk_product":true,"experiment":{"experiment_id":"rewarded_video_q3","variant_id":"native_video","layer":"creative_format"},"ad_behavior":{"close":{"delay_seconds":30}}}"#
         let r = try decodeRewardedInit(json)
         XCTAssertEqual(r.impressionId, "imp_1")
         XCTAssertEqual(r.htmlCreative, "<html/>")
         // The play-to-earn gate now rides on `ad_behavior.close.delay_seconds` (no top-level field).
         XCTAssertEqual(r.adBehavior?.close.delaySeconds, 30)
         XCTAssertTrue(r.prewarmSKProduct)
+        XCTAssertEqual(r.experiment?.experimentId, "rewarded_video_q3")
+        XCTAssertEqual(r.experiment?.variantId, "native_video")
+        XCTAssertEqual(r.experiment?.layer, "creative_format")
     }
 
     func testRewardedInitMissingFieldsFallBackToDefaults() throws {
@@ -1003,7 +1006,16 @@ final class SimulaAdSDKTests: XCTestCase {
         let r = try decodeRewardedInit(#"{"rendered_html":"<html/>","serve_id":"srv_2","ad_id":"a"}"#)
         XCTAssertEqual(r.impressionId, "")   // missing → ""
         XCTAssertNil(r.adBehavior)           // absent `ad_behavior` → nil → no gate, no store prompt
+        XCTAssertNil(r.experiment)
         XCTAssertFalse(r.prewarmSKProduct)
+    }
+
+    func testRewardedInitMalformedExperimentDoesNotFailResponseDecode() throws {
+        let r = try decodeRewardedInit(
+            #"{"impression_id":"imp_2","rendered_html":"<html/>","experiment":"invalid"}"#
+        )
+        XCTAssertEqual(r.impressionId, "imp_2")
+        XCTAssertNil(r.experiment)
     }
 
     func testRewardedInitMalformedJSONThrows() {

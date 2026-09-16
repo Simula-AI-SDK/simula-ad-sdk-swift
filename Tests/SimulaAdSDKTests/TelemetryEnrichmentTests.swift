@@ -123,6 +123,55 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertEqual(env?.variantId, "variant_b")
     }
 
+    func testAdmittedNoFillDoesNotUsePreviousExperimentAssignment() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.setExperiment(experimentId: "previous_exp", variantId: "previous_variant")
+        m.setExperiment(experimentId: nil, variantId: nil)
+        m.recordLifecycle(
+            stage: "load_fail", adFormat: "rewarded", adUnitId: "unit",
+            adId: nil, serveId: nil, durationMs: 5, errorCode: "no_fill"
+        )
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertNil(sender.batches.first?.experimentId)
+        XCTAssertNil(sender.batches.first?.variantId)
+    }
+
+    func testAdmittedThrownLoadFailureDoesNotUsePreviousExperimentAssignment() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.setExperiment(experimentId: "previous_exp", variantId: "previous_variant")
+        m.setExperiment(experimentId: nil, variantId: nil)
+        m.recordError(signature: "rewarded:load", errorCode: "transport")
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertNil(sender.batches.first?.experimentId)
+        XCTAssertNil(sender.batches.first?.variantId)
+    }
+
+    func testSuccessfulLoadReplacesPreviousExperimentAssignment() async {
+        let clock = Clock(1_000)
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: clock)
+
+        m.setExperiment(experimentId: "previous_exp", variantId: "previous_variant")
+        m.setExperiment(experimentId: nil, variantId: nil)
+        m.setExperiment(experimentId: "next_exp", variantId: "next_variant")
+        m.recordLifecycle(
+            stage: "load_success", adFormat: "rewarded", adUnitId: "unit",
+            adId: "impression", serveId: nil, durationMs: 5, errorCode: nil
+        )
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertEqual(sender.batches.first?.experimentId, "next_exp")
+        XCTAssertEqual(sender.batches.first?.variantId, "next_variant")
+    }
+
     func testRecorderNewFields() async {
         let clock = Clock(1_000)
         let sender = FakeSender()

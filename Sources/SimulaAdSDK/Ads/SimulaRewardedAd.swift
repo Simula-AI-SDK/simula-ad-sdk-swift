@@ -251,6 +251,10 @@ public final class SimulaRewardedAd {
             break // nothing held — proceed
         }
 
+        // This load now owns attribution. Clear the prior serve before any session, no-fill, or
+        // transport-failure telemetry can be recorded; a renderable response replaces it below.
+        Telemetry.shared.setExperiment(experimentId: nil, variantId: nil)
+
         // Supersede any in-flight load / discard any ready ad, then start fresh.
         loadTask?.cancel()
         #if os(iOS)
@@ -323,6 +327,10 @@ public final class SimulaRewardedAd {
                 )
             }
             #endif
+            Telemetry.shared.setExperiment(
+                experimentId: response.experiment?.experimentId,
+                variantId: response.experiment?.variantId
+            )
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
                 adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
@@ -520,6 +528,7 @@ public final class SimulaRewardedAd {
                         impressionId: response.impressionId,
                         sessionId: salvageSessionId,
                         elapsedPlayTime: elapsedPlayTime,
+                        configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0,
                         adUnitId: salvageAdUnitId
                     )
                     presentationLease.finishPostCloseTeardown()
@@ -558,6 +567,7 @@ public final class SimulaRewardedAd {
                                 impressionId: response.impressionId,
                                 sessionId: salvageSessionId,
                                 elapsedPlayTime: elapsedPlayTime,
+                                configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0,
                                 adUnitId: salvageAdUnitId
                             )
                             return
@@ -717,7 +727,11 @@ public final class SimulaRewardedAd {
     /// server verification. The completion routes the token / failure back to the
     /// delegate on the main thread.
     private func handleClose(response: RewardedInitResponse, earned: Bool, elapsedPlayTime: Double) {
-        guard earned, let sessionId = self.sessionId, !sessionId.isEmpty else { return }
+        guard let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
+            earned: earned,
+            actualElapsedPlayTime: elapsedPlayTime,
+            configuredDelaySeconds: response.adBehavior?.close.delaySeconds ?? 0
+        ), let sessionId = self.sessionId, !sessionId.isEmpty else { return }
 
         Telemetry.shared.recordLifecycle(stage: "reward_earned", adFormat: Self.adFormat, adUnitId: adUnitId, adId: response.impressionId, serveId: nil)
         delegate?.rewardedDidEarnReward(self)
@@ -725,7 +739,7 @@ public final class SimulaRewardedAd {
         Self.enqueueVerification(
             impressionId: response.impressionId,
             sessionId: sessionId,
-            elapsedPlayTime: elapsedPlayTime,
+            elapsedPlayTime: verificationElapsedPlayTime,
             adUnitId: adUnitId,
             ad: self
         )
@@ -741,14 +755,19 @@ public final class SimulaRewardedAd {
         impressionId: String,
         sessionId: String?,
         elapsedPlayTime: Double,
+        configuredDelaySeconds: Int,
         adUnitId: String
     ) {
-        guard earned, let sessionId, !sessionId.isEmpty, !impressionId.isEmpty else { return }
+        guard let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
+            earned: earned,
+            actualElapsedPlayTime: elapsedPlayTime,
+            configuredDelaySeconds: configuredDelaySeconds
+        ), let sessionId, !sessionId.isEmpty, !impressionId.isEmpty else { return }
         Telemetry.shared.recordLifecycle(stage: "reward_salvaged_on_teardown", adFormat: adFormat, adUnitId: adUnitId, adId: impressionId, serveId: nil)
         enqueueVerification(
             impressionId: impressionId,
             sessionId: sessionId,
-            elapsedPlayTime: elapsedPlayTime,
+            elapsedPlayTime: verificationElapsedPlayTime,
             adUnitId: adUnitId,
             ad: nil
         )

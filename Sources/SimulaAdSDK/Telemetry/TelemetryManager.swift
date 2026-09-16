@@ -377,9 +377,8 @@ final class TelemetryManager: @unchecked Sendable {
         if accumulatedFunnel { scheduleTimedFlush() }
     }
 
-    /// Set the session experiment assignment for the envelope (last assignment wins).
+    /// Replace the session experiment assignment for the envelope (last assignment wins).
     func setExperiment(experimentId: String?, variantId: String?) {
-        if (experimentId?.isEmpty ?? true) && (variantId?.isEmpty ?? true) { return }
         lock.lock()
         self.experimentId = experimentId
         self.variantId = variantId
