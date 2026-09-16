@@ -8,7 +8,7 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.2.1"
+let SIMULA_SDK_VERSION = "1.2.1-dev.3"
 
 struct DuplicateInitializeCountBuffer {
     private(set) var count = 0
@@ -165,7 +165,9 @@ final class Telemetry: @unchecked Sendable {
         if devMode { consoleLog = { line in print("[SimulaTelemetry] \(line)") } }
         return TelemetryManager(
             ctx: ctx,
-            store: UserDefaultsTelemetryStore(),
+            store: UserDefaultsTelemetryStore(
+                environment: processAPIEnvironmentSelection.environmentForRequest()
+            ),
             sender: ApiTelemetrySender(apiKey: apiKey),
             // Resolve one live identity and one privacy snapshot for the entire envelope identity.
             identityProvider: {

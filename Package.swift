@@ -27,6 +27,11 @@ let package = Package(
                 .copy("Resources/games_unavailable.png"),
                 .copy("Resources/minigame_interstitial_background.png"),
                 .copy("Resources/game_icon.png")
+            ],
+            swiftSettings: [
+                // Must exist only while the synchronized artifact version is X.Y.Z-dev.N.
+                // scripts/validate-artifact-flavor.sh enforces that relationship.
+                .define("SIMULA_DEV_ARTIFACT")
             ]
         ),
         .testTarget(

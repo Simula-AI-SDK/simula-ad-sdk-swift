@@ -1,10 +1,5 @@
 import Foundation
 
-// MARK: - API Constants
-
-/// Base URL for all Simula API endpoints (from api.ts)
-private let API_BASE_URL = "https://simula-api-701226639755.us-central1.run.app"
-
 // MARK: - API Error
 
 public enum SimulaAPIError: LocalizedError, Sendable {
@@ -1054,6 +1049,9 @@ public struct VerifyRewardResponse: Decodable, Sendable {
 /// Centralized API client for all Simula endpoints (translates api.ts)
 public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
+    private let environment: @Sendable () -> SimulaAPIEnvironment
+    private let claimSessionEnvironment: @Sendable (Bool) -> SimulaAPIEnvironment?
+    private var baseURLString: String { environment().baseURLString }
 
     /// Shared session tuned for the ad path. The default `URLSession.shared`
     /// uses a 60s request timeout, which would let a hung ad/init request stall
@@ -1077,6 +1075,26 @@ public final class SimulaAPI: @unchecked Sendable {
 
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
+        self.environment = { processAPIEnvironmentSelection.environmentForRequest() }
+        self.claimSessionEnvironment = { devMode in
+            let claim = processAPIEnvironmentSelection.claim(devMode: devMode)
+            return claim.isCompatible ? claim.effective : nil
+        }
+    }
+
+    init(session: URLSession? = nil, environmentSelection: ProcessAPIEnvironmentSelection) {
+        self.session = session ?? SimulaAPI.defaultSession
+        self.environment = { environmentSelection.environmentForRequest() }
+        self.claimSessionEnvironment = { devMode in
+            let claim = environmentSelection.claim(devMode: devMode)
+            return claim.isCompatible ? claim.effective : nil
+        }
+    }
+
+    init(session: URLSession? = nil, environment: SimulaAPIEnvironment) {
+        self.session = session ?? SimulaAPI.defaultSession
+        self.environment = { environment }
+        self.claimSessionEnvironment = { _ in environment }
     }
 
     /// Shared instance for the per-event tracking calls (impressions, clicks, interest, reportAd,
@@ -1122,7 +1140,9 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Create Session
 
-    /// Creates a server session and returns its id.
+    /// Creates a server session and returns its id. This is also a direct public initialization
+    /// boundary: `devMode` claims the process backend before the URL is built. A conflicting prior
+    /// selection returns nil without issuing a request.
     /// Translates `createSession()` from api.ts
     public func createSession(
         apiKey: String,
@@ -1130,7 +1150,10 @@ public final class SimulaAPI: @unchecked Sendable {
         primaryUserID: String? = nil,
         privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
-        guard let url = URL(string: "\(API_BASE_URL)/session/create") else { throw SimulaAPIError.invalidURL }
+        guard let sessionEnvironment = claimSessionEnvironment(devMode) else { return nil }
+        guard let url = URL(string: "\(sessionEnvironment.baseURLString)/session/create") else {
+            throw SimulaAPIError.invalidURL
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1184,7 +1207,7 @@ public final class SimulaAPI: @unchecked Sendable {
         guard !sessionId.isEmpty, !ppid.isEmpty else { return false }
         let encSession = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
         let encPpid = ppid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ppid
-        guard let url = URL(string: "\(API_BASE_URL)/session/\(encSession)/ppid/\(encPpid)") else { return false }
+        guard let url = URL(string: "\(baseURLString)/session/\(encSession)/ppid/\(encPpid)") else { return false }
 
         var request = URLRequest(url: url)
         request.httpMethod = "PATCH"
@@ -1203,8 +1226,13 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Builds the frequency-cap status request URL. `adUnitId` is required; `ppid` and
     /// `sessionId` are appended only when non-empty (the backend falls back to IP address,
     /// device id, and other session signals when omitted). Pure/testable.
-    static func frequencyCapURL(adUnitId: String, ppid: String? = nil, sessionId: String? = nil) -> URL? {
-        guard var components = URLComponents(string: "\(API_BASE_URL)/frequency-cap/status") else {
+    static func frequencyCapURL(
+        adUnitId: String,
+        ppid: String? = nil,
+        sessionId: String? = nil,
+        environment: SimulaAPIEnvironment = .production
+    ) -> URL? {
+        guard var components = URLComponents(string: "\(environment.baseURLString)/frequency-cap/status") else {
             return nil
         }
         var items = [URLQueryItem(name: "ad_unit_id", value: adUnitId)]
@@ -1228,7 +1256,12 @@ public final class SimulaAPI: @unchecked Sendable {
         ppid: String? = nil,
         sessionId: String? = nil
     ) async -> Bool {
-        guard let url = Self.frequencyCapURL(adUnitId: adUnitId, ppid: ppid, sessionId: sessionId) else {
+        guard let url = Self.frequencyCapURL(
+            adUnitId: adUnitId,
+            ppid: ppid,
+            sessionId: sessionId,
+            environment: environment()
+        ) else {
             return false
         }
 
@@ -1255,7 +1288,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// `sessionId` is retained for source compatibility. The public v2 catalog is
     /// session-independent so every supported game remains available in the menu.
     public func fetchCatalog(sessionId: String? = nil) async throws -> CatalogResponse {
-        guard let url = Self.catalogURL(sessionId: sessionId) else {
+        guard let url = Self.catalogURL(sessionId: sessionId, environment: environment()) else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1277,9 +1310,12 @@ public final class SimulaAPI: @unchecked Sendable {
     }
 
     /// Builds the session-independent public catalog URL. Pure/testable.
-    static func catalogURL(sessionId: String? = nil) -> URL? {
+    static func catalogURL(
+        sessionId: String? = nil,
+        environment: SimulaAPIEnvironment = .production
+    ) -> URL? {
         _ = sessionId
-        return URL(string: "\(API_BASE_URL)/minigames/catalogv2")
+        return URL(string: "\(environment.baseURLString)/minigames/catalogv2")
     }
 
     // MARK: - Fetch Characters (Character Selector)
@@ -1292,7 +1328,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// requires the publisher Bearer `apiKey` and a `sessionId` that belongs to that
     /// publisher — the same auth contract as `/session`.
     public func fetchCharacters(apiKey: String, sessionId: String, fill: Int = 4) async -> [CharacterData] {
-        guard let url = URL(string: "\(API_BASE_URL)/character-selector") else { return [] }
+        guard let url = URL(string: "\(baseURLString)/character-selector") else { return [] }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1350,7 +1386,7 @@ public final class SimulaAPI: @unchecked Sendable {
         context: SimulaAdContext? = nil,
         metadata: [String: String]?
     ) async throws -> AdLoadResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/load/interstitial") else {
+        guard let url = URL(string: "\(baseURLString)/load/interstitial") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1424,7 +1460,7 @@ public final class SimulaAPI: @unchecked Sendable {
         charDesc: String? = nil,
         metadata: [String: String]?
     ) async throws -> NativeAdResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/load/native") else {
+        guard let url = URL(string: "\(baseURLString)/load/native") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1492,7 +1528,7 @@ public final class SimulaAPI: @unchecked Sendable {
         context: SimulaAdContext? = nil,
         metadata: [String: String]?
     ) async throws -> RewardedInitResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/load/rewarded") else {
+        guard let url = URL(string: "\(baseURLString)/load/rewarded") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1533,7 +1569,7 @@ public final class SimulaAPI: @unchecked Sendable {
         elapsedPlayTime: Double,
         adUnitId: String = ""
     ) async throws -> VerifyRewardResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/verify-reward") else {
+        guard let url = URL(string: "\(baseURLString)/minigames/verify-reward") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1567,7 +1603,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Initializes a minigame and returns the iframe URL + ad id.
     /// Translates `getMinigame()` from api.ts
     public func getMinigame(_ params: InitMinigameRequest) async throws -> MinigameResponse {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/init") else {
+        guard let url = URL(string: "\(baseURLString)/minigames/init") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1628,7 +1664,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// the serve (campaign creative, then the "Get the App" end screen) in reveal order,
     /// skipping entries without a loadable iframe URL. Side-effect-free on the backend.
     public func fetchFallbacks(impressionId: String) async throws -> [FallbackAd] {
-        guard let url = URL(string: "\(API_BASE_URL)/load/fallbacks/\(impressionId)") else {
+        guard let url = URL(string: "\(baseURLString)/load/fallbacks/\(impressionId)") else {
             throw SimulaAPIError.invalidURL
         }
 
@@ -1658,7 +1694,7 @@ public final class SimulaAPI: @unchecked Sendable {
         gameName: String,
         apiKey: String
     ) async {
-        guard let url = URL(string: "\(API_BASE_URL)/minigames/menu/track/click") else { return }
+        guard let url = URL(string: "\(baseURLString)/minigames/menu/track/click") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1682,7 +1718,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// begin-to-render + 2s. The endpoint takes no body. Best-effort, silent-fail.
     public func trackShown(adId: String, apiKey: String) async {
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/shown") else { return }
+        guard let url = URL(string: "\(baseURLString)/impressions/\(adId)/shown") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1702,7 +1738,7 @@ public final class SimulaAPI: @unchecked Sendable {
     public func trackImpression(adId: String, apiKey: String) async {
         // An empty id would POST to `.../impressions//seen` (no id) — skip it.
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/seen") else { return }
+        guard let url = URL(string: "\(baseURLString)/impressions/\(adId)/seen") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1734,7 +1770,7 @@ public final class SimulaAPI: @unchecked Sendable {
         clickSource: String
     ) async {
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/click") else { return }
+        guard let url = URL(string: "\(baseURLString)/impressions/\(adId)/click") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1755,7 +1791,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// silent-fail like the other tracking calls — a report must never disrupt the ad experience.
     public func reportAd(adId: String, flag: String, note: String? = nil, apiKey: String) async {
         guard !adId.isEmpty else { return }
-        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/report") else { return }
+        guard let url = URL(string: "\(baseURLString)/impressions/\(adId)/report") else { return }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1776,7 +1812,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// no body. Best-effort, silent-fail — feedback must never disrupt the ad experience.
     public func recordInterest(adId: String, interest: Int, apiKey: String) async {
         guard !adId.isEmpty else { return }
-        guard var components = URLComponents(string: "\(API_BASE_URL)/impressions/\(adId)/interest") else { return }
+        guard var components = URLComponents(string: "\(baseURLString)/impressions/\(adId)/interest") else { return }
         components.queryItems = [URLQueryItem(name: "interest", value: String(interest))]
         guard let url = components.url else { return }
 
@@ -1819,7 +1855,7 @@ public final class SimulaAPI: @unchecked Sendable {
         interactionId: String?,
         clickSource: String?
     ) async throws -> Int {
-        guard let url = URL(string: "\(API_BASE_URL)/impressions/\(adId)/\(action)") else {
+        guard let url = URL(string: "\(baseURLString)/impressions/\(adId)/\(action)") else {
             throw SimulaAPIError.invalidURL
         }
         var request = URLRequest(url: url)
@@ -1845,7 +1881,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// (or -1 on a connectivity failure) for the caller to map to accept/drop/retry. The
     /// `TelemetryURLSessionDelegate` skips this path, so the request is never self-recorded.
     public func postTelemetry(apiKey: String, body: Data) async -> Int {
-        guard let url = URL(string: "\(API_BASE_URL)/telemetry/events") else { return -1 }
+        guard let url = URL(string: "\(baseURLString)/telemetry/events") else { return -1 }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

@@ -10,11 +10,12 @@ protocol TelemetryStoring: Sendable {
 
 /// Real store: a single `UserDefaults` entry holding the JSON-encoded buffer.
 final class UserDefaultsTelemetryStore: TelemetryStoring, @unchecked Sendable {
-    private let key = "simula_pending_telemetry_events"
+    private let key: String
     private let defaults: UserDefaults
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, environment: SimulaAPIEnvironment = .production) {
         self.defaults = defaults
+        self.key = SimulaEnvironmentStorageNames.telemetryKey(for: environment)
     }
 
     func load() -> [TelemetryEvent] {

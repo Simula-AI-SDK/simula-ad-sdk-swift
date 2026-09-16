@@ -107,6 +107,12 @@ public enum SimulaAds {
             return false
         }
 
+        // Freeze the backend before any API singleton or durable store can be touched. A later
+        // conflicting entry is rejected so one process never mixes production and staging state.
+        guard processAPIEnvironmentSelection.claim(devMode: devMode).isCompatible else {
+            return false
+        }
+
         guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
             return false
         }
@@ -207,7 +213,7 @@ public enum SimulaAds {
     /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
-        guard let provider = shared, provider.isProcessApiKeyCompatible, !adUnitId.isEmpty else {
+        guard let provider = shared, provider.canMakeRequests, !adUnitId.isEmpty else {
             return false
         }
         // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback

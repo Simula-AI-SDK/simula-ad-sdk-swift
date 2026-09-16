@@ -67,11 +67,18 @@ public final class SimulaProvider: ObservableObject {
     /// Whether the SDK is in development mode
     public let devMode: Bool
 
+    /// Effective process backend. A dev-tagged artifact may select staging; every other artifact
+    /// resolves to production regardless of `devMode`.
+    let apiEnvironment: SimulaAPIEnvironment
+
+    /// False when another SDK entry already selected a different process backend.
+    let isProcessEnvironmentCompatible: Bool
+
     /// False when another API key already owns process-wide SDK infrastructure. Such providers
     /// remain inert so a SwiftUI construction mismatch cannot send requests through mixed keys.
     let isProcessApiKeyCompatible: Bool
     private let processEffectsEnabled: Bool
-    var canMakeRequests: Bool { isProcessApiKeyCompatible }
+    var canMakeRequests: Bool { isProcessApiKeyCompatible && isProcessEnvironmentCompatible }
 
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
@@ -190,6 +197,7 @@ public final class SimulaProvider: ObservableObject {
             telemetryEnabled: telemetryEnabled,
             adContext: adContext,
             apiKeyOwnership: processApiKeyOwnership,
+            environmentSelection: processAPIEnvironmentSelection,
             processEffectsEnabled: true,
             activeProviderRegistry: processActiveSimulaProviderRegistry
         )
@@ -202,7 +210,8 @@ public final class SimulaProvider: ObservableObject {
         primaryUserID: String? = nil,
         hasPrivacyConsent: Bool = true,
         telemetryEnabled: Bool = true,
-        activeProviderRegistry: ActiveSimulaProviderRegistry? = nil
+        activeProviderRegistry: ActiveSimulaProviderRegistry? = nil,
+        environmentSelection: ProcessAPIEnvironmentSelection = ProcessAPIEnvironmentSelection()
     ) {
         self.init(
             apiKey: apiKey,
@@ -213,6 +222,7 @@ public final class SimulaProvider: ObservableObject {
             telemetryEnabled: telemetryEnabled,
             adContext: nil,
             apiKeyOwnership: apiKeyOwnership,
+            environmentSelection: environmentSelection,
             processEffectsEnabled: false,
             activeProviderRegistry: activeProviderRegistry
         )
@@ -227,12 +237,23 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool,
         adContext: SimulaAdContext?,
         apiKeyOwnership: ProcessApiKeyOwnership,
+        environmentSelection: ProcessAPIEnvironmentSelection,
         processEffectsEnabled: Bool,
         activeProviderRegistry: ActiveSimulaProviderRegistry?
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
-        self.isProcessApiKeyCompatible = claimProcessApiKeyIfValid(
+        let environmentClaim = claimProcessAPIEnvironmentIfValid(
+            apiKey: apiKey,
+            devMode: devMode,
+            selection: environmentSelection,
+            reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
+        )
+        self.apiEnvironment = environmentClaim?.effective
+            ?? environmentSelection.effectiveEnvironment
+            ?? .production
+        self.isProcessEnvironmentCompatible = environmentClaim?.isCompatible == true
+        self.isProcessApiKeyCompatible = self.isProcessEnvironmentCompatible && claimProcessApiKeyIfValid(
             apiKey,
             ownership: apiKeyOwnership,
             reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
@@ -251,7 +272,7 @@ public final class SimulaProvider: ObservableObject {
         self.privacyConfig = resolved
         self.telemetryEnabled = telemetryEnabled
 
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         guard processEffectsEnabled else {
             activeProviderRegistry?.register(token: activeProviderToken, provider: self)
             return
@@ -419,7 +440,8 @@ public final class SimulaProvider: ObservableObject {
 
         // SDK-upgrade bookkeeping: read + persist off-main; the beacon itself is recorded in the
         // main phase once telemetry is installed.
-        let versionKey = "simula_sdk_last_version"
+        let environment = processAPIEnvironmentSelection.environmentForRequest()
+        let versionKey = SimulaEnvironmentStorageNames.sdkLastVersionKey(for: environment)
         let lastVersion = UserDefaults.standard.string(forKey: versionKey)
         if lastVersion != SIMULA_SDK_VERSION {
             UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
@@ -622,9 +644,11 @@ public final class SimulaProvider: ObservableObject {
             //     a login/switch is instead captured by the reconcile convergence beacon once
             //     the server session actually represents the new user, and a logout must not
             //     re-enter the dedup memory it just reset.
-            Ipv4Beacon.shared.fire(
-                apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
-            )
+            if apiEnvironment.sendsIPv4Beacon {
+                Ipv4Beacon.shared.fire(
+                    apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
+                )
+            }
         }
         return resolved
     }
@@ -689,7 +713,7 @@ public final class SimulaProvider: ObservableObject {
     /// gathers or refreshes consent). Forwarded to the process-wide store; the
     /// session re-syncs automatically.
     public func updateConsent(_ config: SimulaPrivacyConfig) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         SimulaPrivacy.shared.apply(config)
     }
 
@@ -699,7 +723,7 @@ public final class SimulaProvider: ObservableObject {
     /// A full replacement, not a merge (PRD); all subsequent `POST /load/native` calls use the new
     /// value. Ads already preloaded under the old context are unaffected.
     public func updateContext(_ context: SimulaAdContext?) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         adContext = context
     }
 
@@ -715,7 +739,7 @@ public final class SimulaProvider: ObservableObject {
     /// express an empty id. The network call is best-effort.
     @MainActor
     public func updatePrimaryUserID(_ id: String?) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         let normalized = (id?.isEmpty == false) ? id : nil
         telemetryIdentitySource.setPrimaryUserId(normalized)
         // Reconcile the live server session toward the new id (serialized + single-flight). No-op
@@ -728,7 +752,7 @@ public final class SimulaProvider: ObservableObject {
         // session still holds pre-PATCH (the same stale-identity gate consistentSessionId
         // applies for the frequency-cap check). A login with no session yet is covered by the
         // session-creation init beacon. Only the logout dedup reset lives here.
-        if normalized == nil {
+        if normalized == nil, apiEnvironment.sendsIPv4Beacon {
             Ipv4Beacon.shared.onLogout()
         }
     }
@@ -769,9 +793,11 @@ public final class SimulaProvider: ObservableObject {
                 // so the steady-state reconcile is free; a post-logout re-login with the same
                 // ppid lands here without needing a PATCH and re-captures because the logout
                 // cleared the dedup memory.
-                Ipv4Beacon.shared.fire(
-                    apiKey: apiKey, sessionId: sid, ppid: target, reason: Ipv4Beacon.reasonPpidUpdate
-                )
+                if apiEnvironment.sendsIPv4Beacon {
+                    Ipv4Beacon.shared.fire(
+                        apiKey: apiKey, sessionId: sid, ppid: target, reason: Ipv4Beacon.reasonPpidUpdate
+                    )
+                }
                 break
             }
             let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: target)
@@ -805,7 +831,7 @@ public final class SimulaProvider: ObservableObject {
         coppaApplies: Bool? = nil,
         enableAdvertisingId: Bool? = nil
     ) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         SimulaPrivacy.shared.update(
             hasPrivacyConsent: hasPrivacyConsent,
             tcString: tcString,
@@ -830,7 +856,7 @@ public final class SimulaProvider: ObservableObject {
         gdprApplies: Bool = false,
         tcfPurpose1Consent: Bool = false
     ) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         SimulaPrivacy.shared.clearConsent(
             tcString: tcString,
             uspString: uspString,
@@ -849,7 +875,7 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     @discardableResult
     public func requestTrackingAuthorization() async -> ATTrackingManager.AuthorizationStatus {
-        guard isProcessApiKeyCompatible else {
+        guard canMakeRequests else {
             return SimulaPrivacy.shared.trackingAuthorizationStatus
         }
         return await SimulaPrivacy.shared.requestTrackingAuthorization()
@@ -867,37 +893,37 @@ public final class SimulaProvider: ObservableObject {
 
     /// Get cached ad for a slot/position (translates `getCachedAd`)
     public func getCachedAd(slot: String, position: Int) -> AdData? {
-        guard isProcessApiKeyCompatible else { return nil }
+        guard canMakeRequests else { return nil }
         return adCache[cacheKey(slot: slot, position: position)]
     }
 
     /// Cache an ad for a slot/position (translates `cacheAd`)
     public func cacheAd(slot: String, position: Int, ad: AdData) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         adCache[cacheKey(slot: slot, position: position)] = ad
     }
 
     /// Get cached height for a slot/position (translates `getCachedHeight`)
     public func getCachedHeight(slot: String, position: Int) -> CGFloat? {
-        guard isProcessApiKeyCompatible else { return nil }
+        guard canMakeRequests else { return nil }
         return heightCache[cacheKey(slot: slot, position: position)]
     }
 
     /// Cache height for a slot/position (translates `cacheHeight`)
     public func cacheHeight(slot: String, position: Int, height: CGFloat) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         heightCache[cacheKey(slot: slot, position: position)] = height
     }
 
     /// Check if a slot/position has no fill (translates `hasNoFill`)
     public func hasNoFill(slot: String, position: Int) -> Bool {
-        guard isProcessApiKeyCompatible else { return false }
+        guard canMakeRequests else { return false }
         return noFillCache.contains(cacheKey(slot: slot, position: position))
     }
 
     /// Mark a slot/position as having no fill (translates `markNoFill`)
     public func markNoFill(slot: String, position: Int) {
-        guard isProcessApiKeyCompatible else { return }
+        guard canMakeRequests else { return }
         noFillCache[cacheKey(slot: slot, position: position)] = true
     }
 }
