@@ -221,4 +221,232 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(gate.progress, 0.4, accuracy: 0.001)
         XCTAssertEqual(gate.secondsRemaining, 3)
     }
+
+    func testTimeControlCallbacksFollowNormalReadyPlayingPausedOrder() {
+        var status = FullscreenVideoStatus.ready
+
+        var transition = videoTimeControlTransition(status: status, stopped: false, event: .waiting)
+        XCTAssertEqual(transition, VideoTimeControlTransition(status: .ready, effect: .waiting))
+        status = transition.status
+
+        transition = videoTimeControlTransition(status: status, stopped: false, event: .playing)
+        XCTAssertEqual(transition, VideoTimeControlTransition(status: .playing, effect: .beganPlaying))
+        status = transition.status
+
+        transition = videoTimeControlTransition(status: status, stopped: false, event: .paused)
+        XCTAssertEqual(transition, VideoTimeControlTransition(status: .paused, effect: .paused))
+        status = transition.status
+
+        transition = videoTimeControlTransition(status: status, stopped: false, event: .unknown)
+        XCTAssertEqual(transition, VideoTimeControlTransition(status: .paused, effect: .none))
+    }
+
+    func testLatePlayingPausedWaitingAndUnknownCallbacksCannotReviveFailedPlayerForPoolReuse() {
+        let failure = FullscreenVideoStatus.failed(.playbackFailed)
+        var status = failure
+
+        for event in [
+            VideoTimeControlEvent.playing,
+            .paused,
+            .waiting,
+            .unknown,
+        ] {
+            let transition = videoTimeControlTransition(status: status, stopped: false, event: event)
+            XCTAssertEqual(transition.status, failure)
+            XCTAssertEqual(transition.effect, .cancelDeadlines)
+            status = transition.status
+            XCTAssertFalse(shouldReusePreparedVideoPlayer(
+                status: status,
+                isStopped: false,
+                isActive: false
+            ))
+        }
+    }
+
+    func testLateTimeControlCallbacksKeepEndedStateTerminalWithoutScheduling() {
+        for event in [
+            VideoTimeControlEvent.playing,
+            .paused,
+            .waiting,
+            .unknown,
+        ] {
+            XCTAssertEqual(
+                videoTimeControlTransition(status: .ended, stopped: false, event: event),
+                VideoTimeControlTransition(status: .ended, effect: .cancelDeadlines)
+            )
+        }
+    }
+
+    func testLateTimeControlCallbacksAfterStopPreserveStatusAndCancelDeadlines() {
+        for event in [
+            VideoTimeControlEvent.playing,
+            .paused,
+            .waiting,
+            .unknown,
+        ] {
+            let transition = videoTimeControlTransition(status: .ready, stopped: true, event: event)
+            XCTAssertEqual(transition, VideoTimeControlTransition(
+                status: .ready,
+                effect: .cancelDeadlines
+            ))
+            XCTAssertFalse(shouldReusePreparedVideoPlayer(
+                status: transition.status,
+                isStopped: true,
+                isActive: false
+            ))
+        }
+    }
+
+    func testQueuedLayerReadyCallbackRequiresCurrentGenerationPlayerAndLayer() {
+        let player = NSObject()
+        let replacementPlayer = NSObject()
+        let layer = NSObject()
+        let replacementLayer = NSObject()
+        let playerID = ObjectIdentifier(player)
+        let layerID = ObjectIdentifier(layer)
+
+        XCTAssertTrue(shouldAcceptVideoLayerReadyCallback(
+            callbackGeneration: 4,
+            installationGeneration: 4,
+            callbackPlayerIdentity: playerID,
+            installedPlayerIdentity: playerID,
+            callbackLayerIdentity: layerID,
+            installedLayerIdentity: layerID,
+            layerPlayerIdentity: playerID,
+            isReadyForDisplay: true,
+            firstFrameReported: false
+        ))
+        XCTAssertFalse(shouldAcceptVideoLayerReadyCallback(
+            callbackGeneration: 3,
+            installationGeneration: 4,
+            callbackPlayerIdentity: playerID,
+            installedPlayerIdentity: playerID,
+            callbackLayerIdentity: layerID,
+            installedLayerIdentity: layerID,
+            layerPlayerIdentity: playerID,
+            isReadyForDisplay: true,
+            firstFrameReported: false
+        ))
+        XCTAssertFalse(shouldAcceptVideoLayerReadyCallback(
+            callbackGeneration: 4,
+            installationGeneration: 4,
+            callbackPlayerIdentity: playerID,
+            installedPlayerIdentity: ObjectIdentifier(replacementPlayer),
+            callbackLayerIdentity: layerID,
+            installedLayerIdentity: layerID,
+            layerPlayerIdentity: playerID,
+            isReadyForDisplay: true,
+            firstFrameReported: false
+        ))
+        XCTAssertFalse(shouldAcceptVideoLayerReadyCallback(
+            callbackGeneration: 4,
+            installationGeneration: 4,
+            callbackPlayerIdentity: playerID,
+            installedPlayerIdentity: playerID,
+            callbackLayerIdentity: layerID,
+            installedLayerIdentity: ObjectIdentifier(replacementLayer),
+            layerPlayerIdentity: playerID,
+            isReadyForDisplay: true,
+            firstFrameReported: false
+        ))
+        XCTAssertFalse(shouldAcceptVideoLayerReadyCallback(
+            callbackGeneration: 4,
+            installationGeneration: 4,
+            callbackPlayerIdentity: playerID,
+            installedPlayerIdentity: playerID,
+            callbackLayerIdentity: layerID,
+            installedLayerIdentity: layerID,
+            layerPlayerIdentity: ObjectIdentifier(replacementPlayer),
+            isReadyForDisplay: true,
+            firstFrameReported: false
+        ))
+    }
+
+    func testUninstallGenerationAndExistingLatchRejectQueuedLayerCallback() {
+        let player = NSObject()
+        let layer = NSObject()
+        let playerID = ObjectIdentifier(player)
+        let layerID = ObjectIdentifier(layer)
+
+        for (generation, ready, reported) in [
+            (6 as UInt64, true, false),
+            (5, false, false),
+            (5, true, true),
+        ] {
+            XCTAssertFalse(shouldAcceptVideoLayerReadyCallback(
+                callbackGeneration: 5,
+                installationGeneration: generation,
+                callbackPlayerIdentity: playerID,
+                installedPlayerIdentity: playerID,
+                callbackLayerIdentity: layerID,
+                installedLayerIdentity: layerID,
+                layerPlayerIdentity: playerID,
+                isReadyForDisplay: ready,
+                firstFrameReported: reported
+            ))
+        }
+    }
+
+    func testDisappearedAndReplacementSurfaceCallbacksAreRejected() {
+        let player = NSObject()
+        let replacement = NSObject()
+        let playerID = ObjectIdentifier(player)
+
+        XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
+            viewAppeared: false,
+            visible: true,
+            failureHandled: false,
+            primaryCreativeReady: false,
+            callbackPlayerIdentity: playerID,
+            currentPlayerIdentity: playerID
+        ))
+        XCTAssertFalse(shouldAcceptFullscreenVideoFirstFrameCallback(
+            viewAppeared: true,
+            visible: true,
+            failureHandled: false,
+            primaryCreativeReady: false,
+            callbackPlayerIdentity: playerID,
+            currentPlayerIdentity: ObjectIdentifier(replacement)
+        ))
+        XCTAssertTrue(shouldAcceptFullscreenVideoFirstFrameCallback(
+            viewAppeared: true,
+            visible: true,
+            failureHandled: false,
+            primaryCreativeReady: false,
+            callbackPlayerIdentity: playerID,
+            currentPlayerIdentity: playerID
+        ))
+    }
+
+    func testRecreatedVideoSurfaceShowsAlreadyAdmittedPlayerFrame() {
+        let player = NSObject()
+        let replacement = NSObject()
+        XCTAssertFalse(videoSurfaceShowsFirstFrame(
+            localPlayerIdentity: nil,
+            currentPlayerIdentity: ObjectIdentifier(player),
+            playerFirstFrameAdmitted: false
+        ))
+        XCTAssertTrue(videoSurfaceShowsFirstFrame(
+            localPlayerIdentity: nil,
+            currentPlayerIdentity: ObjectIdentifier(player),
+            playerFirstFrameAdmitted: true
+        ))
+        XCTAssertFalse(videoSurfaceShowsFirstFrame(
+            localPlayerIdentity: ObjectIdentifier(player),
+            currentPlayerIdentity: ObjectIdentifier(replacement),
+            playerFirstFrameAdmitted: false
+        ))
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testPlayerExposesAdmittedFirstFrameForSurfaceRecreation() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        XCTAssertFalse(player.hasAdmittedFirstVisualFrame)
+        XCTAssertTrue(player.admitFirstVisualFrame())
+        XCTAssertTrue(player.hasAdmittedFirstVisualFrame)
+        XCTAssertFalse(player.admitFirstVisualFrame())
+        player.stop()
+    }
+    #endif
 }

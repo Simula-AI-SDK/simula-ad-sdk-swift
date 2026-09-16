@@ -15,6 +15,10 @@ struct FullscreenVisualAdmissionState: Equatable, Sendable {
     private(set) var accruedImpressionMs: Double = 0
     private(set) var terminalOutcome: FullscreenPresentationTerminalOutcome?
 
+    var impressionEligible: Bool {
+        displayAdmitted && visualActive && !blocked && !impressionCommitted && terminalOutcome == nil
+    }
+
     mutating func visualBecameReady() -> Bool {
         guard displayOutcome != .failed, terminalOutcome == nil else { return false }
         visualActive = true
@@ -33,8 +37,7 @@ struct FullscreenVisualAdmissionState: Equatable, Sendable {
     }
 
     mutating func accrueImpression(deltaMs: Double, thresholdMs: Double) -> Bool {
-        guard displayAdmitted, visualActive, !blocked, !impressionCommitted,
-              deltaMs.isFinite, deltaMs > 0 else { return false }
+        guard impressionEligible, deltaMs.isFinite, deltaMs > 0 else { return false }
         accruedImpressionMs += deltaMs
         guard accruedImpressionMs >= thresholdMs else { return false }
         impressionCommitted = true
@@ -55,6 +58,25 @@ struct FullscreenVisualAdmissionState: Equatable, Sendable {
             : .closed
         terminalOutcome = outcome
         return outcome
+    }
+}
+
+struct FullscreenImpressionDwellClock: Equatable, Sendable {
+    private(set) var anchor: TimeInterval?
+
+    mutating func resume(at now: TimeInterval) {
+        guard anchor == nil, now.isFinite else { return }
+        anchor = now
+    }
+
+    mutating func settle(at now: TimeInterval) -> Double {
+        guard let anchor, now.isFinite else { return 0 }
+        self.anchor = now
+        return max(0, now - anchor) * 1_000
+    }
+
+    mutating func pause() {
+        anchor = nil
     }
 }
 
@@ -399,7 +421,9 @@ import UIKit
 @MainActor
 final class FullscreenPresentationAdmission {
     private var state = FullscreenVisualAdmissionState()
+    private var dwellClock = FullscreenImpressionDwellClock()
     private var impressionTask: Task<Void, Never>?
+    private var impressionGeneration: UInt64 = 0
     private var activeSurface: FullscreenVisualSurfaceToken?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var applicationActive: Bool
@@ -409,20 +433,24 @@ final class FullscreenPresentationAdmission {
     private let onImpression: () -> Void
     private let impressionDelayMs: Double
     private let tickNanos: UInt64
+    private let uptime: () -> TimeInterval
 
     init(
         onDisplayed: @escaping () -> Void,
         onDisplayFailed: @escaping () -> Void = {},
         onImpression: @escaping () -> Void,
         impressionDelayMs: Double = fullscreenImpressionDelayMs,
-        tickNanos: UInt64 = impressionTickNanos
+        tickNanos: UInt64 = impressionTickNanos,
+        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        initialApplicationActive: Bool? = nil
     ) {
-        applicationActive = UIApplication.shared.applicationState == .active
+        applicationActive = initialApplicationActive ?? (UIApplication.shared.applicationState == .active)
         self.onDisplayed = onDisplayed
         self.onDisplayFailed = onDisplayFailed
         self.onImpression = onImpression
         self.impressionDelayMs = impressionDelayMs
         self.tickNanos = tickNanos
+        self.uptime = uptime
         state.setBlocked(!applicationActive)
         let center = NotificationCenter.default
         lifecycleObservers.append(center.addObserver(
@@ -450,73 +478,106 @@ final class FullscreenPresentationAdmission {
     var visualIsActive: Bool { state.visualActive }
 
     func visualBecameReady(owner: FullscreenVisualSurfaceToken) {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         let shouldNotifyDisplayed = state.visualBecameReady()
         guard state.visualActive else { return }
         activeSurface = owner
         if shouldNotifyDisplayed { onDisplayed() }
-        guard impressionTask == nil, !state.impressionCommitted else { return }
-        impressionTask = Task { [weak self] in await self?.runImpressionTimer() }
+        reconcileImpressionTimer(at: now)
     }
 
     func presentationDidSucceed() {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         let shouldNotifyDisplayed = state.visualBecameReady()
         guard state.visualActive else { return }
         if shouldNotifyDisplayed { onDisplayed() }
-        guard impressionTask == nil, !state.impressionCommitted else { return }
-        impressionTask = Task { [weak self] in await self?.runImpressionTimer() }
+        reconcileImpressionTimer(at: now)
     }
 
     func visualBecameUnavailable(owner: FullscreenVisualSurfaceToken) {
         guard activeSurface == owner else { return }
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         activeSurface = nil
         state.visualBecameUnavailable()
+        reconcileImpressionTimer(at: now)
     }
 
     func setBlocked(_ blocked: Bool) {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         surfaceBlocked = blocked
-        reconcileBlockedState()
+        reconcileBlockedState(at: now)
     }
 
     func stop() {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         activeSurface = nil
         state.visualBecameUnavailable()
-        impressionTask?.cancel()
-        impressionTask = nil
+        reconcileImpressionTimer(at: now)
     }
 
     @discardableResult
     func finish() -> FullscreenPresentationTerminalOutcome? {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         let outcome = state.finish()
         if outcome == .displayFailed { onDisplayFailed() }
-        stop()
+        activeSurface = nil
+        state.visualBecameUnavailable()
+        reconcileImpressionTimer(at: now)
         return outcome
     }
 
-    private func runImpressionTimer() async {
-        var lastTick = ProcessInfo.processInfo.systemUptime
-        while !state.impressionCommitted {
+    private func runImpressionTimer(generation: UInt64) async {
+        while generation == impressionGeneration, state.impressionEligible {
             do { try await Task.sleep(nanoseconds: tickNanos) } catch { return }
             if Task.isCancelled { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            let shouldCommit = state.accrueImpression(
-                deltaMs: (now - lastTick) * 1_000,
-                thresholdMs: impressionDelayMs
-            )
-            lastTick = now
-            if shouldCommit {
-                onImpression()
-                return
-            }
+            guard generation == impressionGeneration else { return }
+            let now = uptime()
+            settleEligibleImpressionDwell(at: now)
+            if state.impressionCommitted { cancelImpressionTimer() }
         }
     }
 
-    private func setApplicationActive(_ active: Bool) {
+    func setApplicationActive(_ active: Bool) {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
         applicationActive = active
-        reconcileBlockedState()
+        reconcileBlockedState(at: now)
     }
 
-    private func reconcileBlockedState() {
+    private func reconcileBlockedState(at now: TimeInterval) {
         state.setBlocked(surfaceBlocked || !applicationActive)
+        reconcileImpressionTimer(at: now)
+    }
+
+    private func settleEligibleImpressionDwell(at now: TimeInterval) {
+        let deltaMs = dwellClock.settle(at: now)
+        guard state.accrueImpression(deltaMs: deltaMs, thresholdMs: impressionDelayMs) else { return }
+        onImpression()
+    }
+
+    private func reconcileImpressionTimer(at now: TimeInterval) {
+        guard state.impressionEligible else {
+            cancelImpressionTimer()
+            return
+        }
+        dwellClock.resume(at: now)
+        guard impressionTask == nil else { return }
+        impressionGeneration &+= 1
+        let generation = impressionGeneration
+        impressionTask = Task { [weak self] in await self?.runImpressionTimer(generation: generation) }
+    }
+
+    private func cancelImpressionTimer() {
+        impressionGeneration &+= 1
+        impressionTask?.cancel()
+        impressionTask = nil
+        dwellClock.pause()
     }
 }
 #else

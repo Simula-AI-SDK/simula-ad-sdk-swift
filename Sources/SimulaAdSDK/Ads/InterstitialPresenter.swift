@@ -269,6 +269,7 @@ private struct CreativeInterstitialView: View {
     /// state is driven by `UIApplication` background/foreground notifications instead.
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
+    @State private var viewAppeared = false
     /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
     @State private var storeExit: StoreExitTracker?
 
@@ -297,6 +298,7 @@ private struct CreativeInterstitialView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var primaryCreativeReady = false
+    @State private var admittedVideoPlayerIdentity: ObjectIdentifier?
     @State private var terminalState = DeferredTerminalState<Bool>()
 
     // Mid-ad store prompt (`store_prompt`) — a tappable badge shown from `closeTime / 2` until the
@@ -413,9 +415,11 @@ private struct CreativeInterstitialView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            viewAppeared = true
             attributionRouteLifecycle.activate()
             appForegrounded = UIApplication.shared.applicationState == .active
-            admission.setBlocked(storeSheetPresented)
+            readmitVideoVisualIfNeeded()
+            admission.setBlocked(storeSheetPresented || !appForegrounded)
             if storeExit == nil {
                 storeExit = StoreExitTracker(
                     adId: response.impressionId,
@@ -430,6 +434,7 @@ private struct CreativeInterstitialView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            viewAppeared = false
             endSKANViewThroughImpression()
             attributionRouteLifecycle.deactivate()
             gateTask?.cancel()
@@ -661,8 +666,16 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
-        guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
+        guard shouldAcceptFullscreenVideoFirstFrameCallback(
+            viewAppeared: viewAppeared,
+            visible: visible,
+            failureHandled: videoFailureHandled,
+            primaryCreativeReady: primaryCreativeReady,
+            callbackPlayerIdentity: ObjectIdentifier(player),
+            currentPlayerIdentity: videoPlayer.map(ObjectIdentifier.init)
+        ) else { return }
         primaryCreativeReady = true
+        admittedVideoPlayerIdentity = ObjectIdentifier(player)
         handleSKANCreativeReady()
         admission.visualBecameReady(owner: admissionOwner)
         updateVideoGate(player: player, played: player.playedSeconds)
@@ -674,6 +687,20 @@ private struct CreativeInterstitialView: View {
             )
         }
         fireAutoStoreRedirectIfCloseShown()
+    }
+
+    private func readmitVideoVisualIfNeeded() {
+        guard viewAppeared, visible, !videoFailureHandled, !admission.visualIsActive,
+              let videoPlayer,
+              shouldReadmitFullscreenVideoVisual(
+                  primaryCreativeReady: primaryCreativeReady,
+                  playerFirstFrameAdmitted: videoPlayer.hasAdmittedFirstVisualFrame,
+                  admittedPlayerIdentity: admittedVideoPlayerIdentity,
+                  currentPlayerIdentity: ObjectIdentifier(videoPlayer),
+                  status: videoPlayer.status,
+                  isStopped: videoPlayer.isStopped
+              ) else { return }
+        admission.visualBecameReady(owner: admissionOwner)
     }
 
     private func updateVideoGate(

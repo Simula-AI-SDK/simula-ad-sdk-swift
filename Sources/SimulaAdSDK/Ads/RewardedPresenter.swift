@@ -282,6 +282,7 @@ private struct RewardedGameView: View {
     /// foreground state is driven by `UIApplication` background/foreground notifications instead.
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
+    @State private var viewAppeared = false
     /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
     @State private var storeExit: StoreExitTracker?
 
@@ -290,6 +291,7 @@ private struct RewardedGameView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var primaryCreativeReady = false
+    @State private var admittedVideoPlayerIdentity: ObjectIdentifier?
     @State private var htmlReadinessDeadline: RewardedHTMLReadinessDeadlineState
     @State private var terminalState = DeferredTerminalState<RewardedTerminalOutcome>()
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
@@ -448,9 +450,11 @@ private struct RewardedGameView: View {
         .animation(.easeInOut(duration: dismissAnimationDuration), value: visible)
         .hideStatusBar(true)
         .onAppear {
+            viewAppeared = true
             attributionRouteLifecycle.activate()
             appForegrounded = UIApplication.shared.applicationState == .active
-            admission.setBlocked(storeSheetPresented)
+            readmitVideoVisualIfNeeded()
+            admission.setBlocked(storeSheetPresented || !appForegrounded)
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             reconcileTimer()
             startSKOverlay()
@@ -458,6 +462,7 @@ private struct RewardedGameView: View {
             fireAutoStoreRedirectIfCloseShown()
         }
         .onDisappear {
+            viewAppeared = false
             attributionRouteLifecycle.deactivate()
             timerTask?.cancel()
             timerTask = nil
@@ -814,8 +819,16 @@ private struct RewardedGameView: View {
     }
 
     private func handleVideoFirstFrame(player: FullscreenVideoPlayer) {
-        guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
+        guard shouldAcceptFullscreenVideoFirstFrameCallback(
+            viewAppeared: viewAppeared,
+            visible: visible,
+            failureHandled: videoFailureHandled,
+            primaryCreativeReady: primaryCreativeReady,
+            callbackPlayerIdentity: ObjectIdentifier(player),
+            currentPlayerIdentity: videoPlayer.map(ObjectIdentifier.init)
+        ) else { return }
         primaryCreativeReady = true
+        admittedVideoPlayerIdentity = ObjectIdentifier(player)
         admission.visualBecameReady(owner: admissionOwner)
         if !videoStartRecorded {
             videoStartRecorded = true
@@ -825,6 +838,20 @@ private struct RewardedGameView: View {
             )
         }
         updateVideoGate(player: player, played: player.playedSeconds)
+    }
+
+    private func readmitVideoVisualIfNeeded() {
+        guard viewAppeared, visible, !videoFailureHandled, !admission.visualIsActive,
+              let videoPlayer,
+              shouldReadmitFullscreenVideoVisual(
+                  primaryCreativeReady: primaryCreativeReady,
+                  playerFirstFrameAdmitted: videoPlayer.hasAdmittedFirstVisualFrame,
+                  admittedPlayerIdentity: admittedVideoPlayerIdentity,
+                  currentPlayerIdentity: ObjectIdentifier(videoPlayer),
+                  status: videoPlayer.status,
+                  isStopped: videoPlayer.isStopped
+              ) else { return }
+        admission.visualBecameReady(owner: admissionOwner)
     }
 
     private func updateVideoGate(

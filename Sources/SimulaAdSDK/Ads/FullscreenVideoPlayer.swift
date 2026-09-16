@@ -120,6 +120,147 @@ struct VideoFirstFrameDeadlineState: Equatable, Sendable {
     }
 }
 
+enum FullscreenVideoFailure: String, Equatable, Sendable {
+    case preparationTimeout = "prepare_timeout"
+    case playbackTimeout = "playback_timeout"
+    case itemFailed = "prepare_failed"
+    case playbackFailed = "playback_error"
+    case firstFrameTimeout = "first_frame_timeout"
+}
+
+enum FullscreenVideoStatus: Equatable, Sendable {
+    case preparing
+    case ready
+    case playing
+    case paused
+    case ended
+    case failed(FullscreenVideoFailure)
+
+    var isTerminal: Bool {
+        switch self {
+        case .ended, .failed:
+            return true
+        case .preparing, .ready, .playing, .paused:
+            return false
+        }
+    }
+
+    var reusableForPreparedClaim: Bool {
+        switch self {
+        case .preparing, .ready, .paused:
+            return true
+        case .playing, .ended, .failed:
+            return false
+        }
+    }
+}
+
+enum VideoTimeControlEvent: Equatable, Sendable {
+    case playing
+    case paused
+    case waiting
+    case unknown
+}
+
+enum VideoTimeControlEffect: Equatable, Sendable {
+    case beganPlaying
+    case paused
+    case waiting
+    case none
+    case cancelDeadlines
+}
+
+struct VideoTimeControlTransition: Equatable, Sendable {
+    let status: FullscreenVideoStatus
+    let effect: VideoTimeControlEffect
+}
+
+func videoTimeControlTransition(
+    status: FullscreenVideoStatus,
+    stopped: Bool,
+    event: VideoTimeControlEvent
+) -> VideoTimeControlTransition {
+    guard !stopped, !status.isTerminal else {
+        return VideoTimeControlTransition(status: status, effect: .cancelDeadlines)
+    }
+    switch event {
+    case .playing:
+        return VideoTimeControlTransition(status: .playing, effect: .beganPlaying)
+    case .paused:
+        let nextStatus = status == .preparing ? status : .paused
+        return VideoTimeControlTransition(status: nextStatus, effect: .paused)
+    case .waiting:
+        return VideoTimeControlTransition(status: status, effect: .waiting)
+    case .unknown:
+        return VideoTimeControlTransition(status: status, effect: .none)
+    }
+}
+
+func shouldReusePreparedVideoPlayer(
+    status: FullscreenVideoStatus,
+    isStopped: Bool,
+    isActive: Bool
+) -> Bool {
+    !isStopped && !isActive && status.reusableForPreparedClaim
+}
+
+func shouldReadmitFullscreenVideoVisual(
+    primaryCreativeReady: Bool,
+    playerFirstFrameAdmitted: Bool,
+    admittedPlayerIdentity: ObjectIdentifier?,
+    currentPlayerIdentity: ObjectIdentifier,
+    status: FullscreenVideoStatus,
+    isStopped: Bool
+) -> Bool {
+    primaryCreativeReady
+        && playerFirstFrameAdmitted
+        && admittedPlayerIdentity == currentPlayerIdentity
+        && !status.isTerminal
+        && !isStopped
+}
+
+func shouldAcceptFullscreenVideoFirstFrameCallback(
+    viewAppeared: Bool,
+    visible: Bool,
+    failureHandled: Bool,
+    primaryCreativeReady: Bool,
+    callbackPlayerIdentity: ObjectIdentifier,
+    currentPlayerIdentity: ObjectIdentifier?
+) -> Bool {
+    viewAppeared
+        && visible
+        && !failureHandled
+        && !primaryCreativeReady
+        && callbackPlayerIdentity == currentPlayerIdentity
+}
+
+func shouldAcceptVideoLayerReadyCallback(
+    callbackGeneration: UInt64,
+    installationGeneration: UInt64,
+    callbackPlayerIdentity: ObjectIdentifier,
+    installedPlayerIdentity: ObjectIdentifier?,
+    callbackLayerIdentity: ObjectIdentifier,
+    installedLayerIdentity: ObjectIdentifier,
+    layerPlayerIdentity: ObjectIdentifier?,
+    isReadyForDisplay: Bool,
+    firstFrameReported: Bool
+) -> Bool {
+    callbackGeneration == installationGeneration
+        && callbackPlayerIdentity == installedPlayerIdentity
+        && callbackLayerIdentity == installedLayerIdentity
+        && callbackPlayerIdentity == layerPlayerIdentity
+        && isReadyForDisplay
+        && !firstFrameReported
+}
+
+func videoSurfaceShowsFirstFrame(
+    localPlayerIdentity: ObjectIdentifier?,
+    currentPlayerIdentity: ObjectIdentifier,
+    playerFirstFrameAdmitted: Bool
+) -> Bool {
+    localPlayerIdentity == currentPlayerIdentity || playerFirstFrameAdmitted
+}
+
 func shouldShowVideoStorePrompt(enabled: Bool, reachedMidpoint: Bool, dismissUnlocked: Bool) -> Bool {
     enabled && reachedMidpoint && !dismissUnlocked
 }
@@ -164,40 +305,6 @@ import AVFoundation
 import Combine
 import SwiftUI
 import UIKit
-
-enum FullscreenVideoFailure: String, Equatable {
-    case preparationTimeout = "prepare_timeout"
-    case playbackTimeout = "playback_timeout"
-    case itemFailed = "prepare_failed"
-    case playbackFailed = "playback_error"
-    case firstFrameTimeout = "first_frame_timeout"
-}
-
-enum FullscreenVideoStatus: Equatable {
-    case preparing
-    case ready
-    case playing
-    case paused
-    case ended
-    case failed(FullscreenVideoFailure)
-
-    var reusableForPreparedClaim: Bool {
-        switch self {
-        case .preparing, .ready, .paused:
-            return true
-        case .playing, .ended, .failed:
-            return false
-        }
-    }
-}
-
-func shouldReusePreparedVideoPlayer(
-    status: FullscreenVideoStatus,
-    isStopped: Bool,
-    isActive: Bool
-) -> Bool {
-    !isStopped && !isActive && status.reusableForPreparedClaim
-}
 
 enum VideoInterruptionEndAction: Equatable {
     case resume
@@ -248,6 +355,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var stopped = false
 
     var isStopped: Bool { stopped }
+    var hasAdmittedFirstVisualFrame: Bool { firstFrameDeadline.admitted }
 
     init(url: URL, posterURL: URL?) {
         self.posterURL = posterURL
@@ -440,22 +548,33 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     private func handleTimeControlStatus(_ timeControlStatus: AVPlayer.TimeControlStatus) {
-        guard !stopped, status != .ended else { return }
+        let event: VideoTimeControlEvent
         switch timeControlStatus {
-        case .playing:
+        case .playing: event = .playing
+        case .paused: event = .paused
+        case .waitingToPlayAtSpecifiedRate: event = .waiting
+        @unknown default: event = .unknown
+        }
+        let transition = videoTimeControlTransition(status: status, stopped: stopped, event: event)
+        if transition.status != status { status = transition.status }
+        switch transition.effect {
+        case .beganPlaying:
             playbackTimeoutWorkItem?.cancel()
             playbackTimeoutWorkItem = nil
-            status = .playing
             scheduleFirstFrameTimeoutIfNeeded()
         case .paused:
             playbackTimeoutWorkItem?.cancel()
             playbackTimeoutWorkItem = nil
             pauseFirstFrameTimeout()
-            if status != .preparing, !isFailed { status = .paused }
-        case .waitingToPlayAtSpecifiedRate:
+        case .waiting:
             schedulePlaybackTimeoutIfNeeded()
-        @unknown default:
+        case .none:
             break
+        case .cancelDeadlines:
+            playbackTimeoutWorkItem?.cancel()
+            playbackTimeoutWorkItem = nil
+            firstFrameTimeoutWorkItem?.cancel()
+            firstFrameTimeoutWorkItem = nil
         }
     }
 
@@ -850,27 +969,43 @@ final class FullscreenVideoPreparationOwnership {
     }
 }
 
-private final class VideoLayerView: UIView {
+final class VideoLayerView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
     private var readyObservation: NSKeyValueObservation?
     private weak var installedPlayer: AVPlayer?
     private var firstFrameReported = false
+    private var installationGeneration: UInt64 = 0
 
     func install(player: AVPlayer?, onFirstFrame: @escaping () -> Void) {
         guard let playerLayer = layer as? AVPlayerLayer else { return }
         playerLayer.videoGravity = .resizeAspect
         guard installedPlayer !== player else { return }
+        installationGeneration &+= 1
+        let generation = installationGeneration
         readyObservation?.invalidate()
         readyObservation = nil
         installedPlayer = player
         firstFrameReported = false
         playerLayer.player = player
-        guard player != nil else { return }
+        guard let player else { return }
+        let playerIdentity = ObjectIdentifier(player)
         readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
             guard layer.isReadyForDisplay else { return }
-            DispatchQueue.main.async {
-                guard let self, !self.firstFrameReported else { return }
+            let observedLayer = layer
+            DispatchQueue.main.async { [weak self, weak observedLayer, weak player] in
+                guard let self, let observedLayer, player != nil,
+                      shouldAcceptVideoLayerReadyCallback(
+                          callbackGeneration: generation,
+                          installationGeneration: self.installationGeneration,
+                          callbackPlayerIdentity: playerIdentity,
+                          installedPlayerIdentity: self.installedPlayer.map(ObjectIdentifier.init),
+                          callbackLayerIdentity: ObjectIdentifier(observedLayer),
+                          installedLayerIdentity: ObjectIdentifier(self.layer),
+                          layerPlayerIdentity: observedLayer.player.map(ObjectIdentifier.init),
+                          isReadyForDisplay: observedLayer.isReadyForDisplay,
+                          firstFrameReported: self.firstFrameReported
+                      ) else { return }
                 self.firstFrameReported = true
                 self.readyObservation?.invalidate()
                 self.readyObservation = nil
@@ -880,6 +1015,7 @@ private final class VideoLayerView: UIView {
     }
 
     func uninstall() {
+        installationGeneration &+= 1
         readyObservation?.invalidate()
         readyObservation = nil
         installedPlayer = nil
@@ -913,7 +1049,15 @@ struct FullscreenVideoSurface: View {
     let onTap: () -> Void
     let onFirstFrame: () -> Void
     let controlsEnabled: Bool
-    @State private var firstFrameReady = false
+    @State private var firstFramePlayerIdentity: ObjectIdentifier?
+
+    private var showsFirstFrame: Bool {
+        videoSurfaceShowsFirstFrame(
+            localPlayerIdentity: firstFramePlayerIdentity,
+            currentPlayerIdentity: ObjectIdentifier(videoPlayer),
+            playerFirstFrameAdmitted: videoPlayer.hasAdmittedFirstVisualFrame
+        )
+    }
 
     var body: some View {
         ZStack {
@@ -928,12 +1072,13 @@ struct FullscreenVideoSurface: View {
             }
 
             VideoLayerRepresentable(player: videoPlayer.player) {
-                guard !firstFrameReady else { return }
+                let playerIdentity = ObjectIdentifier(videoPlayer)
+                guard firstFramePlayerIdentity != playerIdentity else { return }
                 guard videoPlayer.admitFirstVisualFrame() else { return }
-                firstFrameReady = true
+                firstFramePlayerIdentity = playerIdentity
                 onFirstFrame()
             }
-            .opacity(firstFrameReady ? 1 : 0)
+            .opacity(showsFirstFrame ? 1 : 0)
 
             Color.clear
                 .contentShape(Rectangle())
@@ -973,7 +1118,12 @@ struct FullscreenVideoSurface: View {
             }
         }
         .background(Color.black)
-        .onAppear { videoPlayer.play() }
+        .onAppear {
+            if videoPlayer.hasAdmittedFirstVisualFrame {
+                firstFramePlayerIdentity = ObjectIdentifier(videoPlayer)
+            }
+            videoPlayer.play()
+        }
     }
 }
 #else
