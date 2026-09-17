@@ -451,13 +451,17 @@ public final class SimulaPrivacy: ObservableObject {
         guard shouldReadAdvertisingTracking(generation: generation) else { return }
         let statusReading = await readAdvertisingTrackingStatus()
         let shouldReadId = applyAutomaticAdvertisingStatus(statusReading.value, generation: generation)
+        var idReading: AdvertisingRead<String>?
+        if shouldReadId, shouldReadAutomaticAdvertisingId(generation: generation) {
+            let reading = await readAdvertisingId()
+            applyAutomaticAdvertisingId(reading.value, generation: generation)
+            idReading = reading
+        }
+        // Publish once after the session-specific ATT/IDFA pair is settled. An intermediate ATT
+        // snapshot could make the provider's debounced privacy observer cancel this same refresh.
         recompute()
         recordAdvertisingRead(operation: "att_status_read", reading: statusReading)
-        if shouldReadId, shouldReadAutomaticAdvertisingId(generation: generation) {
-            let idReading = await readAdvertisingId()
-            applyAutomaticAdvertisingId(idReading.value, generation: generation)
-            recordAdvertisingRead(operation: "idfa_read", reading: idReading)
-        }
+        if let idReading { recordAdvertisingRead(operation: "idfa_read", reading: idReading) }
     }
 
     private func runScheduledAdvertisingRefresh(generation: Int) async {

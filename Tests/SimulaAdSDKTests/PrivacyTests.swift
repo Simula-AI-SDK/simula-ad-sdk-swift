@@ -316,6 +316,36 @@ final class PrivacyTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionAdvertisingRefreshPublishesOnlyAfterIdfaSettles() async {
+        let reader = BlockingSecondAdvertisingIdReader()
+        let store = makePrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "initial-idfa")
+
+        await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 2)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+
+        let refresh = Task { await store.refreshAdvertisingTrackingForSession() }
+        await waitUntil { reader.secondIdReadStarted }
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+        XCTAssertNil(store.currentSnapshot.advertisingId)
+
+        reader.releaseSecondIdRead()
+        await refresh.value
+        XCTAssertEqual(store.currentSnapshot.attStatus, 3)
+        XCTAssertEqual(store.currentSnapshot.advertisingId, "refreshed-idfa")
+    }
+
+    @MainActor
     func testDisablingIdfaWhileDeferredRefreshWaitsStillReadsOnlyAtt() async {
         let gate = ControllableLaunchSettledGate()
         let reader = AdvertisingReaderRecorder()
@@ -944,6 +974,32 @@ private final class BlockingAdvertisingReader: @unchecked Sendable {
     private func endRead() {
         lock.lock(); activeReads -= 1; lock.unlock()
     }
+}
+
+private final class BlockingSecondAdvertisingIdReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let secondIdGate = DispatchSemaphore(value: 0)
+    private var idReads = 0
+    private var secondStarted = false
+
+    var secondIdReadStarted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return secondStarted
+    }
+
+    func readStatus() -> Int? { 3 }
+
+    func readId() -> String? {
+        lock.lock()
+        idReads += 1
+        let count = idReads
+        if count == 2 { secondStarted = true }
+        lock.unlock()
+        if count == 2 { secondIdGate.wait() }
+        return count == 1 ? "initial-idfa" : "refreshed-idfa"
+    }
+
+    func releaseSecondIdRead() { secondIdGate.signal() }
 }
 
 private final class BlockingAdvertisingStatusReader: @unchecked Sendable {
