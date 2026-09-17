@@ -27,21 +27,21 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
         )
     }
 
-    func testDeclarativeProviderIsAdoptedWhenOnlyLaterDevModeDiffers() {
+    func testDeclarativeBeforeImperativeAdoptsProviderWhenOnlyLaterDevModeDiffers() {
         let registry = ActiveSimulaProviderRegistry()
         let ownership = ProcessApiKeyOwnership()
         let requested = coreConfiguration()
         let declarative = makeProvider(configuration: requested, ownership: ownership, registry: registry)
         let imperative = SimulaProviderCoreConfiguration(
             apiKey: requested.apiKey,
-            devMode: true,
+            devMode: !requested.devMode,
             primaryUserID: requested.primaryUserID,
             hasPrivacyConsent: requested.hasPrivacyConsent,
             telemetryEnabled: requested.telemetryEnabled
         )
 
         guard case .adopt(let adopted) = registry.resolve(imperative) else {
-            return XCTFail("the active provider must own the process devMode")
+            return XCTFail("imperative initialization must reuse the first declarative provider")
         }
         XCTAssertTrue(adopted === declarative)
     }
@@ -93,7 +93,7 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
         XCTAssertFalse(created)
     }
 
-    func testProviderViewReusesSharedProviderWhenOnlyDevModeDiffers() {
+    func testImperativeBeforeDeclarativeReusesProviderWhenOnlyLaterDevModeDiffers() {
         let registry = ActiveSimulaProviderRegistry()
         let ownership = ProcessApiKeyOwnership()
         let activeConfiguration = coreConfiguration()
@@ -122,6 +122,55 @@ final class ActiveSimulaProviderRegistryTests: XCTestCase {
 
         XCTAssertTrue(selected === shared)
         XCTAssertFalse(created)
+    }
+
+    func testCoreConfigurationDifferencesOtherThanDevModeRemainConflicts() {
+        let registry = ActiveSimulaProviderRegistry()
+        let ownership = ProcessApiKeyOwnership()
+        let configuration = coreConfiguration()
+        let provider = makeProvider(
+            configuration: configuration,
+            ownership: ownership,
+            registry: registry
+        )
+        let conflicts = [
+            SimulaProviderCoreConfiguration(
+                apiKey: "different-key",
+                devMode: configuration.devMode,
+                primaryUserID: configuration.primaryUserID,
+                hasPrivacyConsent: configuration.hasPrivacyConsent,
+                telemetryEnabled: configuration.telemetryEnabled
+            ),
+            SimulaProviderCoreConfiguration(
+                apiKey: configuration.apiKey,
+                devMode: configuration.devMode,
+                primaryUserID: "different-user",
+                hasPrivacyConsent: configuration.hasPrivacyConsent,
+                telemetryEnabled: configuration.telemetryEnabled
+            ),
+            SimulaProviderCoreConfiguration(
+                apiKey: configuration.apiKey,
+                devMode: configuration.devMode,
+                primaryUserID: configuration.primaryUserID,
+                hasPrivacyConsent: !configuration.hasPrivacyConsent,
+                telemetryEnabled: configuration.telemetryEnabled
+            ),
+            SimulaProviderCoreConfiguration(
+                apiKey: configuration.apiKey,
+                devMode: configuration.devMode,
+                primaryUserID: configuration.primaryUserID,
+                hasPrivacyConsent: configuration.hasPrivacyConsent,
+                telemetryEnabled: !configuration.telemetryEnabled
+            ),
+        ]
+
+        withExtendedLifetime(provider) {
+            for conflicting in conflicts {
+                guard case .conflict = registry.resolve(conflicting) else {
+                    return XCTFail("API key, PPID, consent, and telemetry differences must conflict")
+                }
+            }
+        }
     }
 
     func testLivePPIDUpdateDoesNotChangeProviderMatchingConfiguration() {

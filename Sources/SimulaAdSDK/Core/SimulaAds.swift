@@ -60,6 +60,24 @@ public enum SimulaAds {
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
+    /// Selects the process-wide API environment before any SDK initialization or direct API request.
+    /// The first selection wins. Staging is effective only in a development artifact when the host
+    /// app's Info.plist contains the Boolean key `SimulaStagingEnvironmentEnabled` set to `true`;
+    /// otherwise the process fails closed to production.
+    ///
+    /// - Returns: `true` when `environment` is the effective process selection, otherwise `false`.
+    @discardableResult
+    nonisolated public static func configureAPIEnvironment(_ environment: SimulaAPIEnvironment) -> Bool {
+        configureAPIEnvironment(environment, selection: processAPIEnvironmentSelection)
+    }
+
+    nonisolated static func configureAPIEnvironment(
+        _ environment: SimulaAPIEnvironment,
+        selection: ProcessAPIEnvironmentSelection
+    ) -> Bool {
+        selection.configure(environment).isCompatible
+    }
+
     /// Initializes the SDK with the given API key. Safe to call more than once;
     /// the first valid call wins and subsequent calls are ignored so existing ad
     /// instances keep their session.
@@ -125,9 +143,9 @@ public enum SimulaAds {
         )
 
         // Keep this call cheap: it runs on the main thread, typically during app launch. A live
-        // declarative provider owns the process configuration, including devMode/backend selection,
-        // so an imperative entry with only a different devMode adopts it rather than going inert.
-        // With no provider, freeze the requested backend before touching API/durable infrastructure.
+        // declarative provider with the same core configuration is adopted; otherwise initialization
+        // remains inert. With no explicit environment configuration, provider construction freezes
+        // production before touching API/durable infrastructure.
         let provider: SimulaProvider
         switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
         case .adopt(let active):
@@ -140,9 +158,6 @@ public enum SimulaAds {
         case .conflict:
             return false
         case .none:
-            guard processAPIEnvironmentSelection.claim(devMode: devMode).isCompatible else {
-                return false
-            }
             guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
                 return false
             }

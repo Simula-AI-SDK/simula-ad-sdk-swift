@@ -1050,7 +1050,6 @@ public struct VerifyRewardResponse: Decodable, Sendable {
 public final class SimulaAPI: @unchecked Sendable {
     private let session: URLSession
     private let environment: @Sendable () -> SimulaAPIEnvironment
-    private let claimSessionEnvironment: @Sendable (Bool) -> SimulaAPIEnvironment?
     private var baseURLString: String { environment().baseURLString }
 
     /// Shared session tuned for the ad path. The default `URLSession.shared`
@@ -1076,25 +1075,16 @@ public final class SimulaAPI: @unchecked Sendable {
     public init(session: URLSession? = nil) {
         self.session = session ?? SimulaAPI.defaultSession
         self.environment = { processAPIEnvironmentSelection.environmentForRequest() }
-        self.claimSessionEnvironment = { devMode in
-            let claim = processAPIEnvironmentSelection.claim(devMode: devMode)
-            return claim.isCompatible ? claim.effective : nil
-        }
     }
 
     init(session: URLSession? = nil, environmentSelection: ProcessAPIEnvironmentSelection) {
         self.session = session ?? SimulaAPI.defaultSession
         self.environment = { environmentSelection.environmentForRequest() }
-        self.claimSessionEnvironment = { devMode in
-            let claim = environmentSelection.claim(devMode: devMode)
-            return claim.isCompatible ? claim.effective : nil
-        }
     }
 
     init(session: URLSession? = nil, environment: SimulaAPIEnvironment) {
         self.session = session ?? SimulaAPI.defaultSession
         self.environment = { environment }
-        self.claimSessionEnvironment = { _ in environment }
     }
 
     /// Shared instance for the per-event tracking calls (impressions, clicks, interest, reportAd,
@@ -1140,9 +1130,9 @@ public final class SimulaAPI: @unchecked Sendable {
 
     // MARK: - Create Session
 
-    /// Creates a server session and returns its id. This is also a direct public initialization
-    /// boundary: `devMode` claims the process backend before the URL is built. A conflicting prior
-    /// selection returns nil without issuing a request.
+    /// Creates a server session and returns its id. The request uses the process environment selected
+    /// by `SimulaAds.configureAPIEnvironment(_:)`, or freezes production when none was configured.
+    /// `devMode` remains a session property and does not select a backend.
     /// Translates `createSession()` from api.ts
     public func createSession(
         apiKey: String,
@@ -1150,7 +1140,7 @@ public final class SimulaAPI: @unchecked Sendable {
         primaryUserID: String? = nil,
         privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
-        guard let sessionEnvironment = claimSessionEnvironment(devMode) else { return nil }
+        let sessionEnvironment = environment()
         guard let url = URL(string: "\(sessionEnvironment.baseURLString)/session/create") else {
             throw SimulaAPIError.invalidURL
         }

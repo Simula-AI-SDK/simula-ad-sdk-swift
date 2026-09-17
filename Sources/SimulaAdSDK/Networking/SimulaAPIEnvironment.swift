@@ -1,6 +1,7 @@
 import Foundation
+import CoreFoundation
 
-enum SimulaAPIEnvironment: Hashable, Sendable {
+public enum SimulaAPIEnvironment: Hashable, Sendable {
     case production
     case staging
 
@@ -24,7 +25,10 @@ enum SimulaAPIEnvironment: Hashable, Sendable {
 }
 
 struct SimulaArtifactEnvironmentPolicy: Equatable, Sendable {
+    static let stagingInfoPlistKey = "SimulaStagingEnvironmentEnabled"
+
     let allowsStaging: Bool
+    let stagingOptInEnabled: Bool
 
     static let current = SimulaArtifactEnvironmentPolicy(
         allowsStaging: {
@@ -33,11 +37,22 @@ struct SimulaArtifactEnvironmentPolicy: Equatable, Sendable {
             #else
             return false
             #endif
-        }()
+        }(),
+        stagingOptInEnabled: isEnabled(
+            infoDictionaryValue: Bundle.main.object(forInfoDictionaryKey: stagingInfoPlistKey)
+        )
     )
 
-    func environment(devMode: Bool) -> SimulaAPIEnvironment {
-        devMode && allowsStaging ? .staging : .production
+    static func isEnabled(infoDictionaryValue: Any?) -> Bool {
+        guard let number = infoDictionaryValue as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return false
+        }
+        return number.boolValue
+    }
+
+    func environment(for requested: SimulaAPIEnvironment) -> SimulaAPIEnvironment {
+        requested == .staging && allowsStaging && stagingOptInEnabled ? .staging : .production
     }
 }
 
@@ -48,8 +63,7 @@ struct ProcessAPIEnvironmentClaim: Equatable, Sendable {
     var isCompatible: Bool { requested == effective }
 }
 
-/// The first SDK entry or direct API request freezes one backend for the process. Later entries
-/// targeting another backend become inert instead of mixing sessions, queues, or telemetry.
+/// Explicit configuration or the first SDK request freezes one backend for the process.
 final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
     private let lock = NSLock()
     private let policy: SimulaArtifactEnvironmentPolicy
@@ -59,12 +73,18 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
         self.policy = policy
     }
 
-    func claim(devMode: Bool) -> ProcessAPIEnvironmentClaim {
-        claim(policy.environment(devMode: devMode))
+    func configure(_ requested: SimulaAPIEnvironment) -> ProcessAPIEnvironmentClaim {
+        claim(requested: requested, allowed: policy.environment(for: requested))
     }
 
     func environmentForRequest() -> SimulaAPIEnvironment {
-        claim(.production).effective
+        lock.lock()
+        defer { lock.unlock() }
+        guard let selected else {
+            self.selected = .production
+            return .production
+        }
+        return selected
     }
 
     var effectiveEnvironment: SimulaAPIEnvironment? {
@@ -72,30 +92,18 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
         return selected
     }
 
-    private func claim(_ requested: SimulaAPIEnvironment) -> ProcessAPIEnvironmentClaim {
+    private func claim(
+        requested: SimulaAPIEnvironment,
+        allowed: SimulaAPIEnvironment
+    ) -> ProcessAPIEnvironmentClaim {
         lock.lock()
         defer { lock.unlock() }
         guard let selected else {
-            self.selected = requested
-            return ProcessAPIEnvironmentClaim(requested: requested, effective: requested)
+            self.selected = allowed
+            return ProcessAPIEnvironmentClaim(requested: requested, effective: allowed)
         }
         return ProcessAPIEnvironmentClaim(requested: requested, effective: selected)
     }
-}
-
-func claimProcessAPIEnvironmentIfValid(
-    apiKey: String,
-    devMode: Bool,
-    selection: ProcessAPIEnvironmentSelection,
-    reportInvalid: (String) -> Void
-) -> ProcessAPIEnvironmentClaim? {
-    do {
-        try validateSimulaProviderProps(apiKey: apiKey)
-    } catch {
-        reportInvalid(error.localizedDescription)
-        return nil
-    }
-    return selection.claim(devMode: devMode)
 }
 
 enum SimulaEnvironmentStorageNames {

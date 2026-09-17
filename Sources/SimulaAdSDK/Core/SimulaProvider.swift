@@ -67,18 +67,14 @@ public final class SimulaProvider: ObservableObject {
     /// Whether the SDK is in development mode
     public let devMode: Bool
 
-    /// Effective process backend. A dev-tagged artifact may select staging; every other artifact
-    /// resolves to production regardless of `devMode`.
+    /// Effective process backend, selected independently of `devMode` before initialization.
     let apiEnvironment: SimulaAPIEnvironment
-
-    /// False when another SDK entry already selected a different process backend.
-    let isProcessEnvironmentCompatible: Bool
 
     /// False when another API key already owns process-wide SDK infrastructure. Such providers
     /// remain inert so a SwiftUI construction mismatch cannot send requests through mixed keys.
     let isProcessApiKeyCompatible: Bool
     private let processEffectsEnabled: Bool
-    var canMakeRequests: Bool { isProcessApiKeyCompatible && isProcessEnvironmentCompatible }
+    var canMakeRequests: Bool { isProcessApiKeyCompatible }
 
     /// Optional primary user identifier. Mutable mid-session via `updatePrimaryUserID(_:)`; stored in a
     /// thread-safe box so the telemetry flush (a background task) reads it without a data race.
@@ -243,21 +239,15 @@ public final class SimulaProvider: ObservableObject {
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
-        let environmentClaim = claimProcessAPIEnvironmentIfValid(
-            apiKey: apiKey,
-            devMode: devMode,
-            selection: environmentSelection,
-            reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
-        )
-        self.apiEnvironment = environmentClaim?.effective
-            ?? environmentSelection.effectiveEnvironment
-            ?? .production
-        self.isProcessEnvironmentCompatible = environmentClaim?.isCompatible == true
-        self.isProcessApiKeyCompatible = self.isProcessEnvironmentCompatible && claimProcessApiKeyIfValid(
+        let apiKeyCompatible = claimProcessApiKeyIfValid(
             apiKey,
             ownership: apiKeyOwnership,
             reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
         )
+        self.isProcessApiKeyCompatible = apiKeyCompatible
+        self.apiEnvironment = apiKeyCompatible
+            ? environmentSelection.environmentForRequest()
+            : environmentSelection.effectiveEnvironment ?? .production
         self.processEffectsEnabled = processEffectsEnabled
         self.activeProviderRegistry = activeProviderRegistry
         self.matchingPrimaryUserID = primaryUserID
@@ -347,9 +337,8 @@ public final class SimulaProvider: ObservableObject {
     }
 
     func matchesCoreConfiguration(_ configuration: SimulaProviderCoreConfiguration) -> Bool {
-        // devMode is process-owned and first-wins because dev artifacts also use it to select the
-        // backend. A mixed imperative/declarative integration must reuse the active provider rather
-        // than constructing an inert provider merely because the later entry used the default.
+        // devMode remains first-provider-owned for mixed imperative/declarative integrations, but
+        // no longer has any relationship to the independently configured API environment.
         apiKey == configuration.apiKey
             && matchingPrimaryUserID == configuration.primaryUserID
             && hasPrivacyConsent == configuration.hasPrivacyConsent
