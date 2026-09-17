@@ -63,7 +63,7 @@ public final class SimulaProvider: ObservableObject {
         _ primaryUserID: String?,
         _ privacy: ConsentSnapshot
     ) async -> String?
-    typealias ForegroundSessionPreparation = @MainActor () async -> Void
+    typealias SessionRefreshPreparation = @MainActor () async -> Void
     typealias PrivacySnapshotProvider = @MainActor () -> ConsentSnapshot
 
     // MARK: - Configuration (set once at init)
@@ -79,7 +79,7 @@ public final class SimulaProvider: ObservableObject {
     let isProcessApiKeyCompatible: Bool
     private let processEffectsEnabled: Bool
     private let injectedSessionCreation: SessionCreation?
-    private let foregroundSessionPreparation: ForegroundSessionPreparation
+    private let sessionRefreshPreparation: SessionRefreshPreparation
     private let privacySnapshotProvider: PrivacySnapshotProvider
     var canMakeRequests: Bool {
         isProcessApiKeyCompatible && (processEffectsEnabled || injectedSessionCreation != nil)
@@ -121,7 +121,6 @@ public final class SimulaProvider: ObservableObject {
     /// for a host that drives a raw provider without ever calling `start()`.
     private var startupTask: Task<Void, Never>?
     private var startupCompleted = false
-    private var foregroundRefreshPending = false
 
     // MARK: - Session State
 
@@ -130,10 +129,20 @@ public final class SimulaProvider: ObservableObject {
         didSet { telemetryIdentitySource.setSessionId(sessionId) }
     }
 
-    /// The in-flight session-creation task, if any. Lets concurrent callers
-    /// coalesce onto a single request instead of each firing their own.
-    /// Touched only from `@MainActor` methods.
-    private var sessionTask: Task<String?, Never>?
+    private struct SessionFlight {
+        let task: Task<String?, Never>
+        let generation: Int
+        let expirationEpoch: UInt64
+    }
+
+    /// The in-flight session creation, including its ownership tags. Concurrent callers coalesce
+    /// onto this flight; cleanup only clears a handle that still owns the same generation.
+    private var sessionFlight: SessionFlight?
+
+    /// Lifecycle increments this epoch for every qualifying background interval, even before the
+    /// first session exists. A published session is current only when its captured epoch matches.
+    private var applicationSessionExpirationEpoch: UInt64 = 0
+    private var publishedSessionExpirationEpoch: UInt64?
 
     /// Monotonic tag bumped on every session creation. A creation task captures its generation and
     /// only publishes its (sessionId, sessionUserID) pair if that generation is still current — so a
@@ -146,7 +155,7 @@ public final class SimulaProvider: ObservableObject {
     /// after a mid-session login/logout/switch (the local id updates immediately; the server session
     /// reconciles asynchronously, and a logout can't be pushed at all). Consumers that must evaluate
     /// for a specific identity (e.g. the frequency-cap check) compare the two and drop the session id
-    /// when they diverge. Touched only on the main actor, like `sessionTask`.
+    /// when they diverge. Touched only on the main actor, like `sessionFlight`.
     private(set) var sessionUserID: String?
 
     /// Serializes PPID reconciliation: each `reconcileServerPpid()` chains after this task so PATCHes
@@ -218,7 +227,7 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool = true,
         activeProviderRegistry: ActiveSimulaProviderRegistry? = nil,
         sessionCreation: SessionCreation? = nil,
-        foregroundSessionPreparation: @escaping ForegroundSessionPreparation = {},
+        sessionRefreshPreparation: @escaping SessionRefreshPreparation = {},
         privacySnapshotProvider: @escaping PrivacySnapshotProvider = { ConsentSnapshot() }
     ) {
         self.init(
@@ -233,7 +242,7 @@ public final class SimulaProvider: ObservableObject {
             processEffectsEnabled: false,
             activeProviderRegistry: activeProviderRegistry,
             sessionCreation: sessionCreation,
-            foregroundSessionPreparation: foregroundSessionPreparation,
+            sessionRefreshPreparation: sessionRefreshPreparation,
             privacySnapshotProvider: privacySnapshotProvider
         )
     }
@@ -250,7 +259,7 @@ public final class SimulaProvider: ObservableObject {
         processEffectsEnabled: Bool,
         activeProviderRegistry: ActiveSimulaProviderRegistry?,
         sessionCreation: SessionCreation? = nil,
-        foregroundSessionPreparation: ForegroundSessionPreparation? = nil,
+        sessionRefreshPreparation: SessionRefreshPreparation? = nil,
         privacySnapshotProvider: PrivacySnapshotProvider? = nil
     ) {
         self.apiKey = apiKey
@@ -262,7 +271,7 @@ public final class SimulaProvider: ObservableObject {
         )
         self.processEffectsEnabled = processEffectsEnabled
         self.injectedSessionCreation = sessionCreation
-        self.foregroundSessionPreparation = foregroundSessionPreparation ?? {
+        self.sessionRefreshPreparation = sessionRefreshPreparation ?? {
             await SimulaPrivacy.shared.refreshAdvertisingTrackingForSession()
         }
         self.privacySnapshotProvider = privacySnapshotProvider ?? {
@@ -405,14 +414,6 @@ public final class SimulaProvider: ObservableObject {
         )
         // Phase 3: warm the session. Ungated variant — this task IS the startup gate
         // (`ensureSession` awaits its completion), so the task must END here.
-        // A background -> active transition observed during startup is satisfied by the creation
-        // below. If it arrived after this request started, the lifecycle handler has already
-        // superseded it with a replacement task using the current process state.
-        if foregroundRefreshPending {
-            foregroundRefreshPending = false
-            await foregroundSessionPreparation()
-            _ = consumeForegroundPrivacySnapshot(privacySnapshotProvider())
-        }
         _ = await ensureSessionCoalesced()
         startupCompleted = true
     }
@@ -505,7 +506,7 @@ public final class SimulaProvider: ObservableObject {
     }
 
     /// Records each delivered privacy value before deciding whether the current server session must
-    /// be replaced. Foreground refreshes advance the same marker when they consume a fresh snapshot,
+    /// be replaced. Expired-session refreshes advance the same marker when they consume a fresh snapshot,
     /// so the subscriber's delayed delivery cannot recreate an already-refreshed session.
     @MainActor
     func handlePrivacySnapshotChange(_ current: ConsentSnapshot) {
@@ -516,10 +517,10 @@ public final class SimulaProvider: ObservableObject {
         invalidateSessionForPrivacyChange()
     }
 
-    /// Marks a privacy value as consumed by the foreground request already being installed. This
+    /// Marks a privacy value as consumed by the expired-session request already being installed. This
     /// suppresses only the delayed duplicate delivery; a newer value still invalidates the request.
     @MainActor
-    private func consumeForegroundPrivacySnapshot(_ current: ConsentSnapshot) -> PrivacyChangeImpact {
+    private func consumeSessionRefreshPrivacySnapshot(_ current: ConsentSnapshot) -> PrivacyChangeImpact {
         let impact = classifyPrivacyChange(from: observedPrivacySnapshot, to: current)
         observedPrivacySnapshot = current
         resetWebViewsIfNeeded(impact)
@@ -596,42 +597,45 @@ public final class SimulaProvider: ObservableObject {
         // resync retries onto the replacement, instead of returning a premature nil while a session
         // is still being created.
         while true {
-            // An in-flight foreground refresh outranks the cached id. This makes every immediate
-            // ad/session caller coalesce with the refresh rather than racing ahead with stale state.
-            // Otherwise a settled cached id remains the fast path.
-            if sessionTask == nil, let sessionId, !sessionId.isEmpty { return sessionId }
+            // A stale cached id is fail-open only after one refresh attempt settles. While that
+            // attempt is in flight, every caller awaits the same task instead of using old state.
+            if sessionFlight == nil,
+               publishedSessionExpirationEpoch == applicationSessionExpirationEpoch,
+               let sessionId, !sessionId.isEmpty { return sessionId }
 
             // Await the in-flight creation/refresh, or start an initial creation when no id exists.
-            // `awaitedGeneration` is that creation's generation: sessionTask and sessionGeneration are
-            // only ever set together (in startSessionCreation / resyncSession, synchronously), so
-            // reading them here with no intervening await yields a consistent pair.
-            let taskToAwait: Task<String?, Never>
-            let awaitedGeneration: Int
-            let startedHere: Bool
-            if let existing = sessionTask {
-                taskToAwait = existing
-                awaitedGeneration = sessionGeneration
-                startedHere = false
+            // Each flight captures its generation and expiration epoch synchronously, so callers
+            // observe one coherent ownership snapshot before awaiting it.
+            let flight: SessionFlight
+            if let existing = sessionFlight {
+                flight = existing
             } else {
-                let created = startSessionCreation()
-                taskToAwait = created.task
-                awaitedGeneration = created.generation
-                startedHere = true
+                if sessionId?.isEmpty == false {
+                    flight = startStaleSessionRefresh()
+                } else {
+                    flight = startSessionCreation()
+                }
             }
 
-            _ = await taskToAwait.value
+            let result = await flight.task.value
 
             // Superseded mid-await (a resync bumped the generation and started a replacement): retry
             // so we await/observe the replacement rather than this abandoned creation's nil.
-            if sessionGeneration != awaitedGeneration { continue }
+            if sessionGeneration != flight.generation { continue }
 
-            // The creation we awaited is still current and has settled. Clear the handle so a failed
-            // attempt is retried by the NEXT call, and return whatever it published (a genuine nil on
-            // failure is never re-created within this same call).
-            sessionTask = nil
-            if sessionId == nil, !startedHere { continue }
+            clearSessionFlight(ifOwnedBy: flight.generation)
+            // A successful session created for an older lifecycle epoch is immediately stale. Loop
+            // onto one replacement flight before allowing this external request to proceed. Failure
+            // remains fail-open/nil and retries only on a later external call.
+            if result != nil, applicationSessionExpirationEpoch != flight.expirationEpoch { continue }
             return sessionId
         }
+    }
+
+    @MainActor
+    private func clearSessionFlight(ifOwnedBy generation: Int) {
+        guard sessionFlight?.generation == generation else { return }
+        sessionFlight = nil
     }
 
     /// Starts a session-creation task (bumps the generation and stores the in-flight handle) and
@@ -639,19 +643,21 @@ public final class SimulaProvider: ObservableObject {
     /// itself — guarded by the generation so a creation superseded by a resync can't overwrite the
     /// current session — so every awaiter observes consistent state the moment it resolves.
     @MainActor
-    private func startSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
+    private func startSessionCreation() -> SessionFlight {
         let snapshot = privacySnapshotProvider()
         // Capture the ppid this session is created with so `sessionUserID` tracks the server
         // session's true identity (used to detect a stale session after a mid-session change).
         // Deliberately read at scheduling (not when the task runs): the created session represents
         // THIS identity, and `createAndPublishSession` reconciles any change that lands mid-flight.
         let ppidAtCreation = telemetryIdentitySource.identity().primaryUserId
+        let expirationEpoch = applicationSessionExpirationEpoch
         sessionGeneration &+= 1
         let generation = sessionGeneration
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        let task = Task<String?, Never> { @MainActor [weak self] in await self?.createAndPublishSession(generation: generation, ppidAtCreation: ppidAtCreation, snapshot: snapshot) ?? nil }
-        sessionTask = task
-        return (task, generation)
+        let task = Task<String?, Never> { @MainActor [weak self] in await self?.createAndPublishSession(generation: generation, expirationEpoch: expirationEpoch, ppidAtCreation: ppidAtCreation, snapshot: snapshot) ?? nil }
+        let flight = SessionFlight(task: task, generation: generation, expirationEpoch: expirationEpoch)
+        sessionFlight = flight
+        return flight
     }
 
     /// Session-creation task body (named method — see the task-shape note in TelemetryManager):
@@ -663,6 +669,7 @@ public final class SimulaProvider: ObservableObject {
     @MainActor
     private func createAndPublishSession(
         generation: Int,
+        expirationEpoch: UInt64,
         ppidAtCreation: String?,
         snapshot: ConsentSnapshot
     ) async -> String? {
@@ -678,6 +685,7 @@ public final class SimulaProvider: ObservableObject {
             // Set the identity before publishing the id. `sessionId` is the observable commit point,
             // so synchronous subscribers and resumed task waiters see the same/new pair together.
             sessionUserID = ppidAtCreation
+            publishedSessionExpirationEpoch = expirationEpoch
             sessionId = resolved
             // A login/switch that fired WHILE this session was being created couldn't reconcile
             // (sessionId was still nil when updatePrimaryUserID ran, so reconcileServerPpid
@@ -706,62 +714,47 @@ public final class SimulaProvider: ObservableObject {
         return resolved
     }
 
-    /// Installs the refresh task synchronously from the application notification callback. Keeping
-    /// the old pair published until success makes foregrounding fail-safe; putting the task in
-    /// `sessionTask` before returning makes subsequent ad callers await the same POST.
+    /// Lifecycle invalidation is intentionally synchronous and network-free. Incrementing before a
+    /// session exists ensures an in-flight initial creation is revalidated against this transition.
     @MainActor
-    func beginForegroundSessionRefresh() {
+    func markSessionStaleAfterExtendedBackground() {
         guard canMakeRequests else { return }
-        start()
-
-        if !startupCompleted {
-            foregroundRefreshPending = true
-            // If startup's POST began before the app became active, replace it so the surviving
-            // request is genuinely initiated after the transition. `ensureSessionCoalesced` loops
-            // onto this generation, preserving startup gating without a self-await cycle.
-            if sessionTask != nil {
-                replaceSessionCreationPreservingPublishedSession()
-            }
-            return
-        }
-
-        replaceSessionCreationPreservingPublishedSession()
+        applicationSessionExpirationEpoch &+= 1
     }
 
     @MainActor
-    private func replaceSessionCreationPreservingPublishedSession() {
-        sessionGeneration &+= 1
-        sessionTask?.cancel()
-        sessionTask = nil
-        _ = startForegroundSessionCreation()
-    }
-
-    @MainActor
-    private func startForegroundSessionCreation() -> (task: Task<String?, Never>, generation: Int) {
+    private func startStaleSessionRefresh() -> SessionFlight {
+        let expirationEpoch = applicationSessionExpirationEpoch
         sessionGeneration &+= 1
         let generation = sessionGeneration
         let task = Task<String?, Never> { @MainActor [weak self] in
             guard let self else { return nil }
-            await self.foregroundSessionPreparation()
+            await self.sessionRefreshPreparation()
             guard self.sessionGeneration == generation else { return nil }
             let snapshot = self.privacySnapshotProvider()
             // Consume the refreshed value before the debounced publisher delivers the same change.
             // That delivery then becomes a no-op instead of clearing this foreground session.
-            let privacyImpact = self.consumeForegroundPrivacySnapshot(snapshot)
+            let privacyImpact = self.consumeSessionRefreshPrivacySnapshot(snapshot)
             let ppid = self.telemetryIdentitySource.identity().primaryUserId
             let resolved = await self.createAndPublishSession(
                 generation: generation,
+                expirationEpoch: expirationEpoch,
                 ppidAtCreation: ppid,
                 snapshot: snapshot
             )
             if resolved == nil, privacyImpact.requiresSessionResync,
                self.sessionGeneration == generation {
-                self.invalidateSessionForPrivacyChange()
+                // The old session represents privacy state we can no longer send. Drop the pair,
+                // but leave the stale marker set so only a later external call retries.
+                self.sessionUserID = nil
+                self.sessionId = nil
+                self.publishedSessionExpirationEpoch = nil
             }
             return resolved
         }
-        sessionTask = task
-        return (task, generation)
+        let flight = SessionFlight(task: task, generation: generation, expirationEpoch: expirationEpoch)
+        sessionFlight = flight
+        return flight
     }
 
     /// Session-creation task body (named method — see the task-shape note in TelemetryManager).
@@ -809,14 +802,15 @@ public final class SimulaProvider: ObservableObject {
         // the recreated session sets both again atomically. Identity is cleared before the observable
         // id commit point so synchronous subscribers cannot see an invalid pair.
         sessionUserID = nil
+        publishedSessionExpirationEpoch = nil
         sessionId = nil
         // Invalidate any in-flight creation UP FRONT (bump before cancel): a task already past its
         // network call would otherwise still satisfy its generation guard and publish a session built
         // from the now-stale consent snapshot. Bumping first guarantees that guard fails. Cancelling
         // additionally aborts the wasted request; `ensureSession` below starts a fresh creation.
         sessionGeneration &+= 1
-        sessionTask?.cancel()
-        sessionTask = nil
+        sessionFlight?.task.cancel()
+        sessionFlight = nil
         if startupCompleted {
             _ = startSessionCreation()
         }

@@ -162,7 +162,7 @@ final class PrivacyTests: XCTestCase {
     func testExplicitConfigOverridesIAB() async {
         let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
         store.apply(SimulaPrivacyConfig(tcString: "EXPLICIT"))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "EXPLICIT")
     }
 
@@ -170,7 +170,7 @@ final class PrivacyTests: XCTestCase {
         // IAB says Purpose 1 granted ("1..."), explicit override denies it.
         let store = makePrivacy(defaults: makeDefaults(["IABTCF_PurposeConsents": "10000"]))
         store.apply(SimulaPrivacyConfig(gdprApplies: true, tcfPurpose1Consent: false))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcfPurpose1Consent, false)
         XCTAssertFalse(store.currentSnapshot.allowsLocalStorage)
     }
@@ -178,7 +178,7 @@ final class PrivacyTests: XCTestCase {
     func testExplicitNilFallsBackToIAB() async {
         let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_VALUE"]))
         store.apply(SimulaPrivacyConfig(tcString: nil))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "IAB_VALUE")
     }
 
@@ -187,7 +187,7 @@ final class PrivacyTests: XCTestCase {
         let store = makePrivacy(defaults: makeDefaults(["IABTCF_TCString": "IAB_TC"]))
         store.apply(SimulaPrivacyConfig(tcString: "EXPLICIT", uspString: "1YNN"))
         store.clearConsent(tcString: true)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "IAB_TC")  // fell back to IAB
         XCTAssertEqual(store.currentSnapshot.uspString, "1YNN")   // untouched
     }
@@ -196,7 +196,7 @@ final class PrivacyTests: XCTestCase {
         let store = makePrivacy(defaults: makeDefaults())
         store.apply(SimulaPrivacyConfig(gppString: "GPP"))
         store.clearConsent(gppString: true)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertNil(store.currentSnapshot.gppString)
     }
 
@@ -204,7 +204,7 @@ final class PrivacyTests: XCTestCase {
         let store = makePrivacy(defaults: makeDefaults())
         store.apply(SimulaPrivacyConfig(tcString: "TC1", uspString: "1YNN"))
         store.update(tcString: "TC2")
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.tcString, "TC2")
         XCTAssertEqual(store.currentSnapshot.uspString, "1YNN")
     }
@@ -229,7 +229,7 @@ final class PrivacyTests: XCTestCase {
         )
 
         store.apply(SimulaPrivacyConfig())
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 0)
@@ -256,11 +256,63 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(reader.statusCount, 0)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 0)
         XCTAssertEqual(store.currentSnapshot.attStatus, 2)
         XCTAssertNil(store.currentSnapshot.advertisingId)
+    }
+
+    @MainActor
+    func testSessionAdvertisingRefreshUsesCurrentSnapshotWhileLaunchGateIsUnsettled() async {
+        let gate = ControllableLaunchSettledGate()
+        let reader = AdvertisingReaderRecorder()
+        reader.statusRaw = 2
+        let store = makePrivacy(
+            defaults: makeDefaults(),
+            launchGate: gate,
+            now: { 0 },
+            advertisingTrackingStatusReader: { reader.readStatus() },
+            advertisingIdReader: { reader.readId() }
+        )
+        store.apply(SimulaPrivacyConfig(enableAdvertisingId: false))
+        await waitForGateWaiter(gate)
+        let completed = expectation(description: "session refresh completed")
+
+        Task {
+            await store.refreshAdvertisingTrackingForSession()
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 1)
+
+        XCTAssertEqual(reader.statusCount, 0)
+        XCTAssertNil(store.currentSnapshot.attStatus)
+        await gate.open()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
+        XCTAssertEqual(reader.statusCount, 1)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
+    }
+
+    @MainActor
+    func testSettledSessionAdvertisingRefreshCoalescesCallers() async {
+        let reader = BlockingAdvertisingStatusReader()
+        let store = makePrivacy(
+            defaults: makeDefaults(),
+            launchGate: ImmediateLaunchSettledGate.shared,
+            advertisingTrackingStatusReader: { reader.readStatus() }
+        )
+
+        let first = Task { await store.refreshAdvertisingTrackingForSession() }
+        await waitUntil { reader.started }
+        let second = Task { await store.refreshAdvertisingTrackingForSession() }
+        for _ in 0..<3 { await Task.yield() }
+        XCTAssertEqual(reader.count, 1)
+
+        reader.release()
+        await first.value
+        await second.value
+        XCTAssertEqual(reader.count, 1)
+        XCTAssertEqual(store.currentSnapshot.attStatus, 2)
     }
 
     @MainActor
@@ -280,7 +332,7 @@ final class PrivacyTests: XCTestCase {
         store.update(enableAdvertisingId: false)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 0)
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
@@ -308,7 +360,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(reader.idCount, 0)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
     }
@@ -327,16 +379,16 @@ final class PrivacyTests: XCTestCase {
         let config = SimulaPrivacyConfig(enableAdvertisingId: true)
 
         store.apply(config)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         clock.value += SimulaPrivacy.advertisingRefreshInterval - 1
         store.apply(config)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(reader.statusCount, 1)
         XCTAssertEqual(reader.idCount, 1)
 
         clock.value += 1
         store.apply(config)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
     }
 
     @MainActor
@@ -352,7 +404,7 @@ final class PrivacyTests: XCTestCase {
         )
 
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
         store.update(enableAdvertisingId: false)
         XCTAssertNil(store.currentSnapshot.advertisingId)
@@ -360,7 +412,7 @@ final class PrivacyTests: XCTestCase {
 
         clock.value += 1
         store.update(enableAdvertisingId: true)
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
     }
 
@@ -385,7 +437,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(reader.idCount, 0)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(reader.statusCount, 0, "prompt result must supersede the deferred status read")
         XCTAssertEqual(reader.idCount, 0)
     }
@@ -402,7 +454,7 @@ final class PrivacyTests: XCTestCase {
         )
 
         store.apply(SimulaPrivacyConfig(coppaApplies: true, enableAdvertisingId: true))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         await store.refreshAdvertisingTrackingAfterPrompt(statusRaw: 3)
 
         XCTAssertEqual(reader.statusCount, 0)
@@ -431,7 +483,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(reader.statusCount, 0)
         XCTAssertEqual(reader.idCount, 1)
     }
@@ -472,7 +524,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertNil(staleReadEvent?.snapshot.advertisingId)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
     }
 
     @MainActor
@@ -497,7 +549,7 @@ final class PrivacyTests: XCTestCase {
         await gate.open()
         reader.releaseFirstIdRead()
         await stalePrompt.value
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(store.currentSnapshot.attStatus, 2)
         XCTAssertNil(store.currentSnapshot.advertisingId)
@@ -525,7 +577,7 @@ final class PrivacyTests: XCTestCase {
         await gate.open()
         reader.releaseFirstIdRead()
         await stalePrompt.value
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(reader.idCount, 2)
         XCTAssertEqual(store.currentSnapshot.attStatus, 3)
@@ -556,7 +608,7 @@ final class PrivacyTests: XCTestCase {
         XCTAssertNil(store.currentSnapshot.advertisingId)
 
         await gate.open()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
     }
 
     @MainActor
@@ -574,7 +626,7 @@ final class PrivacyTests: XCTestCase {
         store.update(enableAdvertisingId: false)
         store.update(enableAdvertisingId: true)
         reader.releaseFirstIdRead()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(reader.idCount, 2)
         XCTAssertEqual(store.currentSnapshot.advertisingId, "fresh-idfa")
@@ -594,13 +646,13 @@ final class PrivacyTests: XCTestCase {
             advertisingIdReader: { reader.readId() }
         )
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
 
         clock.value += 60
         reader.statusRaw = 2
         store.refreshAdvertisingTrackingOnForeground()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertNil(store.currentSnapshot.advertisingId)
         XCTAssertEqual(reader.idCount, 1, "revocation must not touch the IDFA reader")
@@ -622,13 +674,13 @@ final class PrivacyTests: XCTestCase {
         )
         telemetry.attach(store)
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
         XCTAssertEqual(telemetry.events.last { $0.operation == "idfa_read" }?.snapshot.advertisingId, "test-idfa")
 
         telemetry.clear()
         reader.statusRaw = 2
         store.refreshAdvertisingTrackingOnForeground()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         let statusEvent = telemetry.events.last { $0.operation == "att_status_read" }
         XCTAssertEqual(statusEvent?.snapshot.attStatus, 2)
@@ -658,11 +710,11 @@ final class PrivacyTests: XCTestCase {
             advertisingIdReader: { reader.readId() }
         )
         store.apply(SimulaPrivacyConfig(enableAdvertisingId: true))
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         clock.value += 60
         store.refreshAdvertisingTrackingOnForeground()
-        await store.waitForAdvertisingRefreshIdleForTests()
+        await store.waitForAutomaticAdvertisingRefreshIdleForTests()
 
         XCTAssertEqual(reader.idCount, 1)
         XCTAssertEqual(store.currentSnapshot.advertisingId, "test-idfa")
@@ -892,6 +944,27 @@ private final class BlockingAdvertisingReader: @unchecked Sendable {
     private func endRead() {
         lock.lock(); activeReads -= 1; lock.unlock()
     }
+}
+
+private final class BlockingAdvertisingStatusReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var readCount = 0
+    private var readStarted = false
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return readCount }
+    var started: Bool { lock.lock(); defer { lock.unlock() }; return readStarted }
+
+    func readStatus() -> Int? {
+        lock.lock()
+        readCount += 1
+        readStarted = true
+        lock.unlock()
+        gate.wait()
+        return 2
+    }
+
+    func release() { gate.signal() }
 }
 
 private final class PrivacyClock: @unchecked Sendable {

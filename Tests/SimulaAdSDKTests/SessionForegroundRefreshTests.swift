@@ -4,96 +4,100 @@ import XCTest
 
 @MainActor
 final class SessionForegroundRefreshTests: XCTestCase {
-    func testLifecycleRequiresBackgroundBeforeActiveAndCoalescesRepeatedNotifications() {
-        let center = NotificationCenter()
-        let background = Notification.Name("session-refresh-background")
-        let active = Notification.Name("session-refresh-active")
-        var refreshes = 0
-        let observer = ApplicationSessionLifecycleObserver(
-            center: center,
-            didEnterBackground: background,
-            didBecomeActive: active,
-            refresh: { refreshes += 1 }
-        )
-        _ = observer
+    func testLifecycleDoesNotExpireAtTwentyNineMinutesFiftyNineSeconds() {
+        let harness = makeLifecycleHarness()
 
-        center.post(name: active, object: nil)
-        center.post(name: background, object: nil)
-        center.post(name: background, object: nil)
-        center.post(name: active, object: nil)
-        center.post(name: active, object: nil)
+        harness.center.post(name: harness.background, object: nil)
+        harness.clock.advance(by: applicationSessionBackgroundExpirationInterval - 1)
+        harness.center.post(name: harness.active, object: nil)
 
-        XCTAssertEqual(refreshes, 1)
+        XCTAssertEqual(harness.expirations.value, 0)
+        withExtendedLifetime(harness.observer) {}
     }
 
-    func testLifecycleObserverDoesNotOutliveItsOwner() {
-        let center = NotificationCenter()
-        let background = Notification.Name("session-refresh-lifetime-background")
-        let active = Notification.Name("session-refresh-lifetime-active")
-        var refreshes = 0
-        var observer: ApplicationSessionLifecycleObserver? = ApplicationSessionLifecycleObserver(
-            center: center,
-            didEnterBackground: background,
-            didBecomeActive: active,
-            refresh: { refreshes += 1 }
-        )
-        weak let weakObserver = observer
+    func testLifecycleExpiresAtExactlyThirtyMinutes() {
+        let harness = makeLifecycleHarness()
 
-        center.post(name: background, object: nil)
-        observer = nil
-        center.post(name: active, object: nil)
+        harness.center.post(name: harness.background, object: nil)
+        harness.clock.advance(by: applicationSessionBackgroundExpirationInterval)
+        harness.center.post(name: harness.active, object: nil)
 
-        XCTAssertNil(weakObserver)
-        XCTAssertEqual(refreshes, 0)
+        XCTAssertEqual(harness.expirations.value, 1)
+        withExtendedLifetime(harness.observer) {}
     }
 
-    func testLifecycleCanBeSeededWhenInstalledWhileBackgrounded() {
+    func testLifecycleUsesSleepInclusiveElapsedTimeAndKeepsFirstBackgroundTimestamp() {
+        let harness = makeLifecycleHarness()
+
+        harness.center.post(name: harness.background, object: nil)
+        harness.clock.advance(by: 15 * 60)
+        harness.center.post(name: harness.background, object: nil)
+        harness.clock.advance(by: 16 * 60)
+        harness.center.post(name: harness.active, object: nil)
+
+        XCTAssertEqual(harness.expirations.value, 1)
+        withExtendedLifetime(harness.observer) {}
+    }
+
+    func testLifecycleInstallWhileBackgroundedStartsMeasuringAtInstall() {
         let center = NotificationCenter()
-        let active = Notification.Name("session-refresh-seeded-active")
-        var refreshes = 0
+        let active = Notification.Name("session-expiration-seeded-active")
+        let clock = LockedSessionClock(100)
+        let expirations = LockedInt()
         let observer = ApplicationSessionLifecycleObserver(
             center: center,
-            didEnterBackground: Notification.Name("session-refresh-seeded-background"),
+            didEnterBackground: Notification.Name("session-expiration-seeded-background"),
             didBecomeActive: active,
             initiallyBackgrounded: true,
-            refresh: { refreshes += 1 }
+            now: { clock.value },
+            expire: { expirations.increment() }
         )
-        _ = observer
 
+        clock.advance(by: applicationSessionBackgroundExpirationInterval - 1)
         center.post(name: active, object: nil)
 
-        XCTAssertEqual(refreshes, 1)
+        XCTAssertEqual(expirations.value, 0)
+        withExtendedLifetime(observer) {}
     }
 
-    func testForegroundRefreshRetainsOldPairOnFailureAndCoalescesEnsureCallers() async {
+    func testLifecycleNegativeElapsedTimeFailsSoft() {
+        let harness = makeLifecycleHarness(start: 100)
+
+        harness.center.post(name: harness.background, object: nil)
+        harness.clock.set(99)
+        harness.center.post(name: harness.active, object: nil)
+
+        XCTAssertEqual(harness.expirations.value, 0)
+        withExtendedLifetime(harness.observer) {}
+    }
+
+    func testQualifyingForegroundIsLazyUntilNextEnsureSession() async {
         let creator = ControlledSessionCreator()
-        let provider = makeProvider(primaryUserID: "user-a", creator: creator)
+        let provider = makeProvider(creator: creator)
+        let initial = await provider.ensureSession()
+        XCTAssertEqual(initial, "session-old")
 
-        let initialSession = await provider.ensureSession()
-        XCTAssertEqual(initialSession, "session-old")
-        XCTAssertEqual(provider.sessionUserID, "user-a")
+        provider.markSessionStaleAfterExtendedBackground()
+        for _ in 0..<3 { await Task.yield() }
 
-        provider.beginForegroundSessionRefresh()
+        XCTAssertEqual(creator.callCount, 1)
+        let refresh = Task { await provider.ensureSession() }
         await creator.waitForCallCount(2)
-        let waitersStarted = expectation(description: "ensure callers started")
-        waitersStarted.expectedFulfillmentCount = 2
-        var completedWaiters = 0
-        let firstWaiter = Task {
-            waitersStarted.fulfill()
-            let result = await provider.ensureSession()
-            completedWaiters += 1
-            return result
-        }
-        let secondWaiter = Task {
-            waitersStarted.fulfill()
-            let result = await provider.ensureSession()
-            completedWaiters += 1
-            return result
-        }
-        await fulfillment(of: [waitersStarted], timeout: 1)
+        creator.resolveNext("session-new")
+        let refreshed = await refresh.value
+        XCTAssertEqual(refreshed, "session-new")
+    }
 
-        XCTAssertEqual(creator.callCount, 2)
-        XCTAssertEqual(completedWaiters, 0)
+    func testFailedRefreshFailsOpenRemainsStaleAndRetriesOnLaterCall() async {
+        let creator = ControlledSessionCreator()
+        let provider = makeProvider(creator: creator)
+        let initial = await provider.ensureSession()
+        XCTAssertEqual(initial, "session-old")
+        provider.markSessionStaleAfterExtendedBackground()
+
+        let firstWaiter = Task { await provider.ensureSession() }
+        let secondWaiter = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(2)
         creator.resolveNext(nil)
 
         let firstResult = await firstWaiter.value
@@ -103,59 +107,150 @@ final class SessionForegroundRefreshTests: XCTestCase {
         XCTAssertEqual(provider.sessionId, "session-old")
         XCTAssertEqual(provider.sessionUserID, "user-a")
         XCTAssertEqual(creator.callCount, 2)
-        XCTAssertEqual(completedWaiters, 2)
+
+        let retry = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(3)
+        creator.resolveNext("session-new")
+        let retryResult = await retry.value
+        XCTAssertEqual(retryResult, "session-new")
+        XCTAssertEqual(creator.callCount, 3)
     }
 
-    func testSuccessfulRefreshPublishesSessionIdentityBeforeObservableId() async {
-        let creator = ControlledSessionCreator()
-        let provider = makeProvider(primaryUserID: "user-a", creator: creator)
-        var observedPairs: [(String?, String?)] = []
-        let subscription = provider.$sessionId.dropFirst().sink { id in
-            observedPairs.append((id, provider.sessionUserID))
-        }
+    func testFailedInitialSessionWithMultipleWaitersMakesOneAttempt() async {
+        let creator = ControlledSessionCreator(firstCallIsPending: true)
+        let provider = makeProvider(creator: creator)
+        provider.markSessionStaleAfterExtendedBackground()
+        for _ in 0..<3 { await Task.yield() }
+        XCTAssertEqual(creator.callCount, 0)
 
-        _ = await provider.ensureSession()
+        let firstWaiter = Task { await provider.ensureSession() }
+        let secondWaiter = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(1)
+        creator.resolveNext(nil)
 
-        provider.beginForegroundSessionRefresh()
+        let firstResult = await firstWaiter.value
+        let secondResult = await secondWaiter.value
+        XCTAssertNil(firstResult)
+        XCTAssertNil(secondResult)
+        XCTAssertEqual(creator.callCount, 1)
+
+        let retry = Task { await provider.ensureSession() }
         await creator.waitForCallCount(2)
         creator.resolveNext("session-new")
-        let refreshedSession = await provider.ensureSession()
-        XCTAssertEqual(refreshedSession, "session-new")
-
-        guard observedPairs.count == 2 else {
-            return XCTFail("Expected initial and refreshed session publications")
-        }
-        XCTAssertEqual(observedPairs[0].0, "session-old")
-        XCTAssertEqual(observedPairs[0].1, "user-a")
-        XCTAssertEqual(observedPairs[1].0, "session-new")
-        XCTAssertEqual(observedPairs[1].1, "user-a")
-        withExtendedLifetime(subscription) {}
+        let retryResult = await retry.value
+        XCTAssertEqual(retryResult, "session-new")
     }
 
-    func testForegroundRefreshClaimsSessionTaskWhilePrivacyPreparationIsPending() async {
+    func testExpirationDuringInflightInitialCreationRefreshesBeforeReturning() async {
+        let creator = ControlledSessionCreator(firstCallIsPending: true)
+        let provider = makeProvider(creator: creator)
+        let waiter = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(1)
+
+        provider.markSessionStaleAfterExtendedBackground()
+        creator.resolveNext("session-before-expiration")
+        await creator.waitForCallCount(2)
+        creator.resolveNext("session-current")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, "session-current")
+        XCTAssertEqual(provider.sessionId, "session-current")
+        XCTAssertEqual(creator.callCount, 2)
+    }
+
+    func testExpirationDuringInflightStaleRefreshRefreshesAgainBeforeReturning() async {
         let creator = ControlledSessionCreator()
-        let preparation = ControlledForegroundPreparation()
+        let provider = makeProvider(creator: creator)
+        _ = await provider.ensureSession()
+        provider.markSessionStaleAfterExtendedBackground()
+        let waiter = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(2)
+
+        provider.markSessionStaleAfterExtendedBackground()
+        creator.resolveNext("session-first-epoch")
+        await creator.waitForCallCount(3)
+        creator.resolveNext("session-current")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, "session-current")
+        XCTAssertEqual(provider.sessionId, "session-current")
+        XCTAssertEqual(creator.callCount, 3)
+    }
+
+    func testStaleRefreshClaimsOneTaskWhilePreparationIsPending() async {
+        let creator = ControlledSessionCreator()
+        let preparation = ControlledSessionPreparation()
         let provider = makeProvider(
-            primaryUserID: "user-a",
             creator: creator,
-            foregroundSessionPreparation: { await preparation.wait() }
+            sessionRefreshPreparation: { await preparation.wait() }
         )
         _ = await provider.ensureSession()
+        provider.markSessionStaleAfterExtendedBackground()
 
-        provider.beginForegroundSessionRefresh()
+        let firstWaiter = Task { await provider.ensureSession() }
         await preparation.waitUntilEntered()
-        let waiter = Task { await provider.ensureSession() }
-        await Task.yield()
+        let secondWaiter = Task { await provider.ensureSession() }
+        for _ in 0..<3 { await Task.yield() }
 
         XCTAssertEqual(creator.callCount, 1)
         preparation.finish()
         await creator.waitForCallCount(2)
         creator.resolveNext("session-new")
-        let result = await waiter.value
-        XCTAssertEqual(result, "session-new")
+        let firstResult = await firstWaiter.value
+        let secondResult = await secondWaiter.value
+        XCTAssertEqual(firstResult, "session-new")
+        XCTAssertEqual(secondResult, "session-new")
+        XCTAssertEqual(creator.callCount, 2)
     }
 
-    func testForegroundRefreshConsumesPrivacyChangeBeforeDebouncedDelivery() async {
+    func testEveryRegisteredProviderIsMarkedStaleAndSharedIsDeduplicated() async {
+        let registry = ActiveSimulaProviderRegistry()
+        let ownership = ProcessApiKeyOwnership()
+        let outerCreator = ControlledSessionCreator()
+        let currentCreator = ControlledSessionCreator()
+        let outer = makeProvider(creator: outerCreator, ownership: ownership, registry: registry)
+        let current = makeProvider(creator: currentCreator, ownership: ownership, registry: registry)
+        _ = await outer.ensureSession()
+        _ = await current.ensureSession()
+
+        expireRegisteredApplicationSessions(registry: registry, shared: outer)
+
+        let outerRefresh = Task { await outer.ensureSession() }
+        let currentRefresh = Task { await current.ensureSession() }
+        await outerCreator.waitForCallCount(2)
+        await currentCreator.waitForCallCount(2)
+        outerCreator.resolveNext("outer-new")
+        currentCreator.resolveNext("session-new")
+        let outerResult = await outerRefresh.value
+        let currentResult = await currentRefresh.value
+        XCTAssertEqual(outerResult, "outer-new")
+        XCTAssertEqual(currentResult, "session-new")
+        XCTAssertEqual(outerCreator.callCount, 2)
+        XCTAssertEqual(currentCreator.callCount, 2)
+    }
+
+    func testSuccessfulRefreshPublishesSessionIdentityBeforeObservableId() async {
+        let creator = ControlledSessionCreator()
+        let provider = makeProvider(creator: creator)
+        var observedPairs: [(String?, String?)] = []
+        let subscription = provider.$sessionId.dropFirst().sink { id in
+            observedPairs.append((id, provider.sessionUserID))
+        }
+        _ = await provider.ensureSession()
+        provider.markSessionStaleAfterExtendedBackground()
+
+        let refresh = Task { await provider.ensureSession() }
+        await creator.waitForCallCount(2)
+        creator.resolveNext("session-new")
+        let refreshed = await refresh.value
+        XCTAssertEqual(refreshed, "session-new")
+
+        XCTAssertEqual(observedPairs.map(\.0), ["session-old", "session-new"])
+        XCTAssertEqual(observedPairs.map(\.1), ["user-a", "user-a"])
+        withExtendedLifetime(subscription) {}
+    }
+
+    func testStaleRefreshConsumesPrivacyChangeBeforeDebouncedDelivery() async {
         let creator = ControlledSessionCreator()
         var snapshot = ConsentSnapshot()
         let changed = ConsentSnapshot(
@@ -164,17 +259,17 @@ final class SessionForegroundRefreshTests: XCTestCase {
             attStatus: 3
         )
         let provider = makeProvider(
-            primaryUserID: "user-a",
             creator: creator,
             privacySnapshotProvider: { snapshot }
         )
         _ = await provider.ensureSession()
 
         snapshot = changed
-        provider.beginForegroundSessionRefresh()
+        provider.markSessionStaleAfterExtendedBackground()
+        let refresh = Task { await provider.ensureSession() }
         await creator.waitForCallCount(2)
         creator.resolveNext("session-new")
-        let refreshed = await provider.ensureSession()
+        let refreshed = await refresh.value
         XCTAssertEqual(refreshed, "session-new")
 
         provider.handlePrivacySnapshotChange(changed)
@@ -185,27 +280,97 @@ final class SessionForegroundRefreshTests: XCTestCase {
         XCTAssertEqual(provider.sessionId, "session-new")
     }
 
+    private func makeLifecycleHarness(start: TimeInterval = 0) -> LifecycleHarness {
+        let center = NotificationCenter()
+        let background = Notification.Name("session-expiration-background")
+        let active = Notification.Name("session-expiration-active")
+        let clock = LockedSessionClock(start)
+        let expirations = LockedInt()
+        let observer = ApplicationSessionLifecycleObserver(
+            center: center,
+            didEnterBackground: background,
+            didBecomeActive: active,
+            now: { clock.value },
+            expire: { expirations.increment() }
+        )
+        return LifecycleHarness(
+            center: center,
+            background: background,
+            active: active,
+            clock: clock,
+            expirations: expirations,
+            observer: observer
+        )
+    }
+
     private func makeProvider(
-        primaryUserID: String,
         creator: ControlledSessionCreator,
-        foregroundSessionPreparation: @escaping SimulaProvider.ForegroundSessionPreparation = {},
+        ownership: ProcessApiKeyOwnership = ProcessApiKeyOwnership(),
+        registry: ActiveSimulaProviderRegistry? = nil,
+        sessionRefreshPreparation: @escaping SimulaProvider.SessionRefreshPreparation = {},
         privacySnapshotProvider: @escaping SimulaProvider.PrivacySnapshotProvider = { ConsentSnapshot() }
     ) -> SimulaProvider {
         SimulaProvider(
             testApiKey: "session-refresh-key",
-            apiKeyOwnership: ProcessApiKeyOwnership(),
-            primaryUserID: primaryUserID,
+            apiKeyOwnership: ownership,
+            primaryUserID: "user-a",
+            activeProviderRegistry: registry,
             sessionCreation: { ppid, privacy in
                 await creator.create(primaryUserID: ppid, privacy: privacy)
             },
-            foregroundSessionPreparation: foregroundSessionPreparation,
+            sessionRefreshPreparation: sessionRefreshPreparation,
             privacySnapshotProvider: privacySnapshotProvider
         )
     }
 }
 
+private struct LifecycleHarness {
+    let center: NotificationCenter
+    let background: Notification.Name
+    let active: Notification.Name
+    let clock: LockedSessionClock
+    let expirations: LockedInt
+    let observer: ApplicationSessionLifecycleObserver
+}
+
+private final class LockedSessionClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: TimeInterval
+
+    init(_ value: TimeInterval) {
+        storedValue = value
+    }
+
+    var value: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return storedValue
+    }
+
+    func set(_ value: TimeInterval) {
+        lock.lock(); storedValue = value; lock.unlock()
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock(); storedValue += interval; lock.unlock()
+    }
+}
+
+private final class LockedInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int {
+        lock.lock(); defer { lock.unlock() }
+        return storedValue
+    }
+
+    func increment() {
+        lock.lock(); storedValue += 1; lock.unlock()
+    }
+}
+
 @MainActor
-private final class ControlledForegroundPreparation {
+private final class ControlledSessionPreparation {
     private var enteredContinuation: CheckedContinuation<Void, Never>?
     private var finishContinuation: CheckedContinuation<Void, Never>?
     private var entered = false
@@ -232,17 +397,22 @@ private final class ControlledForegroundPreparation {
 private final class ControlledSessionCreator {
     private(set) var callCount = 0
     private(set) var snapshots: [ConsentSnapshot] = []
+    private let firstCallIsPending: Bool
     private var continuations: [CheckedContinuation<String?, Never>] = []
     private var callCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(firstCallIsPending: Bool = false) {
+        self.firstCallIsPending = firstCallIsPending
+    }
 
     func create(primaryUserID: String?, privacy: ConsentSnapshot) async -> String? {
         _ = primaryUserID
         snapshots.append(privacy)
         callCount += 1
-        if callCount == 1 { return "session-old" }
         let ready = callCountWaiters.filter { $0.0 <= callCount }
         callCountWaiters.removeAll { $0.0 <= callCount }
         ready.forEach { $0.1.resume() }
+        if callCount == 1, !firstCallIsPending { return "session-old" }
         return await withCheckedContinuation { continuation in
             continuations.append(continuation)
         }

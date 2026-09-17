@@ -4,30 +4,34 @@ import Foundation
 import UIKit
 #endif
 
+let applicationSessionBackgroundExpirationInterval: TimeInterval = 30 * 60
+
 struct ApplicationSessionLifecycleState {
-    private(set) var observedBackground: Bool
+    private(set) var backgroundedAt: TimeInterval?
 
-    init(observedBackground: Bool = false) {
-        self.observedBackground = observedBackground
+    init(backgroundedAt: TimeInterval? = nil) {
+        self.backgroundedAt = backgroundedAt
     }
 
-    mutating func didEnterBackground() {
-        observedBackground = true
+    mutating func didEnterBackground(at timestamp: TimeInterval) {
+        if backgroundedAt == nil { backgroundedAt = timestamp }
     }
 
-    mutating func didBecomeActive() -> Bool {
-        guard observedBackground else { return false }
-        observedBackground = false
-        return true
+    mutating func didBecomeActive(at timestamp: TimeInterval) -> Bool {
+        guard let backgroundedAt else { return false }
+        self.backgroundedAt = nil
+        let elapsed = timestamp - backgroundedAt
+        return elapsed >= applicationSessionBackgroundExpirationInterval
     }
 }
 
 /// Observes aggregate application lifecycle notifications. `UIApplication` only posts its
 /// background notification after all scenes have left the foreground, so scene churn does not
-/// create extra session refreshes.
+/// create extra session-expiration signals.
 final class ApplicationSessionLifecycleObserver {
     private let center: NotificationCenter
-    private let refresh: @MainActor () -> Void
+    private let now: @Sendable () -> TimeInterval
+    private let expire: @MainActor () -> Void
     private var state = ApplicationSessionLifecycleState()
     private var observers: [NSObjectProtocol] = []
 
@@ -36,11 +40,13 @@ final class ApplicationSessionLifecycleObserver {
         didEnterBackground: Notification.Name,
         didBecomeActive: Notification.Name,
         initiallyBackgrounded: Bool = false,
-        refresh: @escaping @MainActor () -> Void
+        now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSinceReferenceDate },
+        expire: @escaping @MainActor () -> Void
     ) {
         self.center = center
-        self.refresh = refresh
-        self.state = ApplicationSessionLifecycleState(observedBackground: initiallyBackgrounded)
+        self.now = now
+        self.expire = expire
+        self.state = ApplicationSessionLifecycleState(backgroundedAt: initiallyBackgrounded ? now() : nil)
         observers = [
             center.addObserver(forName: didEnterBackground, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.handleBackground() }
@@ -57,14 +63,26 @@ final class ApplicationSessionLifecycleObserver {
 
     @MainActor
     private func handleBackground() {
-        state.didEnterBackground()
+        state.didEnterBackground(at: now())
     }
 
     @MainActor
     private func handleActive() {
-        guard state.didBecomeActive() else { return }
-        refresh()
+        guard state.didBecomeActive(at: now()) else { return }
+        expire()
     }
+}
+
+@MainActor
+func expireRegisteredApplicationSessions(
+    registry: ActiveSimulaProviderRegistry,
+    shared: SimulaProvider?
+) {
+    var providers = registry.providers()
+    if let shared, !providers.contains(where: { $0 === shared }) {
+        providers.append(shared)
+    }
+    providers.forEach { $0.markSessionStaleAfterExtendedBackground() }
 }
 
 #if os(iOS)
@@ -74,12 +92,10 @@ private let processApplicationSessionLifecycleObserver = ApplicationSessionLifec
     didBecomeActive: UIApplication.didBecomeActiveNotification,
     initiallyBackgrounded: UIApplication.shared.applicationState == .background
 ) {
-    var providers = processActiveSimulaProviderRegistry.providers()
-    if let shared = SimulaAds.shared,
-       !providers.contains(where: { $0 === shared }) {
-        providers.append(shared)
-    }
-    providers.forEach { $0.beginForegroundSessionRefresh() }
+    expireRegisteredApplicationSessions(
+        registry: processActiveSimulaProviderRegistry,
+        shared: SimulaAds.shared
+    )
 }
 
 func installProcessApplicationSessionLifecycleObserver() {

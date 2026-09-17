@@ -80,6 +80,7 @@ public final class SimulaPrivacy: ObservableObject {
     private var automaticRefreshIdleWaiters: [CheckedContinuation<Void, Never>] = []
     private var lastAdvertisingStatusRefresh: TimeInterval?
     private var lastAdvertisingIdRefresh: TimeInterval?
+    @MainActor private var sessionAdvertisingRefreshTask: Task<Void, Never>?
     #if os(iOS)
     private var trackingAuthorizationTask: Task<ATTrackingManager.AuthorizationStatus, Never>?
     #endif
@@ -409,11 +410,54 @@ public final class SimulaPrivacy: ObservableObject {
         scheduleAdvertisingRefresh(alwaysCheckStatus: true)
     }
 
-    /// Refresh the foreground ATT/IDFA snapshot and wait until the coalesced read settles before
-    /// building a new session request. The read remains launch-gated and fail-soft internally.
+    /// Refreshes ATT/IDFA for an expired session only after the launch gate has already settled.
+    /// Before then, session/ad paths return promptly with the current snapshot and leave the
+    /// automatic refresh queued behind the gate. Settled callers coalesce on this dedicated task.
+    @MainActor
     func refreshAdvertisingTrackingForSession() async {
-        refreshAdvertisingTrackingOnForeground()
-        await waitForAdvertisingRefreshIdleForTests()
+        guard launchGate.isSettled else {
+            refreshAdvertisingTrackingOnForeground()
+            return
+        }
+        if let sessionAdvertisingRefreshTask {
+            await sessionAdvertisingRefreshTask.value
+            return
+        }
+        guard let generation = beginSessionAdvertisingRefresh() else {
+            recompute()
+            return
+        }
+        let task = Task { await self.runSessionAdvertisingRefresh(generation: generation) }
+        sessionAdvertisingRefreshTask = task
+        await task.value
+        sessionAdvertisingRefreshTask = nil
+    }
+
+    private func beginSessionAdvertisingRefresh() -> Int? {
+        lock.lock()
+        advertisingRefreshGeneration += 1
+        advertisingRefreshScheduled = false
+        guard !explicitConfig.coppaApplies else {
+            lock.unlock()
+            return nil
+        }
+        advertisingRefreshScheduled = true
+        let generation = advertisingRefreshGeneration
+        lock.unlock()
+        return generation
+    }
+
+    private func runSessionAdvertisingRefresh(generation: Int) async {
+        guard shouldReadAdvertisingTracking(generation: generation) else { return }
+        let statusReading = await readAdvertisingTrackingStatus()
+        let shouldReadId = applyAutomaticAdvertisingStatus(statusReading.value, generation: generation)
+        recompute()
+        recordAdvertisingRead(operation: "att_status_read", reading: statusReading)
+        if shouldReadId, shouldReadAutomaticAdvertisingId(generation: generation) {
+            let idReading = await readAdvertisingId()
+            applyAutomaticAdvertisingId(idReading.value, generation: generation)
+            recordAdvertisingRead(operation: "idfa_read", reading: idReading)
+        }
     }
 
     private func runScheduledAdvertisingRefresh(generation: Int) async {
@@ -453,7 +497,7 @@ public final class SimulaPrivacy: ObservableObject {
         waiters.forEach { $0.resume() }
     }
 
-    func waitForAdvertisingRefreshIdleForTests() async {
+    func waitForAutomaticAdvertisingRefreshIdleForTests() async {
         await withCheckedContinuation { continuation in
             lock.lock()
             if automaticRefreshTasksInFlight == 0 {
