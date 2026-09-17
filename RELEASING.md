@@ -18,9 +18,14 @@ to create tags after any configured environment approval.
 
 1. Update `s.version` in `SimulaAdSDK.podspec` and `SIMULA_SDK_VERSION` in
    `Sources/SimulaAdSDK/Telemetry/Telemetry.swift` to the same semantic version.
-2. Keep the source `Package.swift` on `main`; never commit a binary manifest to `main`.
-3. Run `swift build` and `swift test`, then merge the version change after CI passes.
-4. In GitHub Actions, run **Release XCFramework and CocoaPods** from `main` and enter the version
+2. Keep `SIMULA_DEV_ARTIFACT` in the source `Package.swift` only for an exact `-dev.N` version;
+   remove it for stable and other prerelease versions. `scripts/validate-artifact-flavor.sh` enforces
+   this and the XCFramework builder scans stable binaries for the staging hostname. Even a dev
+   artifact requires an explicit pre-initialization staging request and the host Info.plist Boolean
+   `SimulaStagingEnvironmentEnabled` set to `true`; `devMode` does not choose the backend.
+3. Keep the source `Package.swift` on `main`; never commit a binary manifest to `main`.
+4. Run `swift build` and `swift test`, then merge the version change after CI passes.
+5. In GitHub Actions, run **Release XCFramework and CocoaPods** from `main` and enter the version
    without a leading `v`, for example `1.2.3`.
 
 The workflow rejects an existing Git tag, GitHub release, or CocoaPods version. It tests with the

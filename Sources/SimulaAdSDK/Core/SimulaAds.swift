@@ -60,6 +60,24 @@ public enum SimulaAds {
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
+    /// Selects the process-wide API environment before any SDK initialization or direct API request.
+    /// The first selection wins. Staging is effective only in a development artifact when the host
+    /// app's Info.plist contains the Boolean key `SimulaStagingEnvironmentEnabled` set to `true`;
+    /// otherwise the process fails closed to production.
+    ///
+    /// - Returns: `true` when `environment` is the effective process selection, otherwise `false`.
+    @discardableResult
+    nonisolated public static func configureAPIEnvironment(_ environment: SimulaAPIEnvironment) -> Bool {
+        configureAPIEnvironment(environment, selection: processAPIEnvironmentSelection)
+    }
+
+    nonisolated static func configureAPIEnvironment(
+        _ environment: SimulaAPIEnvironment,
+        selection: ProcessAPIEnvironmentSelection
+    ) -> Bool {
+        selection.configure(environment).isCompatible
+    }
+
     /// Initializes the SDK with the given API key. Safe to call more than once;
     /// the first valid call wins and subsequent calls are ignored so existing ad
     /// instances keep their session.
@@ -107,12 +125,11 @@ public enum SimulaAds {
             return false
         }
 
-        guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
-            return false
-        }
-
         // First valid initialization wins so already-created ads keep their session.
-        guard shared == nil else {
+        if shared != nil {
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             Telemetry.shared.recordDuplicateInitialize()
             return false
         }
@@ -125,18 +142,25 @@ public enum SimulaAds {
             telemetryEnabled: telemetryEnabled
         )
 
-        // Keep this call cheap: it runs on the main thread, typically during app launch. The
-        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up) is deferred to `provider.start()`.
+        // Keep this call cheap: it runs on the main thread, typically during app launch. A live
+        // declarative provider with the same core configuration is adopted; otherwise initialization
+        // remains inert. With no explicit environment configuration, provider construction freezes
+        // production before touching API/durable infrastructure.
         let provider: SimulaProvider
         switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
         case .adopt(let active):
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = active
             provider.updateConsent(resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy))
             if let adContext { provider.updateContext(adContext) }
         case .conflict:
             return false
         case .none:
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = SimulaProvider(
                 apiKey: apiKey,
                 devMode: devMode,
@@ -207,7 +231,7 @@ public enum SimulaAds {
     /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
-        guard let provider = shared, provider.isProcessApiKeyCompatible, !adUnitId.isEmpty else {
+        guard let provider = shared, provider.canMakeRequests, !adUnitId.isEmpty else {
             return false
         }
         // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback

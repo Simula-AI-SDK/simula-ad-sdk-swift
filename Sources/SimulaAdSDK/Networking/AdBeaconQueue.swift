@@ -112,8 +112,8 @@ extension SimulaAPI: BeaconSending {}
 /// - Deduped: shown/seen use `(impressionId, action)`; each click uses its stable interaction id.
 ///   Retries only happen for sends that did NOT get a terminal response, and click retries carry the
 ///   same event-id header so the backend can reconcile a lost response idempotently.
-/// - Durable: atomically persisted under Application Support; survives relaunch and migrates the
-///   exact legacy `simula_pending_beacons` UserDefaults entry once.
+/// - Durable: atomically persisted under Application Support; survives relaunch. Production keeps
+///   the exact `simula_pending_beacons` legacy migration while staging uses isolated storage.
 /// - Backed off: failed attempts retry with the shared exponential backoff (5s → 60s cap).
 ///
 /// `@unchecked Sendable` is safe: mutable state and persistence are confined to `executor`, and
@@ -155,11 +155,16 @@ public final class AdBeaconManager: @unchecked Sendable {
 
     private init() {
         self.sender = SimulaAPI()
+        let environment = processAPIEnvironmentSelection.environmentForRequest()
+        let fileName = SimulaEnvironmentStorageNames.beaconFileName(for: environment)
         let fallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library/Application Support/SimulaAdSDK", isDirectory: true)
-            .appendingPathComponent("pending_beacons.json")
-        let url = DurableJSONQueueStore<PendingBeacon>.applicationSupportURL(fileName: "pending_beacons.json") ?? fallback
-        self.store = FileAdBeaconStore(fileURL: url)
+            .appendingPathComponent(fileName)
+        let url = DurableJSONQueueStore<PendingBeacon>.applicationSupportURL(fileName: fileName) ?? fallback
+        self.store = FileAdBeaconStore(
+            fileURL: url,
+            legacyKey: SimulaEnvironmentStorageNames.beaconLegacyKey(for: environment)
+        )
         self.now = { Date().timeIntervalSince1970 }
         self.launchGate = LaunchSettledGate.shared
         self.persistenceSleep = Self.defaultPersistenceSleep

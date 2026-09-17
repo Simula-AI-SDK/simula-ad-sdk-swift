@@ -52,8 +52,8 @@ func isPermanentVerificationError(_ error: Error) -> Bool {
 /// - Idempotent: deduped by `serve_id`; the API layer maps HTTP 409 (already
 ///   claimed) to a successful verification, so retries converge without
 ///   double-firing the publisher's postback.
-/// - Durable: atomically persisted under Application Support and migrated once from the exact
-///   legacy `simula_pending_reward_verifications` UserDefaults entry.
+/// - Durable: atomically persisted under Application Support. Production keeps the exact legacy
+///   `simula_pending_reward_verifications` migration while staging uses isolated storage.
 /// - Backed off: failed attempts retry with exponential backoff (5s → max 60s).
 ///
 /// `@unchecked Sendable` is safe: mutable state and persistence are confined to `executor`, and
@@ -102,11 +102,16 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
     private init() {
         self.verifier = SimulaAPI()
+        let environment = processAPIEnvironmentSelection.environmentForRequest()
+        let fileName = SimulaEnvironmentStorageNames.rewardFileName(for: environment)
         let fallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library/Application Support/SimulaAdSDK", isDirectory: true)
-            .appendingPathComponent("pending_reward_verifications.json")
-        let url = DurableJSONQueueStore<PendingVerification>.applicationSupportURL(fileName: "pending_reward_verifications.json") ?? fallback
-        self.store = FileRewardVerificationStore(fileURL: url)
+            .appendingPathComponent(fileName)
+        let url = DurableJSONQueueStore<PendingVerification>.applicationSupportURL(fileName: fileName) ?? fallback
+        self.store = FileRewardVerificationStore(
+            fileURL: url,
+            legacyKey: SimulaEnvironmentStorageNames.rewardLegacyKey(for: environment)
+        )
         self.now = { Date().timeIntervalSince1970 }
         self.launchGate = LaunchSettledGate.shared
         self.persistenceSleep = Self.defaultPersistenceSleep
