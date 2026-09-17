@@ -727,34 +727,45 @@ public final class SimulaProvider: ObservableObject {
         let expirationEpoch = applicationSessionExpirationEpoch
         sessionGeneration &+= 1
         let generation = sessionGeneration
+        // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
         let task = Task<String?, Never> { @MainActor [weak self] in
-            guard let self else { return nil }
-            await self.sessionRefreshPreparation()
-            guard self.sessionGeneration == generation else { return nil }
-            let snapshot = self.privacySnapshotProvider()
-            // Consume the refreshed value before the debounced publisher delivers the same change.
-            // That delivery then becomes a no-op instead of clearing this foreground session.
-            let privacyImpact = self.consumeSessionRefreshPrivacySnapshot(snapshot)
-            let ppid = self.telemetryIdentitySource.identity().primaryUserId
-            let resolved = await self.createAndPublishSession(
+            await self?.runStaleSessionRefresh(
                 generation: generation,
-                expirationEpoch: expirationEpoch,
-                ppidAtCreation: ppid,
-                snapshot: snapshot
+                expirationEpoch: expirationEpoch
             )
-            if resolved == nil, privacyImpact.requiresSessionResync,
-               self.sessionGeneration == generation {
-                // The old session represents privacy state we can no longer send. Drop the pair,
-                // but leave the stale marker set so only a later external call retries.
-                self.sessionUserID = nil
-                self.sessionId = nil
-                self.publishedSessionExpirationEpoch = nil
-            }
-            return resolved
         }
         let flight = SessionFlight(task: task, generation: generation, expirationEpoch: expirationEpoch)
         sessionFlight = flight
         return flight
+    }
+
+    @MainActor
+    private func runStaleSessionRefresh(
+        generation: Int,
+        expirationEpoch: UInt64
+    ) async -> String? {
+        await sessionRefreshPreparation()
+        guard sessionGeneration == generation else { return nil }
+        let snapshot = privacySnapshotProvider()
+        // Consume the refreshed value before the debounced publisher delivers the same change.
+        // That delivery then becomes a no-op instead of clearing this foreground session.
+        let privacyImpact = consumeSessionRefreshPrivacySnapshot(snapshot)
+        let ppid = telemetryIdentitySource.identity().primaryUserId
+        let resolved = await createAndPublishSession(
+            generation: generation,
+            expirationEpoch: expirationEpoch,
+            ppidAtCreation: ppid,
+            snapshot: snapshot
+        )
+        if resolved == nil, privacyImpact.requiresSessionResync,
+           sessionGeneration == generation {
+            // The old session represents privacy state we can no longer send. Drop the pair,
+            // but leave the stale marker set so only a later external call retries.
+            sessionUserID = nil
+            sessionId = nil
+            publishedSessionExpirationEpoch = nil
+        }
+        return resolved
     }
 
     /// Session-creation task body (named method — see the task-shape note in TelemetryManager).
