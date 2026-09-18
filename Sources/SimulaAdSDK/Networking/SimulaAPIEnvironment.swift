@@ -54,6 +54,10 @@ struct SimulaArtifactEnvironmentPolicy: Equatable, Sendable {
     func environment(for requested: SimulaAPIEnvironment) -> SimulaAPIEnvironment {
         requested == .staging && allowsStaging && stagingOptInEnabled ? .staging : .production
     }
+
+    var defaultEnvironment: SimulaAPIEnvironment {
+        environment(for: .staging)
+    }
 }
 
 struct ProcessAPIEnvironmentClaim: Equatable, Sendable {
@@ -81,10 +85,16 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let selected else {
-            self.selected = .production
-            return .production
+            let environment = policy.defaultEnvironment
+            self.selected = environment
+            return environment
         }
         return selected
+    }
+
+    var resolvedEnvironment: SimulaAPIEnvironment {
+        lock.lock(); defer { lock.unlock() }
+        return selected ?? policy.defaultEnvironment
     }
 
     var effectiveEnvironment: SimulaAPIEnvironment? {

@@ -57,10 +57,22 @@ public enum SimulaAds {
     /// headers continue to await the forcing cache and include the ID once resolution completes.
     public static var deviceId: String? { SimulaDeviceId.valueIfResolved }
 
+    /// The API environment selected for this process. Before the first SDK request, this reports
+    /// the environment that the host Info.plist and artifact capability would select.
+    nonisolated public static var apiEnvironment: SimulaAPIEnvironment {
+        apiEnvironment(selection: processAPIEnvironmentSelection)
+    }
+
+    nonisolated static func apiEnvironment(
+        selection: ProcessAPIEnvironmentSelection
+    ) -> SimulaAPIEnvironment {
+        selection.resolvedEnvironment
+    }
+
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
-    /// Selects the process-wide API environment before any SDK initialization or direct API request.
+    /// Overrides the process-wide API environment before any SDK initialization or direct API request.
     /// The first selection wins. Staging is effective only in a development artifact when the host
     /// app's Info.plist contains the Boolean key `SimulaStagingEnvironmentEnabled` set to `true`;
     /// otherwise the process fails closed to production.
