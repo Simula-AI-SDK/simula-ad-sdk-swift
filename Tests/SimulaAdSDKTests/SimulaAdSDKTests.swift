@@ -405,6 +405,7 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(b.close.treatment, .hidden)
         XCTAssertEqual(b.close.position, .topRight)
         XCTAssertEqual(b.close.progressBarColor, "#FFFFFF")
+        XCTAssertEqual(b.close.action, .closeX)
         XCTAssertNil(b.storePrompt)
         XCTAssertNil(b.skoverlay)
         XCTAssertNil(b.autoStoreRedirect)
@@ -880,6 +881,8 @@ final class SimulaAdSDKTests: XCTestCase {
         )
         XCTAssertFalse(legacyFallback.nativeClickBeaconV1Enabled)
         XCTAssertTrue(expandedFallback.nativeClickBeaconV1Enabled)
+        XCTAssertEqual(legacyFallback.closeBehavior, .fallbackDefault)
+        XCTAssertEqual(expandedFallback.closeBehavior, .fallbackDefault)
     }
 
     // MARK: - Interstitial configuration defaults / mutability

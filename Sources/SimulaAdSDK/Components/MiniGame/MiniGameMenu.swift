@@ -241,6 +241,7 @@ public struct MiniGameMenu: View {
                     playableBorderColor: theme.resolvedPlayableBorderColor,
                     adId: fallbackAd.adId,
                     nativeClickBeaconV1Enabled: fallbackAd.nativeClickBeaconV1Enabled,
+                    closeBehavior: fallbackAd.closeBehavior,
                     telemetryServeId: currentServeId,
                     onClickHandoffPendingChanged: {
                         updateFallbackClickHandoff($0, renderedIndex: renderedIndex)

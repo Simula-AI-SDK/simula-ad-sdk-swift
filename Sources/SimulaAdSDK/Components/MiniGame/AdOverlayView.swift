@@ -159,6 +159,19 @@ private struct AdOverlayVideoSurfaceIdentity: Hashable {
     let player: ObjectIdentifier
 }
 
+/// Pure per-screen countdown policy. Zero duration unlocks at readiness without starting a ticker or
+/// dividing by zero; positive durations preserve the legacy whole-second numeric circle.
+struct FallbackCountdownPolicy: Equatable {
+    let delaySeconds: Int
+
+    init(delaySeconds: Int) {
+        self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
+    }
+
+    var totalMilliseconds: Double { Double(delaySeconds) * 1_000 }
+    var needsTicker: Bool { delaySeconds > 0 }
+}
+
 // MARK: - AdOverlayView
 
 /// Full-screen overlay that displays one server-rendered HTML or native video fallback.
@@ -166,8 +179,8 @@ private struct AdOverlayVideoSurfaceIdentity: Hashable {
 ///
 /// Features:
 /// - Full-screen dark overlay (matching Kotlin's Color(0xCC000000))
-/// - 5-second countdown timer with animated ring before close button appears
-/// - Close button (top-right, dark-translucent circle with a white ✕) after countdown
+/// - Per-item countdown timer with the legacy numeric ring before the action button appears
+/// - Configurable close/forward button at a supported corner after countdown
 /// - WKWebView loading the ad iframe URL
 /// - Bottom sheet mode support (uses last game height/border color)
 /// - Status bar hiding when full screen or near full screen
@@ -184,6 +197,8 @@ public struct AdOverlayView: View {
     var adId: String = ""
     /// Server-owned assignment for this fallback. False means the HTML retains click counting.
     var nativeClickBeaconV1Enabled: Bool = false
+    /// Per-item fallback close behavior. Defaults differ from primary ads by contract.
+    var closeBehavior: CloseBehavior = .fallbackDefault
     /// Measurement context for this fallback surface. The fallback ad id remains the event identity;
     /// the parent serve is deliberately not reused for fallback click accounting.
     var telemetryAdFormat: String = "interstitial"
@@ -228,15 +243,17 @@ public struct AdOverlayView: View {
     @State private var firstFrameHandoff = PendingFirstFrameHandoff<AdOverlayVideoSurfaceIdentity>()
     @State private var clickHandoffPending = false
     @State private var localRouteLifecycle = AttributionRouteLifecycle()
-    /// Countdown seconds remaining (starts at 5)
-    @State private var adCountdown: Int = 5
+    /// Countdown seconds remaining, initialized from the current fallback item on mount/load.
+    @State private var adCountdown: Int = 0
+    @State private var closeStateInitialized = false
+    @State private var dismissUnlocked = false
     /// Ring progress (0.0 = empty, 1.0 = full) — fills clockwise from the top
     /// (right to left) over the countdown.
     @State private var ringProgress: CGFloat = 0.0
     /// The running countdown ticker. Held so it starts once and is cancelled on disappear, so it
     /// can't outlive the overlay (or be double-started by a re-`onAppear`).
     @State private var countdownTask: Task<Void, Never>?
-    /// Foreground time accrued toward the 5s gate, in ms. The countdown advances only while running,
+    /// Foreground time accrued toward the current item's gate, in ms. The countdown advances only while running,
     /// and resumes from this on return so backgrounded / store-sheet time is never counted.
     @State private var accumulatedMs: Double = 0
     @State private var videoGate = VideoPlaybackGate(configuredDelay: 5)
@@ -274,8 +291,12 @@ public struct AdOverlayView: View {
         return true
     }
 
+    private var countdownPolicy: FallbackCountdownPolicy {
+        FallbackCountdownPolicy(delaySeconds: closeBehavior.delaySeconds)
+    }
+
     private var closeAlignment: Alignment {
-        switch ad.adBehavior.close.position {
+        switch closeBehavior.position {
         case .topRight: return .topTrailing
         case .topLeft: return .topLeading
         case .bottomLeft: return .bottomLeading
@@ -362,8 +383,11 @@ public struct AdOverlayView: View {
                             }
                         }
 
-                        fallbackCloseControl
+                        closeControl
                             .padding(8)
+                            // The fallback info glyph uses an 18pt corner inset. Move a bottom-left
+                            // close farther right so their visible circles and hit regions stay disjoint.
+                            .padding(.leading, closeBehavior.position == .bottomLeft ? 30 : 0)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: closeAlignment)
                     }
                     .frame(maxWidth: .infinity)
@@ -385,7 +409,11 @@ public struct AdOverlayView: View {
             // of the screen's rounded bottom-left corner (where it would otherwise be clipped).
             #if os(iOS)
             if !adId.isEmpty {
-                AdInfoReportOverlay(adId: adId, cornerInset: 18)
+                AdInfoReportOverlay(
+                    adId: adId,
+                    closeAtBottomLeft: closeBehavior.position == .bottomLeft,
+                    cornerInset: 18
+                )
             }
             #endif
         }
@@ -475,6 +503,43 @@ public struct AdOverlayView: View {
 
     // MARK: - Countdown
 
+    @ViewBuilder
+    private var closeControl: some View {
+        if dismissUnlocked {
+            Button(action: requestClose) {
+                Image(systemName: closeBehavior.action == .forward ? "chevron.right" : "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 16, height: 16)
+                    .background(Circle().fill(Color.black.opacity(0.5)))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(CloseButtonStyle())
+            .disabled(clickHandoffPending)
+            .accessibilityLabel(closeBehavior.action == .forward ? "Next ad" : "Close ad")
+        } else if closeBehavior.treatment == .countdownCircle, countdownPolicy.needsTicker {
+            // Keep the fallback countdown's exact legacy numeric-circle appearance. Unlike primary
+            // countdown circles, no eventual action glyph is shown beneath this ring.
+            ZStack {
+                Circle()
+                    .fill(Color.black.opacity(0.4))
+                    .frame(width: 16, height: 16)
+
+                Circle()
+                    .trim(from: 0, to: ringProgress)
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .frame(width: 12, height: 12)
+                    .rotationEffect(.degrees(-90))
+
+                Text("\(closeStateInitialized ? adCountdown : countdownPolicy.delaySeconds)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 44, height: 44)
+        }
+    }
+
     private var nativeClickBeaconImpressionId: String? {
         fallbackNativeClickBeaconImpressionId(
             adId: adId,
@@ -536,7 +601,7 @@ public struct AdOverlayView: View {
             terminalFailure: adPageFailed,
             appForegrounded: appForegrounded,
             storeSheetPresented: storeSheetPresented,
-            dismissUnlocked: adCountdown <= 0,
+            dismissUnlocked: dismissUnlocked,
             clickHandoffPending: clickHandoffPending
         ) {
         case .ignore:
@@ -549,39 +614,6 @@ public struct AdOverlayView: View {
             firstFrameHandoff.invalidate()
             closing = true
             onClose()
-        }
-    }
-
-    @ViewBuilder
-    private var fallbackCloseControl: some View {
-        if adCountdown <= 0 {
-            Button(action: requestClose) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 16, height: 16)
-                    .background(Circle().fill(Color.black.opacity(0.5)))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(CloseButtonStyle())
-            .disabled(clickHandoffPending)
-            .accessibilityLabel("Close ad")
-        } else if ad.adBehavior.close.treatment == .countdownCircle {
-            ZStack {
-                Circle()
-                    .fill(Color.black.opacity(0.4))
-                    .frame(width: 16, height: 16)
-                Circle()
-                    .trim(from: 0, to: ringProgress)
-                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                    .frame(width: 12, height: 12)
-                    .rotationEffect(.degrees(-90))
-                Text("\(adCountdown)")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.white)
-            }
-            .frame(width: 44, height: 44)
         }
     }
 
@@ -636,8 +668,10 @@ public struct AdOverlayView: View {
         adPageFailed = false
         pageFinished = false
         loadTimedOut = false
-        let closeDelay = ad.adBehavior.close.delaySeconds
-        adCountdown = ad.mediaType == .video ? max(1, closeDelay) : closeDelay
+        let closeDelay = countdownPolicy.delaySeconds
+        adCountdown = countdownPolicy.delaySeconds
+        closeStateInitialized = true
+        dismissUnlocked = false
         ringProgress = 0
         accumulatedMs = 0
         videoGate = VideoPlaybackGate(configuredDelay: TimeInterval(closeDelay))
@@ -655,7 +689,11 @@ public struct AdOverlayView: View {
         if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
         loadWatchdogTask = nil
         loadTimedOut = true
-        markPageFailedAndAdvance()
+        adPageReady = true
+        adPageFailed = false
+        countdownTask?.cancel()
+        countdownTask = nil
+        unlockDismissal()
     }
 
     private func markPageFinished() {
@@ -700,8 +738,7 @@ public struct AdOverlayView: View {
         adPageFailed = true
         countdownTask?.cancel()
         countdownTask = nil
-        adCountdown = 0
-        ringProgress = 1
+        unlockDismissal()
     }
 
     /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
@@ -724,15 +761,13 @@ public struct AdOverlayView: View {
     private func startCountdown() {
         // Start exactly once; a re-`onAppear`, resume, or a SwiftUI double-fire must not restart it.
         guard countdownTask == nil else { return }
-        let totalMs = Double(ad.adBehavior.close.delaySeconds) * 1_000
-        guard totalMs > 0 else {
-            adCountdown = 0
-            ringProgress = 1
+        let totalMs = countdownPolicy.totalMilliseconds
+        guard countdownPolicy.needsTicker else {
+            unlockDismissal()
             return
         }
         guard accumulatedMs < totalMs else {
-            adCountdown = 0
-            ringProgress = 1
+            unlockDismissal()
             return
         }
         // Accrue only foreground time: a 50ms ticker driven by the monotonic clock, re-anchored each
@@ -759,8 +794,13 @@ public struct AdOverlayView: View {
             let remainingSecs = ceil(max(0, totalMs - accumulatedMs) / 1000)
             adCountdown = Int(exactly: remainingSecs) ?? 0
         }
+        unlockDismissal()
+    }
+
+    private func unlockDismissal() {
         adCountdown = 0
         ringProgress = 1
+        dismissUnlocked = true
     }
 
     #if os(iOS)
@@ -865,6 +905,7 @@ public struct AdOverlayView: View {
         videoGate.update(duration: player.duration, played: played, ended: ended)
         ringProgress = CGFloat(videoGate.progress)
         adCountdown = videoGate.secondsRemaining
+        dismissUnlocked = videoGate.isUnlocked
     }
 
     private func recordVideoCompleteIfNeeded() {

@@ -62,6 +62,15 @@ entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the 
 `setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. Native preloads do not
 accept metadata; supply it to the `NativeAdSlot` that consumes the preload.
 
+## Development Environment
+
+Development artifacts select the staging API when the app's Info.plist contains
+`SimulaStagingEnvironmentEnabled` as a Boolean set to `true`. Stable artifacts and missing or
+incorrectly typed values fail closed to production. The first environment selection is process-wide,
+and `SimulaAds.apiEnvironment` reports the effective value. Development hosts may explicitly call
+`configureAPIEnvironment(_:)` before initialization; stable artifacts refuse staging. `devMode` does
+not select the API environment.
+
 ## Privacy & App Store Compliance
 
 The SDK bundles a `PrivacyInfo.xcprivacy` manifest and supports IAB consent frameworks (TCF, CCPA, GPP), COPPA, and App Tracking Transparency. See the [Quick Start guide](https://docs.simula.ad/swift-sdk/quick-start#privacy-att) for details.

@@ -5,6 +5,7 @@ import Foundation
 let simulaLaunchSettledQuietWindow: TimeInterval = 5
 
 protocol LaunchSettling: Sendable {
+    var isSettled: Bool { get }
     func waitUntilSettled() async
 }
 
@@ -23,6 +24,8 @@ final class LaunchSettledGate: LaunchSettling, @unchecked Sendable {
 
     private let uptime: @Sendable () -> TimeInterval
 
+    var isSettled: Bool { uptime() >= deadlineUptime }
+
     func waitUntilSettled() async {
         let remaining = deadlineUptime - uptime()
         guard remaining > 0 else { return }
@@ -36,5 +39,6 @@ final class LaunchSettledGate: LaunchSettling, @unchecked Sendable {
 
 struct ImmediateLaunchSettledGate: LaunchSettling {
     static let shared = ImmediateLaunchSettledGate()
+    var isSettled: Bool { true }
     func waitUntilSettled() async {}
 }

@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "SimulaAdSDK"
-  s.version          = "1.2.1"
+  s.version          = "1.2.2-dev.1"
   s.summary          = "Interactive, AI-native ad experiences for modern apps"
 
   s.description      = <<-DESC
@@ -32,6 +32,14 @@ Pod::Spec.new do |s|
 
   s.platform         = :ios, "15.0"
   s.swift_version    = "5.9"
+
+  # Source-only local development follows the same version-gated flavor as SwiftPM. Binary
+  # consumers receive the already-compiled XCFramework and do not inherit this setting.
+  if s.version.to_s.match?(/\A\d+\.\d+\.\d+-dev\.\d+\z/)
+    s.pod_target_xcconfig = {
+      "SWIFT_ACTIVE_COMPILATION_CONDITIONS" => "$(inherited) SIMULA_DEV_ARTIFACT"
+    }
+  end
 
   # Layout gate (fail-loud). Consumers must always get the prebuilt binary; compiling Sources/
   # with a host toolchain re-exposes the miscompile. So:

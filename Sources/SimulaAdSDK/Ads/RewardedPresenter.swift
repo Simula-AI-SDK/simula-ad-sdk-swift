@@ -415,6 +415,7 @@ private struct RewardedGameView: View {
                 treatment: (close ?? CloseBehavior()).treatment,
                 position: (close ?? CloseBehavior()).position,
                 progressBarColor: (close ?? CloseBehavior()).progressBarColor,
+                action: (close ?? CloseBehavior()).action,
                 isRewardCopy: true,
                 enabled: canDismissFullscreen(
                     dismissUnlocked: rewardEarned,

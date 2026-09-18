@@ -529,6 +529,7 @@ final class FallbackAdPresenter {
             videoPlayer: claimedVideoPlayer(at: index),
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            closeBehavior: ad.closeBehavior,
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,

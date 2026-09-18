@@ -15,6 +15,24 @@ final class LaunchSettledGateTests: XCTestCase {
         await gate.waitUntilSettled()
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.1)
     }
+
+    func testSettledQueryDoesNotWait() {
+        let clock = GateClock(100)
+        let gate = LaunchSettledGate(quietWindow: 5, uptime: { clock.value })
+
+        XCTAssertFalse(gate.isSettled)
+        clock.value = 105
+        XCTAssertTrue(gate.isSettled)
+        XCTAssertTrue(ImmediateLaunchSettledGate.shared.isSettled)
+    }
+
+    func testControllableGatePublishesSettledState() async {
+        let gate = ControllableLaunchSettledGate()
+
+        XCTAssertFalse(gate.isSettled)
+        await gate.open()
+        XCTAssertTrue(gate.isSettled)
+    }
 }
 
 private final class GateClock: @unchecked Sendable {

@@ -57,6 +57,25 @@ public enum SimulaAds {
     /// headers continue to await the forcing cache and include the ID once resolution completes.
     public static var deviceId: String? { SimulaDeviceId.valueIfResolved }
 
+    /// The API environment selected for this process. Before initialization or the first request,
+    /// this safely reports production without freezing the later host-configured selection.
+    nonisolated public static var apiEnvironment: SimulaAPIEnvironment {
+        apiEnvironment(selection: processAPIEnvironmentSelection)
+    }
+
+    nonisolated static func apiEnvironment(
+        selection: ProcessAPIEnvironmentSelection
+    ) -> SimulaAPIEnvironment {
+        selection.resolvedEnvironment
+    }
+
+    /// Selects the process-wide API environment before initialization. Staging succeeds only in an
+    /// exact development artifact when `SimulaStagingEnvironmentEnabled` is Boolean `true`.
+    @discardableResult
+    nonisolated public static func configureAPIEnvironment(_ environment: SimulaAPIEnvironment) -> Bool {
+        processAPIEnvironmentSelection.configure(environment)
+    }
+
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 
@@ -107,12 +126,11 @@ public enum SimulaAds {
             return false
         }
 
-        guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
-            return false
-        }
-
         // First valid initialization wins so already-created ads keep their session.
-        guard shared == nil else {
+        if shared != nil {
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             Telemetry.shared.recordDuplicateInitialize()
             return false
         }
@@ -125,18 +143,25 @@ public enum SimulaAds {
             telemetryEnabled: telemetryEnabled
         )
 
-        // Keep this call cheap: it runs on the main thread, typically during app launch. The
-        // one-time heavy lifting (IDFV/UA syscalls, shared URLSession build, telemetry install,
-        // version check, session warm-up) is deferred to `provider.start()`.
+        // Keep this call cheap: it runs on the main thread, typically during app launch. A live
+        // declarative provider with the same core configuration is adopted; otherwise initialization
+        // remains inert. With no explicit environment configuration, provider construction freezes
+        // production before touching API/durable infrastructure.
         let provider: SimulaProvider
         switch processActiveSimulaProviderRegistry.resolve(coreConfiguration) {
         case .adopt(let active):
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = active
             provider.updateConsent(resolvePrivacyConfig(hasPrivacyConsent: hasPrivacyConsent, privacy: privacy))
             if let adContext { provider.updateContext(adContext) }
         case .conflict:
             return false
         case .none:
+            guard claimApiKeyForInitialization(apiKey, ownership: processApiKeyOwnership) else {
+                return false
+            }
             provider = SimulaProvider(
                 apiKey: apiKey,
                 devMode: devMode,
@@ -207,7 +232,7 @@ public enum SimulaAds {
     /// A `true` result is cached for the rest of the local day (reset at local midnight, per the
     /// PRD) so repeated checks for the same ad unit + user don't re-hit the network.
     public static func checkFrequencyCap(adUnitId: String, primaryUserID: String? = nil) async -> Bool {
-        guard let provider = shared, provider.isProcessApiKeyCompatible, !adUnitId.isEmpty else {
+        guard let provider = shared, provider.canMakeRequests, !adUnitId.isEmpty else {
             return false
         }
         // An explicit id passed by the caller is fixed for the whole call; only the SDK fallback
