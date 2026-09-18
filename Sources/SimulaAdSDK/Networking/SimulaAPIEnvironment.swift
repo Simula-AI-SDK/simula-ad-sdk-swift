@@ -66,6 +66,17 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
         self.policy = policy
     }
 
+    func configure(_ requested: SimulaAPIEnvironment) -> Bool {
+        guard requested == .production || policy.defaultEnvironment == .staging else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let selected else {
+            self.selected = requested
+            return true
+        }
+        return selected == requested
+    }
+
     func environmentForRequest() -> SimulaAPIEnvironment {
         lock.lock()
         defer { lock.unlock() }

@@ -69,6 +69,13 @@ public enum SimulaAds {
         selection.resolvedEnvironment
     }
 
+    /// Selects the process-wide API environment before initialization. Staging succeeds only in an
+    /// exact development artifact when `SimulaStagingEnvironmentEnabled` is Boolean `true`.
+    @discardableResult
+    nonisolated public static func configureAPIEnvironment(_ environment: SimulaAPIEnvironment) -> Bool {
+        processAPIEnvironmentSelection.configure(environment)
+    }
+
     // Character context is no longer global: pass charId/charName/charImage/charDesc
     // to each `SimulaInterstitialAd.load()` / `SimulaRewardedAd.load()` call instead.
 

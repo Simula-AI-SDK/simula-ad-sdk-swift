@@ -62,6 +62,22 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
         XCTAssertEqual(selection.effectiveEnvironment, .staging)
     }
 
+    func testExplicitEnvironmentRequiresDevelopmentHostCapability() {
+        let denied = ProcessAPIEnvironmentSelection(
+            policy: SimulaArtifactEnvironmentPolicy(allowsStaging: false, stagingOptInEnabled: true)
+        )
+        XCTAssertFalse(denied.configure(.staging))
+        XCTAssertNil(denied.effectiveEnvironment)
+        XCTAssertTrue(denied.configure(.production))
+
+        let allowed = ProcessAPIEnvironmentSelection(
+            policy: SimulaArtifactEnvironmentPolicy(allowsStaging: true, stagingOptInEnabled: true)
+        )
+        XCTAssertTrue(allowed.configure(.staging))
+        XCTAssertFalse(allowed.configure(.production))
+        XCTAssertEqual(allowed.effectiveEnvironment, .staging)
+    }
+
     func testEffectiveEnvironmentReadDoesNotFreezeHostDefault() {
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(
