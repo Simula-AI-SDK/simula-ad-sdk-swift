@@ -472,6 +472,16 @@ public enum CloseTreatment: Sendable, Equatable {
         default: return .hidden
         }
     }
+
+    /// Fallback end screens intentionally support only the two legacy-compatible treatments.
+    /// Unsupported, malformed, and missing values retain the numeric countdown-circle default.
+    static func fallbackFrom(_ raw: String?) -> CloseTreatment {
+        switch normalizeBehaviorToken(raw) {
+        case "hidden": return .hidden
+        case "countdown_circle": return .countdownCircle
+        default: return .countdownCircle
+        }
+    }
 }
 
 /// Where the close button sits. v2 narrows this to three corners — `bottom_right` is excluded
@@ -486,6 +496,19 @@ public enum ClosePosition: Sendable, Equatable {
         case "bottom_left": return .bottomLeft
         // top_right, plus excluded bottom_right / legacy bottom_corner, plus unknown → safe default.
         default: return .topRight
+        }
+    }
+}
+
+/// The visual meaning of the close affordance. Both actions invoke the surface's existing
+/// navigation callback; `.forward` changes only the glyph and accessibility copy.
+public enum CloseAction: Sendable, Equatable {
+    case closeX, forward
+
+    static func from(_ raw: String?) -> CloseAction {
+        switch normalizeBehaviorToken(raw) {
+        case "forward": return .forward
+        default: return .closeX
         }
     }
 }
@@ -580,6 +603,7 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
     public let delaySeconds: Int
     public let treatment: CloseTreatment
     public let position: ClosePosition
+    public let action: CloseAction
     /// Validated 6-digit hex (with leading `#`); tints the fill of `countdownCircle` and
     /// `progressBar`. White when omitted/invalid. No-op for `hidden` / `rewardOrCloseLabel`.
     public let progressBarColor: String
@@ -588,7 +612,8 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
         delaySeconds: Int = 0,
         treatment: CloseTreatment = .hidden,
         position: ClosePosition = .topRight,
-        progressBarColor: String = "#FFFFFF"
+        progressBarColor: String = "#FFFFFF",
+        action: CloseAction = .closeX
     ) {
         self.delaySeconds = min(maxCloseDelaySeconds, max(0, delaySeconds))
         self.treatment = treatment
@@ -596,11 +621,12 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
         // edge regardless; only its resolved close ✕ follows `position`.)
         self.position = position
         self.progressBarColor = progressBarColor
+        self.action = action
     }
 
     enum CodingKeys: String, CodingKey {
         case delaySeconds = "delay_seconds"
-        case treatment, position
+        case treatment, position, action
         case progressBarColor = "progress_bar_color"
     }
 
@@ -611,8 +637,31 @@ public struct CloseBehavior: Sendable, Equatable, Decodable {
         let treatment = CloseTreatment.from(try? c.decode(String.self, forKey: .treatment))
         let position = ClosePosition.from(try? c.decode(String.self, forKey: .position))
         let color = validatedHexColor(try? c.decode(String.self, forKey: .progressBarColor))
+        let action = CloseAction.from(try? c.decode(String.self, forKey: .action))
         // Route through the memberwise init so the position-vs-treatment snap applies on decode too.
-        self.init(delaySeconds: delay, treatment: treatment, position: position, progressBarColor: color)
+        self.init(
+            delaySeconds: delay,
+            treatment: treatment,
+            position: position,
+            progressBarColor: color,
+            action: action
+        )
+    }
+}
+
+extension CloseBehavior {
+    static var fallbackDefault: CloseBehavior {
+        CloseBehavior(delaySeconds: 5, treatment: .countdownCircle)
+    }
+
+    func replacingAction(_ action: CloseAction) -> CloseBehavior {
+        CloseBehavior(
+            delaySeconds: delaySeconds,
+            treatment: treatment,
+            position: position,
+            progressBarColor: progressBarColor,
+            action: action
+        )
     }
 }
 

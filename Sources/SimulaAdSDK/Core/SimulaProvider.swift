@@ -74,6 +74,9 @@ public final class SimulaProvider: ObservableObject {
     /// Whether the SDK is in development mode
     public let devMode: Bool
 
+    /// Effective process backend, selected independently of `devMode` before initialization.
+    let apiEnvironment: SimulaAPIEnvironment
+
     /// False when another API key already owns process-wide SDK infrastructure. Such providers
     /// remain inert so a SwiftUI construction mismatch cannot send requests through mixed keys.
     let isProcessApiKeyCompatible: Bool
@@ -213,6 +216,7 @@ public final class SimulaProvider: ObservableObject {
             telemetryEnabled: telemetryEnabled,
             adContext: adContext,
             apiKeyOwnership: processApiKeyOwnership,
+            environmentSelection: processAPIEnvironmentSelection,
             processEffectsEnabled: true,
             activeProviderRegistry: processActiveSimulaProviderRegistry
         )
@@ -226,6 +230,7 @@ public final class SimulaProvider: ObservableObject {
         hasPrivacyConsent: Bool = true,
         telemetryEnabled: Bool = true,
         activeProviderRegistry: ActiveSimulaProviderRegistry? = nil,
+        environmentSelection: ProcessAPIEnvironmentSelection = ProcessAPIEnvironmentSelection(),
         sessionCreation: SessionCreation? = nil,
         sessionRefreshPreparation: @escaping SessionRefreshPreparation = {},
         privacySnapshotProvider: @escaping PrivacySnapshotProvider = { ConsentSnapshot() }
@@ -239,6 +244,7 @@ public final class SimulaProvider: ObservableObject {
             telemetryEnabled: telemetryEnabled,
             adContext: nil,
             apiKeyOwnership: apiKeyOwnership,
+            environmentSelection: environmentSelection,
             processEffectsEnabled: false,
             activeProviderRegistry: activeProviderRegistry,
             sessionCreation: sessionCreation,
@@ -256,6 +262,7 @@ public final class SimulaProvider: ObservableObject {
         telemetryEnabled: Bool,
         adContext: SimulaAdContext?,
         apiKeyOwnership: ProcessApiKeyOwnership,
+        environmentSelection: ProcessAPIEnvironmentSelection,
         processEffectsEnabled: Bool,
         activeProviderRegistry: ActiveSimulaProviderRegistry?,
         sessionCreation: SessionCreation? = nil,
@@ -264,11 +271,15 @@ public final class SimulaProvider: ObservableObject {
     ) {
         self.apiKey = apiKey
         self.devMode = devMode
-        self.isProcessApiKeyCompatible = claimProcessApiKeyIfValid(
+        let apiKeyCompatible = claimProcessApiKeyIfValid(
             apiKey,
             ownership: apiKeyOwnership,
             reportInvalid: { assertionFailure("[SimulaSDK] \($0)") }
         )
+        self.isProcessApiKeyCompatible = apiKeyCompatible
+        self.apiEnvironment = apiKeyCompatible
+            ? environmentSelection.environmentForRequest()
+            : environmentSelection.effectiveEnvironment ?? .production
         self.processEffectsEnabled = processEffectsEnabled
         self.injectedSessionCreation = sessionCreation
         self.sessionRefreshPreparation = sessionRefreshPreparation ?? {
@@ -370,7 +381,12 @@ public final class SimulaProvider: ObservableObject {
     }
 
     func matchesCoreConfiguration(_ configuration: SimulaProviderCoreConfiguration) -> Bool {
-        coreConfiguration == configuration
+        // devMode remains first-provider-owned for mixed imperative/declarative integrations, but
+        // no longer has any relationship to the independently configured API environment.
+        apiKey == configuration.apiKey
+            && matchingPrimaryUserID == configuration.primaryUserID
+            && hasPrivacyConsent == configuration.hasPrivacyConsent
+            && telemetryEnabled == configuration.telemetryEnabled
     }
 
     // MARK: - Deferred startup
@@ -464,7 +480,8 @@ public final class SimulaProvider: ObservableObject {
 
         // SDK-upgrade bookkeeping: read + persist off-main; the beacon itself is recorded in the
         // main phase once telemetry is installed.
-        let versionKey = "simula_sdk_last_version"
+        let environment = processAPIEnvironmentSelection.environmentForRequest()
+        let versionKey = SimulaEnvironmentStorageNames.sdkLastVersionKey(for: environment)
         let lastVersion = UserDefaults.standard.string(forKey: versionKey)
         if lastVersion != SIMULA_SDK_VERSION {
             UserDefaults.standard.set(SIMULA_SDK_VERSION, forKey: versionKey)
@@ -707,9 +724,11 @@ public final class SimulaProvider: ObservableObject {
             //     a login/switch is instead captured by the reconcile convergence beacon once
             //     the server session actually represents the new user, and a logout must not
             //     re-enter the dedup memory it just reset.
-            Ipv4Beacon.shared.fire(
-                apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
-            )
+            if apiEnvironment.sendsIPv4Beacon {
+                Ipv4Beacon.shared.fire(
+                    apiKey: apiKey, sessionId: resolved, ppid: ppidAtCreation, reason: Ipv4Beacon.reasonInit
+                )
+            }
         }
         return resolved
     }
@@ -872,7 +891,7 @@ public final class SimulaProvider: ObservableObject {
         // session still holds pre-PATCH (the same stale-identity gate consistentSessionId
         // applies for the frequency-cap check). A login with no session yet is covered by the
         // session-creation init beacon. Only the logout dedup reset lives here.
-        if normalized == nil {
+        if normalized == nil, apiEnvironment.sendsIPv4Beacon {
             Ipv4Beacon.shared.onLogout()
         }
     }
@@ -913,9 +932,11 @@ public final class SimulaProvider: ObservableObject {
                 // so the steady-state reconcile is free; a post-logout re-login with the same
                 // ppid lands here without needing a PATCH and re-captures because the logout
                 // cleared the dedup memory.
-                Ipv4Beacon.shared.fire(
-                    apiKey: apiKey, sessionId: sid, ppid: target, reason: Ipv4Beacon.reasonPpidUpdate
-                )
+                if apiEnvironment.sendsIPv4Beacon {
+                    Ipv4Beacon.shared.fire(
+                        apiKey: apiKey, sessionId: sid, ppid: target, reason: Ipv4Beacon.reasonPpidUpdate
+                    )
+                }
                 break
             }
             let ok = await api.updatePpid(apiKey: apiKey, sessionId: sid, ppid: target)

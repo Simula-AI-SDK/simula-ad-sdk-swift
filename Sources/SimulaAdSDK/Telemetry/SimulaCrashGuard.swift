@@ -418,7 +418,10 @@ final class SimulaCrashGuard: NSObject, @unchecked Sendable {
     private static func resolvePendingURL() -> URL? {
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
-        return base.appendingPathComponent("SimulaCrash", isDirectory: true).appendingPathComponent("pending_crashes.txt")
+        let environment = processAPIEnvironmentSelection.environmentForRequest()
+        return base.appendingPathComponent("SimulaCrash", isDirectory: true).appendingPathComponent(
+            SimulaEnvironmentStorageNames.crashFileName(for: environment)
+        )
     }
 
     /// Append one record + newline, synchronously. Capped so a crash-on-launch loop can't grow it.

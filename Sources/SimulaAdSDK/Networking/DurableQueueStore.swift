@@ -330,8 +330,12 @@ final class FileAdBeaconStore: AdBeaconStoring, @unchecked Sendable {
     static let legacyKey = "simula_pending_beacons"
     private let store: DurableJSONQueueStore<PendingBeacon>
 
-    init(fileURL: URL, legacyDefaults: UserDefaults = .standard) {
-        store = DurableJSONQueueStore(fileURL: fileURL, legacyDefaults: legacyDefaults, legacyKey: Self.legacyKey)
+    init(
+        fileURL: URL,
+        legacyDefaults: UserDefaults = .standard,
+        legacyKey: String = FileAdBeaconStore.legacyKey
+    ) {
+        store = DurableJSONQueueStore(fileURL: fileURL, legacyDefaults: legacyDefaults, legacyKey: legacyKey)
     }
 
     func load() -> DurableQueueLoad<PendingBeacon> { store.load() }
@@ -347,8 +351,12 @@ final class FileRewardVerificationStore: RewardVerificationStoring, @unchecked S
     static let legacyKey = "simula_pending_reward_verifications"
     private let store: DurableJSONQueueStore<PendingVerification>
 
-    init(fileURL: URL, legacyDefaults: UserDefaults = .standard) {
-        store = DurableJSONQueueStore(fileURL: fileURL, legacyDefaults: legacyDefaults, legacyKey: Self.legacyKey)
+    init(
+        fileURL: URL,
+        legacyDefaults: UserDefaults = .standard,
+        legacyKey: String = FileRewardVerificationStore.legacyKey
+    ) {
+        store = DurableJSONQueueStore(fileURL: fileURL, legacyDefaults: legacyDefaults, legacyKey: legacyKey)
     }
 
     func load() -> DurableQueueLoad<PendingVerification> { store.load() }

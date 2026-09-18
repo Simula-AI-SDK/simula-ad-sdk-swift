@@ -29,6 +29,8 @@ cd "$(dirname "$0")/.."
 SCHEME="SimulaAdSDK"
 BUILD_DIR="$PWD/build"
 BUNDLE_NAME="SimulaAdSDK_SimulaAdSDK.bundle"
+ARTIFACT_FLAVOR=$(./scripts/validate-artifact-flavor.sh)
+STAGING_HOST="simula-api-staging-701226639755.us-central1.run.app"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -101,6 +103,16 @@ xcodebuild -create-xcframework \
   -framework "$BUILD_DIR/ios-simulator.xcarchive/Products/usr/local/lib/$SCHEME.framework" \
   -debug-symbols "$BUILD_DIR/ios-simulator.xcarchive/dSYMs/$SCHEME.framework.dSYM" \
   -output "$BUILD_DIR/$SCHEME.xcframework"
+
+# A stable binary must not retain the staging hostname even as dead data. Conversely, prove that
+# a dev-tagged artifact really contains the endpoint selected by its compile definition.
+if [[ "$ARTIFACT_FLAVOR" == "dev" ]]; then
+  grep -R -a -Fq "$STAGING_HOST" "$BUILD_DIR/$SCHEME.xcframework" \
+    || { echo "ERROR: dev XCFramework does not contain the staging endpoint"; exit 1; }
+elif grep -R -a -Fq "$STAGING_HOST" "$BUILD_DIR/$SCHEME.xcframework"; then
+  echo "ERROR: production XCFramework contains the staging endpoint"
+  exit 1
+fi
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   echo "==> Signing"
