@@ -134,9 +134,12 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(sessionId, "session-from-test")
         XCTAssertEqual(selection.effectiveEnvironment, .staging)
+        let expectedHost = SimulaArtifactEnvironmentPolicy.current.allowsStaging
+            ? "simula-api-staging-701226639755.us-central1.run.app"
+            : "simula-api-701226639755.us-central1.run.app"
         XCTAssertEqual(
             SessionEnvironmentURLProtocol.requests.first?.url?.host,
-            "simula-api-staging-701226639755.us-central1.run.app"
+            expectedHost
         )
     }
 
