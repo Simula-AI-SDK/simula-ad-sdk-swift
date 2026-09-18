@@ -64,17 +64,12 @@ accept metadata; supply it to the `NativeAdSlot` that consumes the preload.
 
 ## Development Environment
 
-Development artifacts can opt into the staging API before SDK initialization:
-
-```swift
-let configured = SimulaAds.configureAPIEnvironment(.staging)
-SimulaAds.initialize(apiKey: "YOUR_API_KEY", devMode: true)
-```
-
-The app's Info.plist must also contain `SimulaStagingEnvironmentEnabled` as a Boolean set to `true`.
-Stable artifacts and missing or incorrectly typed Info.plist values fail a staging request closed to
-production. The first environment selection is process-wide; a late or conflicting request returns
-`false` and preserves that first environment. `devMode` does not select the API environment.
+Development artifacts select the staging API when the app's Info.plist contains
+`SimulaStagingEnvironmentEnabled` as a Boolean set to `true`. Stable artifacts and missing or
+incorrectly typed values fail closed to production. The first environment selection is process-wide,
+and `SimulaAds.apiEnvironment` reports the effective value. Development hosts may explicitly call
+`configureAPIEnvironment(_:)` before initialization; stable artifacts refuse staging. `devMode` does
+not select the API environment.
 
 ## Privacy & App Store Compliance
 
