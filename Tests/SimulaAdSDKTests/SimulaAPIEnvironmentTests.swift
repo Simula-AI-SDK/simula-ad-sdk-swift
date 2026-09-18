@@ -19,9 +19,8 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
                     allowsStaging: allowsStaging,
                     stagingOptInEnabled: stagingOptInEnabled
                 )
-                XCTAssertEqual(policy.environment(for: .production), .production)
                 XCTAssertEqual(
-                    policy.environment(for: .staging),
+                    policy.defaultEnvironment,
                     allowsStaging && stagingOptInEnabled ? .staging : .production
                 )
             }
@@ -50,34 +49,7 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
         XCTAssertEqual(SimulaArtifactEnvironmentPolicy.current.allowsStaging, isDevTagged)
     }
 
-    func testConfigureAPIEnvironmentIsFirstWins() {
-        let selection = ProcessAPIEnvironmentSelection(
-            policy: SimulaArtifactEnvironmentPolicy(
-                allowsStaging: true,
-                stagingOptInEnabled: true
-            )
-        )
-
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.staging, selection: selection))
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.staging, selection: selection))
-        XCTAssertFalse(SimulaAds.configureAPIEnvironment(.production, selection: selection))
-        XCTAssertEqual(selection.effectiveEnvironment, .staging)
-    }
-
-    func testRejectedStagingConfigurationFailsClosedAndFreezesProduction() {
-        let selection = ProcessAPIEnvironmentSelection(
-            policy: SimulaArtifactEnvironmentPolicy(
-                allowsStaging: true,
-                stagingOptInEnabled: false
-            )
-        )
-
-        XCTAssertFalse(SimulaAds.configureAPIEnvironment(.staging, selection: selection))
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.production, selection: selection))
-        XCTAssertEqual(selection.effectiveEnvironment, .production)
-    }
-
-    func testDirectRequestUsesHostStagingDefaultBeforeLaterConfiguration() {
+    func testDirectRequestFreezesHostStagingDefault() {
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(
                 allowsStaging: true,
@@ -86,12 +58,11 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
         )
 
         XCTAssertEqual(selection.environmentForRequest(), .staging)
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.staging, selection: selection))
-        XCTAssertFalse(SimulaAds.configureAPIEnvironment(.production, selection: selection))
+        XCTAssertEqual(selection.environmentForRequest(), .staging)
         XCTAssertEqual(selection.effectiveEnvironment, .staging)
     }
 
-    func testEffectiveEnvironmentReportsHostDefaultWithoutFreezingAnOverride() {
+    func testEffectiveEnvironmentReadDoesNotFreezeHostDefault() {
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(
                 allowsStaging: true,
@@ -99,23 +70,19 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(SimulaAds.apiEnvironment(selection: selection), .staging)
-        XCTAssertNil(selection.effectiveEnvironment)
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.production, selection: selection))
         XCTAssertEqual(SimulaAds.apiEnvironment(selection: selection), .production)
+        XCTAssertNil(selection.effectiveEnvironment)
+        XCTAssertEqual(selection.environmentForRequest(), .staging)
+        XCTAssertEqual(SimulaAds.apiEnvironment(selection: selection), .staging)
     }
 
-    func testConfiguredStagingCreateSessionCompilesAndUsesStagingURL() async throws {
+    func testHostConfiguredStagingCreateSessionUsesStagingURL() async throws {
         let allowsStaging = SimulaArtifactEnvironmentPolicy.current.allowsStaging
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(
                 allowsStaging: allowsStaging,
                 stagingOptInEnabled: true
             )
-        )
-        XCTAssertEqual(
-            SimulaAds.configureAPIEnvironment(.staging, selection: selection),
-            allowsStaging
         )
         let api = SimulaAPI(
             session: makeCapturingSession(),
@@ -157,29 +124,8 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
         )
     }
 
-    func testConcurrentConflictingClaimsChooseOneEnvironment() async {
-        let selection = ProcessAPIEnvironmentSelection(
-            policy: SimulaArtifactEnvironmentPolicy(
-                allowsStaging: true,
-                stagingOptInEnabled: true
-            )
-        )
-
-        let claims = await withTaskGroup(of: ProcessAPIEnvironmentClaim.self) { group in
-            group.addTask { selection.configure(.production) }
-            group.addTask { selection.configure(.staging) }
-            var values: [ProcessAPIEnvironmentClaim] = []
-            for await claim in group { values.append(claim) }
-            return values
-        }
-
-        XCTAssertEqual(claims.filter(\.isCompatible).count, 1)
-        XCTAssertEqual(Set(claims.map(\.effective)).count, 1)
-        XCTAssertEqual(claims.first?.effective, selection.effectiveEnvironment)
-    }
-
     @MainActor
-    func testProviderDevModeDoesNotOverridePreconfiguredStaging() {
+    func testProviderDevModeDoesNotOverrideHostConfiguredStaging() {
         let ownership = ProcessApiKeyOwnership()
         let selection = ProcessAPIEnvironmentSelection(
             policy: SimulaArtifactEnvironmentPolicy(
@@ -187,7 +133,6 @@ final class SimulaAPIEnvironmentTests: XCTestCase {
                 stagingOptInEnabled: true
             )
         )
-        XCTAssertTrue(SimulaAds.configureAPIEnvironment(.staging, selection: selection))
         let normalMode = SimulaProvider(
             testApiKey: "same-key",
             apiKeyOwnership: ownership,

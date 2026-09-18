@@ -1206,7 +1206,7 @@ public final class SimulaAPI: @unchecked Sendable {
     // MARK: - Create Session
 
     /// Creates a server session and returns its id. The request uses the process environment selected
-    /// by `SimulaAds.configureAPIEnvironment(_:)`, or derives the host-configured default.
+    /// from the host-configured default.
     /// `devMode` remains a session property and does not select a backend.
     /// Translates `createSession()` from api.ts
     public func createSession(

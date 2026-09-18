@@ -67,9 +67,7 @@ accept metadata; supply it to the `NativeAdSlot` that consumes the preload.
 Development artifacts select the staging API when the app's Info.plist contains
 `SimulaStagingEnvironmentEnabled` as a Boolean set to `true`. Stable artifacts and missing or
 incorrectly typed values fail closed to production. The first environment selection is process-wide,
-and `SimulaAds.apiEnvironment` reports the effective value. The legacy
-`configureAPIEnvironment(_:)` override remains available before initialization; a late or conflicting
-request returns `false` and preserves the first environment. `devMode` does not select the API
+and `SimulaAds.apiEnvironment` reports the effective value. `devMode` does not select the API
 environment.
 
 ## Privacy & App Store Compliance

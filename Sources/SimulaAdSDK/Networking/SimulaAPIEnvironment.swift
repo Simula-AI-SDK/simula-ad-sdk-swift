@@ -51,23 +51,12 @@ struct SimulaArtifactEnvironmentPolicy: Equatable, Sendable {
         return number.boolValue
     }
 
-    func environment(for requested: SimulaAPIEnvironment) -> SimulaAPIEnvironment {
-        requested == .staging && allowsStaging && stagingOptInEnabled ? .staging : .production
-    }
-
     var defaultEnvironment: SimulaAPIEnvironment {
-        environment(for: .staging)
+        allowsStaging && stagingOptInEnabled ? .staging : .production
     }
 }
 
-struct ProcessAPIEnvironmentClaim: Equatable, Sendable {
-    let requested: SimulaAPIEnvironment
-    let effective: SimulaAPIEnvironment
-
-    var isCompatible: Bool { requested == effective }
-}
-
-/// Explicit configuration or the first SDK request freezes one backend for the process.
+/// The first SDK request freezes the host-configured backend for the process.
 final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
     private let lock = NSLock()
     private let policy: SimulaArtifactEnvironmentPolicy
@@ -75,10 +64,6 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
 
     init(policy: SimulaArtifactEnvironmentPolicy = .current) {
         self.policy = policy
-    }
-
-    func configure(_ requested: SimulaAPIEnvironment) -> ProcessAPIEnvironmentClaim {
-        claim(requested: requested, allowed: policy.environment(for: requested))
     }
 
     func environmentForRequest() -> SimulaAPIEnvironment {
@@ -94,7 +79,7 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
 
     var resolvedEnvironment: SimulaAPIEnvironment {
         lock.lock(); defer { lock.unlock() }
-        return selected ?? policy.defaultEnvironment
+        return selected ?? .production
     }
 
     var effectiveEnvironment: SimulaAPIEnvironment? {
@@ -102,18 +87,6 @@ final class ProcessAPIEnvironmentSelection: @unchecked Sendable {
         return selected
     }
 
-    private func claim(
-        requested: SimulaAPIEnvironment,
-        allowed: SimulaAPIEnvironment
-    ) -> ProcessAPIEnvironmentClaim {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let selected else {
-            self.selected = allowed
-            return ProcessAPIEnvironmentClaim(requested: requested, effective: allowed)
-        }
-        return ProcessAPIEnvironmentClaim(requested: requested, effective: selected)
-    }
 }
 
 enum SimulaEnvironmentStorageNames {
