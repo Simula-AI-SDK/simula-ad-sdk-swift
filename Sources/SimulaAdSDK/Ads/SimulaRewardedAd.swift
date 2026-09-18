@@ -249,10 +249,6 @@ public final class SimulaRewardedAd {
             break // nothing held — proceed
         }
 
-        // This load now owns attribution. Clear the prior serve before any session, no-fill, or
-        // transport-failure telemetry can be recorded; a renderable response replaces it below.
-        Telemetry.shared.setExperiment(experimentId: nil, variantId: nil)
-
         // Supersede any in-flight load / discard any ready ad, then start fresh.
         loadTask?.cancel()
         #if os(iOS)
@@ -328,10 +324,6 @@ public final class SimulaRewardedAd {
                 return
             }
             #endif
-            Telemetry.shared.setExperiment(
-                experimentId: response.experiment?.experimentId,
-                variantId: response.experiment?.variantId
-            )
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
                 adId: response.impressionId, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: nil
@@ -437,7 +429,7 @@ public final class SimulaRewardedAd {
                 owner.delegate?.rewardedDidDisplay(owner)
             },
             notifyDisplayFailed: { owner in
-                owner.failDisplay(.noFill)
+                DispatchQueue.main.async { owner.failDisplay(.noFill) }
             },
             notifyImpression: { owner, adValue in
                 owner.delegate?.rewardedDidRecordImpression(owner)
@@ -550,6 +542,7 @@ public final class SimulaRewardedAd {
                     earnedReward: earned
                 )
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    self.discardFallbackPrefetch()
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
@@ -943,12 +936,8 @@ public final class SimulaRewardedAd {
     /// is side-effect-free server-side.
     private func startFallbackPrefetch(impressionId: String) {
         #if os(iOS)
-        fallbackPrefetch?.cancel()
-        fallbackPrefetchToken = nil
-        fallbackPrefetchOwnership = nil
-        releasePreparedFallbackVideos(in: prefetchedFallbacks)
-        prefetchedFallbacks = nil
-        guard !impressionId.isEmpty else { fallbackPrefetch = nil; return }
+        discardFallbackPrefetch()
+        guard !impressionId.isEmpty else { return }
         let token = UUID()
         let ownership = FallbackPrefetchOwnership()
         fallbackPrefetchToken = token
@@ -965,6 +954,17 @@ public final class SimulaRewardedAd {
                 return true
             }
         }
+        #endif
+    }
+
+    private func discardFallbackPrefetch() {
+        #if os(iOS)
+        fallbackPrefetch?.cancel()
+        fallbackPrefetch = nil
+        fallbackPrefetchToken = nil
+        fallbackPrefetchOwnership = nil
+        releasePreparedFallbackVideos(in: prefetchedFallbacks)
+        prefetchedFallbacks = nil
         #endif
     }
 

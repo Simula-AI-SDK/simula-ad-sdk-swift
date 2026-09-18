@@ -91,7 +91,7 @@ struct FullscreenPostPrimaryPolicy: Equatable, Sendable {
     let verifiesEarnedReward: Bool
 
     init(terminalOutcome: FullscreenPresentationTerminalOutcome, earnedReward: Bool = false) {
-        presentsFallbacks = true
+        presentsFallbacks = terminalOutcome == .closed
         notifiesPublisherClose = terminalOutcome == .closed
         verifiesEarnedReward = terminalOutcome == .closed && earnedReward
     }

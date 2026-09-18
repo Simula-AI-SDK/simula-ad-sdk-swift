@@ -652,7 +652,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.displayOutcome, .displayed)
     }
 
-    func testDisplayFailureStillPresentsFallbackWithoutCloseOrReward() {
+    func testDisplayFailureSkipsFallbackCloseAndReward() {
         let policy = FullscreenPostPrimaryPolicy(
             terminalOutcome: .displayFailed,
             earnedReward: true
@@ -661,15 +661,16 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         if policy.presentsFallbacks { callbacks.append("fallback") }
         if policy.notifiesPublisherClose { callbacks.append("close") }
         if policy.verifiesEarnedReward { callbacks.append("reward") }
-        XCTAssertEqual(callbacks, ["fallback"])
+        XCTAssertTrue(callbacks.isEmpty)
     }
 
     func testAdmittedClosePresentsFallbackThenPublishesClose() {
-        let policy = FullscreenPostPrimaryPolicy(terminalOutcome: .closed)
+        let policy = FullscreenPostPrimaryPolicy(terminalOutcome: .closed, earnedReward: true)
         var callbacks: [String] = []
         if policy.presentsFallbacks { callbacks.append("fallback") }
         if policy.notifiesPublisherClose { callbacks.append("close") }
-        XCTAssertEqual(callbacks, ["fallback", "close"])
+        if policy.verifiesEarnedReward { callbacks.append("reward") }
+        XCTAssertEqual(callbacks, ["fallback", "close", "reward"])
     }
 
     func testNativeVideoTapWithoutRoutableDestinationIsNotAdmitted() {
