@@ -84,6 +84,7 @@ jobs:
               echo "::error::telemetry version does not match $VERSION"
               exit 1
             }
+          ./scripts/validate-artifact-flavor.sh
           if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
             echo "::error::Git tag $VERSION already exists"
             exit 1
