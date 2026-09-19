@@ -25,11 +25,13 @@ struct VideoPlaybackGate: Equatable, Sendable {
     }
 
     var isUnlocked: Bool {
+        if configuredDelay <= 0 { return true }
         guard let gateDuration else { return ended }
         return ended || played >= gateDuration
     }
 
     var progress: Double {
+        if configuredDelay <= 0 { return 1 }
         guard let gateDuration else { return 0 }
         guard gateDuration > 0 else { return 1 }
         return min(1, max(0, played / gateDuration))
