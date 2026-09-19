@@ -236,6 +236,39 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(gate.secondsRemaining, 3)
     }
 
+    func testReadyToPlayUnknownDurationBecomesReadyAndCanPlayWithoutWeakeningItemReadiness() {
+        var gate = VideoPlaybackGate(configuredDelay: 5)
+        gate.update(duration: nil, played: 0)
+
+        XCTAssertEqual(
+            fullscreenVideoReadyStatus(status: .preparing, itemReadyToPlay: true),
+            .ready
+        )
+        XCTAssertTrue(shouldPlayFullscreenVideo(
+            wantsPlayback: true,
+            requiresUserResume: false,
+            appActive: true,
+            presentationBlocked: false,
+            audioInterrupted: false,
+            itemReadyToPlay: true
+        ))
+        XCTAssertNil(gate.duration)
+        XCTAssertFalse(gate.isUnlocked)
+
+        XCTAssertEqual(
+            fullscreenVideoReadyStatus(status: .preparing, itemReadyToPlay: false),
+            .preparing
+        )
+        XCTAssertFalse(shouldPlayFullscreenVideo(
+            wantsPlayback: true,
+            requiresUserResume: false,
+            appActive: true,
+            presentationBlocked: false,
+            audioInterrupted: false,
+            itemReadyToPlay: false
+        ))
+    }
+
     func testTimeControlCallbacksFollowNormalReadyPlayingPausedOrder() {
         var status = FullscreenVideoStatus.ready
 
@@ -443,7 +476,7 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
         state.surfaceDidAppear()
         XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
-        state.parentAccepted()
+        XCTAssertTrue(state.parentResponded(accepted: true))
         XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
     }
 
@@ -455,7 +488,7 @@ final class CreativeVideoTests: XCTestCase {
         state.setPresentationActive(true)
         state.surfaceDidAppear()
         XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
-        state.parentAccepted()
+        XCTAssertTrue(state.parentResponded(accepted: true))
         XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
 
         state.setPresentationActive(false)
@@ -466,8 +499,31 @@ final class CreativeVideoTests: XCTestCase {
         state.setPresentationActive(true)
         state.surfaceDidAppear()
         XCTAssertTrue(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
-        state.parentAccepted()
+        XCTAssertTrue(state.parentResponded(accepted: true))
         XCTAssertFalse(state.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+    }
+
+    func testRejectedParentHandoffKeepsFirstFrameAdmissionAndEndRetryOwnedByPlayer() {
+        let player = NSObject()
+        let identity = ObjectIdentifier(player)
+        var handoff = VideoSurfaceFirstFrameHandoffState()
+        var deadline = VideoFirstFrameDeadlineState()
+        handoff.layerBecameReady(playerIdentity: identity, currentPlayerIdentity: identity)
+        handoff.setPresentationActive(true)
+        handoff.surfaceDidAppear()
+        XCTAssertTrue(deadline.arm())
+
+        XCTAssertFalse(handoff.parentResponded(accepted: false))
+        XCTAssertTrue(handoff.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        XCTAssertTrue(deadline.armed)
+
+        XCTAssertTrue(deadline.deferEndUntilFrame())
+        XCTAssertTrue(handoff.parentResponded(accepted: true))
+        XCTAssertTrue(deadline.admit())
+        XCTAssertTrue(deadline.consumePendingEnd())
+        XCTAssertFalse(handoff.shouldAttemptParentHandoff(currentPlayerIdentity: identity))
+        XCTAssertFalse(handoff.parentResponded(accepted: true))
+        XCTAssertFalse(deadline.admit())
     }
 
     func testStaleLayerReadinessCannotTransferToReplacementSurface() {

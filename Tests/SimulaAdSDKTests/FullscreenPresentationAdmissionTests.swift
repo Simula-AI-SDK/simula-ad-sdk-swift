@@ -259,6 +259,44 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ))
     }
 
+    func testRewardedHTMLFailureStopsGateBeforeDeferredUnearnedTerminalCompletes() {
+        var primaryCreativeReady = true
+        var clock = FullscreenGateClock()
+        var reward = RewardCompletionState()
+        var terminal = DeferredTerminalState<RewardedTerminalOutcome>()
+        clock.resume(at: 0)
+
+        let frozenProgress = stopRewardedHTMLGateAfterFailure(
+            primaryCreativeReady: &primaryCreativeReady,
+            clock: &clock,
+            now: 2,
+            gateDuration: 5
+        )
+        let snapshot = rewardedTerminalOutcome(
+            earned: reward.earned,
+            actualElapsedPlayTime: clock.elapsed,
+            completionReason: reward.reason
+        )
+        XCTAssertNil(terminal.request(snapshot, blocked: true))
+
+        clock.update(at: 10, total: 5)
+        if let reason = rewardedHTMLGateCompletionReason(
+            primaryCreativeReady: primaryCreativeReady,
+            actualElapsedPlayTime: clock.elapsed,
+            gateDuration: 5
+        ) {
+            reward.earn(reason: reason)
+        }
+
+        XCTAssertFalse(primaryCreativeReady)
+        XCTAssertEqual(clock.elapsed, 2)
+        XCTAssertEqual(frozenProgress, 0.4, accuracy: 0.001)
+        XCTAssertFalse(reward.earned)
+        XCTAssertEqual(terminal.blockersDidChange(blocked: false), snapshot)
+        XCTAssertFalse(snapshot.earned)
+        XCTAssertNil(snapshot.completionReason)
+    }
+
     func testConfiguredGateVerificationUsesActualVisiblePlayback() {
         XCTAssertEqual(
             rewardVerificationElapsedPlayTime(

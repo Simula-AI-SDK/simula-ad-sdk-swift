@@ -747,11 +747,25 @@ private struct RewardedGameView: View {
 
     private func handlePlayableFailure(_ reason: String) {
         guard !videoFailureHandled else { return }
+        videoFailureHandled = true
         earlyCompletion.primaryCreativeFailed()
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
-        videoFailureHandled = true
+        timerTask?.cancel()
+        timerTask = nil
+        let frozenProgress = stopRewardedHTMLGateAfterFailure(
+            primaryCreativeReady: &primaryCreativeReady,
+            clock: &gateClock,
+            now: ProcessInfo.processInfo.systemUptime,
+            gateDuration: gateDuration
+        )
+        storePromptVisible = false
+        var tx = Transaction(); tx.disablesAnimations = true
+        withTransaction(tx) {
+            closeProgressAnim = frozenProgress
+            closeGateGeneration += 1
+        }
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "rewarded", adUnitId: nil,
             adId: impressionId, serveId: nil, errorCode: reason

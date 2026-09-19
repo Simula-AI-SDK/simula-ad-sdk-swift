@@ -212,6 +212,26 @@ func videoTimeControlTransition(
     }
 }
 
+func fullscreenVideoReadyStatus(
+    status: FullscreenVideoStatus,
+    itemReadyToPlay: Bool
+) -> FullscreenVideoStatus {
+    guard status == .preparing, itemReadyToPlay else { return status }
+    return .ready
+}
+
+func shouldPlayFullscreenVideo(
+    wantsPlayback: Bool,
+    requiresUserResume: Bool,
+    appActive: Bool,
+    presentationBlocked: Bool,
+    audioInterrupted: Bool,
+    itemReadyToPlay: Bool
+) -> Bool {
+    wantsPlayback && !requiresUserResume && appActive
+        && !presentationBlocked && !audioInterrupted && itemReadyToPlay
+}
+
 func shouldReusePreparedVideoPlayer(
     status: FullscreenVideoStatus,
     isStopped: Bool,
@@ -297,8 +317,10 @@ struct VideoSurfaceFirstFrameHandoffState: Equatable {
             && readyLayerPlayerIdentity == currentPlayerIdentity
     }
 
-    mutating func parentAccepted() {
+    mutating func parentResponded(accepted: Bool) -> Bool {
+        guard accepted, !parentNotifiedForAppearance else { return false }
         parentNotifiedForAppearance = true
+        return true
     }
 }
 
@@ -585,10 +607,14 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     private func updateReadyStateIfPossible() {
-        guard item.status == .readyToPlay, duration != nil, status == .preparing else { return }
+        let nextStatus = fullscreenVideoReadyStatus(
+            status: status,
+            itemReadyToPlay: item.status == .readyToPlay
+        )
+        guard nextStatus != status else { return }
         preparationTimeoutWorkItem?.cancel()
         preparationTimeoutWorkItem = nil
-        status = .ready
+        status = nextStatus
         reconcilePlayback()
     }
 
@@ -742,9 +768,14 @@ final class FullscreenVideoPlayer: ObservableObject {
             player.pause()
             return
         }
-        let canPlay = wantsPlayback && !requiresUserResume && appActive
-            && !presentationBlocked && !audioInterrupted
-            && item.status == .readyToPlay && duration != nil
+        let canPlay = shouldPlayFullscreenVideo(
+            wantsPlayback: wantsPlayback,
+            requiresUserResume: requiresUserResume,
+            appActive: appActive,
+            presentationBlocked: presentationBlocked,
+            audioInterrupted: audioInterrupted,
+            itemReadyToPlay: item.status == .readyToPlay
+        )
         if canPlay {
             scheduleFirstFrameTimeoutIfNeeded()
             player.play()
@@ -1307,9 +1338,11 @@ struct FullscreenVideoSurface: View {
         guard firstFrameHandoff.shouldAttemptParentHandoff(
             currentPlayerIdentity: playerIdentity
         ) else { return }
-        guard videoPlayer.hasAdmittedFirstVisualFrame || videoPlayer.admitFirstVisualFrame() else { return }
-        guard onFirstFrame() else { return }
-        firstFrameHandoff.parentAccepted()
+        guard firstFrameHandoff.parentResponded(accepted: onFirstFrame()) else { return }
+        guard videoPlayer.hasAdmittedFirstVisualFrame || videoPlayer.admitFirstVisualFrame() else {
+            videoPlayer.surfaceReadinessTimedOut()
+            return
+        }
     }
 }
 #else

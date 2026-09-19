@@ -281,6 +281,18 @@ func rewardedHTMLGateCompletionReason(
     return .durationElapsed
 }
 
+func stopRewardedHTMLGateAfterFailure(
+    primaryCreativeReady: inout Bool,
+    clock: inout FullscreenGateClock,
+    now: TimeInterval,
+    gateDuration: TimeInterval
+) -> Double {
+    let wasReady = primaryCreativeReady
+    primaryCreativeReady = false
+    clock.pause(at: now, total: gateDuration)
+    return wasReady ? clock.progress(total: gateDuration) : 0
+}
+
 func rewardedTerminalOutcome(
     earned: Bool,
     actualElapsedPlayTime: TimeInterval,
