@@ -945,7 +945,7 @@ func fallbackVideoCTARoute(
     parentStoreUrl: String? = nil,
     allowsParentFallback: Bool
 ) -> FallbackVideoCTARoute? {
-    if ad.hasItemRoutingFields {
+    if ad.hasIOSItemRoutingFields {
         guard hasRoutableVideoDestination(
             trackingUrl: ad.trackingUrl,
             destination: ad.destinationKind,

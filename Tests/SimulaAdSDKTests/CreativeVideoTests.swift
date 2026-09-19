@@ -119,16 +119,18 @@ final class CreativeVideoTests: XCTestCase {
         ))
     }
 
-    func testAndroidOnlyItemRouteFailsClosedOnIOS() throws {
+    func testDestinationAndAndroidOnlyItemRouteInheritParentOnIOS() throws {
         let ad = try XCTUnwrap(try decodeFallbacks(#"{"ads":[{"type":"video","url":"https://cdn.example/v.mp4","destination":"appstore","android_store_url":"https://play.google.com/store/apps/details?id=example"}]}"#).first)
 
-        XCTAssertTrue(ad.hasItemRoutingFields)
-        XCTAssertNil(fallbackVideoCTARoute(
+        XCTAssertFalse(ad.hasIOSItemRoutingFields)
+        let route = fallbackVideoCTARoute(
             ad: ad,
             parentTrackingUrl: "https://parent.example/click",
             parentDestination: .appstore,
             allowsParentFallback: true
-        ))
+        )
+        XCTAssertEqual(route?.source, .parent)
+        XCTAssertEqual(route?.trackingUrl, "https://parent.example/click")
     }
 
     func testAbsentItemRouteFallsBackOnlyForImperativePresentation() throws {

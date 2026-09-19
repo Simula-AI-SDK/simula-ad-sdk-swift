@@ -1246,8 +1246,8 @@ public struct FallbackAd: Sendable {
         AdDestination(rawValue: destination ?? "") ?? .appstore
     }
     var mediaType: CreativeMediaType { .from(type) }
-    var hasItemRoutingFields: Bool {
-        [destination, trackingUrl, iosStoreUrl, androidStoreUrl].contains {
+    var hasIOSItemRoutingFields: Bool {
+        [trackingUrl, iosStoreUrl].contains {
             $0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         }
     }
