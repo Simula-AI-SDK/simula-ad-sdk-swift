@@ -424,6 +424,11 @@ public struct AdOverlayView: View {
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            onPresentationBlockedChanged?(fallbackPresentationBlocked(
+                appForegrounded: appForegrounded,
+                storeSheetPresented: storeSheetPresented
+            ))
             #endif
             hasAppeared = true
             if screenMountCoordinator.scheduleIfNeeded() {
@@ -966,6 +971,13 @@ public struct AdOverlayView: View {
         }
     }
     #endif
+}
+
+func fallbackPresentationBlocked(
+    appForegrounded: Bool,
+    storeSheetPresented: Bool
+) -> Bool {
+    !appForegrounded || storeSheetPresented
 }
 
 enum FallbackCloseRequestAction: Equatable, Sendable {

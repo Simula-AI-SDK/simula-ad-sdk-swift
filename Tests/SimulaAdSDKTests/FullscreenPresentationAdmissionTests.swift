@@ -664,6 +664,21 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(callbacks.isEmpty)
     }
 
+    func testFallbackInitialBlockerIncludesInactiveAppAndExistingSheet() {
+        XCTAssertFalse(fallbackPresentationBlocked(
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+        XCTAssertTrue(fallbackPresentationBlocked(
+            appForegrounded: false,
+            storeSheetPresented: false
+        ))
+        XCTAssertTrue(fallbackPresentationBlocked(
+            appForegrounded: true,
+            storeSheetPresented: true
+        ))
+    }
+
     func testAdmittedClosePresentsFallbackThenPublishesClose() {
         let policy = FullscreenPostPrimaryPolicy(terminalOutcome: .closed, earnedReward: true)
         var callbacks: [String] = []

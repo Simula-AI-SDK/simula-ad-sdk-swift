@@ -1463,6 +1463,7 @@ enum CreativeCTARouter {
     /// no-window early-return can't wedge all future CTAs shut. Each sheet's delegate
     /// resets it on dismiss.
     private static var isPresentingExternal = false
+    static var isExternalPresentationActive: Bool { isPresentingExternal }
     private static var presentationRootOverrideForTesting: (() -> UIViewController?)?
     private static var viewControllerPresenterForTesting: ((UIViewController) -> Bool)?
 
