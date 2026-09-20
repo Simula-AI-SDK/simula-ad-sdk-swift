@@ -480,7 +480,11 @@ private struct RewardedGameView: View {
         .hideStatusBar(true)
         .onAppear {
             appForegrounded = UIApplication.shared.applicationState == .active
-            admission.setBlocked(storeSheetPresented || !appForegrounded)
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            admission.setBlocked(fullscreenPresentationBlocked(
+                appForegrounded: appForegrounded,
+                storeSheetPresented: storeSheetPresented
+            ))
             viewAppeared = true
             attributionRouteLifecycle.activate()
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }

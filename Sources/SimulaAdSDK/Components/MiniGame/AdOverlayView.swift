@@ -1061,7 +1061,10 @@ func fallbackPresentationBlocked(
     appForegrounded: Bool,
     storeSheetPresented: Bool
 ) -> Bool {
-    !appForegrounded || storeSheetPresented
+    fullscreenPresentationBlocked(
+        appForegrounded: appForegrounded,
+        storeSheetPresented: storeSheetPresented
+    )
 }
 
 func shouldShowFallbackLoadingShield(

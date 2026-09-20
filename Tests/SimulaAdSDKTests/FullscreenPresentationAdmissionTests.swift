@@ -594,6 +594,241 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(ownership.consumedByLoadingPresenter)
     }
 
+    func testMiniGameFallbackFetchCancellationRejectsLateResultWithoutSideEffects() {
+        var ownership = MiniGameFallbackFetchOwnership()
+        let request = ownership.begin(serveId: "serve-a", menuId: "menu-a")
+        var presentationSideEffects = 0
+
+        let resolution = ownership.resolve(
+            request,
+            taskCancelled: true,
+            currentServeId: "serve-a",
+            currentMenuId: "menu-a"
+        )
+        if resolution == .apply { presentationSideEffects += 1 }
+
+        XCTAssertEqual(resolution, .rejectCurrent)
+        XCTAssertEqual(presentationSideEffects, 0)
+        XCTAssertNil(ownership.activeRequest)
+    }
+
+    func testMiniGameFallbackFetchExplicitCancelMakesGenerationStale() {
+        var ownership = MiniGameFallbackFetchOwnership()
+        let request = ownership.begin(serveId: "serve-a", menuId: "menu-a")
+
+        ownership.cancel()
+
+        XCTAssertEqual(ownership.resolve(
+            request,
+            taskCancelled: false,
+            currentServeId: "serve-a",
+            currentMenuId: "menu-a"
+        ), .stale)
+        XCTAssertNil(ownership.activeRequest)
+    }
+
+    func testMiniGameFallbackFetchGenerationAndContextOwnResultApplication() {
+        var ownership = MiniGameFallbackFetchOwnership()
+        let superseded = ownership.begin(serveId: "serve-a", menuId: "menu-a")
+        let current = ownership.begin(serveId: "serve-b", menuId: "menu-a")
+
+        XCTAssertEqual(ownership.resolve(
+            superseded,
+            taskCancelled: false,
+            currentServeId: "serve-b",
+            currentMenuId: "menu-a"
+        ), .stale)
+        XCTAssertEqual(ownership.resolve(
+            current,
+            taskCancelled: false,
+            currentServeId: "serve-b",
+            currentMenuId: "menu-a"
+        ), .apply)
+
+        let wrongMenu = ownership.begin(serveId: "serve-c", menuId: "menu-a")
+        XCTAssertEqual(ownership.resolve(
+            wrongMenu,
+            taskCancelled: false,
+            currentServeId: "serve-c",
+            currentMenuId: "menu-b"
+        ), .rejectCurrent)
+        XCTAssertNil(ownership.activeRequest)
+    }
+
+    @MainActor
+    func testMiniGameFallbackVideoReacquiresOnceAfterDisappearReappear() {
+        final class Resource {}
+        var factoryCalls = 0
+        var stopCalls = 0
+        func makeOwnership() -> FallbackVideoOwnership<Resource, String> {
+            FallbackVideoOwnership(
+                token: nil,
+                claim: { _ in nil },
+                discardUnclaimed: { _ in },
+                makeCold: { factoryCalls += 1; return Resource() },
+                releaseClaimed: { _ in },
+                stopCold: { _ in stopCalls += 1 }
+            )
+        }
+
+        var ownership: FallbackVideoOwnership<Resource, String>? = makeOwnership()
+        let firstPlayer = ownership?.resource
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: ownership?.resource != nil
+        ), .none)
+
+        let disappearAction = miniGameFallbackVideoLifecycleAction(
+            event: .disappear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: ownership?.resource != nil
+        )
+        XCTAssertEqual(disappearAction, .release)
+        if disappearAction == .release {
+            ownership?.release()
+            ownership = nil
+        }
+
+        let reappearAction = miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: false
+        )
+        XCTAssertEqual(reappearAction, .reconcile)
+        if reappearAction == .reconcile { ownership = makeOwnership() }
+
+        let reappearedPlayer = retainedFallbackVideoResource(
+            requestedIndex: 1,
+            ownershipIndex: 1,
+            resource: ownership?.resource
+        )
+        let rebuiltPlayer = retainedFallbackVideoResource(
+            requestedIndex: 1,
+            ownershipIndex: 1,
+            resource: ownership?.resource
+        )
+        XCTAssertFalse(firstPlayer === reappearedPlayer)
+        XCTAssertTrue(reappearedPlayer === rebuiltPlayer)
+        XCTAssertNil(retainedFallbackVideoResource(
+            requestedIndex: 2,
+            ownershipIndex: 1,
+            resource: ownership?.resource
+        ))
+        XCTAssertEqual(factoryCalls, 2)
+        XCTAssertEqual(stopCalls, 1)
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: ownership?.resource != nil
+        ), .none)
+
+        ownership?.release()
+        XCTAssertEqual(stopCalls, 2)
+    }
+
+    @MainActor
+    func testFallbackVideoOwnershipUsesColdPlayerWhenTokenIsMissing() {
+        final class Resource {}
+        let cold = Resource()
+        var factoryCalls = 0
+        var stopCalls = 0
+        let ownership = FallbackVideoOwnership<Resource, String>(
+            token: nil,
+            claim: { _ in XCTFail("A missing token must not be claimed"); return nil },
+            discardUnclaimed: { _ in XCTFail("A missing token has nothing to discard") },
+            makeCold: { factoryCalls += 1; return cold },
+            releaseClaimed: { _ in XCTFail("A cold player must not release a pool claim") },
+            stopCold: { resource in
+                XCTAssertTrue(resource === cold)
+                stopCalls += 1
+            }
+        )
+
+        XCTAssertTrue(ownership.resource === cold)
+        XCTAssertEqual(factoryCalls, 1)
+        ownership.release()
+        ownership.release()
+        XCTAssertEqual(stopCalls, 1)
+    }
+
+    @MainActor
+    func testFallbackVideoOwnershipUsesColdPlayerWhenClaimFails() {
+        final class Resource {}
+        let cold = Resource()
+        var discardedTokens: [String] = []
+        var pooledReleaseCalls = 0
+        var stopCalls = 0
+        let ownership = FallbackVideoOwnership<Resource, String>(
+            token: "prepared",
+            claim: { token in
+                XCTAssertEqual(token, "prepared")
+                return nil
+            },
+            discardUnclaimed: { discardedTokens.append($0) },
+            makeCold: { cold },
+            releaseClaimed: { _ in pooledReleaseCalls += 1 },
+            stopCold: { _ in stopCalls += 1 }
+        )
+
+        XCTAssertTrue(ownership.resource === cold)
+        XCTAssertEqual(discardedTokens, ["prepared"])
+        ownership.release()
+        ownership.release()
+        XCTAssertEqual(pooledReleaseCalls, 0)
+        XCTAssertEqual(stopCalls, 1)
+    }
+
+    @MainActor
+    func testFallbackVideoOwnershipReusesClaimAcrossViewRebuildsAndReleasesOnce() {
+        final class Resource {}
+        let pooled = Resource()
+        var claimCalls = 0
+        var factoryCalls = 0
+        var releasedTokens: [String] = []
+        var stopCalls = 0
+        let ownership = FallbackVideoOwnership<Resource, String>(
+            token: "prepared",
+            claim: { _ in claimCalls += 1; return pooled },
+            discardUnclaimed: { _ in XCTFail("A claimed token must not be discarded") },
+            makeCold: { factoryCalls += 1; return Resource() },
+            releaseClaimed: { releasedTokens.append($0) },
+            stopCold: { _ in stopCalls += 1 }
+        )
+
+        let firstBuild = retainedFallbackVideoResource(
+            requestedIndex: 0,
+            ownershipIndex: 0,
+            resource: ownership.resource
+        )
+        let secondBuild = retainedFallbackVideoResource(
+            requestedIndex: 0,
+            ownershipIndex: 0,
+            resource: ownership.resource
+        )
+        XCTAssertTrue(firstBuild === pooled)
+        XCTAssertTrue(secondBuild === pooled)
+        XCTAssertNil(retainedFallbackVideoResource(
+            requestedIndex: 1,
+            ownershipIndex: 0,
+            resource: ownership.resource
+        ))
+        XCTAssertEqual(claimCalls, 1)
+        XCTAssertEqual(factoryCalls, 0)
+        ownership.release()
+        ownership.release()
+        XCTAssertEqual(releasedTokens, ["prepared"])
+        XCTAssertEqual(stopCalls, 0)
+    }
+
     func testPreparedPlayerRetentionIsBoundedAndNeverEvictsActiveEntry() {
         let policy = VideoPreparationRetentionPolicy(capacity: 2, retention: 300)
         let active = UUID()
@@ -990,16 +1225,16 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(callbacks.isEmpty)
     }
 
-    func testFallbackInitialBlockerIncludesInactiveAppAndExistingSheet() {
-        XCTAssertFalse(fallbackPresentationBlocked(
+    func testFullscreenPresenterInitialBlockerIncludesInactiveAppAndExistingSheet() {
+        XCTAssertFalse(fullscreenPresentationBlocked(
             appForegrounded: true,
             storeSheetPresented: false
         ))
-        XCTAssertTrue(fallbackPresentationBlocked(
+        XCTAssertTrue(fullscreenPresentationBlocked(
             appForegrounded: false,
             storeSheetPresented: false
         ))
-        XCTAssertTrue(fallbackPresentationBlocked(
+        XCTAssertTrue(fullscreenPresentationBlocked(
             appForegrounded: true,
             storeSheetPresented: true
         ))
@@ -1505,18 +1740,34 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testUnmatchedInterruptionAcrossReactivationOffersResumeAndExplicitResumeClearsIt() async {
-        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
-        player.play()
+    func testAudioInterruptionObserverForwardsBeganNotification() async {
+        let player = FullscreenVideoPlayer.makeStateTestingPlayer(
+            url: URL(fileURLWithPath: "/dev/null"),
+            posterURL: nil
+        )
+        defer { player.stop() }
+        await Task.yield()
+        XCTAssertEqual(player.status, .preparing)
+        XCTAssertFalse(player.status.isTerminal)
         NotificationCenter.default.post(
             name: AVAudioSession.interruptionNotification,
             object: nil,
             userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
         )
-        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
-        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        await waitUntil { player.hasActiveAudioInterruption }
+        XCTAssertEqual(player.status, .preparing)
+        XCTAssertFalse(player.status.isTerminal)
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+    }
 
-        await waitUntil { player.requiresUserResume }
+    @MainActor
+    func testUnmatchedInterruptionAcrossReactivationOffersResumeAndExplicitResumeClearsIt() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        player.play()
+        player.receiveAudioInterruption(type: .began)
+        player.receiveApplicationActiveState(false)
+        player.receiveApplicationActiveState(true)
+
         XCTAssertTrue(player.requiresUserResume)
         XCTAssertTrue(player.hasActiveAudioInterruption)
         player.resumeAfterInterruption()
@@ -1526,18 +1777,13 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testInterruptionBeforeFirstFrameStillOffersRecoveryAfterFrameAdmission() async {
+    func testInterruptionBeforeFirstFrameStillOffersRecoveryAfterFrameAdmission() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
         player.play()
-        NotificationCenter.default.post(
-            name: AVAudioSession.interruptionNotification,
-            object: nil,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
-        )
-        await waitUntil {
-            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
-        }
+        player.receiveAudioInterruption(type: .began)
 
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.hasPendingInterruptionFallback)
         XCTAssertTrue(player.admitFirstVisualFrame())
         XCTAssertTrue(player.hasPendingInterruptionFallback)
         player.fireInterruptionFallbackForTests()
@@ -1549,17 +1795,13 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testLongSystemInterruptionRemainsActiveUntilExplicitRecovery() async {
+    func testLongSystemInterruptionRemainsActiveUntilExplicitRecovery() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
         player.play()
-        NotificationCenter.default.post(
-            name: AVAudioSession.interruptionNotification,
-            object: nil,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
-        )
-        await waitUntil {
-            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
-        }
+        player.receiveAudioInterruption(type: .began)
+
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.hasPendingInterruptionFallback)
         player.fireInterruptionFallbackForTests()
 
         XCTAssertTrue(player.hasActiveAudioInterruption)
@@ -1575,17 +1817,12 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testIdleInterruptionRearmsRecoveryWhenPlaybackIsRequestedLater() async {
+    func testIdleInterruptionRearmsRecoveryWhenPlaybackIsRequestedLater() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
-        NotificationCenter.default.post(
-            name: AVAudioSession.interruptionNotification,
-            object: nil,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
-        )
-        await waitUntil {
-            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
-        }
+        player.receiveAudioInterruption(type: .began)
 
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.hasPendingInterruptionFallback)
         player.fireInterruptionFallbackForTests()
         XCTAssertTrue(player.hasActiveAudioInterruption)
         XCTAssertFalse(player.requiresUserResume)
@@ -1644,6 +1881,20 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
 
         pool.release(firstToken)
         pool.release(secondToken)
+    }
+
+    @MainActor
+    func testDiscardingUnclaimedPreparationNeverStopsActivePooledPlayer() throws {
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        let url = URL(fileURLWithPath: "/dev/null")
+        let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil))
+        let player = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
+
+        pool.discardPrepared(token)
+
+        XCTAssertFalse(player.isStopped)
+        pool.release(token)
+        XCTAssertTrue(player.isStopped)
     }
 
     @MainActor

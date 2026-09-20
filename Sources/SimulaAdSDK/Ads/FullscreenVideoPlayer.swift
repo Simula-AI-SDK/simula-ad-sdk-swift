@@ -719,6 +719,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var audioInterrupted = false
     private var interruptionPausedPlayback = false
     private var stopped = false
+    private let mediaObservationEnabled: Bool
 
     var isStopped: Bool { stopped }
     var hasAdmittedFirstVisualFrame: Bool { firstFrameDeadline.admitted }
@@ -732,16 +733,29 @@ final class FullscreenVideoPlayer: ObservableObject {
         workItem.perform()
     }
 
-    init(url: URL, posterURL: URL?) {
+    convenience init(url: URL, posterURL: URL?) {
+        self.init(url: url, posterURL: posterURL, mediaObservationEnabled: true)
+    }
+
+    static func makeStateTestingPlayer(url: URL, posterURL: URL?) -> FullscreenVideoPlayer {
+        FullscreenVideoPlayer(
+            url: url,
+            posterURL: posterURL,
+            mediaObservationEnabled: false
+        )
+    }
+
+    private init(url: URL, posterURL: URL?, mediaObservationEnabled: Bool) {
         self.posterURL = posterURL
+        self.mediaObservationEnabled = mediaObservationEnabled
         let item = AVPlayerItem(url: url)
         self.item = item
         self.player = AVPlayer(playerItem: item)
         self.audioTrackIsolation = VideoAudioTrackIsolation(item: item)
         player.isMuted = true
         player.actionAtItemEnd = .pause
-        installObservers()
-        if appActive { schedulePreparationTimeout() }
+        installObservers(mediaObservationEnabled: mediaObservationEnabled)
+        if mediaObservationEnabled, appActive { schedulePreparationTimeout() }
     }
 
     deinit {
@@ -844,44 +858,45 @@ final class FullscreenVideoPlayer: ObservableObject {
         removeObservers()
     }
 
-    private func installObservers() {
-        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            DispatchQueue.main.async { self?.handleItemStatus(item.status) }
-        }
-        durationObservation = item.observe(\.duration, options: [.initial, .new]) { [weak self] item, _ in
-            DispatchQueue.main.async { self?.handleDuration(item.duration) }
-        }
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            DispatchQueue.main.async { self?.handleTimeControlStatus(player.timeControlStatus) }
-        }
-        periodicTimeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            DispatchQueue.main.async { self?.handlePeriodicTime(time) }
-        }
-
+    private func installObservers(mediaObservationEnabled: Bool) {
         let center = NotificationCenter.default
-        notificationObservers.append(center.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in DispatchQueue.main.async { self?.handleEnded() } })
-        notificationObservers.append(center.addObserver(
-            forName: .AVPlayerItemFailedToPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in DispatchQueue.main.async { self?.fail(.playbackFailed) } })
+        if mediaObservationEnabled {
+            itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+                DispatchQueue.main.async { self?.handleItemStatus(item.status) }
+            }
+            durationObservation = item.observe(\.duration, options: [.initial, .new]) { [weak self] item, _ in
+                DispatchQueue.main.async { self?.handleDuration(item.duration) }
+            }
+            timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+                DispatchQueue.main.async { self?.handleTimeControlStatus(player.timeControlStatus) }
+            }
+            periodicTimeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
+                queue: .main
+            ) { [weak self] time in
+                DispatchQueue.main.async { self?.handlePeriodicTime(time) }
+            }
+            notificationObservers.append(center.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime,
+                object: item,
+                queue: .main
+            ) { [weak self] _ in DispatchQueue.main.async { self?.handleEnded() } })
+            notificationObservers.append(center.addObserver(
+                forName: .AVPlayerItemFailedToPlayToEndTime,
+                object: item,
+                queue: .main
+            ) { [weak self] _ in DispatchQueue.main.async { self?.fail(.playbackFailed) } })
+        }
         notificationObservers.append(center.addObserver(
             forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in DispatchQueue.main.async { self?.setAppActive(false) } })
+        ) { [weak self] _ in DispatchQueue.main.async { self?.receiveApplicationActiveState(false) } })
         notificationObservers.append(center.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in DispatchQueue.main.async { self?.setAppActive(true) } })
+        ) { [weak self] _ in DispatchQueue.main.async { self?.receiveApplicationActiveState(true) } })
         notificationObservers.append(center.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil,
@@ -907,7 +922,8 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     private func schedulePreparationTimeout() {
-        guard preparationTimeoutWorkItem == nil, status == .preparing, appActive else { return }
+        guard mediaObservationEnabled, preparationTimeoutWorkItem == nil,
+              status == .preparing, appActive else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.preparationTimedOut()
         }
@@ -1050,7 +1066,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         status = .failed(reason)
     }
 
-    private func setAppActive(_ active: Bool) {
+    func receiveApplicationActiveState(_ active: Bool) {
+        guard !stopped else { return }
         appActive = active
         if active {
             offerResumeForUnmatchedAudioInterruption()
@@ -1065,6 +1082,14 @@ final class FullscreenVideoPlayer: ObservableObject {
     private func handleAudioInterruption(_ notification: Notification) {
         guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        receiveAudioInterruption(type: type, userInfo: notification.userInfo)
+    }
+
+    func receiveAudioInterruption(
+        type: AVAudioSession.InterruptionType,
+        userInfo: [AnyHashable: Any]? = nil
+    ) {
+        guard !stopped else { return }
         switch type {
         case .began:
             interruptionPausedPlayback = wantsPlayback && appActive && !presentationBlocked
@@ -1077,7 +1102,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             audioInterrupted = false
             let action = videoInterruptionEndAction(
                 pausedByInterruption: interruptionPausedPlayback,
-                userInfo: notification.userInfo
+                userInfo: userInfo
             )
             interruptionPausedPlayback = false
             applyInterruptionEndAction(action)
@@ -1175,7 +1200,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     private func scheduleFirstFrameTimeoutIfNeeded() {
-        guard firstFrameDeadline.arm() else { return }
+        guard mediaObservationEnabled, firstFrameDeadline.arm() else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.firstFrameTimedOut()
         }
@@ -1317,6 +1342,11 @@ final class FullscreenVideoPreparationPool {
         guard let token, let entry = entries.removeValue(forKey: token) else { return }
         entry.expiry?.cancel()
         entry.player.stop()
+    }
+
+    func discardPrepared(_ token: FullscreenVideoPreparationToken?) {
+        guard let token, entries[token]?.active == false else { return }
+        release(token)
     }
 
     private func makeRoomForPlayer() -> Bool {

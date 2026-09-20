@@ -67,6 +67,53 @@ final class FallbackPrefetchOwnership {
     }
 }
 
+/// Owns exactly one fallback video resource across repeated view construction. A prepared token is
+/// released only after a successful claim; failed claims discard only inactive preparation before
+/// falling back to a cold resource.
+@MainActor
+final class FallbackVideoOwnership<Resource: AnyObject, Token> {
+    private(set) var resource: Resource?
+    private var cleanup: (() -> Void)?
+
+    init(
+        token: Token?,
+        claim: (Token) -> Resource?,
+        discardUnclaimed: (Token) -> Void,
+        makeCold: () -> Resource,
+        releaseClaimed: @escaping (Token) -> Void,
+        stopCold: @escaping (Resource) -> Void
+    ) {
+        if let token, let claimed = claim(token) {
+            resource = claimed
+            cleanup = { releaseClaimed(token) }
+        } else {
+            if let token { discardUnclaimed(token) }
+            let cold = makeCold()
+            resource = cold
+            cleanup = { stopCold(cold) }
+        }
+    }
+
+    func release() {
+        guard let cleanup else { return }
+        self.cleanup = nil
+        resource = nil
+        cleanup()
+    }
+
+    deinit {
+        cleanup?()
+    }
+}
+
+func retainedFallbackVideoResource<Resource: AnyObject>(
+    requestedIndex: Int,
+    ownershipIndex: Int?,
+    resource: Resource?
+) -> Resource? {
+    requestedIndex == ownershipIndex ? resource : nil
+}
+
 #if os(iOS)
 @MainActor
 func prepareUpcomingFallbackVideos(_ ads: [FallbackAd]) -> [Int: FullscreenVideoPreparationToken] {
@@ -92,6 +139,24 @@ func prepareUpcomingFallbackVideos(
 func releasePreparedFallbackVideos(in result: FallbackFetchResult?) {
     guard case .content(_, let preparedVideos) = result else { return }
     preparedVideos.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
+}
+
+@MainActor
+func makeFallbackVideoOwnership(
+    url: URL,
+    posterURL: URL?,
+    token: FullscreenVideoPreparationToken?,
+    pool: FullscreenVideoPreparationPool = .shared,
+    makePlayer: (URL, URL?) -> FullscreenVideoPlayer = FullscreenVideoPlayer.init
+) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
+    FallbackVideoOwnership(
+        token: token,
+        claim: { pool.claim($0, url: url, posterURL: posterURL) },
+        discardUnclaimed: { pool.discardPrepared($0) },
+        makeCold: { makePlayer(url, posterURL) },
+        releaseClaimed: { pool.release($0) },
+        stopCold: { $0.stop() }
+    )
 }
 #endif
 
@@ -260,6 +325,11 @@ final class FallbackAdPresenter {
     private var failureAdvanceState = FallbackFailureAdvanceState()
     /// Retain only process-pooled preparation tokens for the current and immediately-next fallback.
     private var videoPreparations: [Int: FullscreenVideoPreparationToken] = [:]
+    private var videoOwnershipIndex: Int?
+    private var videoOwnership: FallbackVideoOwnership<
+        FullscreenVideoPlayer,
+        FullscreenVideoPreparationToken
+    >?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onFinish` is then never called).
@@ -526,7 +596,7 @@ final class FallbackAdPresenter {
             ad: ad,
             onClose: { [weak self] in self?.advance(from: index) },
             onCreativeFailure: { [weak self] in self?.advanceAfterCreativeFailure(from: index) },
-            videoPlayer: claimedVideoPlayer(at: index),
+            videoPlayer: retainedVideoPlayer(at: index),
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
             closeBehavior: ad.closeBehavior,
@@ -630,7 +700,8 @@ final class FallbackAdPresenter {
             releaseVideoPreparation(at: playerIndex)
         }
         for playerIndex in retainedIndices where ads.indices.contains(playerIndex) {
-            guard videoPreparations[playerIndex] == nil,
+            guard videoOwnershipIndex != playerIndex,
+                  videoPreparations[playerIndex] == nil,
                   case .video(let url, let posterURL) = ads[playerIndex].creativeContent else { continue }
             videoPreparations[playerIndex] = FullscreenVideoPreparationPool.shared.prepare(
                 url: url,
@@ -639,15 +710,39 @@ final class FallbackAdPresenter {
         }
     }
 
-    private func claimedVideoPlayer(at playerIndex: Int) -> FullscreenVideoPlayer? {
+    private func retainedVideoPlayer(at playerIndex: Int) -> FullscreenVideoPlayer? {
         guard ads.indices.contains(playerIndex),
-              let token = videoPreparations[playerIndex],
-              case .video(let url, let posterURL) = ads[playerIndex].creativeContent else { return nil }
-        return FullscreenVideoPreparationPool.shared.claim(token, url: url, posterURL: posterURL)
+              case .video(let url, let posterURL) = ads[playerIndex].creativeContent else {
+            releaseVideoOwnership()
+            return nil
+        }
+        if let player = retainedFallbackVideoResource(
+            requestedIndex: playerIndex,
+            ownershipIndex: videoOwnershipIndex,
+            resource: videoOwnership?.resource
+        ) {
+            return player
+        }
+        releaseVideoOwnership()
+        let ownership = makeFallbackVideoOwnership(
+            url: url,
+            posterURL: posterURL,
+            token: videoPreparations.removeValue(forKey: playerIndex)
+        )
+        videoOwnershipIndex = playerIndex
+        videoOwnership = ownership
+        return ownership.resource
     }
 
     private func releaseVideoPreparation(at playerIndex: Int) {
+        if videoOwnershipIndex == playerIndex { releaseVideoOwnership() }
         FullscreenVideoPreparationPool.shared.release(videoPreparations.removeValue(forKey: playerIndex))
+    }
+
+    private func releaseVideoOwnership() {
+        videoOwnership?.release()
+        videoOwnership = nil
+        videoOwnershipIndex = nil
     }
 
     /// Tears down the presentation window and fires the close callback once.
@@ -667,6 +762,7 @@ final class FallbackAdPresenter {
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
         failureAdvanceState.clear()
+        releaseVideoOwnership()
         videoPreparations.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
         videoPreparations.removeAll()
         currentRouteLifecycle?.deactivate()

@@ -1,5 +1,12 @@
 import Foundation
 
+func fullscreenPresentationBlocked(
+    appForegrounded: Bool,
+    storeSheetPresented: Bool
+) -> Bool {
+    !appForegrounded || storeSheetPresented
+}
+
 struct FullscreenVisualAdmissionState: Equatable, Sendable {
     enum DisplayOutcome: Equatable, Sendable {
         case pending

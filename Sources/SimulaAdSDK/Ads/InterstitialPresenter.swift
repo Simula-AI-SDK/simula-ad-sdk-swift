@@ -445,7 +445,11 @@ private struct CreativeInterstitialView: View {
         .hideStatusBar(true)
         .onAppear {
             appForegrounded = UIApplication.shared.applicationState == .active
-            admission.setBlocked(storeSheetPresented || !appForegrounded)
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            admission.setBlocked(fullscreenPresentationBlocked(
+                appForegrounded: appForegrounded,
+                storeSheetPresented: storeSheetPresented
+            ))
             viewAppeared = true
             attributionRouteLifecycle.activate()
             if storeExit == nil {
