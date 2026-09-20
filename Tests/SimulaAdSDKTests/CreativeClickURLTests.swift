@@ -173,6 +173,29 @@ final class CreativeClickURLTests: XCTestCase {
         ))
     }
 
+    func testFallbackVideoLoadingShieldDoesNotCoverInterruptionRecovery() {
+        XCTAssertFalse(shouldShowFallbackLoadingShield(
+            isVideo: true,
+            adPageReady: false,
+            terminalFailure: false
+        ))
+        XCTAssertTrue(shouldShowFallbackLoadingShield(
+            isVideo: true,
+            adPageReady: true,
+            terminalFailure: true
+        ))
+        XCTAssertTrue(shouldShowFallbackLoadingShield(
+            isVideo: false,
+            adPageReady: false,
+            terminalFailure: false
+        ))
+        XCTAssertFalse(shouldShowFallbackLoadingShield(
+            isVideo: false,
+            adPageReady: true,
+            terminalFailure: false
+        ))
+    }
+
     func testFailedFallbackVideoCloseRequestsDeferredAdvanceBeforeFirstFrame() {
         XCTAssertEqual(
             fallbackCloseRequestAction(
@@ -218,6 +241,33 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertFalse(state.request(index: 1, blocked: true))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 1), 1)
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
+    }
+
+    func testFailedFallbackHTMLRetainsManualCloseProgression() {
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: false,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: false,
+                clickHandoffPending: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: false,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: false
+            ),
+            .close
+        )
     }
 
     func testFallbackClickAccountingKeepsTelemetryAndPublisherWhenServerOwnsNoBeacon() {

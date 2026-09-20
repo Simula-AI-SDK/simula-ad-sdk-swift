@@ -21,7 +21,7 @@ struct VideoPlaybackGate: Equatable, Sendable {
     }
 
     var gateDuration: TimeInterval? {
-        duration.map { min(configuredDelay, $0) }
+        min(configuredDelay, duration ?? configuredDelay)
     }
 
     var isUnlocked: Bool {
@@ -377,6 +377,22 @@ enum VideoInterruptionEndAction: Equatable {
     case reconcile
 }
 
+func shouldOfferVideoInterruptionResume(
+    audioInterrupted: Bool,
+    wantsPlayback: Bool
+) -> Bool {
+    audioInterrupted && wantsPlayback
+}
+
+func shouldScheduleVideoInterruptionFallback(
+    audioInterrupted: Bool,
+    wantsPlayback: Bool,
+    resumeOffered: Bool,
+    fallbackPending: Bool
+) -> Bool {
+    audioInterrupted && wantsPlayback && !resumeOffered && !fallbackPending
+}
+
 func videoInterruptionEndAction(
     pausedByInterruption: Bool,
     userInfo: [AnyHashable: Any]?
@@ -390,6 +406,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     static let preparationTimeout: TimeInterval = 10
     static let firstFrameTimeout: TimeInterval = 10
     static let pendingEndFrameGrace: TimeInterval = 0.5
+    static let unmatchedInterruptionFallback: TimeInterval = 1
 
     @Published private(set) var status: FullscreenVideoStatus = .preparing
     @Published private(set) var duration: TimeInterval?
@@ -410,6 +427,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var playbackTimeoutWorkItem: DispatchWorkItem?
     private var firstFrameTimeoutWorkItem: DispatchWorkItem?
     private var pendingEndGraceWorkItem: DispatchWorkItem?
+    private var interruptionFallbackWorkItem: DispatchWorkItem?
     private var visiblePlaybackClock = VideoVisiblePlaybackClock()
     private var firstFrameDeadline = VideoFirstFrameDeadlineState()
     private var wantsPlayback = false
@@ -421,6 +439,15 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     var isStopped: Bool { stopped }
     var hasAdmittedFirstVisualFrame: Bool { firstFrameDeadline.admitted }
+    var hasActiveAudioInterruption: Bool { audioInterrupted }
+    var hasPendingInterruptionFallback: Bool {
+        interruptionFallbackWorkItem?.isCancelled == false
+    }
+
+    func fireInterruptionFallbackForTests() {
+        guard let workItem = interruptionFallbackWorkItem, !workItem.isCancelled else { return }
+        workItem.perform()
+    }
 
     init(url: URL, posterURL: URL?) {
         self.posterURL = posterURL
@@ -437,6 +464,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         playbackTimeoutWorkItem?.cancel()
         firstFrameTimeoutWorkItem?.cancel()
         pendingEndGraceWorkItem?.cancel()
+        interruptionFallbackWorkItem?.cancel()
         itemStatusObservation?.invalidate()
         durationObservation?.invalidate()
         timeControlObservation?.invalidate()
@@ -449,11 +477,23 @@ final class FullscreenVideoPlayer: ObservableObject {
     func play() {
         guard !stopped else { return }
         wantsPlayback = true
+        if shouldScheduleVideoInterruptionFallback(
+            audioInterrupted: audioInterrupted,
+            wantsPlayback: wantsPlayback,
+            resumeOffered: requiresUserResume,
+            fallbackPending: hasPendingInterruptionFallback
+        ) {
+            scheduleUnmatchedInterruptionFallback()
+        }
         reconcilePlayback()
     }
 
     func resumeAfterInterruption() {
-        guard !stopped, requiresUserResume else { return }
+        guard !stopped, requiresUserResume || audioInterrupted else { return }
+        interruptionFallbackWorkItem?.cancel()
+        interruptionFallbackWorkItem = nil
+        audioInterrupted = false
+        interruptionPausedPlayback = false
         requiresUserResume = false
         wantsPlayback = true
         reconcilePlayback()
@@ -504,6 +544,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         firstFrameTimeoutWorkItem = nil
         pendingEndGraceWorkItem?.cancel()
         pendingEndGraceWorkItem = nil
+        interruptionFallbackWorkItem?.cancel()
+        interruptionFallbackWorkItem = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         removeObservers()
@@ -692,6 +734,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         firstFrameTimeoutWorkItem = nil
         pendingEndGraceWorkItem?.cancel()
         pendingEndGraceWorkItem = nil
+        interruptionFallbackWorkItem?.cancel()
+        interruptionFallbackWorkItem = nil
         status = .ended
     }
 
@@ -706,6 +750,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         firstFrameTimeoutWorkItem = nil
         pendingEndGraceWorkItem?.cancel()
         pendingEndGraceWorkItem = nil
+        interruptionFallbackWorkItem?.cancel()
+        interruptionFallbackWorkItem = nil
         wantsPlayback = false
         player.pause()
         status = .failed(reason)
@@ -714,6 +760,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     private func setAppActive(_ active: Bool) {
         appActive = active
         if active {
+            offerResumeForUnmatchedAudioInterruption()
             schedulePreparationTimeout()
         } else {
             preparationTimeoutWorkItem?.cancel()
@@ -730,7 +777,10 @@ final class FullscreenVideoPlayer: ObservableObject {
             interruptionPausedPlayback = wantsPlayback && appActive && !presentationBlocked
             audioInterrupted = true
             reconcilePlayback()
+            scheduleUnmatchedInterruptionFallback()
         case .ended:
+            interruptionFallbackWorkItem?.cancel()
+            interruptionFallbackWorkItem = nil
             audioInterrupted = false
             let action = videoInterruptionEndAction(
                 pausedByInterruption: interruptionPausedPlayback,
@@ -747,6 +797,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         guard !stopped else { return }
         switch action {
         case .reconcile:
+            requiresUserResume = false
             reconcilePlayback()
         case .resume:
             requiresUserResume = false
@@ -756,6 +807,30 @@ final class FullscreenVideoPlayer: ObservableObject {
             requiresUserResume = true
             reconcilePlayback()
         }
+    }
+
+    private func scheduleUnmatchedInterruptionFallback() {
+        interruptionFallbackWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.interruptionFallbackWorkItem = nil
+            guard self.appActive else { return }
+            self.offerResumeForUnmatchedAudioInterruption()
+        }
+        interruptionFallbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.unmatchedInterruptionFallback,
+            execute: workItem
+        )
+    }
+
+    private func offerResumeForUnmatchedAudioInterruption() {
+        guard !stopped, !isFailed, status != .ended, audioInterrupted else { return }
+        requiresUserResume = shouldOfferVideoInterruptionResume(
+            audioInterrupted: audioInterrupted,
+            wantsPlayback: wantsPlayback
+        )
+        reconcilePlayback()
     }
 
     private func reconcilePlayback() {
@@ -1066,7 +1141,7 @@ final class FullscreenVideoPreparationOwnership {
 enum FullscreenVideoPreparationReservation {
     case notRequired
     case reserved(FullscreenVideoPreparationOwnership)
-    case unavailable
+    case cold
 }
 
 @MainActor
@@ -1084,7 +1159,7 @@ func reserveFullscreenVideoPreparation(
     prepare: (URL, URL?) -> FullscreenVideoPreparationToken?
 ) -> FullscreenVideoPreparationReservation {
     guard case .video(let url, let posterURL) = creative else { return .notRequired }
-    guard let token = prepare(url, posterURL) else { return .unavailable }
+    guard let token = prepare(url, posterURL) else { return .cold }
     return .reserved(FullscreenVideoPreparationOwnership(token: token))
 }
 

@@ -170,7 +170,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         await waitUntil { store.persisted.isEmpty }
     }
 
-    func testUnknownCompletionReasonFailsWholeQueueWithoutSendingOrDeletingRows() async throws {
+    func testUnknownCompletionReasonIsPreservedWhileSupportedRowsDrain() async throws {
         let data = Data(#"[{"serveId":"future","sessionId":"s","elapsedPlayTime":1,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"future_reason"},{"serveId":"known","sessionId":"s","elapsedPlayTime":2,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"duration_elapsed"}]"#.utf8)
         let seeded = try JSONDecoder().decode([PendingVerification].self, from: data)
         let verifier = FakeVerifier()
@@ -178,13 +178,36 @@ final class RewardVerificationManagerTests: XCTestCase {
         let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         mgr.triggerProcessQueue()
+        await waitUntil { verifier.callOrder == ["known"] && store.persisted.count == 1 }
+
+        XCTAssertEqual(verifier.callOrder, ["known"])
+        XCTAssertEqual(store.persisted.map(\.serveId), ["future"])
+        XCTAssertEqual(store.persisted.first?.completionReasonRawValue, "future_reason")
+        XCTAssertTrue(store.persisted.first?.hasUnsupportedCompletionReason == true)
+        await mgr.cancelPendingWorkForTests()
+    }
+
+    func testUnsupportedOnlyQueueDoesNotScheduleHotRetry() async throws {
+        let data = Data(#"[{"serveId":"future","sessionId":"s","elapsedPlayTime":1,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"future_reason"}]"#.utf8)
+        let seeded = try JSONDecoder().decode([PendingVerification].self, from: data)
+        let verifier = FakeVerifier()
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { 0 },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        mgr.triggerProcessQueue()
         await waitUntil { store.loadCount == 1 }
         await mgr.waitForExecutorForTests()
 
         XCTAssertEqual(verifier.callOrder, [])
-        XCTAssertEqual(store.persisted.map(\.serveId), ["future", "known"])
-        XCTAssertEqual(store.persisted.first?.completionReasonRawValue, "future_reason")
-        XCTAssertTrue(store.persisted.first?.hasUnsupportedCompletionReason == true)
+        XCTAssertFalse(sleeper.isSleeping)
+        XCTAssertEqual(sleeper.count, 0)
+        XCTAssertEqual(store.persisted.map(\.serveId), ["future"])
         await mgr.cancelPendingWorkForTests()
     }
 

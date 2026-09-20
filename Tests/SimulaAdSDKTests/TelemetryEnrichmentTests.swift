@@ -123,6 +123,22 @@ final class TelemetryEnrichmentTests: XCTestCase {
         XCTAssertEqual(env?.variantId, "variant_b")
     }
 
+    func testAcceptedLoadWithoutExperimentClearsStaleAssignment() async {
+        let sender = FakeSender()
+        let m = build(store: FakeStore(), sender: sender, clock: Clock(1_000))
+
+        m.setExperiment(experimentId: "stale_exp", variantId: "stale_variant")
+        m.setExperiment(experimentId: nil, variantId: nil)
+        m.recordLifecycle(
+            stage: "load_success", adFormat: "interstitial", adUnitId: "unit",
+            adId: "ad", serveId: "serve", durationMs: 1, errorCode: nil
+        )
+        await waitUntil { !sender.batches.isEmpty }
+
+        XCTAssertNil(sender.batches.first?.experimentId)
+        XCTAssertNil(sender.batches.first?.variantId)
+    }
+
     func testRecorderNewFields() async {
         let clock = Clock(1_000)
         let sender = FakeSender()

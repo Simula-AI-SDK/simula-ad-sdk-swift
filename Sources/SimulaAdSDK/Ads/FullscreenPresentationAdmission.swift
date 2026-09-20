@@ -150,25 +150,27 @@ struct RewardCompletionState: Equatable, Sendable {
 struct RewardedEarlyCompletionState: Equatable, Sendable {
     private(set) var pending = false
     private(set) var consumed = false
-    private(set) var failed = false
 
     mutating func receive(
         signaled: Bool,
+        requiresCreativeReadiness: Bool = true,
         primaryCreativeReady: Bool,
         rewardEarned: Bool
     ) -> Bool {
-        guard signaled, !failed, !consumed else { return false }
+        guard signaled, !consumed else { return false }
         guard !rewardEarned else {
             consumed = true
             pending = false
             return false
         }
         pending = true
-        return consumeIfReady(primaryCreativeReady: primaryCreativeReady)
+        return consumeIfReady(
+            primaryCreativeReady: primaryCreativeReady || !requiresCreativeReadiness
+        )
     }
 
     mutating func primaryCreativeBecameReady(rewardEarned: Bool) -> Bool {
-        guard !failed, !consumed else { return false }
+        guard !consumed else { return false }
         guard !rewardEarned else {
             consumed = true
             pending = false
@@ -177,25 +179,12 @@ struct RewardedEarlyCompletionState: Equatable, Sendable {
         return consumeIfReady(primaryCreativeReady: true)
     }
 
-    mutating func primaryCreativeFailed() {
-        pending = false
-        failed = true
-    }
-
     private mutating func consumeIfReady(primaryCreativeReady: Bool) -> Bool {
         guard pending, primaryCreativeReady else { return false }
         pending = false
         consumed = true
         return true
     }
-}
-
-func consumeReadyAdBeforeDisplayFailure(
-    transitionToIdle: () -> Void,
-    notifyFailure: () -> Void
-) {
-    transitionToIdle()
-    notifyFailure()
 }
 
 let rewardedHTMLReadinessSafetySeconds: TimeInterval = 10
@@ -263,34 +252,20 @@ struct RewardedHTMLReadinessDeadlineState: Sendable {
 }
 
 func shouldRunRewardedHTMLGate(
-    primaryCreativeReady: Bool,
     appForegrounded: Bool,
     storeSheetPresented: Bool,
     rewardEarned: Bool
 ) -> Bool {
-    primaryCreativeReady && appForegrounded && !storeSheetPresented && !rewardEarned
+    appForegrounded && !storeSheetPresented && !rewardEarned
 }
 
 func rewardedHTMLGateCompletionReason(
-    primaryCreativeReady: Bool,
     actualElapsedPlayTime: TimeInterval,
     gateDuration: TimeInterval
 ) -> RewardCompletionReason? {
-    guard primaryCreativeReady, actualElapsedPlayTime.isFinite, gateDuration.isFinite,
+    guard actualElapsedPlayTime.isFinite, gateDuration.isFinite,
           actualElapsedPlayTime >= max(0, gateDuration) else { return nil }
     return .durationElapsed
-}
-
-func stopRewardedHTMLGateAfterFailure(
-    primaryCreativeReady: inout Bool,
-    clock: inout FullscreenGateClock,
-    now: TimeInterval,
-    gateDuration: TimeInterval
-) -> Double {
-    let wasReady = primaryCreativeReady
-    primaryCreativeReady = false
-    clock.pause(at: now, total: gateDuration)
-    return wasReady ? clock.progress(total: gateDuration) : 0
 }
 
 func rewardedTerminalOutcome(

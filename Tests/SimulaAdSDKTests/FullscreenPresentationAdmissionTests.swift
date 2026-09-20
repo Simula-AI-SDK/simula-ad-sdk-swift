@@ -49,24 +49,34 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.reason, .creativeCompleted)
     }
 
-    func testEarlyCompleteBeforeReadinessLatchesThenEarnsCreativeReason() {
+    func testLegacyHTMLEarlyCompleteBeforeReadinessEarnsImmediately() {
         var early = RewardedEarlyCompletionState()
         var reward = RewardCompletionState()
 
-        XCTAssertFalse(early.receive(
+        XCTAssertTrue(early.receive(
             signaled: true,
+            requiresCreativeReadiness: false,
             primaryCreativeReady: false,
             rewardEarned: reward.earned
         ))
-        XCTAssertTrue(early.pending)
-        XCTAssertFalse(reward.earned)
-        if early.primaryCreativeBecameReady(rewardEarned: reward.earned) {
-            reward.earn(reason: .creativeCompleted)
-        }
+        reward.earn(reason: .creativeCompleted)
 
         XCTAssertTrue(early.consumed)
+        XCTAssertFalse(early.pending)
         XCTAssertTrue(reward.earned)
         XCTAssertEqual(reward.reason, .creativeCompleted)
+    }
+
+    func testNativeVideoEarlyCompletionStillWaitsForFirstFrameReadiness() {
+        var early = RewardedEarlyCompletionState()
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            requiresCreativeReadiness: true,
+            primaryCreativeReady: false,
+            rewardEarned: false
+        ))
+        XCTAssertTrue(early.pending)
+        XCTAssertTrue(early.primaryCreativeBecameReady(rewardEarned: false))
     }
 
     func testEarlyCompleteDuplicateSignalsApplyExactlyOnce() {
@@ -85,26 +95,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertFalse(early.primaryCreativeBecameReady(rewardEarned: false))
     }
 
-    func testEarlyCompleteIsDiscardedWhenPrimaryFailsBeforeReadiness() {
-        var early = RewardedEarlyCompletionState()
-        XCTAssertFalse(early.receive(
-            signaled: true,
-            primaryCreativeReady: false,
-            rewardEarned: false
-        ))
-
-        early.primaryCreativeFailed()
-
-        XCTAssertTrue(early.failed)
-        XCTAssertFalse(early.pending)
-        XCTAssertFalse(early.primaryCreativeBecameReady(rewardEarned: false))
-        XCTAssertFalse(early.receive(
-            signaled: true,
-            primaryCreativeReady: true,
-            rewardEarned: false
-        ))
-    }
-
     func testPendingEarlyCompleteWinsOverZeroAndPositiveHTMLGates() {
         for gateDuration in [0.0, 30.0] {
             var early = RewardedEarlyCompletionState()
@@ -118,7 +108,6 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             if early.primaryCreativeBecameReady(rewardEarned: reward.earned) {
                 reward.earn(reason: .creativeCompleted)
             } else if let reason = rewardedHTMLGateCompletionReason(
-                primaryCreativeReady: true,
                 actualElapsedPlayTime: 0,
                 gateDuration: gateDuration
             ) {
@@ -127,29 +116,11 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
 
             XCTAssertEqual(reward.reason, .creativeCompleted)
             XCTAssertFalse(shouldRunRewardedHTMLGate(
-                primaryCreativeReady: true,
                 appForegrounded: true,
                 storeSheetPresented: false,
                 rewardEarned: reward.earned
             ))
         }
-    }
-
-    func testVideoClaimFailureConsumesReadyBeforeCallbackAndAllowsReentrantLoad() {
-        enum OwnerState: Equatable { case ready, idle, loading }
-        var state = OwnerState.ready
-        var callbackObserved: OwnerState?
-
-        consumeReadyAdBeforeDisplayFailure(
-            transitionToIdle: { state = .idle },
-            notifyFailure: {
-                callbackObserved = state
-                state = .loading
-            }
-        )
-
-        XCTAssertEqual(callbackObserved, .idle)
-        XCTAssertEqual(state, .loading)
     }
 
     func testRewardedHTMLReadinessBudgetUsesSafetyFloorAndCloseDelay() {
@@ -194,35 +165,21 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.deadlineFired(now: 106), .fail)
     }
 
-    func testHTMLRewardGateWaitsForPrimaryCreativeReadiness() {
-        XCTAssertFalse(shouldRunRewardedHTMLGate(
-            primaryCreativeReady: false,
+    func testLegacyHTMLRewardGateRunsFromPresentationWithoutNavigationReadiness() {
+        XCTAssertTrue(shouldRunRewardedHTMLGate(
             appForegrounded: true,
             storeSheetPresented: false,
             rewardEarned: false
         ))
-        XCTAssertNil(rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: false,
+        XCTAssertEqual(rewardedHTMLGateCompletionReason(
             actualElapsedPlayTime: 30,
             gateDuration: 30
-        ))
-        XCTAssertTrue(shouldRunRewardedHTMLGate(
-            primaryCreativeReady: true,
-            appForegrounded: true,
-            storeSheetPresented: false,
-            rewardEarned: false
-        ))
+        ), .durationElapsed)
     }
 
-    func testHTMLZeroGateEarnsOnlyAfterPrimaryCreativeReadiness() {
-        XCTAssertNil(rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: false,
-            actualElapsedPlayTime: 0,
-            gateDuration: 0
-        ))
+    func testLegacyHTMLZeroGateEarnsAtPresentation() {
         XCTAssertEqual(
             rewardedHTMLGateCompletionReason(
-                primaryCreativeReady: true,
                 actualElapsedPlayTime: 0,
                 gateDuration: 0
             ),
@@ -230,18 +187,17 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         )
     }
 
-    func testHTMLFailureBeforeReadinessFallsBackWithoutRewardOrVerification() {
+    func testLegacyHTMLNavigationFailureDoesNotRevokePresentationTimedReward() {
         var completion = RewardCompletionState()
         if let reason = rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: false,
             actualElapsedPlayTime: 30,
-            gateDuration: 0
+            gateDuration: 30
         ) {
             completion.earn(reason: reason)
         }
         let outcome = rewardedTerminalOutcome(
             earned: completion.earned,
-            actualElapsedPlayTime: 0,
+            actualElapsedPlayTime: 30,
             completionReason: completion.reason
         )
         let policy = FullscreenPostPrimaryPolicy(
@@ -250,51 +206,13 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         )
 
         XCTAssertTrue(policy.presentsFallbacks)
-        XCTAssertFalse(policy.verifiesEarnedReward)
-        XCTAssertFalse(outcome.earned)
-        XCTAssertNil(outcome.completionReason)
-        XCTAssertNil(rewardVerificationElapsedPlayTime(
+        XCTAssertTrue(policy.verifiesEarnedReward)
+        XCTAssertTrue(outcome.earned)
+        XCTAssertEqual(outcome.completionReason, .durationElapsed)
+        XCTAssertEqual(rewardVerificationElapsedPlayTime(
             earned: outcome.earned,
             actualElapsedPlayTime: outcome.elapsedPlayTime
-        ))
-    }
-
-    func testRewardedHTMLFailureStopsGateBeforeDeferredUnearnedTerminalCompletes() {
-        var primaryCreativeReady = true
-        var clock = FullscreenGateClock()
-        var reward = RewardCompletionState()
-        var terminal = DeferredTerminalState<RewardedTerminalOutcome>()
-        clock.resume(at: 0)
-
-        let frozenProgress = stopRewardedHTMLGateAfterFailure(
-            primaryCreativeReady: &primaryCreativeReady,
-            clock: &clock,
-            now: 2,
-            gateDuration: 5
-        )
-        let snapshot = rewardedTerminalOutcome(
-            earned: reward.earned,
-            actualElapsedPlayTime: clock.elapsed,
-            completionReason: reward.reason
-        )
-        XCTAssertNil(terminal.request(snapshot, blocked: true))
-
-        clock.update(at: 10, total: 5)
-        if let reason = rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: primaryCreativeReady,
-            actualElapsedPlayTime: clock.elapsed,
-            gateDuration: 5
-        ) {
-            reward.earn(reason: reason)
-        }
-
-        XCTAssertFalse(primaryCreativeReady)
-        XCTAssertEqual(clock.elapsed, 2)
-        XCTAssertEqual(frozenProgress, 0.4, accuracy: 0.001)
-        XCTAssertFalse(reward.earned)
-        XCTAssertEqual(terminal.blockersDidChange(blocked: false), snapshot)
-        XCTAssertFalse(snapshot.earned)
-        XCTAssertNil(snapshot.completionReason)
+        ), 30)
     }
 
     func testConfiguredGateVerificationUsesActualVisiblePlayback() {
@@ -540,6 +458,30 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertFalse(state.request(index: 0, blocked: true))
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 0), 0)
+    }
+
+    func testFallbackHTMLCountdownStartsAtMountWhileVideoWaitsForFirstFrame() {
+        XCTAssertTrue(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: false,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: true,
+            pageFinished: false,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+        XCTAssertTrue(shouldRunFallbackCountdown(
+            isVideo: true,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
     }
 
     func testDeclarativeFallbackFailureWaitsUntilEveryRouteBlockerClears() {
@@ -1100,6 +1042,42 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ]), .resume)
     }
 
+    func testActiveInterruptionOffersResumeWheneverPlaybackIsWanted() {
+        XCTAssertTrue(shouldOfferVideoInterruptionResume(
+            audioInterrupted: true,
+            wantsPlayback: true
+        ))
+        XCTAssertFalse(shouldOfferVideoInterruptionResume(
+            audioInterrupted: true,
+            wantsPlayback: false
+        ))
+        XCTAssertFalse(shouldOfferVideoInterruptionResume(
+            audioInterrupted: false,
+            wantsPlayback: true
+        ))
+    }
+
+    func testLatePlaybackIntentRearmsExpiredInterruptionFallback() {
+        XCTAssertTrue(shouldScheduleVideoInterruptionFallback(
+            audioInterrupted: true,
+            wantsPlayback: true,
+            resumeOffered: false,
+            fallbackPending: false
+        ))
+        XCTAssertFalse(shouldScheduleVideoInterruptionFallback(
+            audioInterrupted: true,
+            wantsPlayback: true,
+            resumeOffered: true,
+            fallbackPending: false
+        ))
+        XCTAssertFalse(shouldScheduleVideoInterruptionFallback(
+            audioInterrupted: true,
+            wantsPlayback: true,
+            resumeOffered: false,
+            fallbackPending: true
+        ))
+    }
+
     @MainActor
     func testInterruptionUserResumeClearsPauseWithoutFailure() {
         let url = URL(fileURLWithPath: "/dev/null")
@@ -1112,6 +1090,108 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         player.resumeAfterInterruption()
         XCTAssertFalse(player.requiresUserResume)
         if case .failed = player.status { XCTFail("Explicit interruption resume must not fail playback") }
+        player.stop()
+    }
+
+    @MainActor
+    func testUnmatchedInterruptionAcrossReactivationOffersResumeAndExplicitResumeClearsIt() async {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        player.play()
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
+        )
+        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+
+        await waitUntil { player.requiresUserResume }
+        XCTAssertTrue(player.requiresUserResume)
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        player.resumeAfterInterruption()
+        XCTAssertFalse(player.requiresUserResume)
+        XCTAssertFalse(player.hasActiveAudioInterruption)
+        player.stop()
+    }
+
+    @MainActor
+    func testInterruptionBeforeFirstFrameStillOffersRecoveryAfterFrameAdmission() async {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        player.play()
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
+        )
+        await waitUntil {
+            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
+        }
+
+        XCTAssertTrue(player.admitFirstVisualFrame())
+        XCTAssertTrue(player.hasPendingInterruptionFallback)
+        player.fireInterruptionFallbackForTests()
+
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.requiresUserResume)
+        player.resumeAfterInterruption()
+        player.stop()
+    }
+
+    @MainActor
+    func testLongSystemInterruptionRemainsActiveUntilExplicitRecovery() async {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        player.play()
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
+        )
+        await waitUntil {
+            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
+        }
+        player.fireInterruptionFallbackForTests()
+
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.requiresUserResume)
+        player.play()
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.requiresUserResume)
+
+        player.resumeAfterInterruption()
+        XCTAssertFalse(player.hasActiveAudioInterruption)
+        XCTAssertFalse(player.requiresUserResume)
+        player.stop()
+    }
+
+    @MainActor
+    func testIdleInterruptionRearmsRecoveryWhenPlaybackIsRequestedLater() async {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
+        )
+        await waitUntil {
+            player.hasActiveAudioInterruption && player.hasPendingInterruptionFallback
+        }
+
+        player.fireInterruptionFallbackForTests()
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertFalse(player.requiresUserResume)
+        XCTAssertFalse(player.hasPendingInterruptionFallback)
+
+        player.play()
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertFalse(player.requiresUserResume)
+        XCTAssertTrue(player.hasPendingInterruptionFallback)
+
+        player.fireInterruptionFallbackForTests()
+        XCTAssertTrue(player.hasActiveAudioInterruption)
+        XCTAssertTrue(player.requiresUserResume)
+
+        player.resumeAfterInterruption()
+        XCTAssertFalse(player.hasActiveAudioInterruption)
+        XCTAssertFalse(player.requiresUserResume)
         player.stop()
     }
 
@@ -1162,15 +1242,15 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testVideoLoadPreparationOutcomeIsUnavailableBeforeLoadSuccess() {
+    func testVideoLoadPreparationSaturationFallsBackToColdShowPreparation() {
         let video = FullscreenCreativeContent.video(
             url: URL(fileURLWithPath: "/dev/null"),
             posterURL: nil
         )
-        guard case .unavailable = reserveFullscreenVideoPreparation(
+        guard case .cold = reserveFullscreenVideoPreparation(
             for: video,
             prepare: { _, _ in nil }
-        ) else { return XCTFail("Expected unavailable video reservation") }
+        ) else { return XCTFail("Expected cold video preparation fallback") }
 
         guard case .notRequired = reserveFullscreenVideoPreparation(
             for: .playable(html: "<html/>"),

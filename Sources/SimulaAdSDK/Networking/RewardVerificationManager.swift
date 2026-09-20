@@ -381,20 +381,22 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
     @discardableResult
     private func processNextIfPossible() -> Bool {
-        guard isLoaded, !isDirty, !isProcessing, completionReasonsAreProcessable() else { return false }
+        guard isLoaded, !isDirty, !isProcessing else { return false }
+        reportUnsupportedCompletionReasonsIfNeeded()
         let nowTs = now()
         guard let task = queue.first(where: {
-            nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
+            !$0.hasUnsupportedCompletionReason
+                && nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
         }) else { return false }
         isProcessing = true
         Task { await self.verify(task) }
         return true
     }
 
-    private func completionReasonsAreProcessable() -> Bool {
+    private func reportUnsupportedCompletionReasonsIfNeeded() {
         guard queue.contains(where: \.hasUnsupportedCompletionReason) else {
             unsupportedCompletionReasonReported = false
-            return true
+            return
         }
         if !unsupportedCompletionReasonReported {
             unsupportedCompletionReasonReported = true
@@ -403,7 +405,6 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 breadcrumb: "queue=reward_verification"
             )
         }
-        return false
     }
 
     private func verify(_ task: PendingVerification) async {
@@ -444,7 +445,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
                 queue[index].lastAttemptTimestamp = now()
                 let nowTs = now()
-                let soonest = queue.map {
+                let soonest = queue.filter { !$0.hasUnsupportedCompletionReason }.map {
                     rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
                 }.min() ?? 0
                 retryDelay = max(soonest, 1)
@@ -466,10 +467,10 @@ public final class RewardVerificationManager: @unchecked Sendable {
     }
 
     private func processOrScheduleRetry() {
-        guard completionReasonsAreProcessable() else { return }
+        reportUnsupportedCompletionReasonsIfNeeded()
         guard !processNextIfPossible() else { return }
         let nowTs = now()
-        guard let delay = queue.map({
+        guard let delay = queue.filter({ !$0.hasUnsupportedCompletionReason }).map({
             rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
         }).filter({ $0 > 0 }).min() else {
             return

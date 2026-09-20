@@ -230,8 +230,8 @@ public struct AdOverlayView: View {
     @State private var adPageReady = false
     /// Terminal load failure keeps the native black shield but removes the indefinite spinner.
     @State private var adPageFailed = false
-    /// A committed document can still fail while loading subresources. Presentation timing starts
-    /// only after `didFinish`, once the creative has passed the stronger readiness boundary.
+    /// A committed document can still fail while loading subresources. HTML close timing starts at
+    /// mount for legacy compatibility; native video timing starts only after its first visual frame.
     @State private var pageFinished = false
     /// A watchdog timeout fails open: close remains available even if the same load finishes later.
     @State private var loadTimedOut = false
@@ -338,8 +338,8 @@ public struct AdOverlayView: View {
                             WebViewRepresentable(
                                 htmlString: html,
                                 onNavigationFinished: { markPageFinished() },
-                                onNavigationFailed: { _ in markPageFailedAndAdvance() },
-                                onWebContentProcessTerminated: { markPageFailedAndAdvance() },
+                                onNavigationFailed: { _ in markLegacyHTMLPageFailed() },
+                                onWebContentProcessTerminated: { markLegacyHTMLPageFailed() },
                                 onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
                                 attributionRouteLifecycle: activeRouteLifecycle,
@@ -373,7 +373,13 @@ public struct AdOverlayView: View {
                         }
                         #endif
 
-                        if !adPageReady {
+                        // The video surface owns its poster/readiness UI and interruption resume control.
+                        // Keep recoverable pre-frame video interactive; terminal failures still fail black.
+                        if shouldShowFallbackLoadingShield(
+                            isVideo: ad.mediaType == .video,
+                            adPageReady: adPageReady,
+                            terminalFailure: adPageFailed
+                        ) {
                             ZStack {
                                 Color.black
                                 if !adPageFailed {
@@ -450,7 +456,11 @@ public struct AdOverlayView: View {
             }
             if !hasLoadableCreative {
                 startCurrentCreativeLoadIfNeeded()
-                markPageFailedAndAdvance()
+                if ad.mediaType == .video {
+                    markPageFailedAndAdvance()
+                } else {
+                    markLegacyHTMLPageFailed()
+                }
             } else {
                 startCurrentCreativeLoadIfNeeded()
                 #if os(iOS)
@@ -712,11 +722,13 @@ public struct AdOverlayView: View {
         beginPresentationIfReady()
     }
 
-    /// `didFinish` can race SwiftUI's `onAppear` for a newly-installed hosting controller. Keep the
-    /// readiness bit and reconcile from both boundaries; callbacks/timing start exactly once only
-    /// after the view is mounted and lifecycle observers can pause any immediate store presentation.
+    /// `didFinish` can race SwiftUI's `onAppear` for a newly-installed hosting controller. HTML
+    /// reconciles from mount; video still waits for first-frame readiness.
     private func beginPresentationIfReady() {
-        guard hasAppeared, pageFinished, !adPageFailed else { return }
+        guard hasAppeared, !closing else { return }
+        if ad.mediaType == .video {
+            guard pageFinished, !adPageFailed else { return }
+        }
         reconcileCountdown()
     }
 
@@ -737,6 +749,17 @@ public struct AdOverlayView: View {
         onCreativeFailure?()
     }
 
+    private func markLegacyHTMLPageFailed() {
+        guard ad.mediaType == .playable else { return }
+        startCurrentCreativeLoadIfNeeded()
+        guard loadCoordinator.failCurrentLoad() else { return }
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        adPageReady = false
+        adPageFailed = true
+        reconcileCountdown()
+    }
+
     private func applyTerminalPageFailure() {
         firstFrameHandoff.clearPending()
         adPageReady = false
@@ -754,8 +777,13 @@ public struct AdOverlayView: View {
             return
         }
         #endif
-        if hasAppeared && pageFinished && !adPageFailed && !loadTimedOut
-            && appForegrounded && !storeSheetPresented {
+        if shouldRunFallbackCountdown(
+            isVideo: ad.mediaType == .video,
+            pageFinished: pageFinished,
+            hasAppeared: hasAppeared,
+            appForegrounded: appForegrounded,
+            storeSheetPresented: storeSheetPresented
+        ) {
             startCountdown()
         } else {
             countdownTask?.cancel()
@@ -980,6 +1008,14 @@ func fallbackPresentationBlocked(
     !appForegrounded || storeSheetPresented
 }
 
+func shouldShowFallbackLoadingShield(
+    isVideo: Bool,
+    adPageReady: Bool,
+    terminalFailure: Bool
+) -> Bool {
+    isVideo ? terminalFailure : !adPageReady
+}
+
 enum FallbackCloseRequestAction: Equatable, Sendable {
     case ignore
     case requestFailureAdvance
@@ -995,7 +1031,7 @@ func fallbackCloseRequestAction(
     dismissUnlocked: Bool,
     clickHandoffPending: Bool
 ) -> FallbackCloseRequestAction {
-    if terminalFailure { return .requestFailureAdvance }
+    if isVideo && terminalFailure { return .requestFailureAdvance }
     guard !isVideo || pageFinished,
           appForegrounded, !storeSheetPresented,
           canDismissFullscreen(
@@ -1003,6 +1039,16 @@ func fallbackCloseRequestAction(
               clickHandoffPending: clickHandoffPending
           ) else { return .ignore }
     return .close
+}
+
+func shouldRunFallbackCountdown(
+    isVideo: Bool,
+    pageFinished: Bool,
+    hasAppeared: Bool,
+    appForegrounded: Bool,
+    storeSheetPresented: Bool
+) -> Bool {
+    hasAppeared && (!isVideo || pageFinished) && appForegrounded && !storeSheetPresented
 }
 
 func canBeginFallbackVideoClick(

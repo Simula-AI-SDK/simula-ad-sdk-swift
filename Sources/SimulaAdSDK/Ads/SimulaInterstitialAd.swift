@@ -396,11 +396,14 @@ public final class SimulaInterstitialAd {
                 break
             case .reserved(let ownership):
                 preparedVideoOwnership = ownership
-            case .unavailable:
-                failLoad(.noFill)
-                return
+            case .cold:
+                break
             }
             #endif
+            Telemetry.shared.setExperiment(
+                experimentId: response.experiment?.experimentId,
+                variantId: response.experiment?.variantId
+            )
             Telemetry.shared.recordLifecycle(
                 stage: "load_success", adFormat: Self.adFormat, adUnitId: adUnitId,
                 adId: response.impressionId, serveId: response.impressionId,
@@ -522,21 +525,22 @@ public final class SimulaInterstitialAd {
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
         if response.creative?.mediaType == .video {
-            guard case .video(let url, let posterURL)? = response.creativeContent,
-                  let ownership = preparedVideoOwnership,
-                  let player = ownership.claim(url: url, posterURL: posterURL),
-                  ownership.transferToPresentation() else {
-                releasePreparedVideo()
+            guard case .video(let url, let posterURL)? = response.creativeContent else {
                 admission.stop()
-                consumeReadyAdBeforeDisplayFailure(
-                    transitionToIdle: { state = .idle },
-                    notifyFailure: { failDisplay(.notReady) }
-                )
+                failDisplay(.notReady)
                 return
             }
-            preparedVideoOwnership = nil
-            presentationVideoPlayer = player
-            presentationVideoOwnership = ownership
+            if let ownership = preparedVideoOwnership,
+               let player = ownership.claim(url: url, posterURL: posterURL),
+               ownership.transferToPresentation() {
+                preparedVideoOwnership = nil
+                presentationVideoPlayer = player
+                presentationVideoOwnership = ownership
+            } else {
+                releasePreparedVideo()
+                presentationVideoPlayer = FullscreenVideoPlayer(url: url, posterURL: posterURL)
+                presentationVideoOwnership = nil
+            }
         } else {
             presentationVideoPlayer = nil
             presentationVideoOwnership = nil

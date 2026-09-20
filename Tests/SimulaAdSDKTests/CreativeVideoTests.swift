@@ -256,6 +256,11 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertNil(gate.duration)
         XCTAssertFalse(gate.isUnlocked)
 
+        gate.update(duration: .infinity, played: 5.1)
+        XCTAssertTrue(gate.isUnlocked)
+        XCTAssertEqual(gate.progress, 1)
+        XCTAssertEqual(gate.secondsRemaining, 0)
+
         XCTAssertEqual(
             fullscreenVideoReadyStatus(status: .preparing, itemReadyToPlay: false),
             .preparing
@@ -268,6 +273,20 @@ final class CreativeVideoTests: XCTestCase {
             audioInterrupted: false,
             itemReadyToPlay: false
         ))
+    }
+
+    func testUnknownDurationUnlocksAtConfiguredPlayedTimeAndLaterFiniteDurationCanClampShorter() {
+        var gate = VideoPlaybackGate(configuredDelay: 8)
+        gate.update(duration: nil, played: 8.25)
+        XCTAssertTrue(gate.isUnlocked)
+        XCTAssertEqual(gate.gateDuration, 8)
+
+        var clamped = VideoPlaybackGate(configuredDelay: 8)
+        clamped.update(duration: nil, played: 3)
+        XCTAssertFalse(clamped.isUnlocked)
+        clamped.update(duration: 2, played: 3)
+        XCTAssertEqual(clamped.gateDuration, 2)
+        XCTAssertTrue(clamped.isUnlocked)
     }
 
     func testTimeControlCallbacksFollowNormalReadyPlayingPausedOrder() {

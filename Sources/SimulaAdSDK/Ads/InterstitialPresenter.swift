@@ -569,8 +569,8 @@ private struct CreativeInterstitialView: View {
         WebViewRepresentable(
             htmlString: html,
             onNavigationFinished: { handlePlayableReady() },
-            onNavigationFailed: { _ in handlePlayableFailure("navigation_failed") },
-            onWebContentProcessTerminated: { handlePlayableFailure("renderer_terminated") },
+            onNavigationFailed: { _ in recordLegacyHTMLFailure("navigation_failed") },
+            onWebContentProcessTerminated: { recordLegacyHTMLFailure("renderer_terminated") },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 updateClickHandoff(.creative, pending: $0)
@@ -599,15 +599,12 @@ private struct CreativeInterstitialView: View {
         // Sits below the safe area (the black backdrop fills the notch / home-indicator region).
     }
 
-    private func handlePlayableFailure(_ reason: String) {
-        guard !videoFailureHandled else { return }
-        videoFailureHandled = true
+    private func recordLegacyHTMLFailure(_ reason: String) {
         handleSKANCreativeFailure()
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "interstitial", adUnitId: response.adUnitId,
             adId: response.impressionId, serveId: response.impressionId, errorCode: reason
         )
-        requestPrimaryCreativeFailure()
     }
 
     private func handlePlayableReady() {

@@ -523,6 +523,7 @@ private struct RewardedGameView: View {
         .onReceive(bridge.$earlyComplete) { earlyComplete in
             guard earlyCompletion.receive(
                 signaled: earlyComplete,
+                requiresCreativeReadiness: videoPlayer != nil,
                 primaryCreativeReady: primaryCreativeReady,
                 rewardEarned: rewardEarned
             ) else { return }
@@ -597,7 +598,7 @@ private struct RewardedGameView: View {
         case .fail:
             htmlReadinessTask?.cancel()
             htmlReadinessTask = nil
-            handlePlayableFailure("readiness_timeout")
+            handleLegacyHTMLFailure("readiness_timeout")
         }
     }
 
@@ -614,10 +615,9 @@ private struct RewardedGameView: View {
     }
 
     private func startTimer() {
-        guard videoPlayer == nil, timerTask == nil, primaryCreativeReady else { return }
+        guard videoPlayer == nil, timerTask == nil else { return }
         // A zero/negative gate is earned immediately (no gate).
         if let reason = rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: primaryCreativeReady,
             actualElapsedPlayTime: gateClock.elapsed,
             gateDuration: gateDuration
         ) {
@@ -663,13 +663,11 @@ private struct RewardedGameView: View {
     }
 
     private func applyElapsedPlayTime() {
-        guard primaryCreativeReady else { return }
         // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
         if gateClock.elapsed >= gateDuration / 2, !storePromptVisible {
             withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
         }
         if let reason = rewardedHTMLGateCompletionReason(
-            primaryCreativeReady: primaryCreativeReady,
             actualElapsedPlayTime: gateClock.elapsed,
             gateDuration: gateDuration
         ) {
@@ -686,7 +684,6 @@ private struct RewardedGameView: View {
             videoPlayer.setPresentationBlocked(blocked)
         } else if !blocked {
             if shouldRunRewardedHTMLGate(
-                primaryCreativeReady: primaryCreativeReady,
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented,
                 rewardEarned: rewardEarned
@@ -720,8 +717,8 @@ private struct RewardedGameView: View {
         WebViewRepresentable(
             htmlString: html,
             onNavigationFinished: { handlePlayableReady() },
-            onNavigationFailed: { _ in handlePlayableFailure("navigation_failed") },
-            onWebContentProcessTerminated: { handlePlayableFailure("renderer_terminated") },
+            onNavigationFailed: { _ in handleLegacyHTMLFailure("navigation_failed") },
+            onWebContentProcessTerminated: { handleLegacyHTMLFailure("renderer_terminated") },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 updateClickHandoff(.creative, pending: $0)
@@ -745,32 +742,14 @@ private struct RewardedGameView: View {
         .allowsHitTesting(!clickHandoffPending)
     }
 
-    private func handlePlayableFailure(_ reason: String) {
-        guard !videoFailureHandled else { return }
-        videoFailureHandled = true
-        earlyCompletion.primaryCreativeFailed()
+    private func handleLegacyHTMLFailure(_ reason: String) {
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
-        timerTask?.cancel()
-        timerTask = nil
-        let frozenProgress = stopRewardedHTMLGateAfterFailure(
-            primaryCreativeReady: &primaryCreativeReady,
-            clock: &gateClock,
-            now: ProcessInfo.processInfo.systemUptime,
-            gateDuration: gateDuration
-        )
-        storePromptVisible = false
-        var tx = Transaction(); tx.disablesAnimations = true
-        withTransaction(tx) {
-            closeProgressAnim = frozenProgress
-            closeGateGeneration += 1
-        }
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "rewarded", adUnitId: nil,
             adId: impressionId, serveId: nil, errorCode: reason
         )
-        requestCreativeFailure()
     }
 
     private func handlePlayableReady() {
