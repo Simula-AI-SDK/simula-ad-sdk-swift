@@ -103,6 +103,17 @@ final class AdOverlayLoadCoordinatorTests: XCTestCase {
         XCTAssertTrue(handoff.receive("video-b", parentAppeared: true))
     }
 
+    func testReplacementPlayerStaleEscapeCannotClaimCurrentSurface() {
+        var handoff = PendingFirstFrameHandoff<String>()
+        handoff.activate("player-a")
+        handoff.activate("player-b")
+
+        XCTAssertFalse(handoff.claimPreFirstFrameFailure("player-a"))
+        XCTAssertTrue(handoff.claimPreFirstFrameFailure("player-b"))
+        XCTAssertFalse(handoff.claimPreFirstFrameFailure("player-b"))
+        XCTAssertTrue(handoff.isTerminal("player-b"))
+    }
+
     func testDuplicatePendingFrameDoesNotDuplicateReplay() {
         var handoff = PendingFirstFrameHandoff<String>()
         handoff.activate("video-a")

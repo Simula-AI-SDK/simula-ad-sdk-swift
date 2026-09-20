@@ -14,9 +14,22 @@ struct FullscreenVisualAdmissionState: Equatable, Sendable {
     private(set) var blocked = false
     private(set) var accruedImpressionMs: Double = 0
     private(set) var terminalOutcome: FullscreenPresentationTerminalOutcome?
+    private(set) var htmlBillingConfirmation = HTMLBillingConfirmation.notRequired
+
+    enum HTMLBillingConfirmation: Equatable, Sendable {
+        case notRequired
+        case pending
+        case confirmed
+        case suppressed
+    }
+
+    var impressionDwellEligible: Bool {
+        displayAdmitted && visualActive && !blocked && !impressionCommitted
+            && terminalOutcome == nil && htmlBillingConfirmation != .suppressed
+    }
 
     var impressionEligible: Bool {
-        displayAdmitted && visualActive && !blocked && !impressionCommitted && terminalOutcome == nil
+        impressionDwellEligible && htmlBillingConfirmation != .pending
     }
 
     mutating func visualBecameReady() -> Bool {
@@ -32,14 +45,36 @@ struct FullscreenVisualAdmissionState: Equatable, Sendable {
         visualActive = false
     }
 
+    mutating func htmlPresentationDidSucceed() -> Bool {
+        if htmlBillingConfirmation == .notRequired {
+            htmlBillingConfirmation = .pending
+        }
+        return visualBecameReady()
+    }
+
+    mutating func htmlNavigationDidCommit(thresholdMs: Double) -> Bool {
+        guard htmlBillingConfirmation != .suppressed else { return false }
+        htmlBillingConfirmation = .confirmed
+        return commitImpressionIfEligible(thresholdMs: thresholdMs)
+    }
+
+    mutating func htmlNavigationDidFail() {
+        guard !impressionCommitted else { return }
+        htmlBillingConfirmation = .suppressed
+    }
+
     mutating func setBlocked(_ blocked: Bool) {
         self.blocked = blocked
     }
 
     mutating func accrueImpression(deltaMs: Double, thresholdMs: Double) -> Bool {
-        guard impressionEligible, deltaMs.isFinite, deltaMs > 0 else { return false }
+        guard impressionDwellEligible, deltaMs.isFinite, deltaMs > 0 else { return false }
         accruedImpressionMs += deltaMs
-        guard accruedImpressionMs >= thresholdMs else { return false }
+        return commitImpressionIfEligible(thresholdMs: thresholdMs)
+    }
+
+    mutating func commitImpressionIfEligible(thresholdMs: Double) -> Bool {
+        guard impressionEligible, accruedImpressionMs >= thresholdMs else { return false }
         impressionCommitted = true
         return true
     }
@@ -83,6 +118,28 @@ struct FullscreenImpressionDwellClock: Equatable, Sendable {
 enum FullscreenPresentationTerminalOutcome: Equatable, Sendable {
     case displayFailed
     case closed
+}
+
+enum LegacyHTMLBillingCallback: Equatable, Sendable {
+    case mainFrameCommitted
+    case navigationFailed
+    case webContentProcessTerminated
+}
+
+enum LegacyHTMLBillingCallbackAction: Equatable, Sendable {
+    case confirm
+    case suppressUncommitted
+    case telemetryOnly
+}
+
+func legacyHTMLBillingCallbackAction(
+    for callback: LegacyHTMLBillingCallback
+) -> LegacyHTMLBillingCallbackAction {
+    switch callback {
+    case .mainFrameCommitted: return .confirm
+    case .navigationFailed: return .suppressUncommitted
+    case .webContentProcessTerminated: return .telemetryOnly
+    }
 }
 
 struct FullscreenPostPrimaryPolicy: Equatable, Sendable {
@@ -477,9 +534,23 @@ final class FullscreenPresentationAdmission {
     func presentationDidSucceed() {
         let now = uptime()
         settleEligibleImpressionDwell(at: now)
-        let shouldNotifyDisplayed = state.visualBecameReady()
+        let shouldNotifyDisplayed = state.htmlPresentationDidSucceed()
         guard state.visualActive else { return }
         if shouldNotifyDisplayed { onDisplayed() }
+        reconcileImpressionTimer(at: now)
+    }
+
+    func htmlNavigationDidCommit() {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
+        if state.htmlNavigationDidCommit(thresholdMs: impressionDelayMs) { onImpression() }
+        reconcileImpressionTimer(at: now)
+    }
+
+    func htmlNavigationDidFail() {
+        let now = uptime()
+        settleEligibleImpressionDwell(at: now)
+        state.htmlNavigationDidFail()
         reconcileImpressionTimer(at: now)
     }
 
@@ -520,7 +591,7 @@ final class FullscreenPresentationAdmission {
     }
 
     private func runImpressionTimer(generation: UInt64) async {
-        while generation == impressionGeneration, state.impressionEligible {
+        while generation == impressionGeneration, state.impressionDwellEligible {
             do { try await Task.sleep(nanoseconds: tickNanos) } catch { return }
             if Task.isCancelled { return }
             guard generation == impressionGeneration else { return }
@@ -549,7 +620,10 @@ final class FullscreenPresentationAdmission {
     }
 
     private func reconcileImpressionTimer(at now: TimeInterval) {
-        guard state.impressionEligible else {
+        if state.commitImpressionIfEligible(thresholdMs: impressionDelayMs) {
+            onImpression()
+        }
+        guard state.impressionDwellEligible else {
             cancelImpressionTimer()
             return
         }
@@ -579,6 +653,8 @@ final class FullscreenPresentationAdmission {
     ) {}
     func visualBecameReady(owner: FullscreenVisualSurfaceToken) {}
     func presentationDidSucceed() {}
+    func htmlNavigationDidCommit() {}
+    func htmlNavigationDidFail() {}
     func visualBecameUnavailable(owner: FullscreenVisualSurfaceToken) {}
     func setBlocked(_ blocked: Bool) {}
     func stop() {}

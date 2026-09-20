@@ -391,6 +391,20 @@ private struct RewardedGameView: View {
     private var presentationActive: Bool {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
     }
+    private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
+        guard let videoPlayer else {
+            return videoPreFirstFrameChromeVisibility(
+                hasVideo: false,
+                firstFrameAdmitted: false,
+                terminal: false
+            )
+        }
+        return videoPreFirstFrameChromeVisibility(
+            hasVideo: true,
+            firstFrameAdmitted: primaryCreativeReady || videoPlayer.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || videoPlayer.status.isTerminal
+        )
+    }
 
     var body: some View {
         ZStack {
@@ -411,23 +425,34 @@ private struct RewardedGameView: View {
             // Close button — honors the server `ad_behavior.close` treatment (hidden / countdown ring /
             // progress bar / reward-or-close label) exactly like the interstitial, but gated on the
             // play-to-earn progress: the ✕ unlocks only once the reward is earned.
-            CloseButtonView(
-                treatment: (close ?? CloseBehavior()).treatment,
-                position: (close ?? CloseBehavior()).position,
-                progressBarColor: (close ?? CloseBehavior()).progressBarColor,
-                action: (close ?? CloseBehavior()).action,
-                isRewardCopy: true,
-                enabled: canDismissFullscreen(
-                    dismissUnlocked: rewardEarned,
-                    clickHandoffPending: clickHandoffPending
-                ),
-                remaining: secondsLeft,
-                progress: closeProgressAnim,
-                onClose: { finish(earned: true) }
-            )
-            // Identity keyed to the pause generation — see `closeGateGeneration`.
-            .id(closeGateGeneration)
-            .animation(.default, value: rewardEarned)
+            if videoChromeVisibility.showsServerControl {
+                CloseButtonView(
+                    treatment: (close ?? CloseBehavior()).treatment,
+                    position: (close ?? CloseBehavior()).position,
+                    progressBarColor: (close ?? CloseBehavior()).progressBarColor,
+                    action: (close ?? CloseBehavior()).action,
+                    isRewardCopy: true,
+                    enabled: canDismissFullscreen(
+                        dismissUnlocked: rewardEarned,
+                        clickHandoffPending: clickHandoffPending
+                    ),
+                    remaining: secondsLeft,
+                    progress: closeProgressAnim,
+                    onClose: { finish(earned: true) }
+                )
+                // Identity keyed to the pause generation — see `closeGateGeneration`.
+                .id(closeGateGeneration)
+                .animation(.default, value: rewardEarned)
+            }
+
+            if let videoPlayer, videoChromeVisibility.showsEscape {
+                VideoPreFirstFrameEscapeButton(
+                    action: { handleVideoPreFirstFrameEscape(player: videoPlayer) },
+                    accessibilityLabel: "Close ad without reward"
+                )
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
 
             // Mid-ad store prompt — appears at half the play-to-earn gate and is removed the instant
             // the reward unlocks (the reward/close pill takes over). Pinned to the corner opposite the
@@ -716,9 +741,12 @@ private struct RewardedGameView: View {
     private func creativeWebView(html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
+            onNavigationCommitted: { handleLegacyHTMLBillingCallback(.mainFrameCommitted) },
             onNavigationFinished: { handlePlayableReady() },
-            onNavigationFailed: { _ in handleLegacyHTMLFailure("navigation_failed") },
-            onWebContentProcessTerminated: { handleLegacyHTMLFailure("renderer_terminated") },
+            onNavigationFailed: { _ in handleLegacyHTMLBillingCallback(.navigationFailed) },
+            onWebContentProcessTerminated: {
+                handleLegacyHTMLBillingCallback(.webContentProcessTerminated)
+            },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 updateClickHandoff(.creative, pending: $0)
@@ -746,10 +774,26 @@ private struct RewardedGameView: View {
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
+        recordLegacyHTMLTelemetry(reason)
+    }
+
+    private func recordLegacyHTMLTelemetry(_ reason: String) {
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "rewarded", adUnitId: nil,
             adId: impressionId, serveId: nil, errorCode: reason
         )
+    }
+
+    private func handleLegacyHTMLBillingCallback(_ callback: LegacyHTMLBillingCallback) {
+        switch legacyHTMLBillingCallbackAction(for: callback) {
+        case .confirm:
+            admission.htmlNavigationDidCommit()
+        case .suppressUncommitted:
+            admission.htmlNavigationDidFail()
+            handleLegacyHTMLFailure("navigation_failed")
+        case .telemetryOnly:
+            recordLegacyHTMLTelemetry("renderer_terminated")
+        }
     }
 
     private func handlePlayableReady() {
@@ -844,6 +888,17 @@ private struct RewardedGameView: View {
         }
         updateVideoGate(player: player, played: player.playedSeconds)
         return true
+    }
+
+    private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
+        guard videoPreFirstFrameEscapeAction(
+            surface: .rewarded,
+            presentationMounted: viewAppeared && visible,
+            firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || player.status.isTerminal
+        ) == .finishRewardedUnearned else { return }
+        videoFailureHandled = true
+        requestCreativeFailure()
     }
 
     private func updateVideoGate(

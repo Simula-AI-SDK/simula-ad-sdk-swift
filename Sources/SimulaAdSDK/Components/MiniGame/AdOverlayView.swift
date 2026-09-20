@@ -131,9 +131,16 @@ struct PendingFirstFrameHandoff<Token: Hashable> {
     mutating func fail(_ token: Token) -> Bool {
         guard accepting else { return false }
         if active == nil { active = token }
-        guard active == token else { return false }
+        guard active == token, terminal != token else { return false }
         pending = nil
         admitted = nil
+        terminal = token
+        return true
+    }
+
+    mutating func claimPreFirstFrameFailure(_ token: Token) -> Bool {
+        guard accepting, active == token, admitted != token, terminal != token else { return false }
+        pending = nil
         terminal = token
         return true
     }
@@ -303,6 +310,23 @@ public struct AdOverlayView: View {
         }
     }
 
+    #if os(iOS)
+    private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
+        guard ad.mediaType == .video, let videoPlayer else {
+            return videoPreFirstFrameChromeVisibility(
+                hasVideo: false,
+                firstFrameAdmitted: false,
+                terminal: false
+            )
+        }
+        return videoPreFirstFrameChromeVisibility(
+            hasVideo: true,
+            firstFrameAdmitted: pageFinished || videoPlayer.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || videoPlayer.status.isTerminal
+        )
+    }
+    #endif
+
     public var body: some View {
         ZStack {
             // Backdrop: fully black full-screen (so the end screen's safe area is solid
@@ -389,12 +413,32 @@ public struct AdOverlayView: View {
                             }
                         }
 
+                        #if os(iOS)
+                        if videoChromeVisibility.showsServerControl {
+                            closeControl
+                                .padding(8)
+                                // The fallback info glyph uses an 18pt corner inset. Move a bottom-left
+                                // close farther right so their visible circles and hit regions stay disjoint.
+                                .padding(.leading, closeBehavior.position == .bottomLeft ? 30 : 0)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: closeAlignment)
+                        }
+                        #else
                         closeControl
                             .padding(8)
-                            // The fallback info glyph uses an 18pt corner inset. Move a bottom-left
-                            // close farther right so their visible circles and hit regions stay disjoint.
                             .padding(.leading, closeBehavior.position == .bottomLeft ? 30 : 0)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: closeAlignment)
+                        #endif
+
+                        #if os(iOS)
+                        if videoChromeVisibility.showsEscape, let videoPlayer {
+                            VideoPreFirstFrameEscapeButton(
+                                action: { handleVideoPreFirstFrameEscape(player: videoPlayer) },
+                                accessibilityLabel: "Skip unavailable ad"
+                            )
+                            .padding(8)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        }
+                        #endif
                     }
                     .frame(maxWidth: .infinity)
                     // Full-screen ads inset the creative + close button below the top safe area
@@ -881,6 +925,18 @@ public struct AdOverlayView: View {
         if pageFinished { return firstFrameHandoff.admitted == identity }
         guard firstFrameHandoff.receive(identity, parentAppeared: hasAppeared) else { return false }
         return admitVideoFirstFrame(player: player, identity: identity)
+    }
+
+    private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
+        guard let identity = videoSurfaceIdentity(for: player),
+              videoPreFirstFrameEscapeAction(
+            surface: .fallback,
+            presentationMounted: hasAppeared && !closing,
+            firstFrameAdmitted: pageFinished || player.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || player.status.isTerminal
+        ) == .requestFallbackFailureAdvance,
+              firstFrameHandoff.claimPreFirstFrameFailure(identity) else { return }
+        markPageFailedAndAdvance()
     }
 
     private func replayPendingVideoFirstFrameIfNeeded() -> Bool {

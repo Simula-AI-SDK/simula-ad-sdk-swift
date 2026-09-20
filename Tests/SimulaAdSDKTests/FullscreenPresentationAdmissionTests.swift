@@ -339,6 +339,96 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(state.accrueImpression(deltaMs: 2_000, thresholdMs: 2_000))
     }
 
+    func testHTMLBillingDwellStartsAtPresentationButWaitsForMainFrameCommit() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.accrueImpression(deltaMs: 2_500, thresholdMs: 2_000))
+        XCTAssertEqual(state.accruedImpressionMs, 2_500)
+        XCTAssertFalse(state.impressionCommitted)
+        XCTAssertTrue(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertTrue(state.impressionCommitted)
+    }
+
+    func testHTMLCommitBeforeThresholdDoesNotRestartPresentationDwell() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.accrueImpression(deltaMs: 750, thresholdMs: 2_000))
+        XCTAssertFalse(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertTrue(state.accrueImpression(deltaMs: 1_250, thresholdMs: 2_000))
+        XCTAssertEqual(state.accruedImpressionMs, 2_000)
+    }
+
+    func testHTMLNavigationFailurePermanentlySuppressesUncommittedBilling() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.accrueImpression(deltaMs: 1_500, thresholdMs: 2_000))
+        state.htmlNavigationDidFail()
+
+        XCTAssertFalse(state.impressionDwellEligible)
+        XCTAssertFalse(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertFalse(state.accrueImpression(deltaMs: 10_000, thresholdMs: 2_000))
+        XCTAssertFalse(state.impressionCommitted)
+    }
+
+    func testHTMLNavigationFailureAfterBillingDoesNotUndoOneShotCommit() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertTrue(state.accrueImpression(deltaMs: 2_000, thresholdMs: 2_000))
+        state.htmlNavigationDidFail()
+
+        XCTAssertTrue(state.impressionCommitted)
+        XCTAssertFalse(state.accrueImpression(deltaMs: 2_000, thresholdMs: 2_000))
+    }
+
+    func testLegacyHTMLPresenterCallbackPolicyKeepsRendererTerminationTelemetryOnly() {
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .mainFrameCommitted),
+            .confirm
+        )
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .navigationFailed),
+            .suppressUncommitted
+        )
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+    }
+
+    func testRendererTerminationTelemetryOnlyStillAllowsRecoveredCommitToBill() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.accrueImpression(deltaMs: 2_500, thresholdMs: 2_000))
+
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+        XCTAssertTrue(state.impressionDwellEligible)
+        XCTAssertTrue(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertTrue(state.impressionCommitted)
+    }
+
+    func testTerminalRecoveryFailureAfterRendererTerminationSuppressesUncommittedBilling() {
+        var state = FullscreenVisualAdmissionState()
+        XCTAssertTrue(state.htmlPresentationDidSucceed())
+        XCTAssertFalse(state.accrueImpression(deltaMs: 1_500, thresholdMs: 2_000))
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .navigationFailed),
+            .suppressUncommitted
+        )
+        state.htmlNavigationDidFail()
+        XCTAssertFalse(state.htmlNavigationDidCommit(thresholdMs: 2_000))
+        XCTAssertFalse(state.accrueImpression(deltaMs: 10_000, thresholdMs: 2_000))
+        XCTAssertFalse(state.impressionCommitted)
+    }
+
     func testImpressionDwellClockDropsPausedTimeAndReanchorsOnResume() {
         var clock = FullscreenImpressionDwellClock()
         clock.resume(at: 10)
@@ -613,6 +703,262 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertFalse(canUseVideoControls(firstFrameAdmitted: true, displayAdmitted: false))
         XCTAssertFalse(canUseVideoControls(firstFrameAdmitted: false, displayAdmitted: true))
         XCTAssertTrue(canUseVideoControls(firstFrameAdmitted: true, displayAdmitted: true))
+    }
+
+    func testPreFirstFrameEscapeRoutesEachSurfaceThroughItsExistingTerminalPath() {
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .interstitial,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .failInterstitialDisplay)
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .rewarded,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .finishRewardedUnearned)
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .fallback,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .requestFallbackFailureAdvance)
+    }
+
+    func testPreFirstFrameEscapeRejectsUnmountedTerminalAndStalePostFrameTaps() {
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .interstitial,
+            presentationMounted: false,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .none)
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .rewarded,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: true
+        ), .none)
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .fallback,
+            presentationMounted: true,
+            firstFrameAdmitted: true,
+            terminal: false
+        ), .none)
+        XCTAssertFalse(shouldShowVideoPreFirstFrameEscape(
+            firstFrameAdmitted: true,
+            terminal: false
+        ))
+    }
+
+    func testPreFirstFrameChromeShowsExactlyOneCloseAction() {
+        XCTAssertEqual(
+            videoPreFirstFrameChromeVisibility(
+                hasVideo: false,
+                firstFrameAdmitted: false,
+                terminal: false
+            ),
+            .init(showsEscape: false, showsServerControl: true)
+        )
+        XCTAssertEqual(
+            videoPreFirstFrameChromeVisibility(
+                hasVideo: true,
+                firstFrameAdmitted: false,
+                terminal: false
+            ),
+            .init(showsEscape: true, showsServerControl: false)
+        )
+        XCTAssertEqual(
+            videoPreFirstFrameChromeVisibility(
+                hasVideo: true,
+                firstFrameAdmitted: true,
+                terminal: false
+            ),
+            .init(showsEscape: false, showsServerControl: true)
+        )
+        XCTAssertEqual(
+            videoPreFirstFrameChromeVisibility(
+                hasVideo: true,
+                firstFrameAdmitted: false,
+                terminal: true
+            ),
+            .init(showsEscape: false, showsServerControl: false)
+        )
+    }
+
+    func testInterstitialPreFrameTerminalMapsToDisplayFailureWithoutPostPrimaryCallbacks() {
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .interstitial,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .failInterstitialDisplay)
+        var admission = FullscreenVisualAdmissionState()
+        let outcome = admission.finish()
+        let policy = outcome.map { FullscreenPostPrimaryPolicy(terminalOutcome: $0) }
+
+        XCTAssertEqual(outcome, .displayFailed)
+        XCTAssertFalse(policy?.presentsFallbacks == true)
+        XCTAssertFalse(policy?.notifiesPublisherClose == true)
+    }
+
+    func testFallbackPreFrameTerminalRequestsOneDeferredFailureAdvance() {
+        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+            surface: .fallback,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ), .requestFallbackFailureAdvance)
+        var handoff = PendingFirstFrameHandoff<String>()
+        handoff.activate("current-player")
+        var advance = FallbackFailureAdvanceState()
+
+        XCTAssertTrue(handoff.claimPreFirstFrameFailure("current-player"))
+        XCTAssertFalse(advance.request(index: 1, blocked: true))
+        XCTAssertFalse(handoff.claimPreFirstFrameFailure("current-player"))
+        XCTAssertEqual(advance.blockersDidClear(currentIndex: 1), 1)
+        XCTAssertNil(advance.blockersDidClear(currentIndex: 1))
+    }
+
+    func testRewardedPreFrameCancellationIsUnearnedZeroTimeWithoutVerificationOrClosePolicy() {
+        let outcome = rewardedTerminalOutcome(
+            earned: false,
+            actualElapsedPlayTime: 0,
+            completionReason: .videoCompleted
+        )
+        let policy = FullscreenPostPrimaryPolicy(
+            terminalOutcome: .displayFailed,
+            earnedReward: outcome.earned
+        )
+
+        XCTAssertFalse(outcome.earned)
+        XCTAssertEqual(outcome.elapsedPlayTime, 0)
+        XCTAssertNil(outcome.completionReason)
+        XCTAssertNil(rewardVerificationElapsedPlayTime(
+            earned: outcome.earned,
+            actualElapsedPlayTime: outcome.elapsedPlayTime
+        ))
+        XCTAssertFalse(policy.presentsFallbacks)
+        XCTAssertFalse(policy.notifiesPublisherClose)
+        XCTAssertFalse(policy.verifiesEarnedReward)
+    }
+
+    func testMutedAudioTrackPolicyDisablesOnlyAudioAndPreservesOriginalState() {
+        var policy = VideoAudioTrackPolicy<String>()
+        let commands = policy.prepareMutedPlayback(tracks: [
+            .init(id: "enabled-audio", isAudio: true, isEnabled: true),
+            .init(id: "disabled-audio", isAudio: true, isEnabled: false),
+            .init(id: "video", isAudio: false, isEnabled: true),
+        ])
+
+        XCTAssertEqual(commands, [.init(id: "enabled-audio", isEnabled: false)])
+        XCTAssertEqual(policy.originalEnabled, [
+            "enabled-audio": true,
+            "disabled-audio": false,
+        ])
+    }
+
+    func testMutedAudioTrackPolicyRestoresRemovedTrackBeforeCapturingReplacementBaseline() {
+        var policy = VideoAudioTrackPolicy<String>()
+        _ = policy.prepareMutedPlayback(tracks: [
+            .init(id: "old", isAudio: true, isEnabled: true),
+        ])
+        let commands = policy.tracksDidChange([
+            .init(id: "replacement", isAudio: true, isEnabled: true),
+        ])
+
+        XCTAssertEqual(commands, [
+            .init(id: "old", isEnabled: true),
+            .init(id: "replacement", isEnabled: false),
+        ])
+        XCTAssertEqual(policy.originalEnabled, ["replacement": true])
+    }
+
+    func testMediaSelectionNotificationCannotOverwriteSDKDisabledBaseline() {
+        var policy = VideoAudioTrackPolicy<String>()
+        XCTAssertEqual(policy.prepareMutedPlayback(tracks: [
+            .init(id: "A", isAudio: true, isEnabled: true),
+        ]), [.init(id: "A", isEnabled: false)])
+
+        XCTAssertTrue(policy.tracksDidChange([
+            .init(id: "A", isAudio: true, isEnabled: false),
+        ]).isEmpty)
+        XCTAssertEqual(policy.originalEnabled, ["A": true])
+
+        XCTAssertEqual(policy.unmute(tracks: [
+            .init(id: "A", isAudio: true, isEnabled: false),
+        ]), [.init(id: "A", isEnabled: true)])
+    }
+
+    func testTrackListChangePreservesExistingBaselineAndCapturesOnlyNewTrack() {
+        var policy = VideoAudioTrackPolicy<String>()
+        _ = policy.prepareMutedPlayback(tracks: [
+            .init(id: "A", isAudio: true, isEnabled: true),
+        ])
+
+        XCTAssertEqual(policy.tracksDidChange([
+            .init(id: "A", isAudio: true, isEnabled: false),
+            .init(id: "B", isAudio: true, isEnabled: true),
+        ]), [.init(id: "B", isEnabled: false)])
+        XCTAssertEqual(policy.originalEnabled, ["A": true, "B": true])
+    }
+
+    func testStrongGeneratedTrackRecordsDoNotTransferBaselineToReplacementObject() throws {
+        final class Track {
+            let onDeinit: () -> Void
+            init(onDeinit: @escaping () -> Void = {}) { self.onDeinit = onDeinit }
+            deinit { onDeinit() }
+        }
+        var records = StrongVideoAudioTrackRecords<Track>()
+        var oldTrackReleases = 0
+        var oldTrack: Track? = Track { oldTrackReleases += 1 }
+        let oldID = records.id(for: try XCTUnwrap(oldTrack))
+        records.retain(ids: [oldID])
+        oldTrack = nil
+        XCTAssertEqual(oldTrackReleases, 0)
+
+        let replacement = Track()
+        let replacementID = records.id(for: replacement)
+        XCTAssertNotEqual(oldID, replacementID)
+        XCTAssertFalse(records.track(for: oldID) === replacement)
+        XCTAssertTrue(records.track(for: replacementID) === replacement)
+
+        records.retain(ids: [replacementID])
+        XCTAssertEqual(oldTrackReleases, 1)
+        XCTAssertNil(records.track(for: oldID))
+        XCTAssertEqual(records.count, 1)
+    }
+
+    func testExplicitUnmuteRestoresRecordedCurrentStatesExactlyOnce() {
+        var policy = VideoAudioTrackPolicy<String>()
+        _ = policy.prepareMutedPlayback(tracks: [
+            .init(id: "originally-enabled", isAudio: true, isEnabled: true),
+            .init(id: "originally-disabled", isAudio: true, isEnabled: false),
+        ])
+        let commands = policy.unmute(tracks: [
+            .init(id: "originally-enabled", isAudio: true, isEnabled: false),
+            .init(id: "originally-disabled", isAudio: true, isEnabled: false),
+        ])
+
+        XCTAssertEqual(commands, [.init(id: "originally-enabled", isEnabled: true)])
+        XCTAssertFalse(policy.isMuted)
+        XCTAssertTrue(policy.originalEnabled.isEmpty)
+        XCTAssertTrue(policy.tracksDidChange([
+            .init(id: "new", isAudio: true, isEnabled: false),
+        ]).isEmpty, "Lifecycle/media-selection changes must never enable tracks while unmuted")
+        XCTAssertTrue(policy.unmute(tracks: []).isEmpty)
+    }
+
+    func testRemuteRecordsCurrentStateAndDisablesBeforePlayback() {
+        var policy = VideoAudioTrackPolicy<String>()
+        _ = policy.unmute(tracks: [])
+        let commands = policy.remute(tracks: [
+            .init(id: "audio", isAudio: true, isEnabled: true),
+        ])
+
+        XCTAssertTrue(policy.isMuted)
+        XCTAssertEqual(commands, [.init(id: "audio", isEnabled: false)])
+        XCTAssertEqual(policy.originalEnabled, ["audio": true])
     }
 
     func testDisplayOutcomeFailsExactlyOnceWhenNothingWasAdmitted() {
@@ -1011,7 +1357,55 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testPresentationShownInactiveStartsImpressionAfterDidBecomeActive() async throws {
+    func testLegacyHTMLEngineCommitsAtPresentationAnchoredThresholdAfterDidCommit() {
+        let clock = TestUptime(10)
+        var displayed = 0
+        var impressions = 0
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: { displayed += 1 },
+            onImpression: { impressions += 1 },
+            impressionDelayMs: 2_000,
+            tickNanos: 60_000_000_000,
+            uptime: { clock.now },
+            initialApplicationActive: true
+        )
+
+        admission.presentationDidSucceed()
+        clock.now = 12.5
+        admission.htmlNavigationDidCommit()
+        admission.htmlNavigationDidCommit()
+
+        XCTAssertEqual(displayed, 1)
+        XCTAssertEqual(impressions, 1)
+        XCTAssertEqual(admission.finish(), .closed)
+    }
+
+    @MainActor
+    func testLegacyHTMLEngineFailureBeforeBillingStopsDwellPermanently() {
+        let clock = TestUptime(0)
+        var impressions = 0
+        let admission = FullscreenPresentationAdmission(
+            onDisplayed: {},
+            onImpression: { impressions += 1 },
+            impressionDelayMs: 2_000,
+            tickNanos: 60_000_000_000,
+            uptime: { clock.now },
+            initialApplicationActive: true
+        )
+
+        admission.presentationDidSucceed()
+        clock.now = 1
+        admission.htmlNavigationDidFail()
+        clock.now = 100
+        admission.htmlNavigationDidCommit()
+        admission.setBlocked(true)
+
+        XCTAssertEqual(impressions, 0)
+        XCTAssertEqual(admission.finish(), .closed)
+    }
+
+    @MainActor
+    func testPresentationShownAndCommittedInactiveStartsImpressionAfterDidBecomeActive() async throws {
         var impressions = 0
         let admission = FullscreenPresentationAdmission(
             onDisplayed: {},
@@ -1021,6 +1415,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         )
         NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
         admission.presentationDidSucceed()
+        admission.htmlNavigationDidCommit()
         try await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertEqual(impressions, 0)
         NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
@@ -1090,6 +1485,22 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         player.resumeAfterInterruption()
         XCTAssertFalse(player.requiresUserResume)
         if case .failed = player.status { XCTFail("Explicit interruption resume must not fail playback") }
+        player.stop()
+    }
+
+    @MainActor
+    func testPlayerMuteDefenseRemainsSynchronizedAcrossExplicitToggle() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        XCTAssertTrue(player.isMuted)
+        XCTAssertTrue(player.player.isMuted)
+        XCTAssertTrue(player.admitFirstVisualFrame())
+
+        player.toggleMuted()
+        XCTAssertFalse(player.isMuted)
+        XCTAssertFalse(player.player.isMuted)
+        player.toggleMuted()
+        XCTAssertTrue(player.isMuted)
+        XCTAssertTrue(player.player.isMuted)
         player.stop()
     }
 

@@ -361,6 +361,20 @@ private struct CreativeInterstitialView: View {
     private var presentationActive: Bool {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
     }
+    private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
+        guard let videoPlayer else {
+            return videoPreFirstFrameChromeVisibility(
+                hasVideo: false,
+                firstFrameAdmitted: false,
+                terminal: false
+            )
+        }
+        return videoPreFirstFrameChromeVisibility(
+            hasVideo: true,
+            firstFrameAdmitted: primaryCreativeReady || videoPlayer.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || videoPlayer.status.isTerminal
+        )
+    }
 
     var body: some View {
         ZStack {
@@ -375,22 +389,33 @@ private struct CreativeInterstitialView: View {
             // Close button — always shown with the compact chrome. Driven by
             // `ad_behavior.close` when present; otherwise a default config (top-right, always
             // available) so ads with no `ad_behavior` still get the small close, not a big one.
-            CloseButtonView(
-                treatment: closeConfig.treatment,
-                position: closeConfig.position,
-                progressBarColor: closeConfig.progressBarColor,
-                action: closeConfig.action,
-                isRewardCopy: isRewardCopy,
-                enabled: canDismissFullscreen(
-                    dismissUnlocked: closeEnabled,
-                    clickHandoffPending: clickHandoffPending
-                ),
-                remaining: closeRemaining,
-                progress: closeProgress,
-                onClose: { handleClose() }
-            )
-            // Identity keyed to the pause generation — see `closeGateGeneration`.
-            .id(closeGateGeneration)
+            if videoChromeVisibility.showsServerControl {
+                CloseButtonView(
+                    treatment: closeConfig.treatment,
+                    position: closeConfig.position,
+                    progressBarColor: closeConfig.progressBarColor,
+                    action: closeConfig.action,
+                    isRewardCopy: isRewardCopy,
+                    enabled: canDismissFullscreen(
+                        dismissUnlocked: closeEnabled,
+                        clickHandoffPending: clickHandoffPending
+                    ),
+                    remaining: closeRemaining,
+                    progress: closeProgress,
+                    onClose: { handleClose() }
+                )
+                // Identity keyed to the pause generation — see `closeGateGeneration`.
+                .id(closeGateGeneration)
+            }
+
+            if let videoPlayer, videoChromeVisibility.showsEscape {
+                VideoPreFirstFrameEscapeButton(
+                    action: { handleVideoPreFirstFrameEscape(player: videoPlayer) },
+                    accessibilityLabel: "Cancel ad"
+                )
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
 
             // Mid-ad store prompt — independent of the close button and SKOverlay. Pinned to the
             // corner opposite the close button (the SDK mirrors the close position horizontally)
@@ -568,9 +593,12 @@ private struct CreativeInterstitialView: View {
     private func htmlCreativeView(_ html: String) -> some View {
         WebViewRepresentable(
             htmlString: html,
+            onNavigationCommitted: { handleLegacyHTMLBillingCallback(.mainFrameCommitted) },
             onNavigationFinished: { handlePlayableReady() },
-            onNavigationFailed: { _ in recordLegacyHTMLFailure("navigation_failed") },
-            onWebContentProcessTerminated: { recordLegacyHTMLFailure("renderer_terminated") },
+            onNavigationFailed: { _ in handleLegacyHTMLBillingCallback(.navigationFailed) },
+            onWebContentProcessTerminated: {
+                handleLegacyHTMLBillingCallback(.webContentProcessTerminated)
+            },
             onAdClick: { handleHtmlClick($0) },
             onClickHandoffPendingChanged: {
                 updateClickHandoff(.creative, pending: $0)
@@ -601,10 +629,26 @@ private struct CreativeInterstitialView: View {
 
     private func recordLegacyHTMLFailure(_ reason: String) {
         handleSKANCreativeFailure()
+        recordLegacyHTMLTelemetry(reason)
+    }
+
+    private func recordLegacyHTMLTelemetry(_ reason: String) {
         Telemetry.shared.recordLifecycle(
             stage: "creative_fail", adFormat: "interstitial", adUnitId: response.adUnitId,
             adId: response.impressionId, serveId: response.impressionId, errorCode: reason
         )
+    }
+
+    private func handleLegacyHTMLBillingCallback(_ callback: LegacyHTMLBillingCallback) {
+        switch legacyHTMLBillingCallbackAction(for: callback) {
+        case .confirm:
+            admission.htmlNavigationDidCommit()
+        case .suppressUncommitted:
+            admission.htmlNavigationDidFail()
+            recordLegacyHTMLFailure("navigation_failed")
+        case .telemetryOnly:
+            recordLegacyHTMLTelemetry("renderer_terminated")
+        }
     }
 
     private func handlePlayableReady() {
@@ -697,6 +741,17 @@ private struct CreativeInterstitialView: View {
         }
         fireAutoStoreRedirectIfCloseShown()
         return true
+    }
+
+    private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
+        guard videoPreFirstFrameEscapeAction(
+            surface: .interstitial,
+            presentationMounted: viewAppeared && visible,
+            firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
+            terminal: videoFailureHandled || player.status.isTerminal
+        ) == .failInterstitialDisplay else { return }
+        videoFailureHandled = true
+        requestPrimaryCreativeFailure()
     }
 
     private func updateVideoGate(

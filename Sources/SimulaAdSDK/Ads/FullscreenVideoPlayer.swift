@@ -334,6 +334,70 @@ func canUseVideoControls(firstFrameAdmitted: Bool, displayAdmitted: Bool) -> Boo
     firstFrameAdmitted && displayAdmitted
 }
 
+enum VideoPreFirstFrameEscapeSurface: Equatable, Sendable {
+    case interstitial
+    case rewarded
+    case fallback
+}
+
+enum VideoPreFirstFrameEscapeAction: Equatable, Sendable {
+    case none
+    case failInterstitialDisplay
+    case finishRewardedUnearned
+    case requestFallbackFailureAdvance
+}
+
+func shouldShowVideoPreFirstFrameEscape(
+    firstFrameAdmitted: Bool,
+    terminal: Bool
+) -> Bool {
+    !firstFrameAdmitted && !terminal
+}
+
+struct VideoPreFirstFrameChromeVisibility: Equatable, Sendable {
+    let showsEscape: Bool
+    let showsServerControl: Bool
+}
+
+func videoPreFirstFrameChromeVisibility(
+    hasVideo: Bool,
+    firstFrameAdmitted: Bool,
+    terminal: Bool
+) -> VideoPreFirstFrameChromeVisibility {
+    if hasVideo && terminal {
+        return VideoPreFirstFrameChromeVisibility(
+            showsEscape: false,
+            showsServerControl: false
+        )
+    }
+    let showsEscape = hasVideo && shouldShowVideoPreFirstFrameEscape(
+        firstFrameAdmitted: firstFrameAdmitted,
+        terminal: terminal
+    )
+    return VideoPreFirstFrameChromeVisibility(
+        showsEscape: showsEscape,
+        showsServerControl: !showsEscape
+    )
+}
+
+func videoPreFirstFrameEscapeAction(
+    surface: VideoPreFirstFrameEscapeSurface,
+    presentationMounted: Bool,
+    firstFrameAdmitted: Bool,
+    terminal: Bool
+) -> VideoPreFirstFrameEscapeAction {
+    guard presentationMounted,
+          shouldShowVideoPreFirstFrameEscape(
+              firstFrameAdmitted: firstFrameAdmitted,
+              terminal: terminal
+          ) else { return .none }
+    switch surface {
+    case .interstitial: return .failInterstitialDisplay
+    case .rewarded: return .finishRewardedUnearned
+    case .fallback: return .requestFallbackFailureAdvance
+    }
+}
+
 enum FullscreenVideoTelemetryStage {
     static let start = "video_start"
     static let complete = "video_complete"
@@ -362,6 +426,125 @@ struct VideoPreparationRetentionPolicy: Equatable, Sendable {
     func evictionCandidate(_ entries: [Entry]) -> UUID? {
         guard entries.count >= max(1, capacity) else { return nil }
         return entries.filter { !$0.active }.min { $0.lastTouched < $1.lastTouched }?.id
+    }
+}
+
+struct VideoAudioTrackSnapshot<ID: Hashable & Sendable>: Equatable, Sendable {
+    let id: ID
+    let isAudio: Bool
+    let isEnabled: Bool
+}
+
+struct VideoAudioTrackCommand<ID: Hashable & Sendable>: Equatable, Sendable {
+    let id: ID
+    let isEnabled: Bool
+}
+
+struct VideoAudioTrackPolicy<ID: Hashable & Sendable>: Sendable {
+    private(set) var isMuted = true
+    private(set) var originalEnabled: [ID: Bool] = [:]
+
+    mutating func prepareMutedPlayback(
+        tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        guard isMuted else { return [] }
+        return disableCurrentAudioTracks(tracks)
+    }
+
+    mutating func tracksDidChange(
+        _ tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        guard isMuted else { return [] }
+        return reconcileCurrentAudioTracks(tracks)
+    }
+
+    mutating func remute(
+        tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        isMuted = true
+        return disableCurrentAudioTracks(tracks)
+    }
+
+    mutating func unmute(
+        tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        guard isMuted else { return [] }
+        let audioTracks = tracks.filter(\.isAudio)
+        let currentIDs = Set(audioTracks.map(\.id))
+        var commands = restoreRemovedAudioTracks(currentIDs: currentIDs)
+        commands += audioTracks.compactMap { track -> VideoAudioTrackCommand<ID>? in
+            guard track.isAudio, let original = originalEnabled[track.id],
+                  track.isEnabled != original else { return nil }
+            return VideoAudioTrackCommand(id: track.id, isEnabled: original)
+        }
+        isMuted = false
+        originalEnabled.removeAll(keepingCapacity: false)
+        return commands
+    }
+
+    mutating func teardown() {
+        originalEnabled.removeAll(keepingCapacity: false)
+    }
+
+    private mutating func disableCurrentAudioTracks(
+        _ tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        reconcileCurrentAudioTracks(tracks)
+    }
+
+    private mutating func reconcileCurrentAudioTracks(
+        _ tracks: [VideoAudioTrackSnapshot<ID>]
+    ) -> [VideoAudioTrackCommand<ID>] {
+        let audioTracks = tracks.filter(\.isAudio)
+        let currentIDs = Set(audioTracks.map(\.id))
+        var commands = restoreRemovedAudioTracks(currentIDs: currentIDs)
+        originalEnabled = originalEnabled.filter { currentIDs.contains($0.key) }
+        commands.reserveCapacity(commands.count + audioTracks.count)
+        for track in audioTracks {
+            if originalEnabled[track.id] == nil {
+                originalEnabled[track.id] = track.isEnabled
+            }
+            if track.isEnabled {
+                commands.append(VideoAudioTrackCommand(id: track.id, isEnabled: false))
+            }
+        }
+        return commands
+    }
+
+    private func restoreRemovedAudioTracks(
+        currentIDs: Set<ID>
+    ) -> [VideoAudioTrackCommand<ID>] {
+        originalEnabled.compactMap { id, original in
+            currentIDs.contains(id) ? nil : VideoAudioTrackCommand(id: id, isEnabled: original)
+        }
+    }
+}
+
+struct StrongVideoAudioTrackRecords<Track: AnyObject> {
+    private struct Record {
+        let id: UUID
+        let track: Track
+    }
+
+    private var records: [Record] = []
+
+    var count: Int { records.count }
+
+    mutating func id(for track: Track) -> UUID {
+        if let record = records.first(where: { $0.track === track }) {
+            return record.id
+        }
+        let record = Record(id: UUID(), track: track)
+        records.append(record)
+        return record.id
+    }
+
+    func track(for id: UUID) -> Track? {
+        records.first(where: { $0.id == id })?.track
+    }
+
+    mutating func retain(ids: Set<UUID>) {
+        records.removeAll { !ids.contains($0.id) }
     }
 }
 
@@ -402,6 +585,105 @@ func videoInterruptionEndAction(
 }
 
 @MainActor
+/// Best-effort per-track isolation for tracks AVFoundation identifies as audio. Dynamic streams may
+/// expose item tracks without an asset track; those remain untouched and rely on AVPlayer.isMuted.
+private final class VideoAudioTrackIsolation {
+    private let item: AVPlayerItem
+    private var policy = VideoAudioTrackPolicy<UUID>()
+    private var trackRecords = StrongVideoAudioTrackRecords<AVPlayerItemTrack>()
+    private var tracksObservation: NSKeyValueObservation?
+    private var mediaSelectionObserver: NSObjectProtocol?
+    private var tornDown = false
+
+    init(item: AVPlayerItem) {
+        self.item = item
+        tracksObservation = item.observe(\.tracks, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.knownTracksDidChange() }
+        }
+        mediaSelectionObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.mediaSelectionDidChangeNotification,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.mediaSelectionDidChange() }
+        }
+    }
+
+    deinit {
+        tracksObservation?.invalidate()
+        if let mediaSelectionObserver {
+            NotificationCenter.default.removeObserver(mediaSelectionObserver)
+        }
+    }
+
+    func prepareMutedPlayback() {
+        reconcile { policy, snapshots in
+            policy.prepareMutedPlayback(tracks: snapshots)
+        }
+    }
+
+    func remute() {
+        reconcile { policy, snapshots in policy.remute(tracks: snapshots) }
+    }
+
+    func unmute() {
+        reconcile { policy, snapshots in policy.unmute(tracks: snapshots) }
+    }
+
+    func teardown() {
+        guard !tornDown else { return }
+        tornDown = true
+        tracksObservation?.invalidate()
+        tracksObservation = nil
+        if let mediaSelectionObserver {
+            NotificationCenter.default.removeObserver(mediaSelectionObserver)
+            self.mediaSelectionObserver = nil
+        }
+        policy.teardown()
+        trackRecords.retain(ids: [])
+    }
+
+    private func knownTracksDidChange() {
+        guard !tornDown else { return }
+        reconcile { policy, snapshots in policy.tracksDidChange(snapshots) }
+    }
+
+    private func mediaSelectionDidChange() {
+        guard !tornDown else { return }
+        // Preserve baselines captured before the SDK disabled existing tracks. The notification may
+        // reflect our own disabled state; only newly identifiable audio tracks capture a new baseline.
+        reconcile { policy, snapshots in policy.tracksDidChange(snapshots) }
+    }
+
+    private func snapshots() -> [VideoAudioTrackSnapshot<UUID>] {
+        item.tracks.compactMap { track in
+            // A nil assetTrack has no trustworthy media type. Leave it untouched and rely on
+            // AVPlayer.isMuted; treating unknown tracks as audio can disable the video track.
+            guard track.assetTrack?.mediaType == .audio else { return nil }
+            return VideoAudioTrackSnapshot(
+                id: trackRecords.id(for: track),
+                isAudio: true,
+                isEnabled: track.isEnabled
+            )
+        }
+    }
+
+    private func reconcile(
+        transition: (
+            inout VideoAudioTrackPolicy<UUID>,
+            [VideoAudioTrackSnapshot<UUID>]
+        ) -> [VideoAudioTrackCommand<UUID>]
+    ) {
+        let snapshots = snapshots()
+        let commands = transition(&policy, snapshots)
+        for command in commands {
+            trackRecords.track(for: command.id)?.isEnabled = command.isEnabled
+        }
+        trackRecords.retain(ids: Set(policy.originalEnabled.keys))
+    }
+}
+
+@MainActor
 final class FullscreenVideoPlayer: ObservableObject {
     static let preparationTimeout: TimeInterval = 10
     static let firstFrameTimeout: TimeInterval = 10
@@ -418,6 +700,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     let posterURL: URL?
 
     private let item: AVPlayerItem
+    private let audioTrackIsolation: VideoAudioTrackIsolation
     private var itemStatusObservation: NSKeyValueObservation?
     private var durationObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
@@ -451,8 +734,10 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     init(url: URL, posterURL: URL?) {
         self.posterURL = posterURL
-        self.item = AVPlayerItem(url: url)
+        let item = AVPlayerItem(url: url)
+        self.item = item
         self.player = AVPlayer(playerItem: item)
+        self.audioTrackIsolation = VideoAudioTrackIsolation(item: item)
         player.isMuted = true
         player.actionAtItemEnd = .pause
         installObservers()
@@ -506,10 +791,17 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     func toggleMuted() {
         guard !stopped, firstFrameDeadline.admitted else { return }
-        isMuted.toggle()
         // Do not alter or activate the host's AVAudioSession. AVPlayer participates in the
         // publisher's existing policy, which is safer than replacing its category/options.
-        player.isMuted = isMuted
+        if isMuted {
+            audioTrackIsolation.unmute()
+            isMuted = false
+            player.isMuted = false
+        } else {
+            player.isMuted = true
+            isMuted = true
+            audioTrackIsolation.remute()
+        }
     }
 
     func admitFirstVisualFrame() -> Bool {
@@ -547,6 +839,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         interruptionFallbackWorkItem?.cancel()
         interruptionFallbackWorkItem = nil
         player.pause()
+        audioTrackIsolation.teardown()
         player.replaceCurrentItem(with: nil)
         removeObservers()
     }
@@ -855,6 +1148,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         )
         if canPlay {
             scheduleFirstFrameTimeoutIfNeeded()
+            if isMuted { audioTrackIsolation.prepareMutedPlayback() }
             player.play()
         } else {
             playbackTimeoutWorkItem?.cancel()
@@ -1312,6 +1606,24 @@ private struct VideoLayerRepresentable: UIViewRepresentable {
 
     static func dismantleUIView(_ view: VideoLayerView, coordinator: ()) {
         view.uninstall()
+    }
+}
+
+struct VideoPreFirstFrameEscapeButton: View {
+    let action: () -> Void
+    let accessibilityLabel: String
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(Color.black.opacity(0.55)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
