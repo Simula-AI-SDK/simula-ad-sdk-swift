@@ -1,0 +1,531 @@
+import Foundation
+
+let maxVideoPlanSKOverlayDelaySeconds = 60
+let defaultVideoPlanSKOverlayDelaySeconds = 3
+
+func effectiveVideoPlanSKOverlayConfig(
+    isVideoPlanV2: Bool,
+    config: SKOverlayConfig?
+) -> SKOverlayConfig? {
+    guard isVideoPlanV2 else { return nil }
+    if let config, !config.enabled { return nil }
+    return SKOverlayConfig(
+        enabled: true,
+        timing: .delayed,
+        delaySeconds: min(
+            maxVideoPlanSKOverlayDelaySeconds,
+            max(0, config?.delaySeconds ?? defaultVideoPlanSKOverlayDelaySeconds)
+        ),
+        position: config?.position ?? .bottom,
+        dismissible: config?.dismissible ?? true
+    )
+}
+
+enum VideoPlanSKOverlayClockAction: Equatable, Sendable {
+    case none
+    case schedule(TimeInterval)
+    case ready
+}
+
+/// Presentation-owned eligible-time clock. It is independent of any individual video view, so a
+/// video-to-video or video-to-playable handoff neither resets nor cancels the one-shot overlay.
+struct VideoPlanSKOverlayClock: Equatable, Sendable {
+    let delay: TimeInterval
+    private(set) var elapsed: TimeInterval = 0
+    private(set) var started = false
+    private(set) var blocked = true
+    private(set) var ready = false
+    private(set) var cancelled = false
+    private var anchor: TimeInterval?
+
+    init(delay: TimeInterval) {
+        self.delay = min(
+            TimeInterval(maxVideoPlanSKOverlayDelaySeconds),
+            max(0, delay.isFinite ? delay : TimeInterval(defaultVideoPlanSKOverlayDelaySeconds))
+        )
+    }
+
+    mutating func start(now: TimeInterval, blocked: Bool) -> VideoPlanSKOverlayClockAction {
+        guard !cancelled, !ready else { return .none }
+        if !started { started = true }
+        return setBlocked(blocked, now: now)
+    }
+
+    mutating func setBlocked(_ blocked: Bool, now: TimeInterval) -> VideoPlanSKOverlayClockAction {
+        guard started, !cancelled, !ready else { return .none }
+        accrue(now: now)
+        self.blocked = blocked
+        anchor = blocked ? nil : now
+        if elapsed >= delay {
+            ready = true
+            anchor = nil
+            return .ready
+        }
+        return blocked ? .none : .schedule(delay - elapsed)
+    }
+
+    mutating func deadlineFired(now: TimeInterval) -> VideoPlanSKOverlayClockAction {
+        guard started, !blocked, !cancelled, !ready else { return .none }
+        accrue(now: now)
+        anchor = now
+        if elapsed >= delay {
+            ready = true
+            anchor = nil
+            return .ready
+        }
+        return .schedule(delay - elapsed)
+    }
+
+    mutating func cancel(now: TimeInterval) {
+        accrue(now: now)
+        cancelled = true
+        anchor = nil
+    }
+
+    private mutating func accrue(now: TimeInterval) {
+        guard let anchor, !blocked, now.isFinite, now >= anchor else { return }
+        elapsed = min(delay, elapsed + now - anchor)
+    }
+}
+
+struct VideoPlanBlockerOwner: Hashable, Sendable {
+    let id: UUID
+    init(id: UUID = UUID()) { self.id = id }
+}
+
+struct VideoPlanBlockerState: Equatable, Sendable {
+    private(set) var owner: VideoPlanBlockerOwner?
+    private(set) var generation: UInt64 = 0
+
+    mutating func activate(
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64,
+        blocked: Bool
+    ) -> Bool {
+        self.owner = owner
+        self.generation = generation
+        return blocked
+    }
+
+    func update(
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64,
+        blocked: Bool
+    ) -> Bool? {
+        guard self.owner == owner, self.generation == generation else { return nil }
+        return blocked
+    }
+
+    mutating func deactivate(owner: VideoPlanBlockerOwner, generation: UInt64) -> Bool? {
+        guard self.owner == owner, self.generation == generation else { return nil }
+        self.owner = nil
+        return true
+    }
+}
+
+enum VideoPlanOverlayPhase: String, Equatable, Sendable {
+    case video
+    case nextStep = "next_step"
+}
+
+struct VideoPlanOverlayPlacementState: Equatable, Sendable {
+    private(set) var phase = VideoPlanOverlayPhase.nextStep
+    private(set) var readyOn: VideoPlanOverlayPhase?
+    private(set) var shownOn: VideoPlanOverlayPhase?
+
+    mutating func videoBecameActive() {
+        phase = .video
+    }
+
+    mutating func handoffBegan() {
+        phase = .nextStep
+    }
+
+    mutating func becameReady() {
+        if readyOn == nil { readyOn = phase }
+    }
+
+    mutating func shown() -> VideoPlanOverlayPhase {
+        shownOn = phase
+        return phase
+    }
+}
+
+struct VideoHandoffTimingSample: Equatable, Sendable {
+    let msToNextStepReady: Double
+    let secondsSinceVideoStart: Double
+}
+
+struct VideoHandoffTimingState: Equatable, Sendable {
+    private var videoStartedAt: TimeInterval?
+    private var terminalAt: TimeInterval?
+
+    mutating func videoStarted(now: TimeInterval) {
+        guard now.isFinite else { return }
+        videoStartedAt = now
+    }
+
+    mutating func videoTerminated(now: TimeInterval) {
+        guard now.isFinite else { return }
+        terminalAt = now
+    }
+
+    mutating func nextStepReady(now: TimeInterval) -> VideoHandoffTimingSample? {
+        guard now.isFinite, let terminalAt, now >= terminalAt else { return nil }
+        let startedAt = videoStartedAt ?? terminalAt
+        self.terminalAt = nil
+        videoStartedAt = nil
+        return VideoHandoffTimingSample(
+            msToNextStepReady: (now - terminalAt) * 1_000,
+            secondsSinceVideoStart: max(0, now - startedAt)
+        )
+    }
+}
+
+struct VideoPlanHandoffTelemetry: Sendable {
+    let adFormat: String
+    let adUnitId: String?
+    let adId: String?
+    let serveId: String?
+    let creative: Creative?
+    let behavior: AdBehavior?
+    let muted: Bool
+    let mutedWatchMs: Int
+    let unmutedWatchMs: Int
+    let videoPositionS: Double
+    let durationS: Double?
+    let secondsSinceVideoStart: Double?
+    let reason: String
+}
+
+struct VideoPlanOverlayTelemetry: Sendable {
+    let adFormat: String
+    let adUnitId: String?
+    let adId: String?
+    let serveId: String?
+    let creative: Creative?
+    let behavior: AdBehavior?
+}
+
+#if os(iOS)
+import StoreKit
+import UIKit
+
+@MainActor
+final class VideoPlanPresentationScope {
+    private(set) var isMuted = false
+
+    private var clock: VideoPlanSKOverlayClock?
+    private var deadlineTask: Task<Void, Never>?
+    private var resolvedAppID: String?
+    private var resolutionStarted = false
+    private var config: SKOverlayConfig?
+    private var attribution: AdAttribution?
+    private weak var originatingScene: UIWindowScene?
+    private var ownership: SKOverlayOwnershipToken?
+    private var cancelled = false
+    private var blocked = true
+    private var blockerState = VideoPlanBlockerState()
+    private var handoffTiming = VideoHandoffTimingState()
+    private var pendingHandoff: VideoPlanHandoffTelemetry?
+    private var overlayTelemetry: VideoPlanOverlayTelemetry?
+    private var overlayShownAt: TimeInterval?
+    private var overlayFailureRecorded = false
+    private var overlayPlacement = VideoPlanOverlayPlacementState()
+
+    func updateMuted(_ muted: Bool) {
+        isMuted = muted
+    }
+
+    func firstVideoFrame(
+        creative: Creative?,
+        behavior: AdBehavior?,
+        adFormat: String,
+        adUnitId: String?,
+        adId: String?,
+        serveId: String?,
+        config sourceConfig: SKOverlayConfig?,
+        trackingUrl: String?,
+        destination: AdDestination,
+        storeUrl: String?,
+        attribution: AdAttribution?,
+        originatingScene: UIWindowScene,
+        blocked: Bool
+    ) {
+        guard !cancelled, creative?.usesVideoPlanV2 == true else { return }
+        completePendingHandoff(now: ProcessInfo.processInfo.systemUptime)
+        handoffTiming.videoStarted(now: ProcessInfo.processInfo.systemUptime)
+        overlayPlacement.videoBecameActive()
+        guard let effective = effectiveVideoPlanSKOverlayConfig(
+            isVideoPlanV2: true,
+            config: sourceConfig
+        ) else { return }
+        self.blocked = blocked
+        if clock == nil {
+            overlayTelemetry = VideoPlanOverlayTelemetry(
+                adFormat: adFormat,
+                adUnitId: adUnitId,
+                adId: adId,
+                serveId: serveId,
+                creative: creative,
+                behavior: behavior
+            )
+            config = effective
+            self.attribution = attribution
+            self.originatingScene = originatingScene
+            clock = VideoPlanSKOverlayClock(delay: TimeInterval(effective.delaySeconds))
+            resolveAppIDIfNeeded(
+                trackingUrl: trackingUrl,
+                destination: destination,
+                storeUrl: storeUrl
+            )
+        }
+        guard var clock else { return }
+        let action = clock.start(now: ProcessInfo.processInfo.systemUptime, blocked: blocked)
+        self.clock = clock
+        apply(action)
+    }
+
+    func videoTerminated(_ telemetry: VideoPlanHandoffTelemetry) {
+        guard !cancelled else { return }
+        closePendingHandoffIfNeeded(reasonOverride: "next_step_failed")
+        pendingHandoff = telemetry
+        overlayPlacement.handoffBegan()
+        let now = ProcessInfo.processInfo.systemUptime
+        if let age = telemetry.secondsSinceVideoStart {
+            handoffTiming.videoStarted(now: max(0, now - age))
+        }
+        handoffTiming.videoTerminated(now: now)
+    }
+
+    func handoffBegan() {
+        guard !cancelled else { return }
+        overlayPlacement.handoffBegan()
+    }
+
+    func playableStepReady() {
+        guard !cancelled else { return }
+        completePendingHandoff(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func completePendingHandoff(now: TimeInterval) {
+        guard let pendingHandoff,
+              let timing = handoffTiming.nextStepReady(now: now) else { return }
+        self.pendingHandoff = nil
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.handoff,
+            adFormat: pendingHandoff.adFormat,
+            adUnitId: pendingHandoff.adUnitId,
+            adId: pendingHandoff.adId,
+            serveId: pendingHandoff.serveId,
+            isVideoPlanV2: true,
+            creative: pendingHandoff.creative,
+            behavior: pendingHandoff.behavior,
+            muted: pendingHandoff.muted,
+            mutedWatchMs: pendingHandoff.mutedWatchMs,
+            unmutedWatchMs: pendingHandoff.unmutedWatchMs,
+            videoPositionS: pendingHandoff.videoPositionS,
+            durationS: pendingHandoff.durationS,
+            reason: pendingHandoff.reason,
+            msToNextStepReady: timing.msToNextStepReady,
+            secondsSinceVideoStart: timing.secondsSinceVideoStart,
+            on: "next_step"
+        )
+    }
+
+    func activateBlocker(
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64,
+        blocked: Bool
+    ) {
+        applyBlocked(blockerState.activate(owner: owner, generation: generation, blocked: blocked))
+    }
+
+    func updateBlocker(
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64,
+        blocked: Bool
+    ) {
+        guard let accepted = blockerState.update(
+            owner: owner,
+            generation: generation,
+            blocked: blocked
+        ) else { return }
+        applyBlocked(accepted)
+    }
+
+    func deactivateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64) {
+        guard let blocked = blockerState.deactivate(owner: owner, generation: generation) else { return }
+        applyBlocked(blocked)
+    }
+
+    private func applyBlocked(_ blocked: Bool) {
+        self.blocked = blocked
+        guard var clock else { return }
+        let action = clock.setBlocked(blocked, now: ProcessInfo.processInfo.systemUptime)
+        self.clock = clock
+        apply(action)
+        if !blocked { presentIfReady() }
+    }
+
+    func cancel() {
+        guard !cancelled else { return }
+        closePendingHandoffIfNeeded()
+        cancelled = true
+        deadlineTask?.cancel()
+        deadlineTask = nil
+        if var clock {
+            clock.cancel(now: ProcessInfo.processInfo.systemUptime)
+            self.clock = clock
+        }
+        if let ownership, #available(iOS 14.0, *) {
+            SKOverlayPresenter.dismiss(ownershipToken: ownership)
+            recordOverlay(
+                stage: FullscreenVideoTelemetryStage.skoverlayDismissed,
+                visibleS: overlayShownAt.map { max(0, ProcessInfo.processInfo.systemUptime - $0) }
+            )
+        }
+        ownership = nil
+    }
+
+    private func closePendingHandoffIfNeeded(reasonOverride: String? = nil) {
+        guard let pendingHandoff else { return }
+        self.pendingHandoff = nil
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.close,
+            adFormat: pendingHandoff.adFormat,
+            adUnitId: pendingHandoff.adUnitId,
+            adId: pendingHandoff.adId,
+            serveId: pendingHandoff.serveId,
+            isVideoPlanV2: true,
+            creative: pendingHandoff.creative,
+            behavior: pendingHandoff.behavior,
+            muted: pendingHandoff.muted,
+            mutedWatchMs: pendingHandoff.mutedWatchMs,
+            unmutedWatchMs: pendingHandoff.unmutedWatchMs,
+            videoPositionS: pendingHandoff.videoPositionS,
+            durationS: pendingHandoff.durationS,
+            reason: reasonOverride ?? pendingHandoff.reason,
+            secondsSinceVideoStart: pendingHandoff.secondsSinceVideoStart
+        )
+    }
+
+    private func resolveAppIDIfNeeded(
+        trackingUrl: String?,
+        destination: AdDestination,
+        storeUrl: String?
+    ) {
+        guard !resolutionStarted, #available(iOS 14.0, *) else { return }
+        resolutionStarted = true
+        CreativeCTARouter.resolveAppStoreID(
+            trackingUrl: trackingUrl,
+            destination: destination,
+            storeUrl: storeUrl
+        ) { [weak self] appID in
+            guard let self, !self.cancelled else { return }
+            self.resolvedAppID = appID
+            if appID?.isEmpty != false {
+                self.recordOverlayFailure("app_id_unresolved")
+            }
+            self.presentIfReady()
+        }
+    }
+
+    private func apply(_ action: VideoPlanSKOverlayClockAction) {
+        deadlineTask?.cancel()
+        deadlineTask = nil
+        switch action {
+        case .none:
+            break
+        case .ready:
+            overlayPlacement.becameReady()
+            presentIfReady()
+        case .schedule(let delay):
+            guard delay.isFinite, delay >= 0 else { return }
+            deadlineTask = Task { [weak self] in
+                if delay > 0 {
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                    catch { return }
+                }
+                guard !Task.isCancelled else { return }
+                self?.deadlineFired()
+            }
+        }
+    }
+
+    private func deadlineFired() {
+        deadlineTask = nil
+        guard var clock else { return }
+        let action = clock.deadlineFired(now: ProcessInfo.processInfo.systemUptime)
+        self.clock = clock
+        apply(action)
+    }
+
+    private func presentIfReady() {
+        guard !cancelled, ownership == nil, clock?.ready == true, !blocked,
+              let config, let appID = resolvedAppID, !appID.isEmpty,
+              let originatingScene,
+              UIApplication.shared.applicationState == .active,
+              originatingScene.activationState == .foregroundActive,
+              #available(iOS 14.0, *) else { return }
+        let presented = SKOverlayPresenter.present(
+            appID: appID,
+            config: config,
+            attribution: attribution,
+            originatingScene: originatingScene
+        )
+        guard let presented else {
+            recordOverlayFailure("presentation_failed")
+            return
+        }
+        ownership = presented
+        overlayShownAt = ProcessInfo.processInfo.systemUptime
+        recordOverlay(
+            stage: FullscreenVideoTelemetryStage.skoverlayShown,
+            on: overlayPlacement.shown().rawValue
+        )
+    }
+
+    private func recordOverlayFailure(_ error: String) {
+        guard !overlayFailureRecorded else { return }
+        overlayFailureRecorded = true
+        recordOverlay(stage: FullscreenVideoTelemetryStage.skoverlayFailed, error: error)
+    }
+
+    private func recordOverlay(
+        stage: String,
+        visibleS: Double? = nil,
+        error: String? = nil,
+        on: String? = nil
+    ) {
+        guard let telemetry = overlayTelemetry else { return }
+        recordFullscreenVideoLifecycle(
+            stage: stage,
+            adFormat: telemetry.adFormat,
+            adUnitId: telemetry.adUnitId,
+            adId: telemetry.adId,
+            serveId: telemetry.serveId,
+            isVideoPlanV2: true,
+            creative: telemetry.creative,
+            behavior: telemetry.behavior,
+            muted: isMuted,
+            errorCode: error,
+            visibleS: visibleS,
+            on: on
+        )
+    }
+}
+#else
+@MainActor
+final class VideoPlanPresentationScope {
+    private(set) var isMuted = false
+    func updateMuted(_ muted: Bool) { isMuted = muted }
+    func videoTerminated(_ telemetry: VideoPlanHandoffTelemetry) {}
+    func handoffBegan() {}
+    func playableStepReady() {}
+    func activateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
+    func updateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
+    func deactivateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64) {}
+    func cancel() {}
+}
+#endif

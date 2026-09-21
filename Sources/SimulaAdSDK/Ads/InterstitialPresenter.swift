@@ -101,8 +101,10 @@ final class InterstitialPresenter {
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
+        onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
         onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -127,9 +129,11 @@ final class InterstitialPresenter {
             apiKey: apiKey,
             response: response,
             videoPlayer: videoPlayer,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             originatingScene: scene,
             bridge: bridge,
+            onVideoStarted: onVideoStarted,
             onClick: onClick,
             onRequestDismiss: { [weak self] in self?.dismiss() }
         )
@@ -167,8 +171,10 @@ final class InterstitialPresenter {
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
+        onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping () -> Void,
         onClose: @escaping (FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -177,8 +183,10 @@ final class InterstitialPresenter {
             response: response,
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             onWillPresent: onWillPresent,
+            onVideoStarted: onVideoStarted,
             onClick: { _ in onClick() },
             onClose: onClose
         )
@@ -255,11 +263,13 @@ private struct CreativeInterstitialView: View {
     let apiKey: String
     let response: AdLoadResponse
     let videoPlayer: FullscreenVideoPlayer?
+    let videoPlanScope: VideoPlanPresentationScope?
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
     let originatingScene: UIWindowScene
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
+    let onVideoStarted: () -> Void
     let onClick: (ClickInteraction) -> Void
     let onRequestDismiss: () -> Void
 
@@ -297,6 +307,9 @@ private struct CreativeInterstitialView: View {
     @State private var videoGate: VideoPlaybackGate
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
+    @State private var videoCompletionHandled = false
+    @State private var videoPlanBlockerOwner = VideoPlanBlockerOwner()
+    @State private var videoPlanBlockerGeneration: UInt64 = 0
     @State private var primaryCreativeReady = false
     @State private var admittedVideoPlayerIdentity: ObjectIdentifier?
     @State private var terminalState = DeferredTerminalState<Bool>()
@@ -327,19 +340,23 @@ private struct CreativeInterstitialView: View {
         apiKey: String,
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer?,
+        videoPlanScope: VideoPlanPresentationScope?,
         admission: FullscreenPresentationAdmission,
         originatingScene: UIWindowScene,
         bridge: CreativeBridge,
+        onVideoStarted: @escaping () -> Void,
         onClick: @escaping (ClickInteraction) -> Void,
         onRequestDismiss: @escaping () -> Void
     ) {
         self.apiKey = apiKey
         self.response = response
         self.videoPlayer = videoPlayer
+        self.videoPlanScope = videoPlanScope
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.originatingScene = originatingScene
         self.bridge = bridge
+        self.onVideoStarted = onVideoStarted
         self.onClick = onClick
         self.onRequestDismiss = onRequestDismiss
         // Close starts enabled unless the server-driven `close.delay_seconds` gates it.
@@ -360,6 +377,9 @@ private struct CreativeInterstitialView: View {
     private var clickHandoffPending: Bool { clickHandoffs.isPending }
     private var presentationActive: Bool {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
+    }
+    private var usesVideoPlanV2: Bool {
+        response.usesVideoPlanV2Contract && response.creative?.usesVideoPlanV2 == true
     }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
@@ -461,7 +481,13 @@ private struct CreativeInterstitialView: View {
             }
             reconcileGate()
             startStorePromptTrigger()
-            startSKOverlay()
+            if !usesVideoPlanV2 { startSKOverlay() }
+            videoPlanBlockerGeneration &+= 1
+            videoPlanScope?.activateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration,
+                blocked: !appForegrounded || storeSheetPresented
+            )
             // PLAYABLE_END: if the close button is already available (delay 0), fire immediately.
             fireAutoStoreRedirectIfCloseShown()
         }
@@ -481,6 +507,10 @@ private struct CreativeInterstitialView: View {
             storePromptTask?.cancel()
             storePromptTask = nil
             videoPlayer?.setPresentationBlocked(true)
+            videoPlanScope?.deactivateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration
+            )
             skOverlayTask?.cancel()
             skOverlayTask = nil
             dismissSKOverlay()
@@ -493,12 +523,14 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             endSKANViewThroughImpressionIfStarted()
             appForegrounded = false
+            updateVideoPlanBlocker(true)
             admission.setBlocked(true)
             storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
+            updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
             storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
@@ -519,12 +551,14 @@ private struct CreativeInterstitialView: View {
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             endSKANViewThroughImpressionIfStarted()
             storeSheetPresented = true
+            updateVideoPlanBlocker(true)
             admission.setBlocked(true)
             storeExit?.onAway() // an in-app store/Safari sheet covered the ad
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
+            updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
             storeExit?.onReturn() // the in-app sheet was dismissed
             storePromptGestureGuard.releaseAfterExternalReturn()
@@ -672,7 +706,33 @@ private struct CreativeInterstitialView: View {
             controlsEnabled: canUseVideoControls(
                 firstFrameAdmitted: primaryCreativeReady,
                 displayAdmitted: admission.hasAdmittedDisplay
-            )
+            ),
+            chromeConfiguration: videoChromeConfiguration(
+                creative: response.creative,
+                behavior: response.adBehavior,
+                isVideoPlanV2: usesVideoPlanV2
+            ),
+            onMuteChanged: { muted in
+                guard usesVideoPlanV2 else { return }
+                videoPlanScope?.updateMuted(muted)
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.muteToggle,
+                    adFormat: "interstitial", adUnitId: response.adUnitId,
+                    adId: response.impressionId, serveId: response.impressionId,
+                    isVideoPlanV2: usesVideoPlanV2,
+                    creative: response.creative, behavior: response.adBehavior,
+                    muted: muted,
+                    mutedWatchMs: player.mutedWatchMilliseconds,
+                    unmutedWatchMs: player.unmutedWatchMilliseconds,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            telemetryPauseReason: videoPauseReason,
+            onTelemetryEvent: usesVideoPlanV2
+                ? { event in recordVideoSurfaceTelemetry(event, player: player) }
+                : nil
         )
             .allowsHitTesting(!clickHandoffPending)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -688,26 +748,54 @@ private struct CreativeInterstitialView: View {
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady else { return }
+            guard primaryCreativeReady, !videoCompletionHandled else { return }
+            videoCompletionHandled = true
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.complete, adFormat: "interstitial", adUnitId: response.adUnitId,
-                adId: response.impressionId, serveId: response.impressionId
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.complete,
+                adFormat: "interstitial", adUnitId: response.adUnitId,
+                adId: response.impressionId, serveId: response.impressionId,
+                isVideoPlanV2: usesVideoPlanV2,
+                creative: response.creative, behavior: response.adBehavior,
+                muted: player.isMuted,
+                mutedWatchMs: player.mutedWatchMilliseconds,
+                unmutedWatchMs: player.unmutedWatchMilliseconds,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
+            markVideoHandoff(player: player, reason: "complete")
+            if shouldAutomaticallyAdvanceCompletedVideo(
+                usesVideoPlanV2: usesVideoPlanV2,
+                status: status
+            ) {
+                requestPrimaryCreativeFailure()
+            }
         case .failed(let reason):
             guard !videoFailureHandled else { return }
             videoFailureHandled = true
             handleSKANCreativeFailure()
             admission.visualBecameUnavailable(owner: admissionOwner)
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.fail, adFormat: "interstitial", adUnitId: response.adUnitId,
-                adId: response.impressionId, serveId: response.impressionId, errorCode: reason.rawValue
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.fail,
+                adFormat: "interstitial", adUnitId: response.adUnitId,
+                adId: response.impressionId, serveId: response.impressionId,
+                isVideoPlanV2: usesVideoPlanV2,
+                creative: response.creative, behavior: response.adBehavior,
+                muted: player.isMuted,
+                mutedWatchMs: player.mutedWatchMilliseconds,
+                unmutedWatchMs: player.unmutedWatchMilliseconds,
+                errorCode: reason.rawValue,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
             Telemetry.shared.recordError(
                 signature: "video:playback_failed",
                 errorCode: reason.rawValue,
                 breadcrumb: "surface=interstitial"
             )
+            markVideoHandoff(player: player, reason: "failed")
             requestPrimaryCreativeFailure()
         case .preparing:
             break
@@ -738,11 +826,34 @@ private struct CreativeInterstitialView: View {
         updateVideoGate(player: player, played: player.playedSeconds)
         if !videoStartRecorded {
             videoStartRecorded = true
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.start, adFormat: "interstitial", adUnitId: response.adUnitId,
-                adId: response.impressionId, serveId: response.impressionId
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.start,
+                adFormat: "interstitial", adUnitId: response.adUnitId,
+                adId: response.impressionId, serveId: response.impressionId,
+                isVideoPlanV2: usesVideoPlanV2,
+                creative: response.creative, behavior: response.adBehavior,
+                muted: player.isMuted,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
+            onVideoStarted()
         }
+        videoPlanScope?.firstVideoFrame(
+            creative: response.creative,
+            behavior: response.adBehavior,
+            adFormat: "interstitial",
+            adUnitId: response.adUnitId,
+            adId: response.impressionId,
+            serveId: response.impressionId,
+            config: response.adBehavior?.skoverlay,
+            trackingUrl: response.trackingUrl,
+            destination: response.destinationKind,
+            storeUrl: response.iosStoreUrl,
+            attribution: response.skanAttribution,
+            originatingScene: originatingScene,
+            blocked: !appForegrounded || storeSheetPresented
+        )
         fireAutoStoreRedirectIfCloseShown()
         return true
     }
@@ -778,6 +889,53 @@ private struct CreativeInterstitialView: View {
             closeEnabled = true
             storePromptVisible = false
         }
+    }
+
+    private var videoPauseReason: String {
+        if !appForegrounded { return "backgrounded" }
+        if storeSheetPresented { return "store_presented" }
+        if videoPlayer?.hasActiveAudioInterruption == true { return "audio_interruption" }
+        return "playback"
+    }
+
+    private func recordVideoSurfaceTelemetry(
+        _ event: VideoSurfaceTelemetryEvent,
+        player: FullscreenVideoPlayer
+    ) {
+        let stage: String
+        var quartile: Int?
+        var reason: String?
+        var pausedMs: Double?
+        switch event {
+        case .quartile(let value):
+            stage = FullscreenVideoTelemetryStage.duration
+            quartile = value
+        case .pause(let value):
+            stage = FullscreenVideoTelemetryStage.pause
+            reason = value
+        case .resume(let value, let duration):
+            stage = FullscreenVideoTelemetryStage.resume
+            reason = value
+            pausedMs = duration
+        }
+        recordFullscreenVideoLifecycle(
+            stage: stage,
+            adFormat: "interstitial", adUnitId: response.adUnitId,
+            adId: response.impressionId, serveId: response.impressionId,
+            isVideoPlanV2: usesVideoPlanV2,
+            creative: response.creative, behavior: response.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            quartile: quartile,
+            reason: reason,
+            pausedMs: pausedMs,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            on: stage == FullscreenVideoTelemetryStage.pause
+                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil
+        )
     }
 
     private func requestPrimaryCreativeFailure() {
@@ -933,12 +1091,52 @@ private struct CreativeInterstitialView: View {
             dismissUnlocked: closeEnabled,
             clickHandoffPending: clickHandoffPending
         ) else { return }
+        if let player = videoPlayer, usesVideoPlanV2 {
+            recordVideoClose(player: player, reason: "user")
+            videoPlanScope?.handoffBegan()
+        }
         endSKANViewThroughImpression()
         // Fade the whole surface out, then remove the hosting window.
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
             onRequestDismiss()
         }
+    }
+
+    private func recordVideoClose(player: FullscreenVideoPlayer, reason: String) {
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.close,
+            adFormat: "interstitial", adUnitId: response.adUnitId,
+            adId: response.impressionId, serveId: response.impressionId,
+            isVideoPlanV2: usesVideoPlanV2,
+            creative: response.creative, behavior: response.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            reason: reason,
+            secondsSinceVideoStart: player.secondsSinceVideoStart
+        )
+    }
+
+    private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
+        guard usesVideoPlanV2 else { return }
+        videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
+            adFormat: "interstitial",
+            adUnitId: response.adUnitId,
+            adId: response.impressionId,
+            serveId: response.impressionId,
+            creative: response.creative,
+            behavior: response.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            reason: reason
+        ))
     }
 
     /// Close-delay gate. The interstitial gates its close button on the server-driven
@@ -1031,6 +1229,14 @@ private struct CreativeInterstitialView: View {
         } else {
             pauseGate()
         }
+    }
+
+    private func updateVideoPlanBlocker(_ blocked: Bool) {
+        videoPlanScope?.updateBlocker(
+            owner: videoPlanBlockerOwner,
+            generation: videoPlanBlockerGeneration,
+            blocked: blocked
+        )
     }
 
     // MARK: Store prompt (mid-ad)
@@ -1218,6 +1424,7 @@ private struct CreativeInterstitialView: View {
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).
     private func presentSKOverlayOnClickIfNeeded() {
+        guard !usesVideoPlanV2 else { return }
         guard let config = response.adBehavior?.skoverlay, config.enabled, config.timing == .onClick else { return }
         // If StoreOpen also selects SKStoreProductViewController, the sheet takes foreground while
         // this scene-owned overlay remains behind it. Both server-selected StoreKit surfaces retain

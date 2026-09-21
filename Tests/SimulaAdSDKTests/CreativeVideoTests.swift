@@ -68,6 +68,499 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(capabilities.dictionary["video_v1"] as? Bool, true)
     }
 
+    func testCapabilitiesAdvertiseVideoPlanV2Independently() throws {
+        let capabilities = DeviceCapabilities(
+            osVersion: "18.0.0",
+            storekitAvailable: true,
+            skanVersion: "4.0",
+            adAttributionKitAvailable: true,
+            nativeClickBeaconV1: true,
+            videoV1: true,
+            videoPlanV2: true
+        )
+        let data = try JSONEncoder().encode(capabilities)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["video_v1"] as? Bool, true)
+        XCTAssertEqual(object["video_plan_v2"] as? Bool, true)
+        XCTAssertEqual(capabilities.dictionary["video_plan_v2"] as? Bool, true)
+    }
+
+    func testVideoPlanV2CreativeAndStyleDecode() throws {
+        let response = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,
+          "creative":{
+            "type":"video","url":"https://cdn.example/ad.mp4","cta":"Play Now",
+            "app_icon_url":"https://cdn.example/icon.png","app_name":"Example Game",
+            "subtitle":"Build your city","video_pool":"ugc","clip_index":0
+          },
+          "ad_behavior":{"video":{"style":"bottom_card"}}
+        }
+        """#)
+        let creative = try XCTUnwrap(response.creative)
+
+        XCTAssertTrue(creative.usesVideoPlanV2)
+        XCTAssertEqual(creative.cta, "Play Now")
+        XCTAssertEqual(creative.appIconUrl, "https://cdn.example/icon.png")
+        XCTAssertEqual(creative.appName, "Example Game")
+        XCTAssertEqual(creative.subtitle, "Build your city")
+        XCTAssertEqual(creative.videoPool, "ugc")
+        XCTAssertEqual(creative.clipIndex, 0)
+        XCTAssertEqual(response.adBehavior?.video.style, .bottomCard)
+        XCTAssertEqual(
+            videoChromeConfiguration(
+                creative: creative,
+                behavior: response.adBehavior,
+                isVideoPlanV2: true
+            ),
+            VideoChromeConfiguration(
+                style: .bottomCard,
+                cta: "Play Now",
+                appIconURL: URL(string: "https://cdn.example/icon.png"),
+                title: "Example Game",
+                subtitle: "Build your city"
+            )
+        )
+    }
+
+    func testAllVideoChromeStylesAndUnknownFallback() throws {
+        XCTAssertEqual(
+            VideoChromeStyle.allCases.map(\.rawValue),
+            ["bottom_bar", "floating_pill", "bottom_card", "corner_cta", "feed_card"]
+        )
+        for style in VideoChromeStyle.allCases {
+            let data = Data(#"{"style":"\#(style.rawValue)"}"#.utf8)
+            XCTAssertEqual(try JSONDecoder().decode(VideoBehavior.self, from: data).style, style)
+        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(VideoBehavior.self, from: Data(#"{"style":"future"}"#.utf8)).style,
+            .cornerCTA
+        )
+        XCTAssertEqual(try JSONDecoder().decode(VideoBehavior.self, from: Data("{}".utf8)).style, .cornerCTA)
+    }
+
+    func testTitleOnlyChromeDoesNotManufactureSubtitle() throws {
+        let response = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,
+          "creative":{"type":"video","url":"https://cdn.example/ad.mp4","app_name":"Title","clip_index":0}
+        }
+        """#)
+        let config = videoChromeConfiguration(
+            creative: response.creative,
+            behavior: response.adBehavior,
+            isVideoPlanV2: true
+        )
+
+        XCTAssertEqual(config?.title, "Title")
+        XCTAssertNil(config?.subtitle)
+        XCTAssertEqual(config?.style, .cornerCTA)
+        XCTAssertEqual(config?.cta, "Install")
+    }
+
+    func testVideoV1PayloadDoesNotEnterV2Runtime() throws {
+        let response = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,
+          "creative":{"type":"video","url":"https://cdn.example/ad.mp4","video_pool":"ugc"},
+          "ad_behavior":{"video":{"style":"feed_card"}}
+        }
+        """#)
+
+        XCTAssertFalse(response.creative?.usesVideoPlanV2 == true)
+        XCTAssertNil(videoChromeConfiguration(
+            creative: response.creative,
+            behavior: response.adBehavior,
+            isVideoPlanV2: false
+        ))
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: false, status: .ended))
+    }
+
+    func testNestedFallbackCreativePreservesV2SemanticIndexAndChrome() throws {
+        let ads = try decodeFallbacks(#"""
+        {"ads":[{
+          "ad_id":"es2",
+          "creative":{"type":"video","url":"https://cdn.example/es2.mp4","cta":"Get","app_icon_url":"https://cdn.example/icon.png","app_name":"Game","video_pool":"trailer","clip_index":2},
+          "ad_behavior":{"video":{"style":"floating_pill"}}
+        }]}
+        """#)
+        let ad = try XCTUnwrap(ads.first)
+
+        XCTAssertEqual(ad.sourceIndex, 0)
+        XCTAssertEqual(ad.creative?.clipIndex, 2)
+        XCTAssertEqual(ad.creative?.videoPool, "trailer")
+        XCTAssertTrue(ad.usesVideoPlanV2)
+        XCTAssertEqual(ad.adBehavior.video.style, .floatingPill)
+        XCTAssertTrue(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: ad.usesVideoPlanV2, status: .ended))
+    }
+
+    func testAllPlayableGoldenFlowRemainsPrimaryThenES1ThenES2() throws {
+        let primary = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2",
+          "creative":{"type":"playable","clip_index":0}
+        }
+        """#)
+        let fallbacks = try decodeFallbacks(#"""
+        {"video_plan_version":"video_plan_v2","ads":[
+          {"rendered_html":"ES1","creative":{"type":"playable","clip_index":1}},
+          {"rendered_html":"ES2","creative":{"type":"playable","clip_index":2}}
+        ]}
+        """#)
+
+        XCTAssertEqual(primary.creativeContent, .playable(html: "PRIMARY"))
+        XCTAssertTrue(primary.usesVideoPlanV2Contract)
+        XCTAssertFalse(primary.creative?.usesVideoPlanV2 == true)
+        XCTAssertEqual(fallbacks.map(\.sourceIndex), [0, 1])
+        XCTAssertEqual(fallbacks.map(\.renderedHtml), ["ES1", "ES2"])
+        XCTAssertEqual(fallbacks.map { $0.creative?.clipIndex }, [1, 2])
+        XCTAssertEqual(fallbacks.map(\.mediaType), [.playable, .playable])
+    }
+
+    func testVideoPlanSKOverlayDefaultsClampAndStayV2Only() {
+        XCTAssertNil(effectiveVideoPlanSKOverlayConfig(isVideoPlanV2: false, config: nil))
+        let defaults = effectiveVideoPlanSKOverlayConfig(isVideoPlanV2: true, config: nil)
+        XCTAssertEqual(defaults?.enabled, true)
+        XCTAssertEqual(defaults?.timing, .delayed)
+        XCTAssertEqual(defaults?.delaySeconds, 3)
+
+        let clamped = effectiveVideoPlanSKOverlayConfig(
+            isVideoPlanV2: true,
+            config: SKOverlayConfig(enabled: true, delaySeconds: 300)
+        )
+        XCTAssertEqual(clamped?.delaySeconds, 60)
+        XCTAssertNil(effectiveVideoPlanSKOverlayConfig(
+            isVideoPlanV2: true,
+            config: SKOverlayConfig(enabled: false)
+        ))
+    }
+
+    func testVideoPlanSKOverlayClockCountsOnlyEligiblePresentationTime() {
+        var clock = VideoPlanSKOverlayClock(delay: 3)
+        XCTAssertEqual(clock.start(now: 10, blocked: false), .schedule(3))
+        XCTAssertEqual(clock.setBlocked(true, now: 11), .none)
+        XCTAssertEqual(clock.deadlineFired(now: 20), .none)
+        XCTAssertEqual(clock.setBlocked(false, now: 20), .schedule(2))
+        XCTAssertEqual(clock.deadlineFired(now: 22), .ready)
+        XCTAssertTrue(clock.ready)
+        XCTAssertEqual(clock.deadlineFired(now: 23), .none)
+        XCTAssertEqual(clock.setBlocked(true, now: 30), .none)
+
+        var cancelled = VideoPlanSKOverlayClock(delay: 3)
+        XCTAssertEqual(cancelled.start(now: 0, blocked: false), .schedule(3))
+        cancelled.cancel(now: 1)
+        XCTAssertEqual(cancelled.deadlineFired(now: 10), .none)
+        XCTAssertFalse(cancelled.ready)
+    }
+
+    func testVideoPlanStallDeadlineIsEightEligibleSecondsOnly() {
+        XCTAssertEqual(videoPlanV2EligibleStallTimeout, 8)
+        XCTAssertTrue(shouldArmVideoStallDeadline(
+            wantsPlayback: true,
+            appActive: true,
+            presentationBlocked: false,
+            audioInterrupted: false
+        ))
+        XCTAssertFalse(shouldArmVideoStallDeadline(
+            wantsPlayback: true,
+            appActive: false,
+            presentationBlocked: false,
+            audioInterrupted: false
+        ))
+        XCTAssertFalse(shouldArmVideoStallDeadline(
+            wantsPlayback: true,
+            appActive: true,
+            presentationBlocked: true,
+            audioInterrupted: false
+        ))
+        XCTAssertFalse(shouldArmVideoStallDeadline(
+            wantsPlayback: true,
+            appActive: true,
+            presentationBlocked: false,
+            audioInterrupted: true
+        ))
+    }
+
+    func testPostFrameWatchdogPausesAndResetsForMediaOrDownloadProgress() {
+        var watchdog = VideoProgressWatchdog(budget: 8)
+        XCTAssertFalse(watchdog.observe(now: 0, eligible: true, mediaTime: 1, bufferedEnd: 2))
+        XCTAssertFalse(watchdog.observe(now: 4, eligible: true, mediaTime: 1, bufferedEnd: 2))
+        XCTAssertEqual(watchdog.remaining, 4, accuracy: 0.001)
+
+        XCTAssertFalse(watchdog.observe(now: 10, eligible: false, mediaTime: 1, bufferedEnd: 2))
+        XCTAssertEqual(watchdog.remaining, 4, accuracy: 0.001)
+        XCTAssertFalse(watchdog.observe(now: 20, eligible: true, mediaTime: 1, bufferedEnd: 2))
+        XCTAssertFalse(watchdog.observe(now: 22, eligible: true, mediaTime: 1, bufferedEnd: 3))
+        XCTAssertEqual(watchdog.remaining, 8, accuracy: 0.001)
+        XCTAssertFalse(watchdog.observe(now: 26, eligible: true, mediaTime: 2, bufferedEnd: 3))
+        XCTAssertEqual(watchdog.remaining, 8, accuracy: 0.001)
+        XCTAssertFalse(watchdog.observe(now: 30, eligible: true, mediaTime: 2, bufferedEnd: 3))
+        XCTAssertTrue(watchdog.observe(now: 34, eligible: true, mediaTime: 2, bufferedEnd: 3))
+    }
+
+    func testAudioTrackIsolationStartsUnmutedForV2() {
+        var policy = VideoAudioTrackPolicy<String>(isMuted: false)
+        let tracks = [VideoAudioTrackSnapshot(id: "audio", isAudio: true, isEnabled: true)]
+
+        XCTAssertFalse(policy.isMuted)
+        XCTAssertTrue(policy.prepareMutedPlayback(tracks: tracks).isEmpty)
+        XCTAssertEqual(policy.remute(tracks: tracks), [
+            VideoAudioTrackCommand(id: "audio", isEnabled: false),
+        ])
+    }
+
+    func testBlockerOwnerGenerationRejectsStaleDisappear() {
+        let primary = VideoPlanBlockerOwner()
+        let fallback = VideoPlanBlockerOwner()
+        var state = VideoPlanBlockerState()
+
+        XCTAssertFalse(state.activate(owner: primary, generation: 1, blocked: false))
+        XCTAssertFalse(state.activate(owner: fallback, generation: 1, blocked: false))
+        XCTAssertNil(state.deactivate(owner: primary, generation: 1))
+        XCTAssertNil(state.update(owner: primary, generation: 1, blocked: true))
+        XCTAssertEqual(state.update(owner: fallback, generation: 1, blocked: true), true)
+        XCTAssertEqual(state.deactivate(owner: fallback, generation: 1), true)
+    }
+
+    func testSKOverlayShownPhaseTracksVideoAndNextStepSeparately() {
+        var duringVideo = VideoPlanOverlayPlacementState()
+        duringVideo.videoBecameActive()
+        duringVideo.becameReady()
+        XCTAssertEqual(duringVideo.readyOn, .video)
+        XCTAssertEqual(duringVideo.shown(), .video)
+        XCTAssertEqual(duringVideo.shownOn, .video)
+
+        var delayedAcrossHandoff = VideoPlanOverlayPlacementState()
+        delayedAcrossHandoff.videoBecameActive()
+        delayedAcrossHandoff.becameReady()
+        delayedAcrossHandoff.handoffBegan()
+        XCTAssertEqual(delayedAcrossHandoff.readyOn, .video)
+        XCTAssertEqual(delayedAcrossHandoff.shown(), .nextStep)
+        XCTAssertEqual(delayedAcrossHandoff.shownOn, .nextStep)
+
+        var nextVideo = VideoPlanOverlayPlacementState()
+        nextVideo.videoBecameActive()
+        nextVideo.handoffBegan()
+        nextVideo.videoBecameActive()
+        nextVideo.becameReady()
+        XCTAssertEqual(nextVideo.shown(), .video)
+    }
+
+    func testSKOverlayShownTelemetrySerializesCanonicalOnValues() throws {
+        for phase in [VideoPlanOverlayPhase.video, .nextStep] {
+            var event = TelemetryEvent(
+                type: TelemetryType.lifecycle,
+                name: FullscreenVideoTelemetryStage.skoverlayShown,
+                eventId: phase.rawValue,
+                timestamp: 1
+            )
+            event.on = phase.rawValue
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+            )
+            XCTAssertEqual(object["name"] as? String, "skoverlay_shown")
+            XCTAssertEqual(object["on"] as? String, phase.rawValue)
+        }
+    }
+
+    func testHandoffTimingMeasuresTerminalToNextReadyAndWholeVideoAge() {
+        var timing = VideoHandoffTimingState()
+        timing.videoStarted(now: 10)
+        timing.videoTerminated(now: 18)
+        let sample = try? XCTUnwrap(timing.nextStepReady(now: 18.25))
+
+        XCTAssertEqual(sample?.msToNextStepReady ?? -1, 250, accuracy: 0.001)
+        XCTAssertEqual(sample?.secondsSinceVideoStart ?? -1, 8.25, accuracy: 0.001)
+        XCTAssertNil(timing.nextStepReady(now: 19))
+    }
+
+    func testQuartileAndPauseTelemetryStateMachinesAreOneShot() {
+        var quartiles = VideoQuartileState()
+        XCTAssertEqual(quartiles.crossed(position: 2.4, duration: 10), [])
+        XCTAssertEqual(quartiles.crossed(position: 7.6, duration: 10), [25, 50, 75])
+        XCTAssertEqual(quartiles.crossed(position: 10, duration: 10), [])
+
+        var pause = VideoPauseTelemetryState()
+        XCTAssertTrue(pause.pause(now: 5, reason: "backgrounded"))
+        XCTAssertFalse(pause.pause(now: 6, reason: "store_presented"))
+        let resumed = pause.resume(now: 7.25)
+        XCTAssertEqual(resumed?.reason, "backgrounded")
+        XCTAssertEqual(resumed?.pausedMs ?? -1, 2_250, accuracy: 0.001)
+        XCTAssertNil(pause.resume(now: 8))
+    }
+
+    func testCanonicalPoolAliasAndValidVideoClipRules() throws {
+        let canonical = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,"video_plan_version":"video_plan_v2",
+          "creative":{"type":"video","url":"https://cdn.example/a.mp4","video_pool":"ugc","pool":"trailer","clip_index":1}
+        }
+        """#)
+        let alias = try decodeRewarded(#"""
+        {
+          "video_plan_version":"video_plan_v2",
+          "creative":{"type":"video","url":"https://cdn.example/b.mp4","pool":"gameplay","clip_index":2}
+        }
+        """#)
+        let invalid = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,"video_plan_version":"video_plan_v2",
+          "creative":{"type":"video","url":"https://cdn.example/c.mp4","video_pool":"ugc","clip_index":3}
+        }
+        """#)
+        let playable = try decodeInterstitial(#"""
+        {
+          "ad_inserted":true,"rendered_html":"HTML","video_plan_version":"video_plan_v2",
+          "creative":{"type":"playable","clip_index":0}
+        }
+        """#)
+
+        XCTAssertEqual(canonical.creative?.videoPool, "ugc")
+        XCTAssertEqual(alias.creative?.videoPool, "gameplay")
+        XCTAssertTrue(canonical.creative?.usesVideoPlanV2 == true)
+        XCTAssertFalse(invalid.creative?.usesVideoPlanV2 == true)
+        XCTAssertTrue(playable.usesVideoPlanV2Contract)
+        XCTAssertFalse(playable.creative?.usesVideoPlanV2 == true)
+    }
+
+    func testFallbackNestedAndFlatMetadataMergePerField() throws {
+        let ad = try XCTUnwrap(try decodeFallbacks(#"""
+        {"video_plan_version":"video_plan_v2","ads":[{
+          "type":"video","url":"https://flat.example/video.mp4","poster_url":"https://flat.example/poster.jpg",
+          "cta":"Flat CTA","app_icon_url":"https://flat.example/icon.png","app_name":"Flat Name",
+          "subtitle":"Flat Subtitle","video_pool":"ugc","clip_index":1,
+          "creative":{"type":"video","url":"","cta":"Nested CTA","app_name":"Nested Name","pool":"trailer"}
+        }]}
+        """#).first)
+
+        XCTAssertEqual(ad.url, "https://flat.example/video.mp4")
+        XCTAssertEqual(ad.posterUrl, "https://flat.example/poster.jpg")
+        XCTAssertEqual(ad.creative?.cta, "Nested CTA")
+        XCTAssertEqual(ad.creative?.appIconUrl, "https://flat.example/icon.png")
+        XCTAssertEqual(ad.creative?.appName, "Nested Name")
+        XCTAssertEqual(ad.creative?.subtitle, "Flat Subtitle")
+        XCTAssertEqual(ad.creative?.videoPool, "trailer")
+        XCTAssertEqual(ad.creative?.clipIndex, 1)
+        XCTAssertTrue(ad.usesVideoPlanV2Contract)
+        XCTAssertTrue(ad.usesVideoPlanV2)
+    }
+
+    func testStyleRequirementsDegradeToCornerCTA() {
+        XCTAssertEqual(resolvedVideoChromeStyle(
+            requested: .bottomBar, hasAppIcon: false, hasAppName: true
+        ), .cornerCTA)
+        XCTAssertEqual(resolvedVideoChromeStyle(
+            requested: .floatingPill, hasAppIcon: true, hasAppName: false
+        ), .floatingPill)
+        XCTAssertEqual(resolvedVideoChromeStyle(
+            requested: .bottomCard, hasAppIcon: true, hasAppName: false
+        ), .cornerCTA)
+        XCTAssertEqual(resolvedVideoChromeStyle(
+            requested: .feedCard, hasAppIcon: true, hasAppName: true
+        ), .feedCard)
+    }
+
+    func testVideoAudioWatchAccountingAggregatesMutedAndUnmutedMediaTime() {
+        var accounting = VideoAudioWatchAccounting()
+        accounting.update(playedSeconds: 2, isMuted: false)
+        accounting.update(playedSeconds: 3.25, isMuted: true)
+        accounting.update(playedSeconds: 3, isMuted: false)
+
+        XCTAssertEqual(accounting.unmutedMilliseconds, 2_000)
+        XCTAssertEqual(accounting.mutedMilliseconds, 1_250)
+    }
+
+    func testVideoTelemetryWireFieldsAreExact() throws {
+        var event = TelemetryEvent(
+            type: TelemetryType.lifecycle,
+            name: FullscreenVideoTelemetryStage.complete,
+            eventId: "event",
+            timestamp: 1
+        )
+        event.clipIndex = 2
+        event.muted = false
+        event.impressionId = "imp-1"
+        event.style = "feed_card"
+        event.skoverlayEnabled = true
+        event.skoverlayDelaySeconds = 3
+        event.videoPositionS = 2.5
+        event.pool = "ugc"
+        event.durationS = 10
+        event.quartile = 25
+        event.reason = "background"
+        event.pausedMs = 200
+        event.watchedS = 2
+        event.secondsUnmuted = 1.6
+        event.secondsMuted = 0.4
+        event.msToNextStepReady = 30
+        event.secondsSinceVideoStart = 2.6
+        event.on = "video"
+        event.visibleS = 4
+        event.videoError = "none"
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["name"] as? String, "video_complete")
+        XCTAssertEqual(object["clip_index"] as? Int, 2)
+        XCTAssertEqual(object["muted"] as? Bool, false)
+        XCTAssertNil(object["video_pool"])
+        XCTAssertNil(object["video_style"])
+        XCTAssertNil(object["muted_watch_ms"])
+        XCTAssertNil(object["unmuted_watch_ms"])
+        XCTAssertEqual(object["impression_id"] as? String, "imp-1")
+        XCTAssertEqual(object["style"] as? String, "feed_card")
+        XCTAssertEqual(object["skoverlay_enabled"] as? Bool, true)
+        XCTAssertEqual(object["skoverlay_delay_seconds"] as? Int, 3)
+        XCTAssertEqual(object["video_position_s"] as? Double, 2.5)
+        XCTAssertEqual(object["pool"] as? String, "ugc")
+        XCTAssertEqual(object["duration_s"] as? Double, 10)
+        XCTAssertEqual(object["quartile"] as? Int, 25)
+        XCTAssertEqual(object["reason"] as? String, "background")
+        XCTAssertEqual(object["paused_ms"] as? Double, 200)
+        XCTAssertEqual(object["watched_s"] as? Double, 2)
+        XCTAssertEqual(object["seconds_unmuted"] as? Double, 1.6)
+        XCTAssertEqual(object["seconds_muted"] as? Double, 0.4)
+        XCTAssertEqual(object["ms_to_next_step_ready"] as? Double, 30)
+        XCTAssertEqual(object["seconds_since_video_start"] as? Double, 2.6)
+        XCTAssertEqual(object["on"] as? String, "video")
+        XCTAssertEqual(object["visible_s"] as? Double, 4)
+        XCTAssertEqual(object["error"] as? String, "none")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.mute, "video_mute")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.unmute, "video_unmute")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.muteToggle, "video_mute_toggle")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.duration, "video_duration")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.quartile, "video_duration")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.pause, "video_pause")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.resume, "video_resume")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.close, "video_close")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.handoff, "video_handoff")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.skoverlayShown, "skoverlay_shown")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.skoverlayDismissed, "skoverlay_dismissed")
+        XCTAssertEqual(FullscreenVideoTelemetryStage.skoverlayFailed, "skoverlay_failed")
+    }
+
+    func testLegacyVideoLifecycleSerializationHasNoV2Fields() throws {
+        let event = TelemetryEvent(
+            type: TelemetryType.lifecycle,
+            name: FullscreenVideoTelemetryStage.start,
+            eventId: "legacy",
+            timestamp: 1
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        for key in [
+            "video_pool", "video_style", "muted_watch_ms", "unmuted_watch_ms",
+            "impression_id", "style",
+            "skoverlay_enabled", "video_position_s", "pool", "duration_s", "quartile",
+            "paused_ms", "watched_s", "ms_to_next_step_ready", "on", "visible_s", "error",
+        ] {
+            XCTAssertNil(object[key], "Legacy video event unexpectedly serialized \(key)")
+        }
+    }
+
     func testFallbackVideoAndBehaviorDecodeAndClamp() throws {
         let ads = try decodeFallbacks(#"{"ads":[{"ad_id":"v","type":"video","url":"https://cdn.example/v.mp4","poster_url":"https://cdn.example/p.jpg","ad_behavior":{"close":{"delay_seconds":999,"treatment":"progress_bar","position":"top_left"}}}]}"#)
         let ad = try XCTUnwrap(ads.first)
@@ -587,20 +1080,44 @@ final class CreativeVideoTests: XCTestCase {
 
     #if os(iOS)
     @MainActor
-    func testFallbackVideoPreparationRemainsBestEffortAfterCapacityRejection() throws {
+    func testFallbackVideoPreparationOnlyWarmsImmediateNextClip() throws {
         let ads = try decodeFallbacks(
-            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"}]}"#
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
         )
-        let secondToken = FullscreenVideoPreparationToken()
         var attempts = 0
+
+        let beforeFirstFrame = prepareUpcomingFallbackVideos(
+            ads,
+            allowV2Preparation: false
+        ) { _, _ in
+            attempts += 1
+            return FullscreenVideoPreparationToken()
+        }
+        XCTAssertTrue(beforeFirstFrame.isEmpty)
+        XCTAssertEqual(attempts, 0)
 
         let prepared = prepareUpcomingFallbackVideos(ads) { _, _ in
             attempts += 1
-            return attempts == 2 ? secondToken : nil
+            return FullscreenVideoPreparationToken()
+        }
+
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(prepared.keys.sorted(), [0])
+    }
+
+    @MainActor
+    func testVideoV1FallbackPreparationKeepsCurrentAndNextGoldenBehavior() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"}]}"#
+        )
+        var attempts = 0
+        let prepared = prepareUpcomingFallbackVideos(ads) { _, _ in
+            attempts += 1
+            return FullscreenVideoPreparationToken()
         }
 
         XCTAssertEqual(attempts, 2)
-        XCTAssertEqual(prepared, [1: secondToken])
+        XCTAssertEqual(prepared.keys.sorted(), [0, 1])
     }
 
     @MainActor

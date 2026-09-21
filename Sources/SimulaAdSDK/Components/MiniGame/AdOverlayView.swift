@@ -236,7 +236,10 @@ public struct AdOverlayView: View {
     let ad: FallbackAd
     let onClose: () -> Void
     var onCreativeFailure: (() -> Void)? = nil
+    var onVideoCompleted: (() -> Void)? = nil
+    var onVideoStarted: (() -> Void)? = nil
     var videoPlayer: FullscreenVideoPlayer? = nil
+    var videoPlanScope: VideoPlanPresentationScope? = nil
     /// Height from the last game session (if bottom sheet mode). nil = fullscreen.
     var playableHeightDp: CGFloat?
     /// Border color for bottom sheet drag handle area.
@@ -308,6 +311,9 @@ public struct AdOverlayView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var videoCompleteRecorded = false
+    @State private var videoTerminalAdvanceRequested = false
+    @State private var videoPlanBlockerOwner = VideoPlanBlockerOwner()
+    @State private var videoPlanBlockerGeneration: UInt64 = 0
     #if os(iOS)
     @State private var originatingScene: UIWindowScene?
     #endif
@@ -433,9 +439,37 @@ public struct AdOverlayView: View {
                                 presentationActive: hasAppeared && !closing
                                     && appForegrounded && !storeSheetPresented,
                                 onTap: { handleVideoClick() },
-                                onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
-                                controlsEnabled: pageFinished
-                            )
+                                 onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
+                                 controlsEnabled: pageFinished,
+                                 chromeConfiguration: videoChromeConfiguration(
+                                     creative: ad.creative,
+                                     behavior: ad.adBehavior,
+                                     isVideoPlanV2: ad.usesVideoPlanV2
+                                 ),
+                                 onMuteChanged: { muted in
+                                     guard ad.usesVideoPlanV2 else { return }
+                                     videoPlanScope?.updateMuted(muted)
+                                     recordFullscreenVideoLifecycle(
+                                         stage: FullscreenVideoTelemetryStage.muteToggle,
+                                         adFormat: videoTelemetryAdFormat,
+                                         adUnitId: telemetryAdUnitId,
+                                         adId: adId.isEmpty ? nil : adId,
+                                         serveId: telemetryServeId,
+                                         isVideoPlanV2: ad.usesVideoPlanV2,
+                                         creative: ad.creative,
+                                         behavior: ad.adBehavior,
+                                         muted: muted,
+                                         mutedWatchMs: videoPlayer.mutedWatchMilliseconds,
+                                         unmutedWatchMs: videoPlayer.unmutedWatchMilliseconds,
+                                         videoPositionS: videoPlayer.playedSeconds,
+                                         durationS: videoPlayer.duration
+                                     )
+                                 },
+                                 telemetryPauseReason: videoPauseReason,
+                                 onTelemetryEvent: ad.usesVideoPlanV2
+                                     ? { event in recordVideoSurfaceTelemetry(event, player: videoPlayer) }
+                                     : nil
+                             )
                                 .allowsHitTesting(!clickHandoffPending)
                                 .onReceive(videoPlayer.$status) { handleVideoStatus($0, player: videoPlayer) }
                                 .onReceive(videoPlayer.$playedSeconds) { updateVideoGate(player: videoPlayer, played: $0) }
@@ -527,6 +561,12 @@ public struct AdOverlayView: View {
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented
             ))
+            videoPlanBlockerGeneration &+= 1
+            videoPlanScope?.activateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration,
+                blocked: !appForegrounded || storeSheetPresented
+            )
             #endif
             hasAppeared = true
             if screenMountCoordinator.scheduleIfNeeded() {
@@ -546,6 +586,7 @@ public struct AdOverlayView: View {
                     }
                 }
             }
+            if ad.mediaType == .playable { videoPlanScope?.playableStepReady() }
             if !hasLoadableCreative {
                 startCurrentCreativeLoadIfNeeded()
                 if ad.mediaType == .video {
@@ -580,6 +621,10 @@ public struct AdOverlayView: View {
             updateClickHandoffPending(false)
             #if os(iOS)
             videoPlayer?.setPresentationBlocked(true)
+            videoPlanScope?.deactivateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration
+            )
             #endif
         }
         .onChange(of: creativeIdentity) { _ in
@@ -591,21 +636,25 @@ public struct AdOverlayView: View {
             onBackground: {
                 appForegrounded = false
                 onPresentationBlockedChanged?(true)
+                updateVideoPlanBlocker(true)
                 reconcileCountdown()
             },
             onForeground: {
                 appForegrounded = true
                 onPresentationBlockedChanged?(storeSheetPresented)
+                updateVideoPlanBlocker(storeSheetPresented)
                 reconcileCountdown()
             },
             onSheetPresent: {
                 storeSheetPresented = true
                 onPresentationBlockedChanged?(true)
+                updateVideoPlanBlocker(true)
                 reconcileCountdown()
             },
             onSheetDismiss: {
                 storeSheetPresented = false
                 onPresentationBlockedChanged?(!appForegrounded)
+                updateVideoPlanBlocker(!appForegrounded)
                 reconcileCountdown()
             }
         ))
@@ -722,6 +771,12 @@ public struct AdOverlayView: View {
             else { onClose() }
         case .close:
             firstFrameHandoff.invalidate()
+            #if os(iOS)
+            if ad.usesVideoPlanV2, let player = videoPlayer {
+                recordVideoClose(player: player, reason: "user")
+                videoPlanScope?.handoffBegan()
+            }
+            #endif
             closing = true
             onClose()
         }
@@ -763,6 +818,7 @@ public struct AdOverlayView: View {
             videoFailureHandled = false
             videoStartRecorded = false
             videoCompleteRecorded = false
+            videoTerminalAdvanceRequested = false
         }
         guard identityChanged || loadCoordinator.isIdle
                 || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading
@@ -886,6 +942,14 @@ public struct AdOverlayView: View {
         }
     }
 
+    private func updateVideoPlanBlocker(_ blocked: Bool) {
+        videoPlanScope?.updateBlocker(
+            owner: videoPlanBlockerOwner,
+            generation: videoPlanBlockerGeneration,
+            blocked: blocked
+        )
+    }
+
     private func startCountdown() {
         // Start exactly once; a re-`onAppear`, resume, or a SwiftUI double-fire must not restart it.
         guard countdownTask == nil else { return }
@@ -947,6 +1011,14 @@ public struct AdOverlayView: View {
             }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             recordVideoCompleteIfNeeded()
+            markVideoHandoff(player: player, reason: "complete")
+            if shouldAutomaticallyAdvanceCompletedVideo(
+                usesVideoPlanV2: ad.usesVideoPlanV2,
+                status: status
+            ), !videoTerminalAdvanceRequested {
+                videoTerminalAdvanceRequested = true
+                onVideoCompleted?()
+            }
         case .failed(let reason):
             guard !videoFailureHandled else { return }
             guard let identity = videoSurfaceIdentity(for: player),
@@ -954,16 +1026,27 @@ public struct AdOverlayView: View {
             videoFailureHandled = true
             _ = loadCoordinator.failCurrentLoad()
             applyTerminalPageFailure()
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.fail, adFormat: videoTelemetryAdFormat,
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.fail,
+                adFormat: videoTelemetryAdFormat,
                 adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
-                serveId: telemetryServeId, errorCode: reason.rawValue
+                serveId: telemetryServeId,
+                isVideoPlanV2: ad.usesVideoPlanV2,
+                creative: ad.creative, behavior: ad.adBehavior,
+                muted: player.isMuted,
+                mutedWatchMs: player.mutedWatchMilliseconds,
+                unmutedWatchMs: player.unmutedWatchMilliseconds,
+                errorCode: reason.rawValue,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
             Telemetry.shared.recordError(
                 signature: "video:playback_failed",
                 errorCode: reason.rawValue,
                 breadcrumb: "surface=\(videoTelemetryAdFormat)"
             )
+            markVideoHandoff(player: player, reason: "failed")
             onCreativeFailure?()
         case .preparing:
             break
@@ -1012,10 +1095,35 @@ public struct AdOverlayView: View {
         pageFinished = true
         if !videoStartRecorded {
             videoStartRecorded = true
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.start, adFormat: videoTelemetryAdFormat,
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.start,
+                adFormat: videoTelemetryAdFormat,
                 adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
-                serveId: telemetryServeId
+                serveId: telemetryServeId,
+                isVideoPlanV2: ad.usesVideoPlanV2,
+                creative: ad.creative, behavior: ad.adBehavior,
+                muted: player.isMuted,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
+            )
+            onVideoStarted?()
+        }
+        if ad.usesVideoPlanV2, let originatingScene {
+            videoPlanScope?.firstVideoFrame(
+                creative: ad.creative,
+                behavior: ad.adBehavior,
+                adFormat: videoTelemetryAdFormat,
+                adUnitId: telemetryAdUnitId,
+                adId: adId.isEmpty ? nil : adId,
+                serveId: telemetryServeId,
+                config: ad.adBehavior.skoverlay,
+                trackingUrl: ctaTrackingUrl,
+                destination: ctaDestination,
+                storeUrl: ctaStoreUrl,
+                attribution: attribution,
+                originatingScene: originatingScene,
+                blocked: !appForegrounded || storeSheetPresented
             )
         }
         let ended = player.status == .ended
@@ -1048,14 +1156,110 @@ public struct AdOverlayView: View {
         dismissUnlocked = videoGate.isUnlocked
     }
 
+    private var videoPauseReason: String {
+        if !appForegrounded { return "backgrounded" }
+        if storeSheetPresented { return "store_presented" }
+        if videoPlayer?.hasActiveAudioInterruption == true { return "audio_interruption" }
+        return "playback"
+    }
+
+    private func recordVideoSurfaceTelemetry(
+        _ event: VideoSurfaceTelemetryEvent,
+        player: FullscreenVideoPlayer
+    ) {
+        let stage: String
+        var quartile: Int?
+        var reason: String?
+        var pausedMs: Double?
+        switch event {
+        case .quartile(let value):
+            stage = FullscreenVideoTelemetryStage.duration
+            quartile = value
+        case .pause(let value):
+            stage = FullscreenVideoTelemetryStage.pause
+            reason = value
+        case .resume(let value, let duration):
+            stage = FullscreenVideoTelemetryStage.resume
+            reason = value
+            pausedMs = duration
+        }
+        recordFullscreenVideoLifecycle(
+            stage: stage,
+            adFormat: videoTelemetryAdFormat,
+            adUnitId: telemetryAdUnitId,
+            adId: adId.isEmpty ? nil : adId,
+            serveId: telemetryServeId,
+            isVideoPlanV2: ad.usesVideoPlanV2,
+            creative: ad.creative, behavior: ad.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            quartile: quartile,
+            reason: reason,
+            pausedMs: pausedMs,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            on: stage == FullscreenVideoTelemetryStage.pause
+                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil
+        )
+    }
+
     private func recordVideoCompleteIfNeeded() {
         guard !videoCompleteRecorded else { return }
         videoCompleteRecorded = true
-        Telemetry.shared.recordLifecycle(
-            stage: FullscreenVideoTelemetryStage.complete, adFormat: videoTelemetryAdFormat,
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.complete,
+            adFormat: videoTelemetryAdFormat,
             adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
-            serveId: telemetryServeId
+            serveId: telemetryServeId,
+            isVideoPlanV2: ad.usesVideoPlanV2,
+            creative: ad.creative, behavior: ad.adBehavior,
+            muted: videoPlayer?.isMuted,
+            mutedWatchMs: videoPlayer?.mutedWatchMilliseconds,
+            unmutedWatchMs: videoPlayer?.unmutedWatchMilliseconds,
+            videoPositionS: videoPlayer?.playedSeconds,
+            durationS: videoPlayer?.duration,
+            secondsSinceVideoStart: videoPlayer?.secondsSinceVideoStart
         )
+    }
+
+    private func recordVideoClose(player: FullscreenVideoPlayer, reason: String) {
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.close,
+            adFormat: videoTelemetryAdFormat,
+            adUnitId: telemetryAdUnitId,
+            adId: adId.isEmpty ? nil : adId,
+            serveId: telemetryServeId,
+            isVideoPlanV2: ad.usesVideoPlanV2,
+            creative: ad.creative, behavior: ad.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            reason: reason,
+            secondsSinceVideoStart: player.secondsSinceVideoStart
+        )
+    }
+
+    private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
+        guard ad.usesVideoPlanV2 else { return }
+        videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
+            adFormat: videoTelemetryAdFormat,
+            adUnitId: telemetryAdUnitId,
+            adId: adId.isEmpty ? nil : adId,
+            serveId: telemetryServeId,
+            creative: ad.creative,
+            behavior: ad.adBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            reason: reason
+        ))
     }
 
     private func handleVideoClick() {

@@ -1,5 +1,7 @@
 import Foundation
 
+let videoPlanV2EligibleStallTimeout: TimeInterval = 8
+
 struct VideoPlaybackGate: Equatable, Sendable {
     let configuredDelay: TimeInterval
     private(set) var duration: TimeInterval?
@@ -84,6 +86,93 @@ struct VideoVisiblePlaybackClock: Equatable, Sendable {
         }
         self.lastMediaTime = sample
         return playedSeconds
+    }
+}
+
+/// Splits admitted media time by the audio state that was in effect while each interval played.
+/// Media time, rather than wall time, excludes background, StoreKit, buffering, and interruption gaps.
+struct VideoAudioWatchAccounting: Equatable, Sendable {
+    private var lastPlayedSeconds: TimeInterval = 0
+    private(set) var mutedSeconds: TimeInterval = 0
+    private(set) var unmutedSeconds: TimeInterval = 0
+
+    mutating func update(playedSeconds: TimeInterval, isMuted: Bool) {
+        guard playedSeconds.isFinite, playedSeconds >= lastPlayedSeconds else { return }
+        let delta = playedSeconds - lastPlayedSeconds
+        lastPlayedSeconds = playedSeconds
+        if isMuted { mutedSeconds += delta } else { unmutedSeconds += delta }
+    }
+
+    var mutedMilliseconds: Int { boundedMilliseconds(mutedSeconds) }
+    var unmutedMilliseconds: Int { boundedMilliseconds(unmutedSeconds) }
+
+    private func boundedMilliseconds(_ seconds: TimeInterval) -> Int {
+        let value = seconds * 1_000
+        guard value.isFinite, value > 0 else { return 0 }
+        return Int(min(value.rounded(), Double(Int.max)))
+    }
+}
+
+func shouldArmVideoStallDeadline(
+    wantsPlayback: Bool,
+    appActive: Bool,
+    presentationBlocked: Bool,
+    audioInterrupted: Bool
+) -> Bool {
+    wantsPlayback && appActive && !presentationBlocked && !audioInterrupted
+}
+
+/// Eight eligible seconds without media movement or newly buffered data is a dead V2 clip. App,
+/// store, and Safari blockers pause the remaining budget rather than resetting it.
+struct VideoProgressWatchdog: Equatable, Sendable {
+    let budget: TimeInterval
+    private(set) var remaining: TimeInterval
+    private var lastEligibleTime: TimeInterval?
+    private var lastMediaTime: TimeInterval?
+    private var lastBufferedEnd: TimeInterval?
+
+    init(budget: TimeInterval = videoPlanV2EligibleStallTimeout) {
+        let bounded = max(0, budget.isFinite ? budget : videoPlanV2EligibleStallTimeout)
+        self.budget = bounded
+        self.remaining = bounded
+    }
+
+    mutating func observe(
+        now: TimeInterval,
+        eligible: Bool,
+        mediaTime: TimeInterval,
+        bufferedEnd: TimeInterval
+    ) -> Bool {
+        guard now.isFinite else { return false }
+        let media = mediaTime.isFinite ? max(0, mediaTime) : (lastMediaTime ?? 0)
+        let buffered = bufferedEnd.isFinite ? max(0, bufferedEnd) : (lastBufferedEnd ?? 0)
+        let progressed = lastMediaTime.map { media > $0 + 0.01 } ?? false
+        let downloaded = lastBufferedEnd.map { buffered > $0 + 0.01 } ?? false
+        let rewound = lastMediaTime.map { media < $0 } ?? false
+        lastMediaTime = media
+        lastBufferedEnd = buffered
+
+        if progressed || downloaded || rewound {
+            remaining = budget
+            lastEligibleTime = eligible ? now : nil
+            return false
+        }
+        guard eligible else {
+            lastEligibleTime = nil
+            return false
+        }
+        if let previous = lastEligibleTime, now >= previous {
+            remaining = max(0, remaining - (now - previous))
+        }
+        lastEligibleTime = now
+        return remaining <= 0
+    }
+
+    mutating func reset() {
+        remaining = budget
+        lastEligibleTime = nil
+        lastMediaTime = nil
+        lastBufferedEnd = nil
     }
 }
 
@@ -339,6 +428,13 @@ func canUseVideoControls(firstFrameAdmitted: Bool, displayAdmitted: Bool) -> Boo
     firstFrameAdmitted && displayAdmitted
 }
 
+func shouldAutomaticallyAdvanceCompletedVideo(
+    usesVideoPlanV2: Bool,
+    status: FullscreenVideoStatus
+) -> Bool {
+    usesVideoPlanV2 && status == .ended
+}
+
 enum VideoPreFirstFrameEscapeSurface: Equatable, Sendable {
     case interstitial
     case rewarded
@@ -407,6 +503,179 @@ enum FullscreenVideoTelemetryStage {
     static let start = "video_start"
     static let complete = "video_complete"
     static let fail = "video_fail"
+    static let muteToggle = "video_mute_toggle"
+    static let mute = "video_mute" // decode/analytics alias; V2 emits `video_mute_toggle`.
+    static let unmute = "video_unmute" // decode/analytics alias.
+    static let duration = "video_duration"
+    static let quartile = "video_duration"
+    static let pause = "video_pause"
+    static let resume = "video_resume"
+    static let close = "video_close"
+    static let handoff = "video_handoff"
+    static let skoverlayShown = "skoverlay_shown"
+    static let skoverlayDismissed = "skoverlay_dismissed"
+    static let skoverlayFailed = "skoverlay_failed"
+}
+
+struct VideoQuartileState: Equatable, Sendable {
+    private var emitted: Set<Int> = []
+
+    mutating func crossed(position: TimeInterval, duration: TimeInterval?) -> [Int] {
+        guard position.isFinite, position >= 0, let duration,
+              duration.isFinite, duration > 0 else { return [] }
+        return [25, 50, 75].filter { quartile in
+            guard !emitted.contains(quartile), position / duration >= Double(quartile) / 100 else {
+                return false
+            }
+            emitted.insert(quartile)
+            return true
+        }
+    }
+}
+
+struct VideoPauseTelemetryState: Equatable, Sendable {
+    private var startedAt: TimeInterval?
+    private var reason: String?
+
+    mutating func pause(now: TimeInterval, reason: String) -> Bool {
+        guard startedAt == nil, now.isFinite else { return false }
+        startedAt = now
+        self.reason = reason
+        return true
+    }
+
+    mutating func resume(now: TimeInterval) -> (reason: String, pausedMs: Double)? {
+        guard let startedAt, now.isFinite, now >= startedAt else { return nil }
+        let result = (reason ?? "playback", (now - startedAt) * 1_000)
+        self.startedAt = nil
+        reason = nil
+        return result
+    }
+}
+
+enum VideoSurfaceTelemetryEvent: Equatable, Sendable {
+    case quartile(Int)
+    case pause(reason: String)
+    case resume(reason: String, pausedMs: Double)
+}
+
+func recordFullscreenVideoLifecycle(
+    stage: String,
+    adFormat: String,
+    adUnitId: String?,
+    adId: String?,
+    serveId: String?,
+    isVideoPlanV2: Bool,
+    creative: Creative?,
+    behavior: AdBehavior?,
+    muted: Bool?,
+    mutedWatchMs: Int? = nil,
+    unmutedWatchMs: Int? = nil,
+    errorCode: String? = nil,
+    videoPositionS: Double? = nil,
+    durationS: Double? = nil,
+    quartile: Int? = nil,
+    reason: String? = nil,
+    pausedMs: Double? = nil,
+    msToNextStepReady: Double? = nil,
+    secondsSinceVideoStart: Double? = nil,
+    visibleS: Double? = nil,
+    on: String? = nil
+) {
+    guard isVideoPlanV2 else {
+        Telemetry.shared.recordLifecycle(
+            stage: stage,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            adId: adId,
+            serveId: serveId,
+            errorCode: errorCode
+        )
+        return
+    }
+    let style = resolvedVideoChromeStyle(
+        requested: behavior?.video.style ?? .cornerCTA,
+        hasAppIcon: validatedCreativeURL(creative?.appIconUrl) != nil,
+        hasAppName: creative?.videoChromeTitle != nil
+    ).rawValue
+    let overlay = effectiveVideoPlanSKOverlayConfig(isVideoPlanV2: true, config: behavior?.skoverlay)
+    let mutedSeconds = mutedWatchMs.map { Double($0) / 1_000 }
+    let unmutedSeconds = unmutedWatchMs.map { Double($0) / 1_000 }
+    let watchedSeconds = (mutedWatchMs != nil || unmutedWatchMs != nil)
+        ? Double((mutedWatchMs ?? 0) + (unmutedWatchMs ?? 0)) / 1_000
+        : nil
+    Telemetry.shared.recordVideoLifecycle(
+        stage: stage,
+        adFormat: adFormat,
+        adUnitId: adUnitId,
+        adId: adId,
+        serveId: serveId,
+        errorCode: errorCode,
+        clipIndex: creative?.clipIndex,
+        muted: muted,
+        impressionId: serveId ?? adId,
+        style: style,
+        skoverlayEnabled: overlay != nil,
+        skoverlayDelaySeconds: overlay?.delaySeconds,
+        videoPositionS: videoPositionS,
+        pool: creative?.videoPool,
+        durationS: durationS,
+        quartile: quartile,
+        reason: reason,
+        pausedMs: pausedMs,
+        watchedS: watchedSeconds,
+        secondsUnmuted: unmutedSeconds,
+        secondsMuted: mutedSeconds,
+        msToNextStepReady: msToNextStepReady,
+        secondsSinceVideoStart: secondsSinceVideoStart,
+        on: on,
+        visibleS: visibleS,
+        error: errorCode
+    )
+}
+
+struct VideoChromeConfiguration: Equatable, Sendable {
+    let style: VideoChromeStyle
+    let cta: String
+    let appIconURL: URL?
+    let title: String?
+    let subtitle: String?
+}
+
+func resolvedVideoChromeStyle(
+    requested: VideoChromeStyle,
+    hasAppIcon: Bool,
+    hasAppName: Bool
+) -> VideoChromeStyle {
+    switch requested {
+    case .bottomBar, .floatingPill:
+        return hasAppIcon ? requested : .cornerCTA
+    case .bottomCard, .feedCard:
+        return hasAppIcon && hasAppName ? requested : .cornerCTA
+    case .cornerCTA:
+        return .cornerCTA
+    }
+}
+
+func videoChromeConfiguration(
+    creative: Creative?,
+    behavior: AdBehavior?,
+    isVideoPlanV2: Bool
+) -> VideoChromeConfiguration? {
+    guard isVideoPlanV2, let creative, creative.usesVideoPlanV2 else { return nil }
+    let iconURL = validatedCreativeURL(creative.appIconUrl)
+    let title = creative.videoChromeTitle
+    return VideoChromeConfiguration(
+        style: resolvedVideoChromeStyle(
+            requested: behavior?.video.style ?? .cornerCTA,
+            hasAppIcon: iconURL != nil,
+            hasAppName: title != nil
+        ),
+        cta: creative.videoCTATitle,
+        appIconURL: iconURL,
+        title: title,
+        subtitle: creative.videoChromeSubtitle
+    )
 }
 
 struct FullscreenVideoPreparationToken: Hashable, Sendable {
@@ -446,8 +715,12 @@ struct VideoAudioTrackCommand<ID: Hashable & Sendable>: Equatable, Sendable {
 }
 
 struct VideoAudioTrackPolicy<ID: Hashable & Sendable>: Sendable {
-    private(set) var isMuted = true
+    private(set) var isMuted: Bool
     private(set) var originalEnabled: [ID: Bool] = [:]
+
+    init(isMuted: Bool = true) {
+        self.isMuted = isMuted
+    }
 
     mutating func prepareMutedPlayback(
         tracks: [VideoAudioTrackSnapshot<ID>]
@@ -559,6 +832,34 @@ import Combine
 import SwiftUI
 import UIKit
 
+/// Reference-counted because the next clip can become active before the prior player is released.
+/// The host's exact category/mode/options are restored when the last V2 player leaves playback.
+@MainActor
+private final class VideoAudioSessionCoordinator {
+    static let shared = VideoAudioSessionCoordinator()
+    private var claims = 0
+
+    func claim() -> Bool {
+        if claims > 0 {
+            claims += 1
+            return true
+        }
+        let activated = (try? AVAudioSession.sharedInstance().setActive(true)) != nil
+        if activated {
+            claims = 1
+            return true
+        }
+        return false
+    }
+
+    func release() {
+        guard claims > 0 else { return }
+        claims -= 1
+        // Activation can be shared with the host and AVPlayer exposes no ownership query. Never
+        // deactivate or restore a stale category snapshot from SDK teardown.
+    }
+}
+
 enum VideoInterruptionEndAction: Equatable {
     case resume
     case stayPaused
@@ -594,14 +895,15 @@ func videoInterruptionEndAction(
 /// expose item tracks without an asset track; those remain untouched and rely on AVPlayer.isMuted.
 private final class VideoAudioTrackIsolation {
     private let item: AVPlayerItem
-    private var policy = VideoAudioTrackPolicy<UUID>()
+    private var policy: VideoAudioTrackPolicy<UUID>
     private var trackRecords = StrongVideoAudioTrackRecords<AVPlayerItemTrack>()
     private var tracksObservation: NSKeyValueObservation?
     private var mediaSelectionObserver: NSObjectProtocol?
     private var tornDown = false
 
-    init(item: AVPlayerItem) {
+    init(item: AVPlayerItem, startsMuted: Bool) {
         self.item = item
+        self.policy = VideoAudioTrackPolicy(isMuted: startsMuted)
         tracksObservation = item.observe(\.tracks, options: [.initial, .new]) { [weak self] _, _ in
             DispatchQueue.main.async { self?.knownTracksDidChange() }
         }
@@ -690,10 +992,11 @@ private final class VideoAudioTrackIsolation {
 
 @MainActor
 final class FullscreenVideoPlayer: ObservableObject {
-    static let preparationTimeout: TimeInterval = 10
-    static let firstFrameTimeout: TimeInterval = 10
-    static let pendingEndFrameGrace: TimeInterval = 0.5
-    static let unmatchedInterruptionFallback: TimeInterval = 1
+    nonisolated static let preparationTimeout: TimeInterval = 10
+    nonisolated static let firstFrameTimeout: TimeInterval = 10
+    nonisolated static let pendingEndFrameGrace: TimeInterval = 0.5
+    nonisolated static let unmatchedInterruptionFallback: TimeInterval = 1
+    nonisolated static let videoPlanV2StallTimeout = videoPlanV2EligibleStallTimeout
 
     @Published private(set) var status: FullscreenVideoStatus = .preparing
     @Published private(set) var duration: TimeInterval?
@@ -716,7 +1019,9 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var firstFrameTimeoutWorkItem: DispatchWorkItem?
     private var pendingEndGraceWorkItem: DispatchWorkItem?
     private var interruptionFallbackWorkItem: DispatchWorkItem?
+    private var progressWatchdogWorkItem: DispatchWorkItem?
     private var visiblePlaybackClock = VideoVisiblePlaybackClock()
+    private var audioWatchAccounting = VideoAudioWatchAccounting()
     private var firstFrameDeadline = VideoFirstFrameDeadlineState()
     private var wantsPlayback = false
     private var presentationBlocked = false
@@ -725,12 +1030,22 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var interruptionPausedPlayback = false
     private var stopped = false
     private let mediaObservationEnabled: Bool
+    private let usesManagedAudioSession: Bool
+    private let usesProgressWatchdog: Bool
+    private var ownsAudioSessionClaim = false
+    private var progressWatchdog: VideoProgressWatchdog
+    private var firstFrameUptime: TimeInterval?
 
     var isStopped: Bool { stopped }
     var hasAdmittedFirstVisualFrame: Bool { firstFrameDeadline.admitted }
     var hasActiveAudioInterruption: Bool { audioInterrupted }
     var hasPendingInterruptionFallback: Bool {
         interruptionFallbackWorkItem?.isCancelled == false
+    }
+    var mutedWatchMilliseconds: Int { audioWatchAccounting.mutedMilliseconds }
+    var unmutedWatchMilliseconds: Int { audioWatchAccounting.unmutedMilliseconds }
+    var secondsSinceVideoStart: Double? {
+        firstFrameUptime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) }
     }
 
     func fireInterruptionFallbackForTests() {
@@ -739,25 +1054,58 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
 
     convenience init(url: URL, posterURL: URL?) {
-        self.init(url: url, posterURL: posterURL, mediaObservationEnabled: true)
+        self.init(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: true,
+            stallTimeout: Self.preparationTimeout,
+            mediaObservationEnabled: true
+        )
+    }
+
+    convenience init(
+        url: URL,
+        posterURL: URL?,
+        startsMuted: Bool,
+        stallTimeout: TimeInterval
+    ) {
+        self.init(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout,
+            mediaObservationEnabled: true
+        )
     }
 
     static func makeStateTestingPlayer(url: URL, posterURL: URL?) -> FullscreenVideoPlayer {
         FullscreenVideoPlayer(
             url: url,
             posterURL: posterURL,
+            startsMuted: true,
+            stallTimeout: Self.preparationTimeout,
             mediaObservationEnabled: false
         )
     }
 
-    private init(url: URL, posterURL: URL?, mediaObservationEnabled: Bool) {
+    private init(
+        url: URL,
+        posterURL: URL?,
+        startsMuted: Bool,
+        stallTimeout: TimeInterval,
+        mediaObservationEnabled: Bool
+    ) {
         self.posterURL = posterURL
         self.mediaObservationEnabled = mediaObservationEnabled
+        self.usesManagedAudioSession = !startsMuted
+        self.usesProgressWatchdog = stallTimeout == videoPlanV2EligibleStallTimeout
+        self.progressWatchdog = VideoProgressWatchdog(budget: stallTimeout)
         let item = AVPlayerItem(url: url)
         self.item = item
         self.player = AVPlayer(playerItem: item)
-        self.audioTrackIsolation = VideoAudioTrackIsolation(item: item)
-        player.isMuted = true
+        self.audioTrackIsolation = VideoAudioTrackIsolation(item: item, startsMuted: startsMuted)
+        self.isMuted = startsMuted
+        player.isMuted = startsMuted
         player.actionAtItemEnd = .pause
         installObservers(mediaObservationEnabled: mediaObservationEnabled)
         if mediaObservationEnabled, appActive { schedulePreparationTimeout() }
@@ -769,6 +1117,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         firstFrameTimeoutWorkItem?.cancel()
         pendingEndGraceWorkItem?.cancel()
         interruptionFallbackWorkItem?.cancel()
+        progressWatchdogWorkItem?.cancel()
         itemStatusObservation?.invalidate()
         durationObservation?.invalidate()
         timeControlObservation?.invalidate()
@@ -776,6 +1125,11 @@ final class FullscreenVideoPlayer: ObservableObject {
             player.removeTimeObserver(periodicTimeObserver)
         }
         notificationObservers.forEach(NotificationCenter.default.removeObserver)
+        if ownsAudioSessionClaim {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { VideoAudioSessionCoordinator.shared.release() }
+            }
+        }
     }
 
     func play() {
@@ -810,9 +1164,13 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     func toggleMuted() {
         guard !stopped, firstFrameDeadline.admitted else { return }
-        // Do not alter or activate the host's AVAudioSession. AVPlayer participates in the
-        // publisher's existing policy, which is safer than replacing its category/options.
-        if isMuted {
+        setMuted(!isMuted)
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard !stopped, muted != isMuted else { return }
+        audioWatchAccounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
+        if !muted {
             audioTrackIsolation.unmute()
             isMuted = false
             player.isMuted = false
@@ -820,7 +1178,9 @@ final class FullscreenVideoPlayer: ObservableObject {
             player.isMuted = true
             isMuted = true
             audioTrackIsolation.remute()
+            releaseAudioSessionClaim()
         }
+        reconcilePlayback()
     }
 
     func admitFirstVisualFrame() -> Bool {
@@ -830,7 +1190,12 @@ final class FullscreenVideoPlayer: ObservableObject {
         pendingEndGraceWorkItem?.cancel()
         pendingEndGraceWorkItem = nil
         visiblePlaybackClock.admitFirstFrame(mediaTime: player.currentTime().seconds)
+        firstFrameUptime = ProcessInfo.processInfo.systemUptime
         playedSeconds = 0
+        if usesProgressWatchdog {
+            progressWatchdog.reset()
+            scheduleProgressWatchdogTick()
+        }
         if firstFrameDeadline.pendingEnd {
             DispatchQueue.main.async { [weak self] in self?.completePendingEndAfterFirstFrame() }
         }
@@ -857,7 +1222,12 @@ final class FullscreenVideoPlayer: ObservableObject {
         pendingEndGraceWorkItem = nil
         interruptionFallbackWorkItem?.cancel()
         interruptionFallbackWorkItem = nil
+        progressWatchdogWorkItem?.cancel()
+        progressWatchdogWorkItem = nil
         player.pause()
+        if ownsAudioSessionClaim {
+            releaseAudioSessionClaim()
+        }
         audioTrackIsolation.teardown()
         player.replaceCurrentItem(with: nil)
         removeObservers()
@@ -1017,7 +1387,54 @@ final class FullscreenVideoPlayer: ObservableObject {
         let seconds = time.seconds
         if seconds.isFinite, seconds >= 0 {
             playedSeconds = visiblePlaybackClock.update(mediaTime: seconds)
+            audioWatchAccounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
         }
+    }
+
+    private func scheduleProgressWatchdogTick() {
+        guard usesProgressWatchdog, firstFrameDeadline.admitted,
+              !stopped, !status.isTerminal, progressWatchdogWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.progressWatchdogTick() }
+        progressWatchdogWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func progressWatchdogTick() {
+        progressWatchdogWorkItem = nil
+        guard !stopped, !status.isTerminal else { return }
+        let mediaTime = player.currentTime().seconds
+        let bufferedEnd = currentBufferedEnd()
+        let eligible = wantsPlayback && appActive && !presentationBlocked
+            && !audioInterrupted && firstFrameDeadline.admitted
+        if progressWatchdog.observe(
+            now: ProcessInfo.processInfo.systemUptime,
+            eligible: eligible,
+            mediaTime: mediaTime,
+            bufferedEnd: bufferedEnd
+        ) {
+            fail(.playbackTimeout)
+            return
+        }
+        scheduleProgressWatchdogTick()
+    }
+
+    private func currentBufferedEnd() -> TimeInterval {
+        item.loadedTimeRanges.compactMap { value -> TimeInterval? in
+            let end = CMTimeRangeGetEnd(value.timeRangeValue).seconds
+            return end.isFinite ? end : nil
+        }.max() ?? 0
+    }
+
+    private func pauseProgressWatchdog() {
+        guard usesProgressWatchdog, firstFrameDeadline.admitted else { return }
+        _ = progressWatchdog.observe(
+            now: ProcessInfo.processInfo.systemUptime,
+            eligible: false,
+            mediaTime: player.currentTime().seconds,
+            bufferedEnd: currentBufferedEnd()
+        )
+        progressWatchdogWorkItem?.cancel()
+        progressWatchdogWorkItem = nil
     }
 
     private func handleEnded() {
@@ -1050,6 +1467,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         pendingEndGraceWorkItem = nil
         interruptionFallbackWorkItem?.cancel()
         interruptionFallbackWorkItem = nil
+        progressWatchdogWorkItem?.cancel()
+        progressWatchdogWorkItem = nil
         status = .ended
     }
 
@@ -1066,6 +1485,8 @@ final class FullscreenVideoPlayer: ObservableObject {
         pendingEndGraceWorkItem = nil
         interruptionFallbackWorkItem?.cancel()
         interruptionFallbackWorkItem = nil
+        progressWatchdogWorkItem?.cancel()
+        progressWatchdogWorkItem = nil
         wantsPlayback = false
         player.pause()
         status = .failed(reason)
@@ -1165,6 +1586,8 @@ final class FullscreenVideoPlayer: ObservableObject {
                 pendingEndGraceWorkItem?.cancel()
                 pendingEndGraceWorkItem = nil
             }
+            releaseAudioSessionClaim()
+            pauseProgressWatchdog()
             player.pause()
             return
         }
@@ -1177,10 +1600,16 @@ final class FullscreenVideoPlayer: ObservableObject {
             itemReadyToPlay: item.status == .readyToPlay
         )
         if canPlay {
+            if !isMuted, usesManagedAudioSession, !ownsAudioSessionClaim {
+                ownsAudioSessionClaim = VideoAudioSessionCoordinator.shared.claim()
+            }
             scheduleFirstFrameTimeoutIfNeeded()
             if isMuted { audioTrackIsolation.prepareMutedPlayback() }
             player.play()
+            scheduleProgressWatchdogTick()
         } else {
+            releaseAudioSessionClaim()
+            pauseProgressWatchdog()
             playbackTimeoutWorkItem?.cancel()
             playbackTimeoutWorkItem = nil
             pauseFirstFrameTimeout()
@@ -1188,9 +1617,21 @@ final class FullscreenVideoPlayer: ObservableObject {
         }
     }
 
+    private func releaseAudioSessionClaim() {
+        guard ownsAudioSessionClaim else { return }
+        ownsAudioSessionClaim = false
+        VideoAudioSessionCoordinator.shared.release()
+    }
+
     private func schedulePlaybackTimeoutIfNeeded() {
-        guard playbackTimeoutWorkItem == nil, wantsPlayback, appActive,
-              !presentationBlocked, !audioInterrupted else { return }
+        guard !usesProgressWatchdog else { return }
+        guard playbackTimeoutWorkItem == nil,
+              shouldArmVideoStallDeadline(
+                  wantsPlayback: wantsPlayback,
+                  appActive: appActive,
+                  presentationBlocked: presentationBlocked,
+                  audioInterrupted: audioInterrupted
+              ) else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.playbackTimedOut()
         }
@@ -1258,6 +1699,8 @@ final class FullscreenVideoPreparationPool {
     private struct Entry {
         let url: URL
         let posterURL: URL?
+        let startsMuted: Bool
+        let stallTimeout: TimeInterval
         let player: FullscreenVideoPlayer
         var active: Bool
         var lastTouched: TimeInterval
@@ -1286,13 +1729,25 @@ final class FullscreenVideoPreparationPool {
         )
     }
 
-    func prepare(url: URL, posterURL: URL?) -> FullscreenVideoPreparationToken? {
+    func prepare(
+        url: URL,
+        posterURL: URL?,
+        startsMuted: Bool = true,
+        stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
+    ) -> FullscreenVideoPreparationToken? {
         guard makeRoomForPlayer() else { return nil }
         let token = FullscreenVideoPreparationToken()
-        let player = FullscreenVideoPlayer(url: url, posterURL: posterURL)
+        let player = FullscreenVideoPlayer(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout
+        )
         entries[token] = Entry(
             url: url,
             posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout,
             player: player,
             active: false,
             lastTouched: ProcessInfo.processInfo.systemUptime,
@@ -1305,10 +1760,13 @@ final class FullscreenVideoPreparationPool {
     func claim(
         _ token: FullscreenVideoPreparationToken,
         url: URL,
-        posterURL: URL?
+        posterURL: URL?,
+        startsMuted: Bool = true,
+        stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
     ) -> FullscreenVideoPlayer? {
         if entries[token]?.active == true { return nil }
         if var entry = entries[token], entry.url == url, entry.posterURL == posterURL,
+           entry.startsMuted == startsMuted, entry.stallTimeout == stallTimeout,
            shouldReusePreparedVideoPlayer(
                status: entry.player.status,
                isStopped: entry.player.isStopped,
@@ -1323,10 +1781,17 @@ final class FullscreenVideoPreparationPool {
         }
         release(token)
         guard makeRoomForPlayer() else { return nil }
-        let player = FullscreenVideoPlayer(url: url, posterURL: posterURL)
+        let player = FullscreenVideoPlayer(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout
+        )
         entries[token] = Entry(
             url: url,
             posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout,
             player: player,
             active: true,
             lastTouched: ProcessInfo.processInfo.systemUptime,
@@ -1417,12 +1882,19 @@ final class FullscreenVideoPreparationOwnership {
         self.token = token
     }
 
-    func claim(url: URL, posterURL: URL?) -> FullscreenVideoPlayer? {
+    func claim(
+        url: URL,
+        posterURL: URL?,
+        startsMuted: Bool = true,
+        stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
+    ) -> FullscreenVideoPlayer? {
         guard state == .ad else { return nil }
         guard let player = FullscreenVideoPreparationPool.shared.claim(
             token,
             url: url,
-            posterURL: posterURL
+            posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout
         ) else { return nil }
         state = .claimed
         return player
@@ -1475,10 +1947,17 @@ enum FullscreenVideoPreparationReservation {
 
 @MainActor
 func reserveFullscreenVideoPreparation(
-    for creative: FullscreenCreativeContent
+    for creative: FullscreenCreativeContent,
+    startsMuted: Bool = true,
+    stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
 ) -> FullscreenVideoPreparationReservation {
     reserveFullscreenVideoPreparation(for: creative) { url, posterURL in
-        FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: posterURL)
+        FullscreenVideoPreparationPool.shared.prepare(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: startsMuted,
+            stallTimeout: stallTimeout
+        )
     }
 }
 
@@ -1668,7 +2147,13 @@ struct FullscreenVideoSurface: View {
     let onTap: () -> Void
     let onFirstFrame: () -> Bool
     let controlsEnabled: Bool
+    var chromeConfiguration: VideoChromeConfiguration? = nil
+    var onMuteChanged: ((Bool) -> Void)? = nil
+    var telemetryPauseReason: String = "playback"
+    var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
     @State private var firstFrameHandoff = VideoSurfaceFirstFrameHandoffState()
+    @State private var quartileState = VideoQuartileState()
+    @State private var pauseTelemetryState = VideoPauseTelemetryState()
 
     private var showsFirstFrame: Bool {
         videoSurfaceShowsFirstFrame(
@@ -1723,20 +2208,21 @@ struct FullscreenVideoSurface: View {
             }
 
             VStack {
-                Spacer()
                 HStack {
+                    if controlsEnabled, chromeConfiguration != nil {
+                        muteButton
+                            .padding(12)
+                    }
                     Spacer()
-                    if controlsEnabled {
-                        Button(action: { videoPlayer.toggleMuted() }) {
-                        Image(systemName: videoPlayer.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.white)
-                            .frame(width: 44, height: 44)
-                            .background(Circle().fill(Color.black.opacity(0.55)))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(videoPlayer.isMuted ? "Unmute ad" : "Mute ad")
+                }
+                Spacer()
+                if controlsEnabled, let chromeConfiguration {
+                    VideoCreativeChrome(configuration: chromeConfiguration, action: onTap)
                         .padding(12)
+                } else if controlsEnabled {
+                    HStack {
+                        Spacer()
+                        muteButton.padding(12)
                     }
                 }
             }
@@ -1755,6 +2241,45 @@ struct FullscreenVideoSurface: View {
             firstFrameHandoff.setPresentationActive(active)
             attemptParentHandoff()
         }
+        .onReceive(videoPlayer.$playedSeconds) { position in
+            guard onTelemetryEvent != nil else { return }
+            for quartile in quartileState.crossed(position: position, duration: videoPlayer.duration) {
+                onTelemetryEvent?(.quartile(quartile))
+            }
+        }
+        .onReceive(videoPlayer.$status) { status in
+            guard onTelemetryEvent != nil, videoPlayer.hasAdmittedFirstVisualFrame else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            switch status {
+            case .paused:
+                if let duration = videoPlayer.duration,
+                   videoPlayer.playedSeconds >= max(0, duration - 0.15) { return }
+                if pauseTelemetryState.pause(now: now, reason: telemetryPauseReason) {
+                    onTelemetryEvent?(.pause(reason: telemetryPauseReason))
+                }
+            case .playing:
+                if let resumed = pauseTelemetryState.resume(now: now) {
+                    onTelemetryEvent?(.resume(reason: resumed.reason, pausedMs: resumed.pausedMs))
+                }
+            case .preparing, .ready, .ended, .failed:
+                break
+            }
+        }
+    }
+
+    private var muteButton: some View {
+        Button(action: {
+            videoPlayer.toggleMuted()
+            onMuteChanged?(videoPlayer.isMuted)
+        }) {
+            Image(systemName: videoPlayer.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(Color.black.opacity(0.55)))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(videoPlayer.isMuted ? "Unmute ad" : "Mute ad")
     }
 
     private func attemptParentHandoff() {
@@ -1767,6 +2292,108 @@ struct FullscreenVideoSurface: View {
             videoPlayer.surfaceReadinessTimedOut()
             return
         }
+    }
+}
+
+private struct VideoCreativeChrome: View {
+    let configuration: VideoChromeConfiguration
+    let action: () -> Void
+
+    var body: some View {
+        switch configuration.style {
+        case .bottomBar:
+            HStack(spacing: 10) {
+                identity
+                Spacer(minLength: 8)
+                cta
+            }
+            .padding(10)
+            .frame(maxWidth: 560)
+            .background(Color.black.opacity(0.88))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        case .floatingPill:
+            HStack(spacing: 8) {
+                identity
+                cta
+            }
+            .padding(8)
+            .frame(maxWidth: 360)
+            .background(Color.black.opacity(0.88))
+            .clipShape(Capsule())
+        case .bottomCard:
+            HStack(spacing: 12) {
+                identity
+                Spacer(minLength: 8)
+                cta
+            }
+            .padding(14)
+            .frame(maxWidth: 440)
+            .background(Color.black.opacity(0.9))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
+        case .cornerCTA:
+            HStack {
+                Spacer()
+                cta
+            }
+        case .feedCard:
+            VStack(alignment: .leading, spacing: 10) {
+                identity
+                cta.frame(maxWidth: .infinity)
+            }
+            .padding(14)
+            .frame(maxWidth: 340, alignment: .leading)
+            .background(Color.black.opacity(0.9))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var identity: some View {
+        HStack(spacing: 9) {
+            if let url = configuration.appIconURL {
+                CachedAsyncImage(url: url) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().scaledToFill()
+                    } else {
+                        Color.white.opacity(0.12)
+                    }
+                }
+                .frame(width: 40, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+            if let title = configuration.title {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    if let subtitle = configuration.subtitle {
+                        Text(subtitle)
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.72))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+    }
+
+    private var cta: some View {
+        Button(action: action) {
+            Text(configuration.cta)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .padding(.horizontal, 16)
+                .frame(maxWidth: 180)
+                .frame(minHeight: 40)
+                .background(Color(red: 0.05, green: 0.36, blue: 0.95))
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(configuration.cta)
     }
 }
 #else

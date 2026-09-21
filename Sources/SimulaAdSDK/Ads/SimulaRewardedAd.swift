@@ -168,6 +168,8 @@ public final class SimulaRewardedAd {
     /// The prefetch result once it lands, so the close path can present the fallback window
     /// synchronously (before the primary window is torn down) rather than awaiting.
     private var prefetchedFallbacks: FallbackFetchResult?
+    private var videoPlanScope: VideoPlanPresentationScope?
+    private var primaryV2VideoStarted = false
     #endif
 
     // MARK: - Init
@@ -314,7 +316,15 @@ public final class SimulaRewardedAd {
             }
             #if os(iOS)
             releasePreparedVideo()
-            switch reserveFullscreenVideoPreparation(for: creative) {
+            let usesVideoPlanV2 = response.usesVideoPlanV2Contract
+                && response.creative?.usesVideoPlanV2 == true
+            switch reserveFullscreenVideoPreparation(
+                for: creative,
+                startsMuted: !usesVideoPlanV2,
+                stallTimeout: usesVideoPlanV2
+                    ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                    : FullscreenVideoPlayer.preparationTimeout
+            ) {
             case .notRequired:
                 break
             case .reserved(let ownership):
@@ -410,6 +420,12 @@ public final class SimulaRewardedAd {
         }
 
         let presenter = RewardedPresenter()
+        videoPlanScope?.cancel()
+        let videoPlanScope = response.usesVideoPlanV2Contract
+            ? VideoPlanPresentationScope()
+            : nil
+        self.videoPlanScope = videoPlanScope
+        primaryV2VideoStarted = false
         showStartNanos = DispatchTime.now().uptimeNanoseconds
         // Captured by value for the teardown salvage: the presenters self-retain while on
         // screen, so the close flow below can run after the host destroyed this ad object —
@@ -446,21 +462,37 @@ public final class SimulaRewardedAd {
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
+        let primaryUsesVideoPlanV2 = response.usesVideoPlanV2Contract
+            && response.creative?.usesVideoPlanV2 == true
         if response.creative?.mediaType == .video {
             guard case .video(let url, let posterURL)? = response.creativeContent else {
                 admission.stop()
                 failDisplay(.notReady)
                 return
             }
+            let startsMuted = !primaryUsesVideoPlanV2
+            let stallTimeout = primaryUsesVideoPlanV2
+                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                : FullscreenVideoPlayer.preparationTimeout
             if let ownership = preparedVideoOwnership,
-               let player = ownership.claim(url: url, posterURL: posterURL),
+               let player = ownership.claim(
+                   url: url,
+                   posterURL: posterURL,
+                   startsMuted: startsMuted,
+                   stallTimeout: stallTimeout
+               ),
                ownership.transferToPresentation() {
                 preparedVideoOwnership = nil
                 presentationVideoPlayer = player
                 presentationVideoOwnership = ownership
             } else {
                 releasePreparedVideo()
-                presentationVideoPlayer = FullscreenVideoPlayer(url: url, posterURL: posterURL)
+                presentationVideoPlayer = FullscreenVideoPlayer(
+                    url: url,
+                    posterURL: posterURL,
+                    startsMuted: startsMuted,
+                    stallTimeout: stallTimeout
+                )
                 presentationVideoOwnership = nil
             }
         } else {
@@ -470,9 +502,14 @@ public final class SimulaRewardedAd {
         let didPresent = presenter.present(
             impressionId: response.impressionId,
             apiKey: provider.apiKey,
+            adUnitId: adUnitId,
+            serveId: response.impressionId,
             renderedHtml: response.renderedHtml,
+            creative: response.creative,
+            videoBehavior: response.adBehavior?.video ?? VideoBehavior(),
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,
@@ -496,6 +533,13 @@ public final class SimulaRewardedAd {
                     StoreProductPrewarmer.shared.disable()
                 }
             },
+            onVideoStarted: { [weak self] in
+                guard primaryUsesVideoPlanV2, let self else { return }
+                self.primaryV2VideoStarted = true
+                if let result = self.prefetchedFallbacks {
+                    self.prefetchedFallbacks = preparingImmediateV2FallbackIfNeeded(result)
+                }
+            },
             onClick: { [weak self] interaction in
                 // CLICKED is one admitted user CTA/store-prompt tap; automatic redirects never enter here.
                 Telemetry.shared.recordLifecycle(
@@ -512,6 +556,7 @@ public final class SimulaRewardedAd {
             },
             onClose: { [weak self] earned, elapsedPlayTime, completionReason, presentationLease, originalKeyWindow in
                 guard let self else {
+                    videoPlanScope?.cancel()
                     let terminalOutcome = admission.finish()
                     if terminalOutcome == .closed {
                         // The host destroyed this ad object while the playable was up. Preserve only
@@ -538,6 +583,8 @@ public final class SimulaRewardedAd {
                 self.releasePreparedVideo()
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
+                    videoPlanScope?.cancel()
+                    self.videoPlanScope = nil
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
@@ -546,6 +593,8 @@ public final class SimulaRewardedAd {
                     earnedReward: earned
                 )
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    videoPlanScope?.cancel()
+                    self.videoPlanScope = nil
                     self.discardFallbackPrefetch()
                     presentationLease.finishPostCloseTeardown()
                     return
@@ -566,6 +615,7 @@ public final class SimulaRewardedAd {
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        videoPlanScope?.cancel()
                         SimulaRewardedAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: salvageAdUnitId,
@@ -574,6 +624,7 @@ public final class SimulaRewardedAd {
                         let verifyEarned = outcome.shouldVerifyEarnedReward(
                             postPrimaryPolicy.verifiesEarnedReward
                         )
+                        self?.videoPlanScope = nil
                         guard postPrimaryPolicy.notifiesPublisherClose else { return }
                         guard let self else {
                             // The host destroyed this ad object during the fallback screens (they
@@ -617,6 +668,8 @@ public final class SimulaRewardedAd {
         )
 
         guard didPresent else {
+            videoPlanScope?.cancel()
+            self.videoPlanScope = nil
             admission.stop()
             if let presentationVideoOwnership,
                presentationVideoOwnership.returnToAdAfterPresentationFailure() {
@@ -951,7 +1004,11 @@ public final class SimulaRewardedAd {
         // screens — even if this ad object is released before the task starts (parity with the
         // pre-refactor closure); `self` stays weak and only gates the state write.
         fallbackPrefetch = Task { [weak self, api] in
-            await Self.runFallbackPrefetch(api: api, impressionId: impressionId) { [weak self] result in
+            await Self.runFallbackPrefetch(
+                api: api,
+                impressionId: impressionId,
+                allowV2Preparation: { [weak self] in self?.primaryV2VideoStarted == true }
+            ) { [weak self] result in
                 if ownership.consumedByLoadingPresenter { return true }
                 guard self?.fallbackPrefetchToken == token else { return false }
                 self?.prefetchedFallbacks = result
@@ -981,6 +1038,7 @@ public final class SimulaRewardedAd {
     private static func runFallbackPrefetch(
         api: SimulaAPI,
         impressionId: String,
+        allowV2Preparation: @escaping @MainActor () -> Bool,
         publish: @escaping @MainActor (FallbackFetchResult) -> Bool
     ) async -> FallbackFetchResult {
         let result: FallbackFetchResult
@@ -988,7 +1046,10 @@ public final class SimulaRewardedAd {
             let ads = try await api.fetchFallbacks(impressionId: impressionId)
             result = ads.isEmpty
                 ? .noContent
-                : .content(ads, preparedVideos: prepareUpcomingFallbackVideos(ads))
+                : .content(ads, preparedVideos: prepareUpcomingFallbackVideos(
+                    ads,
+                    allowV2Preparation: allowV2Preparation()
+                ))
         } catch {
             result = .failure
         }
@@ -1106,6 +1167,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            videoPlanScope: videoPlanScope,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1171,6 +1233,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            videoPlanScope: videoPlanScope,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil

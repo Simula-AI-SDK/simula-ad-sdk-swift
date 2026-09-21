@@ -123,19 +123,47 @@ func retainedFallbackVideoResource<Resource: AnyObject>(
 
 #if os(iOS)
 @MainActor
-func prepareUpcomingFallbackVideos(_ ads: [FallbackAd]) -> [Int: FullscreenVideoPreparationToken] {
-    prepareUpcomingFallbackVideos(ads) { url, posterURL in
-        FullscreenVideoPreparationPool.shared.prepare(url: url, posterURL: posterURL)
+func prepareUpcomingFallbackVideos(
+    _ ads: [FallbackAd],
+    allowV2Preparation: Bool = true
+) -> [Int: FullscreenVideoPreparationToken] {
+    var prepared: [Int: FullscreenVideoPreparationToken] = [:]
+    let v2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+    if v2 && !allowV2Preparation { return prepared }
+    let candidates = v2 ? ads.prefix(1) : ads.prefix(2)
+    for (index, ad) in candidates.enumerated() {
+        guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
+        prepared[index] = FullscreenVideoPreparationPool.shared.prepare(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: !ad.usesVideoPlanV2,
+            stallTimeout: ad.usesVideoPlanV2
+                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                : FullscreenVideoPlayer.preparationTimeout
+        )
     }
+    return prepared
+}
+
+@MainActor
+func preparingImmediateV2FallbackIfNeeded(_ result: FallbackFetchResult) -> FallbackFetchResult {
+    guard case .content(let ads, let existing) = result,
+          existing.isEmpty,
+          ads.contains(where: { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }) else { return result }
+    return .content(ads, preparedVideos: prepareUpcomingFallbackVideos(ads, allowV2Preparation: true))
 }
 
 @MainActor
 func prepareUpcomingFallbackVideos(
     _ ads: [FallbackAd],
+    allowV2Preparation: Bool = true,
     prepare: (URL, URL?) -> FullscreenVideoPreparationToken?
 ) -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
-    for (index, ad) in ads.prefix(2).enumerated() {
+    let v2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+    if v2 && !allowV2Preparation { return prepared }
+    let limit = v2 ? 1 : 2
+    for (index, ad) in ads.prefix(limit).enumerated() {
         guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
         prepared[index] = prepare(url, posterURL)
     }
@@ -194,14 +222,25 @@ func acceptPreparedFallbackContent(
 func makeFallbackVideoOwnership(
     url: URL,
     posterURL: URL?,
-    token: FullscreenVideoPreparationToken?
+    token: FullscreenVideoPreparationToken?,
+    startsMuted: Bool = true,
+    stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
 ) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
     makeFallbackVideoOwnership(
         url: url,
         posterURL: posterURL,
         token: token,
+        startsMuted: startsMuted,
+        stallTimeout: stallTimeout,
         pool: FullscreenVideoPreparationPool.shared,
-        makePlayer: { FullscreenVideoPlayer(url: $0, posterURL: $1) }
+        makePlayer: {
+            FullscreenVideoPlayer(
+                url: $0,
+                posterURL: $1,
+                startsMuted: startsMuted,
+                stallTimeout: stallTimeout
+            )
+        }
     )
 }
 
@@ -210,12 +249,22 @@ func makeFallbackVideoOwnership(
     url: URL,
     posterURL: URL?,
     token: FullscreenVideoPreparationToken?,
+    startsMuted: Bool = true,
+    stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout,
     pool: FullscreenVideoPreparationPool,
     makePlayer: (URL, URL?) -> FullscreenVideoPlayer
 ) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
     FallbackVideoOwnership(
         token: token,
-        claim: { pool.claim($0, url: url, posterURL: posterURL) },
+        claim: {
+            pool.claim(
+                $0,
+                url: url,
+                posterURL: posterURL,
+                startsMuted: startsMuted,
+                stallTimeout: stallTimeout
+            )
+        },
         discardUnclaimed: { pool.discardPrepared($0) },
         makeCold: { makePlayer(url, posterURL) },
         releaseClaimed: { pool.release($0) },
@@ -387,6 +436,7 @@ final class FallbackAdPresenter {
     private var clickHandoffIndex: Int?
     private var presentationBlockedIndex: Int?
     private var failureAdvanceState = FallbackFailureAdvanceState()
+    private var videoPlanScope: VideoPlanPresentationScope?
     /// Retain only process-pooled preparation tokens for the current and immediately-next fallback.
     private var videoPreparations: [Int: FullscreenVideoPreparationToken] = [:]
     private var videoOwnershipIndex: Int?
@@ -412,6 +462,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -432,6 +483,7 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
+            videoPlanScope: videoPlanScope,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -457,6 +509,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
@@ -477,6 +530,7 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
+            videoPlanScope: videoPlanScope,
             presentationLease: presentationLease,
             onFinish: onFinish
         )
@@ -509,6 +563,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String,
         telemetryAdUnitId: String?,
         telemetryServeId: String?,
+        videoPlanScope: VideoPlanPresentationScope?,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
@@ -530,6 +585,8 @@ final class FallbackAdPresenter {
         self.telemetryAdFormat = telemetryAdFormat
         self.telemetryAdUnitId = telemetryAdUnitId
         self.telemetryServeId = telemetryServeId
+        self.videoPlanScope = videoPlanScope
+            ?? (ads.contains(where: \.usesVideoPlanV2) ? VideoPlanPresentationScope() : nil)
         self.presentationLease = presentationLease
         isLoading = startsLoading
         if !startsLoading { loadingGeneration = nil }
@@ -585,6 +642,9 @@ final class FallbackAdPresenter {
                 return
             }
             self.ads = ads
+            if videoPlanScope == nil, ads.contains(where: \.usesVideoPlanV2) {
+                videoPlanScope = VideoPlanPresentationScope()
+            }
             videoPreparations = preparedVideos
             index = 0
             prepareVideoPlayers(around: 0)
@@ -661,7 +721,14 @@ final class FallbackAdPresenter {
             ad: ad,
             onClose: { [weak self] in self?.advance(from: index) },
             onCreativeFailure: { [weak self] in self?.advanceAfterCreativeFailure(from: index) },
+            onVideoCompleted: ad.usesVideoPlanV2
+                ? { [weak self] in self?.advanceAfterCreativeFailure(from: index) }
+                : nil,
+            onVideoStarted: ad.usesVideoPlanV2
+                ? { [weak self] in self?.prepareImmediateNextVideo(after: index) }
+                : nil,
             videoPlayer: retainedVideoPlayer(at: index),
+            videoPlanScope: videoPlanScope,
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
             closeBehavior: ad.closeBehavior,
@@ -764,6 +831,10 @@ final class FallbackAdPresenter {
         for playerIndex in discardedIndices {
             releaseVideoPreparation(at: playerIndex)
         }
+        let v2 = videoPlanScope != nil
+            || ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+        guard !v2 else { return }
+        // Preserve video_v1's eager current + next preparation exactly.
         for playerIndex in retainedIndices where ads.indices.contains(playerIndex) {
             guard videoOwnershipIndex != playerIndex,
                   videoPreparations[playerIndex] == nil,
@@ -773,6 +844,22 @@ final class FallbackAdPresenter {
                 posterURL: posterURL
             )
         }
+    }
+
+    private func prepareImmediateNextVideo(after currentIndex: Int) {
+        guard ads.indices.contains(currentIndex), ads[currentIndex].usesVideoPlanV2,
+              videoOwnershipIndex == currentIndex else { return }
+        let nextIndex = currentIndex + 1
+        guard ads.indices.contains(nextIndex), videoPreparations[nextIndex] == nil,
+              case .video(let url, let posterURL) = ads[nextIndex].creativeContent else { return }
+        videoPreparations[nextIndex] = FullscreenVideoPreparationPool.shared.prepare(
+            url: url,
+            posterURL: posterURL,
+            startsMuted: !(ads[nextIndex].usesVideoPlanV2),
+            stallTimeout: ads[nextIndex].usesVideoPlanV2
+                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                : FullscreenVideoPlayer.preparationTimeout
+        )
     }
 
     private func retainedVideoPlayer(at playerIndex: Int) -> FullscreenVideoPlayer? {
@@ -792,10 +879,17 @@ final class FallbackAdPresenter {
         let ownership = makeFallbackVideoOwnership(
             url: url,
             posterURL: posterURL,
-            token: videoPreparations.removeValue(forKey: playerIndex)
+            token: videoPreparations.removeValue(forKey: playerIndex),
+            startsMuted: !ads[playerIndex].usesVideoPlanV2,
+            stallTimeout: ads[playerIndex].usesVideoPlanV2
+                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                : FullscreenVideoPlayer.preparationTimeout
         )
         videoOwnershipIndex = playerIndex
         videoOwnership = ownership
+        if ads[playerIndex].usesVideoPlanV2, let player = ownership.resource {
+            player.setMuted(videoPlanScope?.isMuted ?? false)
+        }
         return ownership.resource
     }
 
@@ -827,6 +921,9 @@ final class FallbackAdPresenter {
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
         failureAdvanceState.clear()
+        let videoPlanScope = videoPlanScope
+        self.videoPlanScope = nil
+        videoPlanScope?.cancel()
         releaseVideoOwnership()
         videoPreparations.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
         videoPreparations.removeAll()
