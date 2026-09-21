@@ -1108,9 +1108,9 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             stopCold: { _ in }
         )
 
-        let releasingOwnership = ownership
+        let releaseBox = BackgroundReleaseBox(ownership)
         ownership = nil
-        await Task.detached { _ = releasingOwnership }.value
+        await Task.detached { releaseBox.release() }.value
 
         await fulfillment(of: [cleanup, resourceDeinit], timeout: TestWait.timeout)
     }

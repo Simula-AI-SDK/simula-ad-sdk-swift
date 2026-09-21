@@ -1,6 +1,9 @@
 import Foundation
 import XCTest
 @testable import SimulaAdSDK
+#if os(iOS)
+import UIKit
+#endif
 
 final class CreativeClickURLTests: XCTestCase {
     private let activationNonce = "activation-nonce"
@@ -172,6 +175,116 @@ final class CreativeClickURLTests: XCTestCase {
             storeUrl: nil
         ))
     }
+
+    func testFallbackVideoRouteRequiresForegroundActivePresentation() {
+        XCTAssertTrue(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: false,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: false,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: false,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: false,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: false
+        ))
+    }
+
+    func testFallbackVideoRouteUsesOnlyCapturedForegroundScene() {
+        let captured = NSObject()
+        let inactive = NSObject()
+
+        XCTAssertTrue(fallbackVideoRouteOriginatingScene(
+            captured,
+            isForegroundActive: { $0 === captured }
+        ) === captured)
+        XCTAssertNil(fallbackVideoRouteOriginatingScene(
+            inactive,
+            isForegroundActive: { $0 === captured }
+        ))
+        XCTAssertNil(fallbackVideoRouteOriginatingScene(
+            Optional<NSObject>.none,
+            isForegroundActive: { $0 === captured }
+        ))
+    }
+
+    @MainActor
+    func testFallbackVideoDelayedRouteRejectsBackgroundBeforeBegin() {
+        var appForegrounded = true
+        var applicationActive = true
+        var released = 0
+        var routes = 0
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            isActive: {
+                fallbackVideoRouteExecutionIsActive(
+                    routeActive: true,
+                    hasAppeared: true,
+                    appForegrounded: appForegrounded,
+                    applicationActive: applicationActive,
+                    sceneForegroundActive: true
+                )
+            },
+            onUIHandoffReleased: { released += 1 },
+            onOutcome: { outcomes.append($0) }
+        )
+
+        appForegrounded = false
+        applicationActive = false
+        XCTAssertFalse(execution.begin(path: .directStore))
+        execution.complete { routes += 1; return true }
+
+        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(released, 1)
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testFallbackVideoSceneReaderDeliversDetachAfterViewDeallocates() async {
+        let detached = expectation(description: "overlay scene detached")
+        var reader: AdOverlayWindowSceneView? = AdOverlayWindowSceneView()
+        reader?.onSceneChanged = { captured in
+            XCTAssertNil(captured)
+            detached.fulfill()
+        }
+        reader?.didMoveToWindow()
+        reader = nil
+
+        await fulfillment(of: [detached], timeout: TestWait.timeout)
+    }
+    #endif
 
     func testFallbackVideoLoadingShieldDoesNotCoverInterruptionRecovery() {
         XCTAssertFalse(shouldShowFallbackLoadingShield(

@@ -166,6 +166,47 @@ private struct AdOverlayVideoSurfaceIdentity: Hashable {
     let player: ObjectIdentifier
 }
 
+#if os(iOS)
+final class AdOverlayWindowSceneView: UIView {
+    var onSceneChanged: ((UIWindowScene?) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        let scene = window?.windowScene
+        let callback = onSceneChanged
+        if let scene {
+            DispatchQueue.main.async { [weak self] in
+                guard self?.window?.windowScene === scene else { return }
+                callback?(scene)
+            }
+        } else {
+            // The callback must survive this view's deallocation so stale scene state is cleared.
+            DispatchQueue.main.async { callback?(nil) }
+        }
+    }
+}
+
+private struct AdOverlayWindowSceneReader: UIViewRepresentable {
+    let onSceneChanged: (UIWindowScene?) -> Void
+
+    func makeUIView(context: Context) -> AdOverlayWindowSceneView {
+        let view = AdOverlayWindowSceneView()
+        view.isUserInteractionEnabled = false
+        view.onSceneChanged = onSceneChanged
+        return view
+    }
+
+    func updateUIView(_ view: AdOverlayWindowSceneView, context: Context) {
+        view.onSceneChanged = onSceneChanged
+        guard let scene = view.window?.windowScene else { return }
+        DispatchQueue.main.async { [weak view] in
+            guard view?.window?.windowScene === scene else { return }
+            onSceneChanged(scene)
+        }
+    }
+}
+#endif
+
 /// Pure per-screen countdown policy. Zero duration unlocks at readiness without starting a ticker or
 /// dividing by zero; positive durations preserve the legacy whole-second numeric circle.
 struct FallbackCountdownPolicy: Equatable {
@@ -267,6 +308,9 @@ public struct AdOverlayView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var videoCompleteRecorded = false
+    #if os(iOS)
+    @State private var originatingScene: UIWindowScene?
+    #endif
     @State private var closing = false
     /// The countdown runs only while the app is foregrounded AND no in-app store/Safari sheet covers
     /// the ad. This overlay lives in a stand-alone `UIWindow` where SwiftUI's `\.scenePhase` doesn't
@@ -329,6 +373,10 @@ public struct AdOverlayView: View {
 
     public var body: some View {
         ZStack {
+            #if os(iOS)
+            AdOverlayWindowSceneReader { scene in originatingScene = scene }
+                .frame(width: 0, height: 0)
+            #endif
             // Backdrop: fully black full-screen (so the end screen's safe area is solid
             // black, matching Android); the in-game bottom sheet keeps 80% to show the
             // paused game behind it (matching Kotlin's Color(0xCC000000)).
@@ -520,6 +568,9 @@ public struct AdOverlayView: View {
             screenMountCoordinator.cancelScheduled()
             activeRouteLifecycle.deactivate()
             hasAppeared = false
+            #if os(iOS)
+            originatingScene = nil
+            #endif
             loadWatchdogTask?.cancel()
             loadWatchdogTask = nil
             loadCoordinator.cancel()
@@ -1008,6 +1059,17 @@ public struct AdOverlayView: View {
     }
 
     private func handleVideoClick() {
+        let capturedScene = fallbackVideoRouteOriginatingScene(
+            originatingScene,
+            isForegroundActive: { $0.activationState == .foregroundActive }
+        )
+        guard fallbackVideoRouteExecutionIsActive(
+            routeActive: activeRouteLifecycle.isActive,
+            hasAppeared: hasAppeared,
+            appForegrounded: appForegrounded,
+            applicationActive: UIApplication.shared.applicationState == .active,
+            sceneForegroundActive: capturedScene != nil
+        ), let originatingScene = capturedScene else { return }
         guard canBeginFallbackVideoClick(
             pageFinished: pageFinished,
             clickHandoffPending: clickHandoffPending,
@@ -1028,10 +1090,21 @@ public struct AdOverlayView: View {
         ) {
             DispatchQueue.main.async {
                 let execution = AttributionRouteExecution(
-                    originatingScene: nil,
-                    isActive: { activeRouteLifecycle.isActive && hasAppeared },
+                    originatingScene: originatingScene,
+                    isActive: {
+                        fallbackVideoRouteExecutionIsActive(
+                            routeActive: activeRouteLifecycle.isActive,
+                            hasAppeared: hasAppeared,
+                            appForegrounded: appForegrounded,
+                            applicationActive: UIApplication.shared.applicationState == .active,
+                            sceneForegroundActive:
+                                originatingScene.activationState == .foregroundActive
+                        )
+                    },
                     allowsDetachedDeterministicAttribution: true,
                     survivesPresentationTeardownAfterBegin: true,
+                    canCompleteAfterPresentationTeardown:
+                        committedRouteTerminalAvailability(originatingScene: originatingScene),
                     onUIHandoffReleased: { updateClickHandoffPending(false) },
                     onOutcome: { _ in }
                 )
@@ -1055,6 +1128,24 @@ public struct AdOverlayView: View {
         }
     }
     #endif
+}
+
+func fallbackVideoRouteOriginatingScene<Scene: AnyObject>(
+    _ capturedScene: Scene?,
+    isForegroundActive: (Scene) -> Bool
+) -> Scene? {
+    guard let capturedScene, isForegroundActive(capturedScene) else { return nil }
+    return capturedScene
+}
+
+func fallbackVideoRouteExecutionIsActive(
+    routeActive: Bool,
+    hasAppeared: Bool,
+    appForegrounded: Bool,
+    applicationActive: Bool,
+    sceneForegroundActive: Bool
+) -> Bool {
+    routeActive && hasAppeared && appForegrounded && applicationActive && sceneForegroundActive
 }
 
 func fallbackPresentationBlocked(
