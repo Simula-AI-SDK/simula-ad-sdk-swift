@@ -402,7 +402,7 @@ private struct RewardedGameView: View {
         return videoPreFirstFrameChromeVisibility(
             hasVideo: true,
             firstFrameAdmitted: primaryCreativeReady || videoPlayer.hasAdmittedFirstVisualFrame,
-            terminal: videoFailureHandled || videoPlayer.status.isTerminal
+            terminal: videoFailureHandled || videoPlayer.status.isFailure
         )
     }
 

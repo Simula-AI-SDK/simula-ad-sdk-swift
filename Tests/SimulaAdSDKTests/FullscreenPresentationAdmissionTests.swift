@@ -1021,6 +1021,24 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         )
     }
 
+    func testCompletedVideoRestoresServerCloseWhileFailureHidesAllChrome() {
+        let ended = videoPreFirstFrameChromeVisibility(
+            hasVideo: true,
+            firstFrameAdmitted: true,
+            terminal: FullscreenVideoStatus.ended.isFailure
+        )
+        XCTAssertFalse(ended.showsEscape)
+        XCTAssertTrue(ended.showsServerControl)
+
+        let failed = videoPreFirstFrameChromeVisibility(
+            hasVideo: true,
+            firstFrameAdmitted: true,
+            terminal: FullscreenVideoStatus.failed(.playbackFailed).isFailure
+        )
+        XCTAssertFalse(failed.showsEscape)
+        XCTAssertFalse(failed.showsServerControl)
+    }
+
     func testInterstitialPreFrameTerminalMapsToDisplayFailureWithoutPostPrimaryCallbacks() {
         XCTAssertEqual(videoPreFirstFrameEscapeAction(
             surface: .interstitial,

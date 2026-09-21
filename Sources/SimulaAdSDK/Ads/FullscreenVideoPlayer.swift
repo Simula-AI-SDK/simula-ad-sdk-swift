@@ -163,6 +163,11 @@ enum FullscreenVideoStatus: Equatable, Sendable {
         }
     }
 
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+
     var reusableForPreparedClaim: Bool {
         switch self {
         case .preparing, .ready, .paused:

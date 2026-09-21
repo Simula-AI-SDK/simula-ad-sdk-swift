@@ -322,7 +322,7 @@ public struct AdOverlayView: View {
         return videoPreFirstFrameChromeVisibility(
             hasVideo: true,
             firstFrameAdmitted: pageFinished || videoPlayer.hasAdmittedFirstVisualFrame,
-            terminal: videoFailureHandled || videoPlayer.status.isTerminal
+            terminal: videoFailureHandled || videoPlayer.status.isFailure
         )
     }
     #endif
