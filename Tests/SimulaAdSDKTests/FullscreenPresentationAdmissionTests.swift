@@ -10,6 +10,41 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         init(_ now: TimeInterval) { self.now = now }
     }
 
+    private final class LockedCleanupObservation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cleanupCount = 0
+        private var everyCleanupRanOnMain = true
+
+        func record() {
+            lock.lock()
+            cleanupCount += 1
+            everyCleanupRanOnMain = everyCleanupRanOnMain && Thread.isMainThread
+            lock.unlock()
+        }
+
+        func snapshot() -> (count: Int, allOnMain: Bool) {
+            lock.lock()
+            let snapshot = (cleanupCount, everyCleanupRanOnMain)
+            lock.unlock()
+            return snapshot
+        }
+    }
+
+    private final class BackgroundReleaseBox<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Value?
+
+        init(_ value: Value) {
+            self.value = value
+        }
+
+        func release() {
+            lock.lock()
+            value = nil
+            lock.unlock()
+        }
+    }
+
     func testVideoFailureNeverEarnsBeforeGateEvenAfterFirstFrame() {
         let beforeFrame = rewardedTerminalOutcome(earned: false, actualElapsedPlayTime: 0)
         let afterFrame = rewardedTerminalOutcome(earned: false, actualElapsedPlayTime: 2.5)
@@ -118,7 +153,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             XCTAssertFalse(shouldRunRewardedHTMLGate(
                 appForegrounded: true,
                 storeSheetPresented: false,
-                rewardEarned: reward.earned
+                rewardEarned: reward.earned,
+                gatePermanentlyIneligible: false
             ))
         }
     }
@@ -169,7 +205,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(shouldRunRewardedHTMLGate(
             appForegrounded: true,
             storeSheetPresented: false,
-            rewardEarned: false
+            rewardEarned: false,
+            gatePermanentlyIneligible: false
         ))
         XCTAssertEqual(rewardedHTMLGateCompletionReason(
             actualElapsedPlayTime: 30,
@@ -213,6 +250,154 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             earned: outcome.earned,
             actualElapsedPlayTime: outcome.elapsedPlayTime
         ), 30)
+    }
+
+    func testUncommittedRewardedHTMLNavigationFailureCannotEarnAfterDeferredTeardown() {
+        var failure = RewardedHTMLTerminalFailureState()
+        var terminal = DeferredTerminalState<RewardedTerminalOutcome>()
+        var early = RewardedEarlyCompletionState()
+
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: false,
+            rewardEarned: false
+        ))
+        XCTAssertTrue(early.pending)
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .terminate(earned: false))
+        early.cancel()
+        XCTAssertFalse(early.pending)
+        XCTAssertFalse(early.receive(
+            signaled: true,
+            primaryCreativeReady: true,
+            rewardEarned: false
+        ))
+        XCTAssertTrue(failure.gatePermanentlyIneligible)
+        let outcome = RewardedTerminalOutcome(earned: false, elapsedPlayTime: 3)
+        XCTAssertNil(terminal.request(outcome, blocked: true))
+        XCTAssertFalse(shouldRunRewardedHTMLGate(
+            appForegrounded: true,
+            storeSheetPresented: false,
+            rewardEarned: false,
+            gatePermanentlyIneligible: failure.gatePermanentlyIneligible
+        ))
+        XCTAssertEqual(terminal.blockersDidChange(blocked: false), outcome)
+        XCTAssertFalse(outcome.earned)
+    }
+
+    func testUncommittedRewardedHTMLReadinessTimeoutCannotEarn() {
+        var deadline = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0)
+        var failure = RewardedHTMLTerminalFailureState()
+
+        XCTAssertEqual(deadline.reconcile(now: 0, eligible: true), .schedule(10))
+        XCTAssertEqual(deadline.deadlineFired(now: 10), .fail)
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .terminate(earned: false))
+        XCTAssertFalse(shouldRunRewardedHTMLGate(
+            appForegrounded: true,
+            storeSheetPresented: false,
+            rewardEarned: false,
+            gatePermanentlyIneligible: failure.gatePermanentlyIneligible
+        ))
+    }
+
+    func testCommittedRewardedHTMLFailurePreservesFailOpenRewardGate() {
+        var failure = RewardedHTMLTerminalFailureState()
+        var deadline = RewardedHTMLReadinessDeadlineState(configuredCloseDelay: 0)
+        XCTAssertEqual(deadline.reconcile(now: 0, eligible: true), .schedule(10))
+        XCTAssertTrue(failure.visualDidCommit())
+        XCTAssertEqual(deadline.complete(now: 1), .cancel)
+
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .preserveFailOpen)
+        XCTAssertEqual(deadline.deadlineFired(now: 10), .none)
+        XCTAssertFalse(failure.gatePermanentlyIneligible)
+        XCTAssertTrue(shouldRunRewardedHTMLGate(
+            appForegrounded: true,
+            storeSheetPresented: false,
+            rewardEarned: false,
+            gatePermanentlyIneligible: failure.gatePermanentlyIneligible
+        ))
+    }
+
+    func testAlreadyEarnedEarlyCompleteSurvivesPrecommitRewardedHTMLFailure() {
+        var early = RewardedEarlyCompletionState()
+        var reward = RewardCompletionState()
+        var failure = RewardedHTMLTerminalFailureState()
+
+        XCTAssertTrue(early.receive(
+            signaled: true,
+            requiresCreativeReadiness: false,
+            primaryCreativeReady: false,
+            rewardEarned: false
+        ))
+        reward.earn(reason: .creativeCompleted)
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: reward.earned), .terminate(earned: true))
+
+        let outcome = rewardedTerminalOutcome(
+            earned: reward.earned,
+            actualElapsedPlayTime: 1,
+            completionReason: reward.reason
+        )
+        XCTAssertTrue(outcome.earned)
+        XCTAssertEqual(outcome.completionReason, .creativeCompleted)
+    }
+
+    func testRendererTerminationTelemetryOnlyAllowsSuccessfulRewardedHTMLCommit() {
+        var failure = RewardedHTMLTerminalFailureState()
+
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+        XCTAssertFalse(failure.visualCommitted)
+        XCTAssertTrue(failure.visualDidCommit())
+        XCTAssertTrue(failure.visualCommitted)
+        XCTAssertFalse(failure.gatePermanentlyIneligible)
+    }
+
+    func testFailedRendererRecoveryUsesCommitAwareRewardedHTMLPolicy() {
+        var precommit = RewardedHTMLTerminalFailureState()
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+        XCTAssertEqual(precommit.terminalFailure(rewardAlreadyEarned: false), .terminate(earned: false))
+
+        var postcommit = RewardedHTMLTerminalFailureState()
+        XCTAssertTrue(postcommit.visualDidCommit())
+        XCTAssertEqual(
+            legacyHTMLBillingCallbackAction(for: .webContentProcessTerminated),
+            .telemetryOnly
+        )
+        XCTAssertEqual(postcommit.terminalFailure(rewardAlreadyEarned: false), .preserveFailOpen)
+    }
+
+    func testTerminalUncommittedRewardedHTMLGateCannotRestartAfterBlockersChange() {
+        var failure = RewardedHTMLTerminalFailureState()
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .terminate(earned: false))
+
+        for (foregrounded, sheetPresented) in [(false, false), (true, true), (true, false)] {
+            XCTAssertFalse(shouldRunRewardedHTMLGate(
+                appForegrounded: foregrounded,
+                storeSheetPresented: sheetPresented,
+                rewardEarned: false,
+                gatePermanentlyIneligible: failure.gatePermanentlyIneligible
+            ))
+        }
+    }
+
+    func testRewardedHTMLTerminalFailureAndDeferredCallbackRemainOneShot() {
+        var failure = RewardedHTMLTerminalFailureState()
+        var terminal = DeferredTerminalState<RewardedTerminalOutcome>()
+        let outcome = RewardedTerminalOutcome(earned: false, elapsedPlayTime: 2)
+        var callbackCount = 0
+
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .terminate(earned: false))
+        XCTAssertEqual(failure.terminalFailure(rewardAlreadyEarned: false), .none)
+        XCTAssertNil(terminal.request(outcome, blocked: true))
+        if terminal.blockersDidChange(blocked: false) != nil { callbackCount += 1 }
+        if terminal.blockersDidChange(blocked: false) != nil { callbackCount += 1 }
+        if terminal.request(outcome, blocked: false) != nil { callbackCount += 1 }
+
+        XCTAssertEqual(callbackCount, 1)
     }
 
     func testConfiguredGateVerificationUsesActualVisiblePlayback() {
@@ -827,6 +1012,73 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ownership.release()
         XCTAssertEqual(releasedTokens, ["prepared"])
         XCTAssertEqual(stopCalls, 0)
+    }
+
+    @MainActor
+    func testFallbackVideoOwnershipOffMainDeinitCleansUpOnceOnMain() async {
+        final class Resource {}
+        let cleanupRan = expectation(description: "cleanup ran")
+        let backgroundReleaseFinished = expectation(description: "background release finished")
+        let observation = LockedCleanupObservation()
+        var ownership: FallbackVideoOwnership<Resource, String>? = FallbackVideoOwnership(
+            token: nil,
+            claim: { _ in nil },
+            discardUnclaimed: { _ in },
+            makeCold: { Resource() },
+            releaseClaimed: { _ in },
+            stopCold: { _ in
+                observation.record()
+                cleanupRan.fulfill()
+            }
+        )
+        let releaseBox = BackgroundReleaseBox(ownership)
+        ownership = nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            releaseBox.release()
+            backgroundReleaseFinished.fulfill()
+        }
+
+        await fulfillment(
+            of: [backgroundReleaseFinished, cleanupRan],
+            timeout: TestWait.timeout
+        )
+        let snapshot = observation.snapshot()
+        XCTAssertEqual(snapshot.count, 1)
+        XCTAssertTrue(snapshot.allOnMain)
+    }
+
+    @MainActor
+    func testFallbackVideoOwnershipExplicitReleaseThenOffMainDeinitDoesNotRepeatCleanup() async {
+        final class Resource {}
+        let backgroundReleaseFinished = expectation(description: "background release finished")
+        let mainQueueDrained = expectation(description: "main queue drained")
+        let observation = LockedCleanupObservation()
+        var ownership: FallbackVideoOwnership<Resource, String>? = FallbackVideoOwnership(
+            token: nil,
+            claim: { _ in nil },
+            discardUnclaimed: { _ in },
+            makeCold: { Resource() },
+            releaseClaimed: { _ in },
+            stopCold: { _ in observation.record() }
+        )
+        ownership?.release()
+        let releaseBox = BackgroundReleaseBox(ownership)
+        ownership = nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            releaseBox.release()
+            DispatchQueue.main.async { mainQueueDrained.fulfill() }
+            backgroundReleaseFinished.fulfill()
+        }
+
+        await fulfillment(
+            of: [backgroundReleaseFinished, mainQueueDrained],
+            timeout: TestWait.timeout
+        )
+        let snapshot = observation.snapshot()
+        XCTAssertEqual(snapshot.count, 1)
+        XCTAssertTrue(snapshot.allOnMain)
     }
 
     func testPreparedPlayerRetentionIsBoundedAndNeverEvictsActiveEntry() {

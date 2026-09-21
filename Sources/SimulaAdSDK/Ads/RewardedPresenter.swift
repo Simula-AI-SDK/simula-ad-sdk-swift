@@ -293,6 +293,7 @@ private struct RewardedGameView: View {
     @State private var primaryCreativeReady = false
     @State private var admittedVideoPlayerIdentity: ObjectIdentifier?
     @State private var htmlReadinessDeadline: RewardedHTMLReadinessDeadlineState
+    @State private var htmlTerminalFailure = RewardedHTMLTerminalFailureState()
     @State private var terminalState = DeferredTerminalState<RewardedTerminalOutcome>()
     /// Smoothly-animated 0→1 fill for the close bar/ring. Driven by a linear animation over the
     /// remaining gate (re-anchored on pause/resume) so the indicator glides instead of stepping once
@@ -550,6 +551,7 @@ private struct RewardedGameView: View {
         // AD_EARLY_COMPLETE (PRD §3): the creative finished early (e.g. survey done), so grant the
         // reward and reveal the close button immediately, bypassing the play timer.
         .onReceive(bridge.$earlyComplete) { earlyComplete in
+            guard videoPlayer != nil || !htmlTerminalFailure.gatePermanentlyIneligible else { return }
             guard earlyCompletion.receive(
                 signaled: earlyComplete,
                 requiresCreativeReadiness: videoPlayer != nil,
@@ -609,7 +611,8 @@ private struct RewardedGameView: View {
     private func reconcileHTMLReadinessDeadline() {
         let action = htmlReadinessDeadline.reconcile(
             now: ProcessInfo.processInfo.systemUptime,
-            eligible: videoPlayer == nil && visible && !primaryCreativeReady && !videoFailureHandled
+            eligible: videoPlayer == nil && visible && !primaryCreativeReady
+                && !htmlTerminalFailure.gatePermanentlyIneligible
                 && appForegrounded && !storeSheetPresented
         )
         applyHTMLReadinessDeadline(action)
@@ -627,7 +630,7 @@ private struct RewardedGameView: View {
         case .fail:
             htmlReadinessTask?.cancel()
             htmlReadinessTask = nil
-            handleLegacyHTMLFailure("readiness_timeout")
+            handleLegacyHTMLTerminalFailure("readiness_timeout")
         }
     }
 
@@ -644,7 +647,8 @@ private struct RewardedGameView: View {
     }
 
     private func startTimer() {
-        guard videoPlayer == nil, timerTask == nil else { return }
+        guard videoPlayer == nil, timerTask == nil,
+              !htmlTerminalFailure.gatePermanentlyIneligible else { return }
         // A zero/negative gate is earned immediately (no gate).
         if let reason = rewardedHTMLGateCompletionReason(
             actualElapsedPlayTime: gateClock.elapsed,
@@ -668,6 +672,7 @@ private struct RewardedGameView: View {
     }
 
     private func applyEarlyCompletion() {
+        guard videoPlayer != nil || !htmlTerminalFailure.gatePermanentlyIneligible else { return }
         timerTask?.cancel()
         timerTask = nil
         gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
@@ -692,6 +697,7 @@ private struct RewardedGameView: View {
     }
 
     private func applyElapsedPlayTime() {
+        guard !htmlTerminalFailure.gatePermanentlyIneligible else { return }
         // Reveal the store prompt at the halfway point to the reward (mid play-to-earn).
         if gateClock.elapsed >= gateDuration / 2, !storePromptVisible {
             withAnimation(.easeInOut(duration: 0.25)) { storePromptVisible = true }
@@ -715,7 +721,8 @@ private struct RewardedGameView: View {
             if shouldRunRewardedHTMLGate(
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented,
-                rewardEarned: rewardEarned
+                rewardEarned: rewardEarned,
+                gatePermanentlyIneligible: htmlTerminalFailure.gatePermanentlyIneligible
             ) {
                 startTimer()
             }
@@ -774,11 +781,33 @@ private struct RewardedGameView: View {
         .allowsHitTesting(!clickHandoffPending)
     }
 
-    private func handleLegacyHTMLFailure(_ reason: String) {
+    private func handleLegacyHTMLTerminalFailure(_ reason: String) {
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
         )
         recordLegacyHTMLTelemetry(reason)
+        switch htmlTerminalFailure.terminalFailure(rewardAlreadyEarned: rewardEarned) {
+        case .none, .preserveFailOpen:
+            return
+        case .terminate(let earned):
+            admission.htmlNavigationDidFail()
+            stopHTMLRewardGate()
+            requestTerminal(earned: earned)
+        }
+    }
+
+    private func stopHTMLRewardGate() {
+        timerTask?.cancel()
+        timerTask = nil
+        gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
+        earlyCompletion.cancel()
+        storePromptVisible = false
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            closeProgressAnim = closeProgress
+            closeGateGeneration += 1
+        }
     }
 
     private func recordLegacyHTMLTelemetry(_ reason: String) {
@@ -791,17 +820,21 @@ private struct RewardedGameView: View {
     private func handleLegacyHTMLBillingCallback(_ callback: LegacyHTMLBillingCallback) {
         switch legacyHTMLBillingCallbackAction(for: callback) {
         case .confirm:
+            guard htmlTerminalFailure.visualDidCommit() else { return }
+            applyHTMLReadinessDeadline(
+                htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)
+            )
             admission.htmlNavigationDidCommit()
         case .suppressUncommitted:
-            admission.htmlNavigationDidFail()
-            handleLegacyHTMLFailure("navigation_failed")
+            handleLegacyHTMLTerminalFailure("navigation_failed")
         case .telemetryOnly:
             recordLegacyHTMLTelemetry("renderer_terminated")
         }
     }
 
     private func handlePlayableReady() {
-        guard visible, !videoFailureHandled, !primaryCreativeReady else { return }
+        guard visible, !videoFailureHandled, !primaryCreativeReady,
+              videoPlayer != nil || !htmlTerminalFailure.gatePermanentlyIneligible else { return }
         primaryCreativeReady = true
         applyHTMLReadinessDeadline(
             htmlReadinessDeadline.complete(now: ProcessInfo.processInfo.systemUptime)

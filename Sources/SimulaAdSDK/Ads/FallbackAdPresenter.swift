@@ -102,7 +102,10 @@ final class FallbackVideoOwnership<Resource: AnyObject, Token> {
     }
 
     deinit {
-        cleanup?()
+        guard let cleanup else { return }
+        DispatchQueue.main.async {
+            cleanup()
+        }
     }
 }
 

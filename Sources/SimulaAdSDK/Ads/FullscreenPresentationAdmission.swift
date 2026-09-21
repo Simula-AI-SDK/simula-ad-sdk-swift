@@ -243,11 +243,47 @@ struct RewardedEarlyCompletionState: Equatable, Sendable {
         return consumeIfReady(primaryCreativeReady: true)
     }
 
+    mutating func cancel() {
+        pending = false
+        consumed = true
+    }
+
     private mutating func consumeIfReady(primaryCreativeReady: Bool) -> Bool {
         guard pending, primaryCreativeReady else { return false }
         pending = false
         consumed = true
         return true
+    }
+}
+
+enum RewardedHTMLTerminalFailureAction: Equatable, Sendable {
+    case none
+    case preserveFailOpen
+    case terminate(earned: Bool)
+}
+
+/// Presentation-local policy: a visual commit retains legacy fail-open behavior; only a terminal
+/// precommit failure permanently disables the reward gate and requests teardown.
+struct RewardedHTMLTerminalFailureState: Equatable, Sendable {
+    private(set) var visualCommitted = false
+    private(set) var gatePermanentlyIneligible = false
+    private(set) var terminalTeardownRequested = false
+
+    @discardableResult
+    mutating func visualDidCommit() -> Bool {
+        guard !terminalTeardownRequested else { return false }
+        visualCommitted = true
+        return true
+    }
+
+    mutating func terminalFailure(
+        rewardAlreadyEarned: Bool
+    ) -> RewardedHTMLTerminalFailureAction {
+        if visualCommitted { return .preserveFailOpen }
+        guard !terminalTeardownRequested else { return .none }
+        gatePermanentlyIneligible = true
+        terminalTeardownRequested = true
+        return .terminate(earned: rewardAlreadyEarned)
     }
 }
 
@@ -318,9 +354,10 @@ struct RewardedHTMLReadinessDeadlineState: Sendable {
 func shouldRunRewardedHTMLGate(
     appForegrounded: Bool,
     storeSheetPresented: Bool,
-    rewardEarned: Bool
+    rewardEarned: Bool,
+    gatePermanentlyIneligible: Bool
 ) -> Bool {
-    appForegrounded && !storeSheetPresented && !rewardEarned
+    appForegrounded && !storeSheetPresented && !rewardEarned && !gatePermanentlyIneligible
 }
 
 func rewardedHTMLGateCompletionReason(
