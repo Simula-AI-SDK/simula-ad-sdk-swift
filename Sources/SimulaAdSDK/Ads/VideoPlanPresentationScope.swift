@@ -182,6 +182,55 @@ struct VideoHandoffTimingState: Equatable, Sendable {
     }
 }
 
+struct VideoPlanHandoffCompletion<Origin> {
+    let origin: Origin
+    let timing: VideoHandoffTimingSample
+}
+
+/// Keeps the video that initiated a handoff until a later step is actually ready. A video that
+/// fails before first frame has no start age and therefore cannot replace the pending origin.
+struct VideoPlanHandoffState<Origin> {
+    private(set) var pendingOrigin: Origin?
+    private var timing = VideoHandoffTimingState()
+
+    mutating func videoStarted(
+        now: TimeInterval
+    ) -> VideoPlanHandoffCompletion<Origin>? {
+        let completion = nextStepReady(now: now)
+        timing.videoStarted(now: now)
+        return completion
+    }
+
+    mutating func videoTerminated(
+        origin: Origin,
+        secondsSinceVideoStart: TimeInterval?,
+        now: TimeInterval
+    ) {
+        guard pendingOrigin == nil,
+              let secondsSinceVideoStart,
+              secondsSinceVideoStart.isFinite,
+              secondsSinceVideoStart >= 0,
+              now.isFinite else { return }
+        pendingOrigin = origin
+        timing.videoStarted(now: max(0, now - secondsSinceVideoStart))
+        timing.videoTerminated(now: now)
+    }
+
+    mutating func nextStepReady(
+        now: TimeInterval
+    ) -> VideoPlanHandoffCompletion<Origin>? {
+        guard let pendingOrigin,
+              let sample = timing.nextStepReady(now: now) else { return nil }
+        self.pendingOrigin = nil
+        return VideoPlanHandoffCompletion(origin: pendingOrigin, timing: sample)
+    }
+
+    mutating func closePending() -> Origin? {
+        defer { pendingOrigin = nil }
+        return pendingOrigin
+    }
+}
+
 struct VideoPlanHandoffTelemetry: Sendable {
     let adFormat: String
     let adUnitId: String?
@@ -226,8 +275,7 @@ final class VideoPlanPresentationScope {
     private var cancelled = false
     private var blocked = true
     private var blockerState = VideoPlanBlockerState()
-    private var handoffTiming = VideoHandoffTimingState()
-    private var pendingHandoff: VideoPlanHandoffTelemetry?
+    private var handoffState = VideoPlanHandoffState<VideoPlanHandoffTelemetry>()
     private var overlayTelemetry: VideoPlanOverlayTelemetry?
     private var overlayShownAt: TimeInterval?
     private var overlayFailureRecorded = false
@@ -253,8 +301,10 @@ final class VideoPlanPresentationScope {
         blocked: Bool
     ) {
         guard !cancelled, creative?.usesVideoPlanV2 == true else { return }
-        completePendingHandoff(now: ProcessInfo.processInfo.systemUptime)
-        handoffTiming.videoStarted(now: ProcessInfo.processInfo.systemUptime)
+        let now = ProcessInfo.processInfo.systemUptime
+        if let completion = handoffState.videoStarted(now: now) {
+            recordHandoff(completion)
+        }
         overlayPlacement.videoBecameActive()
         guard let effective = effectiveVideoPlanSKOverlayConfig(
             isVideoPlanV2: true,
@@ -288,14 +338,13 @@ final class VideoPlanPresentationScope {
 
     func videoTerminated(_ telemetry: VideoPlanHandoffTelemetry) {
         guard !cancelled else { return }
-        closePendingHandoffIfNeeded(reasonOverride: "next_step_failed")
-        pendingHandoff = telemetry
         overlayPlacement.handoffBegan()
         let now = ProcessInfo.processInfo.systemUptime
-        if let age = telemetry.secondsSinceVideoStart {
-            handoffTiming.videoStarted(now: max(0, now - age))
-        }
-        handoffTiming.videoTerminated(now: now)
+        handoffState.videoTerminated(
+            origin: telemetry,
+            secondsSinceVideoStart: telemetry.secondsSinceVideoStart,
+            now: now
+        )
     }
 
     func handoffBegan() {
@@ -308,10 +357,20 @@ final class VideoPlanPresentationScope {
         completePendingHandoff(now: ProcessInfo.processInfo.systemUptime)
     }
 
+    func nextStepFailed() {
+        guard !cancelled else { return }
+        closePendingHandoffIfNeeded(reasonOverride: "next_step_failed")
+    }
+
     private func completePendingHandoff(now: TimeInterval) {
-        guard let pendingHandoff,
-              let timing = handoffTiming.nextStepReady(now: now) else { return }
-        self.pendingHandoff = nil
+        guard let completion = handoffState.nextStepReady(now: now) else { return }
+        recordHandoff(completion)
+    }
+
+    private func recordHandoff(
+        _ completion: VideoPlanHandoffCompletion<VideoPlanHandoffTelemetry>
+    ) {
+        let pendingHandoff = completion.origin
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.handoff,
             adFormat: pendingHandoff.adFormat,
@@ -327,8 +386,8 @@ final class VideoPlanPresentationScope {
             videoPositionS: pendingHandoff.videoPositionS,
             durationS: pendingHandoff.durationS,
             reason: pendingHandoff.reason,
-            msToNextStepReady: timing.msToNextStepReady,
-            secondsSinceVideoStart: timing.secondsSinceVideoStart,
+            msToNextStepReady: completion.timing.msToNextStepReady,
+            secondsSinceVideoStart: completion.timing.secondsSinceVideoStart,
             on: "next_step"
         )
     }
@@ -389,8 +448,7 @@ final class VideoPlanPresentationScope {
     }
 
     private func closePendingHandoffIfNeeded(reasonOverride: String? = nil) {
-        guard let pendingHandoff else { return }
-        self.pendingHandoff = nil
+        guard let pendingHandoff = handoffState.closePending() else { return }
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.close,
             adFormat: pendingHandoff.adFormat,
@@ -523,6 +581,7 @@ final class VideoPlanPresentationScope {
     func videoTerminated(_ telemetry: VideoPlanHandoffTelemetry) {}
     func handoffBegan() {}
     func playableStepReady() {}
+    func nextStepFailed() {}
     func activateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
     func updateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
     func deactivateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64) {}

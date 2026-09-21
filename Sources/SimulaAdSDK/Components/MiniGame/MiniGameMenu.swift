@@ -794,6 +794,7 @@ public struct MiniGameMenu: View {
             showAdOverlay = false
             fallbackAds = []
             fallbackAdIndex = 0
+            fallbackVideoPlanScope?.nextStepFailed()
             fallbackVideoPlanScope?.cancel()
             fallbackVideoPlanScope = nil
         }

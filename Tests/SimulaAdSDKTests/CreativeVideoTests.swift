@@ -375,6 +375,52 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertNil(timing.nextStepReady(now: 19))
     }
 
+    func testPreReadyVideoFailurePreservesOriginUntilLaterVideoStarts() throws {
+        var state = VideoPlanHandoffState<String>()
+        state.videoTerminated(origin: "A", secondsSinceVideoStart: 4, now: 10)
+
+        state.videoTerminated(origin: "B", secondsSinceVideoStart: nil, now: 10.2)
+        XCTAssertEqual(state.pendingOrigin, "A")
+
+        let completion = try XCTUnwrap(state.videoStarted(now: 10.5))
+        XCTAssertEqual(completion.origin, "A")
+        XCTAssertEqual(completion.timing.msToNextStepReady, 500, accuracy: 0.001)
+        XCTAssertEqual(completion.timing.secondsSinceVideoStart, 4.5, accuracy: 0.001)
+        XCTAssertNil(state.pendingOrigin)
+    }
+
+    func testPreReadyVideoFailurePreservesOriginUntilPlayableReady() throws {
+        var state = VideoPlanHandoffState<String>()
+        state.videoTerminated(origin: "A", secondsSinceVideoStart: 2, now: 8)
+        state.videoTerminated(origin: "B", secondsSinceVideoStart: nil, now: 8.1)
+
+        let completion = try XCTUnwrap(state.nextStepReady(now: 8.3))
+        XCTAssertEqual(completion.origin, "A")
+        XCTAssertEqual(completion.timing.msToNextStepReady, 300, accuracy: 0.001)
+        XCTAssertEqual(completion.timing.secondsSinceVideoStart, 2.3, accuracy: 0.001)
+    }
+
+    func testNormalVideoToVideoHandoffCompletesBeforeTrackingNextOrigin() throws {
+        var state = VideoPlanHandoffState<String>()
+        state.videoTerminated(origin: "A", secondsSinceVideoStart: 3, now: 7)
+
+        let first = try XCTUnwrap(state.videoStarted(now: 7.25))
+        XCTAssertEqual(first.origin, "A")
+        XCTAssertEqual(first.timing.msToNextStepReady, 250, accuracy: 0.001)
+
+        state.videoTerminated(origin: "B", secondsSinceVideoStart: 1.5, now: 8.75)
+        XCTAssertEqual(state.pendingOrigin, "B")
+    }
+
+    func testExhaustedVideoChainClosesPreservedOrigin() {
+        var state = VideoPlanHandoffState<String>()
+        state.videoTerminated(origin: "A", secondsSinceVideoStart: 5, now: 12)
+        state.videoTerminated(origin: "B", secondsSinceVideoStart: nil, now: 12.1)
+
+        XCTAssertEqual(state.closePending(), "A")
+        XCTAssertNil(state.closePending())
+    }
+
     func testQuartileAndPauseTelemetryStateMachinesAreOneShot() {
         var quartiles = VideoQuartileState()
         XCTAssertEqual(quartiles.crossed(position: 2.4, duration: 10), [])
@@ -489,6 +535,61 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertEqual(accounting.unmutedMilliseconds, 2_000)
         XCTAssertEqual(accounting.mutedMilliseconds, 1_250)
+    }
+
+    func testFinalVideoPlaybackAccountsMutedTail() {
+        var clock = VideoVisiblePlaybackClock()
+        var accounting = VideoAudioWatchAccounting()
+        clock.admitFirstFrame(mediaTime: 4)
+        let sampled = clock.update(mediaTime: 5)
+        accounting.update(playedSeconds: sampled, isMuted: true)
+
+        let final = finalizeVideoPlayback(
+            clock: &clock,
+            accounting: &accounting,
+            finalMediaTime: 5.25,
+            isMuted: true
+        )
+
+        XCTAssertEqual(final.playedSeconds, 1.25, accuracy: 0.001)
+        XCTAssertEqual(final.mutedWatchMilliseconds, 1_250)
+        XCTAssertEqual(final.unmutedWatchMilliseconds, 0)
+    }
+
+    func testFinalVideoPlaybackAccountsUnmutedTail() {
+        var clock = VideoVisiblePlaybackClock()
+        var accounting = VideoAudioWatchAccounting()
+        clock.admitFirstFrame(mediaTime: 2)
+        let sampled = clock.update(mediaTime: 3.5)
+        accounting.update(playedSeconds: sampled, isMuted: false)
+
+        let final = finalizeVideoPlayback(
+            clock: &clock,
+            accounting: &accounting,
+            finalMediaTime: 3.75,
+            isMuted: false
+        )
+
+        XCTAssertEqual(final.playedSeconds, 1.75, accuracy: 0.001)
+        XCTAssertEqual(final.mutedWatchMilliseconds, 0)
+        XCTAssertEqual(final.unmutedWatchMilliseconds, 1_750)
+    }
+
+    func testFinalVideoPlaybackAccountsShortClipWithoutPeriodicSample() {
+        var clock = VideoVisiblePlaybackClock()
+        var accounting = VideoAudioWatchAccounting()
+        clock.admitFirstFrame(mediaTime: 10)
+
+        let final = finalizeVideoPlayback(
+            clock: &clock,
+            accounting: &accounting,
+            finalMediaTime: 10.08,
+            isMuted: false
+        )
+
+        XCTAssertEqual(final.playedSeconds, 0.08, accuracy: 0.001)
+        XCTAssertEqual(final.mutedWatchMilliseconds, 0)
+        XCTAssertEqual(final.unmutedWatchMilliseconds, 80)
     }
 
     func testVideoTelemetryWireFieldsAreExact() throws {

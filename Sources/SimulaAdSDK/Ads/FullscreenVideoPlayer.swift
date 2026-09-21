@@ -113,6 +113,27 @@ struct VideoAudioWatchAccounting: Equatable, Sendable {
     }
 }
 
+struct FinalVideoPlaybackSnapshot: Equatable, Sendable {
+    let playedSeconds: TimeInterval
+    let mutedWatchMilliseconds: Int
+    let unmutedWatchMilliseconds: Int
+}
+
+func finalizeVideoPlayback(
+    clock: inout VideoVisiblePlaybackClock,
+    accounting: inout VideoAudioWatchAccounting,
+    finalMediaTime: TimeInterval,
+    isMuted: Bool
+) -> FinalVideoPlaybackSnapshot {
+    let playedSeconds = clock.update(mediaTime: finalMediaTime)
+    accounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
+    return FinalVideoPlaybackSnapshot(
+        playedSeconds: playedSeconds,
+        mutedWatchMilliseconds: accounting.mutedMilliseconds,
+        unmutedWatchMilliseconds: accounting.unmutedMilliseconds
+    )
+}
+
 func shouldArmVideoStallDeadline(
     wantsPlayback: Bool,
     appActive: Bool,
@@ -1460,8 +1481,13 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     private func completeEnded() {
         guard !stopped, !isFailed, status != .ended else { return }
-        let finalPosition = player.currentTime().seconds
-        playedSeconds = visiblePlaybackClock.update(mediaTime: finalPosition)
+        let finalSnapshot = finalizeVideoPlayback(
+            clock: &visiblePlaybackClock,
+            accounting: &audioWatchAccounting,
+            finalMediaTime: player.currentTime().seconds,
+            isMuted: isMuted
+        )
+        playedSeconds = finalSnapshot.playedSeconds
         wantsPlayback = false
         playbackTimeoutWorkItem?.cancel()
         playbackTimeoutWorkItem = nil

@@ -827,6 +827,7 @@ final class FallbackAdPresenter {
             hostingController?.rootView = adView(at: index)
         } else {
             guard let outcome = presentationCoordinator.completedPresentedContent() else { return }
+            videoPlanScope?.nextStepFailed()
             dismiss(outcome: outcome)
         }
     }
