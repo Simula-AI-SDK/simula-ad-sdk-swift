@@ -138,7 +138,64 @@ func prepareUpcomingFallbackVideos(
 @MainActor
 func releasePreparedFallbackVideos(in result: FallbackFetchResult?) {
     guard case .content(_, let preparedVideos) = result else { return }
-    preparedVideos.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
+    discardPreparedFallbackVideos(preparedVideos)
+}
+
+@MainActor
+func discardPreparedFallbackVideos(
+    _ preparedVideos: [Int: FullscreenVideoPreparationToken]
+) {
+    discardPreparedFallbackVideos(preparedVideos) {
+        FullscreenVideoPreparationPool.shared.discardPrepared($0)
+    }
+}
+
+@MainActor
+func discardPreparedFallbackVideos(
+    _ preparedVideos: [Int: FullscreenVideoPreparationToken],
+    discard: (FullscreenVideoPreparationToken) -> Void
+) {
+    preparedVideos.values.forEach(discard)
+}
+
+@MainActor
+func acceptPreparedFallbackContent(
+    ads: [FallbackAd],
+    preparedVideos: [Int: FullscreenVideoPreparationToken]
+) -> Bool {
+    acceptPreparedFallbackContent(
+        ads: ads,
+        preparedVideos: preparedVideos,
+        discard: { FullscreenVideoPreparationPool.shared.discardPrepared($0) }
+    )
+}
+
+@MainActor
+func acceptPreparedFallbackContent(
+    ads: [FallbackAd],
+    preparedVideos: [Int: FullscreenVideoPreparationToken],
+    discard: (FullscreenVideoPreparationToken) -> Void
+) -> Bool {
+    guard !ads.isEmpty else {
+        discardPreparedFallbackVideos(preparedVideos, discard: discard)
+        return false
+    }
+    return true
+}
+
+@MainActor
+func makeFallbackVideoOwnership(
+    url: URL,
+    posterURL: URL?,
+    token: FullscreenVideoPreparationToken?
+) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
+    makeFallbackVideoOwnership(
+        url: url,
+        posterURL: posterURL,
+        token: token,
+        pool: FullscreenVideoPreparationPool.shared,
+        makePlayer: { FullscreenVideoPlayer(url: $0, posterURL: $1) }
+    )
 }
 
 @MainActor
@@ -146,8 +203,8 @@ func makeFallbackVideoOwnership(
     url: URL,
     posterURL: URL?,
     token: FullscreenVideoPreparationToken?,
-    pool: FullscreenVideoPreparationPool = .shared,
-    makePlayer: (URL, URL?) -> FullscreenVideoPlayer = FullscreenVideoPlayer.init
+    pool: FullscreenVideoPreparationPool,
+    makePlayer: (URL, URL?) -> FullscreenVideoPlayer
 ) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
     FallbackVideoOwnership(
         token: token,
@@ -351,7 +408,7 @@ final class FallbackAdPresenter {
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
-        guard !ads.isEmpty else { return false }
+        guard acceptPreparedFallbackContent(ads: ads, preparedVideos: preparedVideos) else { return false }
         videoPreparations = preparedVideos
         _ = presentationCoordinator.beginPresenting()
         let didPresent = beginPresentation(
@@ -515,7 +572,8 @@ final class FallbackAdPresenter {
         isLoading = false
         switch resolution {
         case .presentContent:
-            guard case .content(let ads, let preparedVideos) = result, !ads.isEmpty else {
+            guard case .content(let ads, let preparedVideos) = result,
+                  acceptPreparedFallbackContent(ads: ads, preparedVideos: preparedVideos) else {
                 dismiss(outcome: .noContent)
                 return
             }

@@ -1092,7 +1092,7 @@ public final class SimulaInterstitialAd {
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
-        guard !ads.isEmpty else {
+        guard acceptPreparedFallbackContent(ads: ads, preparedVideos: preparedVideos) else {
             onFallbackFinished(.noContent)
             presentationLease.finishPostCloseTeardown()
             return

@@ -1148,7 +1148,7 @@ public final class SimulaRewardedAd {
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
         // No fallback screens is an unavailable/no-content outcome, not normal screen completion.
-        guard !ads.isEmpty else {
+        guard acceptPreparedFallbackContent(ads: ads, preparedVideos: preparedVideos) else {
             onFallbackFinished(.noContent)
             presentationLease.finishPostCloseTeardown()
             return

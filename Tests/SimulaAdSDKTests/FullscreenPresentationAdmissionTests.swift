@@ -1997,6 +1997,54 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         pool.release(token)
     }
 
+    @MainActor
+    func testEmptyFallbackCleanupDiscardsIdleButPreservesActivePreparation() throws {
+        let pool = FullscreenVideoPreparationPool(capacity: 2)
+        let idleURL = URL(fileURLWithPath: "/dev/null/idle")
+        let activeURL = URL(fileURLWithPath: "/dev/null/active")
+        let idleToken = try XCTUnwrap(pool.prepare(url: idleURL, posterURL: nil))
+        let activeToken = try XCTUnwrap(pool.prepare(url: activeURL, posterURL: nil))
+        defer {
+            pool.release(idleToken)
+            pool.release(activeToken)
+        }
+        let idlePlayer = try XCTUnwrap(pool.claim(idleToken, url: idleURL, posterURL: nil))
+        let activePlayer = try XCTUnwrap(pool.claim(activeToken, url: activeURL, posterURL: nil))
+        pool.returnToPrepared(idleToken)
+
+        let accepted = acceptPreparedFallbackContent(
+            ads: [],
+            preparedVideos: [0: idleToken, 1: activeToken],
+            discard: { pool.discardPrepared($0) }
+        )
+
+        XCTAssertFalse(accepted)
+        XCTAssertTrue(idlePlayer.isStopped)
+        XCTAssertFalse(activePlayer.isStopped)
+        pool.release(activeToken)
+        XCTAssertTrue(activePlayer.isStopped)
+    }
+
+    @MainActor
+    func testNonemptyFallbackContentTransfersPreparationWithoutDiscarding() {
+        let token = FullscreenVideoPreparationToken()
+        var discarded: [FullscreenVideoPreparationToken] = []
+        let ad = FallbackAd(
+            adId: "fallback",
+            iframeUrl: "",
+            html: "<html/>",
+            nativeClickBeaconV1Enabled: false,
+            closeBehavior: .fallbackDefault
+        )
+
+        XCTAssertTrue(acceptPreparedFallbackContent(
+            ads: [ad],
+            preparedVideos: [0: token],
+            discard: { discarded.append($0) }
+        ))
+        XCTAssertTrue(discarded.isEmpty)
+    }
+
     func testPendingEndGraceIsBoundedInsideFirstFrameDeadline() {
         XCTAssertGreaterThan(FullscreenVideoPlayer.pendingEndFrameGrace, 0)
         XCTAssertLessThan(FullscreenVideoPlayer.pendingEndFrameGrace, FullscreenVideoPlayer.firstFrameTimeout)
