@@ -1081,6 +1081,40 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(snapshot.allOnMain)
     }
 
+    @MainActor
+    func testFallbackVideoOwnershipOffMainClaimedResourceLivesThroughMainCleanup() async {
+        final class Resource {
+            let onDeinit: () -> Void
+            init(onDeinit: @escaping () -> Void) { self.onDeinit = onDeinit }
+            deinit { onDeinit() }
+        }
+
+        let cleanup = expectation(description: "claimed cleanup on main")
+        let resourceDeinit = expectation(description: "claimed resource deinit on main")
+        var ownership: FallbackVideoOwnership<Resource, String>? = FallbackVideoOwnership(
+            token: "token",
+            claim: { _ in
+                Resource {
+                    XCTAssertTrue(Thread.isMainThread)
+                    resourceDeinit.fulfill()
+                }
+            },
+            discardUnclaimed: { _ in },
+            makeCold: { Resource(onDeinit: {}) },
+            releaseClaimed: { _ in
+                XCTAssertTrue(Thread.isMainThread)
+                cleanup.fulfill()
+            },
+            stopCold: { _ in }
+        )
+
+        let releasingOwnership = ownership
+        ownership = nil
+        await Task.detached { _ = releasingOwnership }.value
+
+        await fulfillment(of: [cleanup, resourceDeinit], timeout: TestWait.timeout)
+    }
+
     func testPreparedPlayerRetentionIsBoundedAndNeverEvictsActiveEntry() {
         let policy = VideoPreparationRetentionPolicy(capacity: 2, retention: 300)
         let active = UUID()

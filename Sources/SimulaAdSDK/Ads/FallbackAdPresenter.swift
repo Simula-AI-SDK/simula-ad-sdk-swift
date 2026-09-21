@@ -85,7 +85,11 @@ final class FallbackVideoOwnership<Resource: AnyObject, Token> {
     ) {
         if let token, let claimed = claim(token) {
             resource = claimed
-            cleanup = { releaseClaimed(token) }
+            cleanup = {
+                withExtendedLifetime(claimed) {
+                    releaseClaimed(token)
+                }
+            }
         } else {
             if let token { discardUnclaimed(token) }
             let cold = makeCold()
