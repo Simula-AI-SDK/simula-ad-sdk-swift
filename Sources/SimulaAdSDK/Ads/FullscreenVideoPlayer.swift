@@ -537,11 +537,15 @@ struct VideoPauseTelemetryState: Equatable, Sendable {
     private var startedAt: TimeInterval?
     private var reason: String?
 
-    mutating func pause(now: TimeInterval, reason: String) -> Bool {
-        guard startedAt == nil, now.isFinite else { return false }
+    mutating func pause(
+        now: TimeInterval,
+        reasonProvider: () -> String
+    ) -> String? {
+        guard startedAt == nil, now.isFinite else { return nil }
+        let reason = reasonProvider()
         startedAt = now
         self.reason = reason
-        return true
+        return reason
     }
 
     mutating func resume(now: TimeInterval) -> (reason: String, pausedMs: Double)? {
@@ -2149,7 +2153,7 @@ struct FullscreenVideoSurface: View {
     let controlsEnabled: Bool
     var chromeConfiguration: VideoChromeConfiguration? = nil
     var onMuteChanged: ((Bool) -> Void)? = nil
-    var telemetryPauseReason: String = "playback"
+    var telemetryPauseReason: () -> String = { "playback" }
     var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
     @State private var firstFrameHandoff = VideoSurfaceFirstFrameHandoffState()
     @State private var quartileState = VideoQuartileState()
@@ -2254,8 +2258,11 @@ struct FullscreenVideoSurface: View {
             case .paused:
                 if let duration = videoPlayer.duration,
                    videoPlayer.playedSeconds >= max(0, duration - 0.15) { return }
-                if pauseTelemetryState.pause(now: now, reason: telemetryPauseReason) {
-                    onTelemetryEvent?(.pause(reason: telemetryPauseReason))
+                if let reason = pauseTelemetryState.pause(
+                    now: now,
+                    reasonProvider: telemetryPauseReason
+                ) {
+                    onTelemetryEvent?(.pause(reason: reason))
                 }
             case .playing:
                 if let resumed = pauseTelemetryState.resume(now: now) {

@@ -716,7 +716,10 @@ public final class SimulaInterstitialAd {
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
         // instant the user closes — fetching after close left a gap that flashed the screen behind.
         // GET /load/fallbacks is side-effect-free (no impression tracking), so this reports nothing early.
-        startFallbackPrefetch(impressionId: response.impressionId)
+        startFallbackPrefetch(
+            impressionId: response.impressionId,
+            primaryUsesVideoPlanV2: primaryUsesVideoPlanV2
+        )
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -930,7 +933,10 @@ public final class SimulaInterstitialAd {
     /// (`GET /load/fallbacks/{impressionId}`) while the primary ad is on screen, so they're ready
     /// the instant the user closes. Missing content and fetch failure remain distinct unavailable
     /// outcomes for telemetry. The fetch is side-effect-free server-side.
-    private func startFallbackPrefetch(impressionId: String) {
+    private func startFallbackPrefetch(
+        impressionId: String,
+        primaryUsesVideoPlanV2: Bool
+    ) {
         #if os(iOS)
         discardFallbackPrefetch()
         guard !impressionId.isEmpty else { return }
@@ -946,7 +952,12 @@ public final class SimulaInterstitialAd {
             await Self.runFallbackPrefetch(
                 api: api,
                 impressionId: impressionId,
-                allowV2Preparation: { [weak self] in self?.primaryV2VideoStarted == true }
+                allowV2Preparation: { [weak self] in
+                    allowsV2FallbackPreparation(
+                        primaryUsesVideoPlanV2: primaryUsesVideoPlanV2,
+                        primaryV2VideoStarted: self?.primaryV2VideoStarted == true
+                    )
+                }
             ) { [weak self] result in
                 if ownership.consumedByLoadingPresenter { return true }
                 guard self?.fallbackPrefetchToken == token else { return false }

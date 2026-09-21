@@ -729,7 +729,7 @@ private struct CreativeInterstitialView: View {
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
             },
-            telemetryPauseReason: videoPauseReason,
+            telemetryPauseReason: { videoPauseReason },
             onTelemetryEvent: usesVideoPlanV2
                 ? { event in recordVideoSurfaceTelemetry(event, player: player) }
                 : nil

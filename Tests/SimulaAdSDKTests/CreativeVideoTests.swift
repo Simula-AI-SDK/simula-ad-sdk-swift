@@ -382,12 +382,32 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(quartiles.crossed(position: 10, duration: 10), [])
 
         var pause = VideoPauseTelemetryState()
-        XCTAssertTrue(pause.pause(now: 5, reason: "backgrounded"))
-        XCTAssertFalse(pause.pause(now: 6, reason: "store_presented"))
+        XCTAssertEqual(pause.pause(now: 5) { "backgrounded" }, "backgrounded")
+        XCTAssertNil(pause.pause(now: 6) { "store_presented" })
         let resumed = pause.resume(now: 7.25)
         XCTAssertEqual(resumed?.reason, "backgrounded")
         XCTAssertEqual(resumed?.pausedMs ?? -1, 2_250, accuracy: 0.001)
         XCTAssertNil(pause.resume(now: 8))
+    }
+
+    func testPauseTelemetryResolvesProviderAtPauseAndRetainsReasonForResume() {
+        var liveReason = "playback"
+        var providerCalls = 0
+        let reasonProvider = {
+            providerCalls += 1
+            return liveReason
+        }
+        var pause = VideoPauseTelemetryState()
+
+        liveReason = "audio_interruption"
+        XCTAssertEqual(
+            pause.pause(now: 5, reasonProvider: reasonProvider),
+            "audio_interruption"
+        )
+        XCTAssertNil(pause.pause(now: 5.5, reasonProvider: reasonProvider))
+        XCTAssertEqual(providerCalls, 1)
+        liveReason = "backgrounded"
+        XCTAssertEqual(pause.resume(now: 6)?.reason, "audio_interruption")
     }
 
     func testCanonicalPoolAliasAndValidVideoClipRules() throws {
@@ -1076,6 +1096,48 @@ final class CreativeVideoTests: XCTestCase {
             localPlayerIdentity: ObjectIdentifier(player),
             currentPlayerIdentity: ObjectIdentifier(replacement)
         ))
+    }
+
+    func testV2FallbackPreparationGateWaitsOnlyForV2VideoPrimary() {
+        XCTAssertTrue(allowsV2FallbackPreparation(
+            primaryUsesVideoPlanV2: false,
+            primaryV2VideoStarted: false
+        ))
+        XCTAssertFalse(allowsV2FallbackPreparation(
+            primaryUsesVideoPlanV2: true,
+            primaryV2VideoStarted: false
+        ))
+        XCTAssertTrue(allowsV2FallbackPreparation(
+            primaryUsesVideoPlanV2: true,
+            primaryV2VideoStarted: true
+        ))
+    }
+
+    func testV2FallbackPreparationKeepsOriginalIndexPastPlayable() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"HTML"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1}]}"#
+        )
+
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [1])
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads, allowV2Preparation: false), [])
+    }
+
+    func testV2FallbackPreparationSelectsOnlyNextVideoAcrossPlayable() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":0},{"type":"playable","rendered_html":"HTML"},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":1}]}"#
+        )
+
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0])
+        XCTAssertEqual(nextV2FallbackVideoIndex(in: ads, after: 0), 2)
+        XCTAssertNil(nextV2FallbackVideoIndex(in: ads, after: 2))
+    }
+
+    func testVideoV1FallbackPreparationIndicesKeepCurrentAndNextBehavior() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"},{"type":"video","url":"https://cdn.example/three.mp4"}]}"#
+        )
+
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0, 1])
     }
 
     #if os(iOS)

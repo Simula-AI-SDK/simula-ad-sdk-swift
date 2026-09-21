@@ -949,10 +949,9 @@ public struct MiniGameMenu: View {
 
     private func prepareNextMiniGameFallbackVideo(after currentIndex: Int) {
         #if os(iOS)
-        guard fallbackAds.indices.contains(currentIndex), fallbackAds[currentIndex].usesVideoPlanV2,
-              fallbackVideoOwnershipIndex == currentIndex else { return }
-        let nextIndex = currentIndex + 1
-        guard fallbackAds.indices.contains(nextIndex), fallbackVideoTokens[nextIndex] == nil,
+        guard fallbackVideoOwnershipIndex == currentIndex,
+              let nextIndex = nextV2FallbackVideoIndex(in: fallbackAds, after: currentIndex),
+              fallbackVideoTokens[nextIndex] == nil,
               case .video(let url, let posterURL) = fallbackAds[nextIndex].creativeContent else { return }
         fallbackVideoTokens[nextIndex] = FullscreenVideoPreparationPool.shared.prepare(
             url: url,

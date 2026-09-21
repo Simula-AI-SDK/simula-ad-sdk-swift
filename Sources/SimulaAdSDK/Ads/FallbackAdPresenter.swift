@@ -121,6 +121,33 @@ func retainedFallbackVideoResource<Resource: AnyObject>(
     requestedIndex == ownershipIndex ? resource : nil
 }
 
+func allowsV2FallbackPreparation(
+    primaryUsesVideoPlanV2: Bool,
+    primaryV2VideoStarted: Bool
+) -> Bool {
+    !primaryUsesVideoPlanV2 || primaryV2VideoStarted
+}
+
+func upcomingFallbackVideoIndices(
+    _ ads: [FallbackAd],
+    allowV2Preparation: Bool = true
+) -> [Int] {
+    let usesVideoPlanV2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+    if usesVideoPlanV2 {
+        guard allowV2Preparation else { return [] }
+        return ads.indices.first(where: { ads[$0].usesVideoPlanV2 }).map { [$0] } ?? []
+    }
+    return ads.indices.prefix(2).filter {
+        if case .video = ads[$0].creativeContent { return true }
+        return false
+    }
+}
+
+func nextV2FallbackVideoIndex(in ads: [FallbackAd], after currentIndex: Int) -> Int? {
+    guard ads.indices.contains(currentIndex), ads[currentIndex].usesVideoPlanV2 else { return nil }
+    return ads.indices.dropFirst(currentIndex + 1).first { ads[$0].usesVideoPlanV2 }
+}
+
 #if os(iOS)
 @MainActor
 func prepareUpcomingFallbackVideos(
@@ -128,10 +155,8 @@ func prepareUpcomingFallbackVideos(
     allowV2Preparation: Bool = true
 ) -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
-    let v2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
-    if v2 && !allowV2Preparation { return prepared }
-    let candidates = v2 ? ads.prefix(1) : ads.prefix(2)
-    for (index, ad) in candidates.enumerated() {
+    for index in upcomingFallbackVideoIndices(ads, allowV2Preparation: allowV2Preparation) {
+        let ad = ads[index]
         guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
         prepared[index] = FullscreenVideoPreparationPool.shared.prepare(
             url: url,
@@ -160,10 +185,8 @@ func prepareUpcomingFallbackVideos(
     prepare: (URL, URL?) -> FullscreenVideoPreparationToken?
 ) -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
-    let v2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
-    if v2 && !allowV2Preparation { return prepared }
-    let limit = v2 ? 1 : 2
-    for (index, ad) in ads.prefix(limit).enumerated() {
+    for index in upcomingFallbackVideoIndices(ads, allowV2Preparation: allowV2Preparation) {
+        let ad = ads[index]
         guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
         prepared[index] = prepare(url, posterURL)
     }
@@ -847,10 +870,9 @@ final class FallbackAdPresenter {
     }
 
     private func prepareImmediateNextVideo(after currentIndex: Int) {
-        guard ads.indices.contains(currentIndex), ads[currentIndex].usesVideoPlanV2,
-              videoOwnershipIndex == currentIndex else { return }
-        let nextIndex = currentIndex + 1
-        guard ads.indices.contains(nextIndex), videoPreparations[nextIndex] == nil,
+        guard videoOwnershipIndex == currentIndex,
+              let nextIndex = nextV2FallbackVideoIndex(in: ads, after: currentIndex),
+              videoPreparations[nextIndex] == nil,
               case .video(let url, let posterURL) = ads[nextIndex].creativeContent else { return }
         videoPreparations[nextIndex] = FullscreenVideoPreparationPool.shared.prepare(
             url: url,

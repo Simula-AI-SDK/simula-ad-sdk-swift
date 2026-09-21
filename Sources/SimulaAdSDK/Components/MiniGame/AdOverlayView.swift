@@ -465,7 +465,7 @@ public struct AdOverlayView: View {
                                          durationS: videoPlayer.duration
                                      )
                                  },
-                                 telemetryPauseReason: videoPauseReason,
+                                 telemetryPauseReason: { videoPauseReason },
                                  onTelemetryEvent: ad.usesVideoPlanV2
                                      ? { event in recordVideoSurfaceTelemetry(event, player: videoPlayer) }
                                      : nil
