@@ -188,7 +188,7 @@ final class NativeAdParsingTests: XCTestCase {
         XCTAssertEqual(r.impressionId, "serve-123")
         XCTAssertTrue(r.adInserted)
         XCTAssertEqual(r.adFormat, "character_ad")
-        XCTAssertEqual(r.iframeURL, "https://api/iframe/abc")
+        XCTAssertEqual(r.renderedHTML, "<iframe srcdoc=...></iframe>")
         XCTAssertEqual(r.destination, "web")
         XCTAssertEqual(r.destinationKind, .web)
         XCTAssertEqual(r.trackingUrl, "https://mmp.example/click?cid=1")
@@ -196,7 +196,7 @@ final class NativeAdParsingTests: XCTestCase {
     }
 
     func testDestinationDefaultsToAppStoreAndTrackingURLToNilWhenOmitted() throws {
-        let json = #"{"impression_id":"s","ad_inserted":true,"ad_format":"character_ad","iframe_url":"u"}"#
+        let json = #"{"impression_id":"s","ad_inserted":true,"ad_format":"character_ad","rendered_html":"<html/>"}"#
         let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
         XCTAssertEqual(r.destination, "appstore")
         XCTAssertEqual(r.destinationKind, .appstore)
@@ -226,10 +226,16 @@ final class NativeAdParsingTests: XCTestCase {
     }
 
     func testUnknownKeysAreIgnored() throws {
-        let json = #"{"ad_inserted":true,"ad_format":"character_ad","iframe_url":"u","future":1}"#
+        let json = #"{"ad_inserted":true,"ad_format":"character_ad","rendered_html":"<html/>","future":1}"#
         let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
         XCTAssertTrue(r.adInserted)
-        XCTAssertEqual(r.iframeURL, "u")
+        XCTAssertEqual(r.renderedHTML, "<html/>")
+    }
+
+    func testIframeOnlyFillIsNotRenderable() throws {
+        let json = #"{"ad_inserted":true,"ad_format":"character_ad","iframe_url":"https://api/iframe/abc"}"#
+        let r = try JSONDecoder().decode(NativeAdResponse.self, from: data(json))
+        XCTAssertFalse(r.hasCreative)
     }
 
     // MARK: - skan_attribution (parity with interstitial/rewarded)

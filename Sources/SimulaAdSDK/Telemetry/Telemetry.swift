@@ -332,7 +332,7 @@ final class Telemetry: @unchecked Sendable {
         afterPendingPersistence(timeout: 0.35, completion: completion)
     }
 
-    /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
+    /// Replace the session's experiment assignment; two nil values clear a previous serve's value.
     func setExperiment(experimentId: String?, variantId: String?) {
         current?.setExperiment(experimentId: experimentId, variantId: variantId)
     }

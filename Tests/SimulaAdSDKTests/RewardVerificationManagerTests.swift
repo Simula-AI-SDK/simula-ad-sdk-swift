@@ -111,6 +111,106 @@ final class RewardVerificationManagerTests: XCTestCase {
         await mgr.cancelPendingWorkForTests()
     }
 
+    func testCompletionReasonPersistsAndIsReusedOnRetry() async {
+        let verifier = FakeVerifier()
+        verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
+        let clock = TestClock(0)
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { clock.time },
+            sleep: { await sleeper.sleep($0) }
+        )
+        defer { sleeper.release() }
+
+        mgr.queueVerification(
+            serveId: "A",
+            sessionId: "s",
+            elapsedPlayTime: 8,
+            completionReason: .videoCompleted
+        )
+        _ = await sleeper.waitForSleepRequest()
+
+        XCTAssertEqual(store.persisted.first?.completionReason, .videoCompleted)
+        XCTAssertEqual(verifier.completionReasons(for: "A"), [.videoCompleted])
+
+        verifier.clearError(for: "A")
+        clock.time = 5
+        sleeper.release()
+        await waitUntil { store.persisted.isEmpty }
+
+        XCTAssertEqual(verifier.completionReasons(for: "A"), [.videoCompleted, .videoCompleted])
+    }
+
+    func testDuplicateEnqueueDoesNotOverwriteFirstCompletionReason() async {
+        let verifier = FakeVerifier()
+        verifier.gate("A")
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
+
+        mgr.queueVerification(
+            serveId: "A",
+            sessionId: "s",
+            elapsedPlayTime: 8,
+            completionReason: .videoCompleted
+        )
+        await verifier.waitUntilEntered("A")
+        mgr.queueVerification(
+            serveId: "A",
+            sessionId: "s",
+            elapsedPlayTime: 30,
+            completionReason: .durationElapsed
+        )
+        await mgr.waitForExecutorForTests()
+
+        XCTAssertEqual(store.persisted.first?.completionReason, .videoCompleted)
+        verifier.release("A")
+        await waitUntil { store.persisted.isEmpty }
+    }
+
+    func testUnknownCompletionReasonIsPreservedWhileSupportedRowsDrain() async throws {
+        let data = Data(#"[{"serveId":"future","sessionId":"s","elapsedPlayTime":1,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"future_reason"},{"serveId":"known","sessionId":"s","elapsedPlayTime":2,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"duration_elapsed"}]"#.utf8)
+        let seeded = try JSONDecoder().decode([PendingVerification].self, from: data)
+        let verifier = FakeVerifier()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
+
+        mgr.triggerProcessQueue()
+        await waitUntil { verifier.callOrder == ["known"] && store.persisted.count == 1 }
+
+        XCTAssertEqual(verifier.callOrder, ["known"])
+        XCTAssertEqual(store.persisted.map(\.serveId), ["future"])
+        XCTAssertEqual(store.persisted.first?.completionReasonRawValue, "future_reason")
+        XCTAssertTrue(store.persisted.first?.hasUnsupportedCompletionReason == true)
+        await mgr.cancelPendingWorkForTests()
+    }
+
+    func testUnsupportedOnlyQueueDoesNotScheduleHotRetry() async throws {
+        let data = Data(#"[{"serveId":"future","sessionId":"s","elapsedPlayTime":1,"retryCount":0,"lastAttemptTimestamp":0,"completionReason":"future_reason"}]"#.utf8)
+        let seeded = try JSONDecoder().decode([PendingVerification].self, from: data)
+        let verifier = FakeVerifier()
+        let sleeper = ControllableSleep()
+        let store = ScriptedRewardStore(initial: seeded)
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { 0 },
+            sleep: { await sleeper.sleep($0) }
+        )
+
+        mgr.triggerProcessQueue()
+        await waitUntil { store.loadCount == 1 }
+        await mgr.waitForExecutorForTests()
+
+        XCTAssertEqual(verifier.callOrder, [])
+        XCTAssertFalse(sleeper.isSleeping)
+        XCTAssertEqual(sleeper.count, 0)
+        XCTAssertEqual(store.persisted.map(\.serveId), ["future"])
+        await mgr.cancelPendingWorkForTests()
+    }
+
     func testVerificationEnqueuedDuringInFlightDrainIsRoutedToItsOwnCaller() async {
         let verifier = FakeVerifier()
         verifier.setToken("tokA", for: "A")
@@ -303,23 +403,30 @@ final class RewardVerificationManagerTests: XCTestCase {
         XCTAssertEqual(duplicateCallback.count, 0)
     }
 
-    func testNonFiniteElapsedTimeDoesNotPoisonQueue() async {
+    func testInvalidElapsedTimeDoesNotPoisonQueue() async {
         let verifier = FakeVerifier()
         verifier.setToken("token", for: "valid")
         let store = ScriptedRewardStore(saveResults: [])
         let invalidCallback = RewardCallbackRecorder()
+        let negativeCallback = RewardCallbackRecorder()
         let validCallback = RewardCallbackRecorder()
         let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 0 })
 
         mgr.queueVerification(serveId: "invalid", sessionId: "s", elapsedPlayTime: .nan) {
             invalidCallback.record($0)
         }
+        mgr.queueVerification(serveId: "negative", sessionId: "s", elapsedPlayTime: -1) {
+            negativeCallback.record($0)
+        }
         mgr.queueVerification(serveId: "valid", sessionId: "s", elapsedPlayTime: 1) {
             validCallback.record($0)
         }
 
-        await waitUntil { invalidCallback.count == 1 && validCallback.count == 1 }
+        await waitUntil {
+            invalidCallback.count == 1 && negativeCallback.count == 1 && validCallback.count == 1
+        }
         XCTAssertEqual(verifier.callCount("invalid"), 0)
+        XCTAssertEqual(verifier.callCount("negative"), 0)
         XCTAssertEqual(verifier.callCount("valid"), 1)
         XCTAssertTrue(store.persisted.isEmpty)
     }
@@ -639,6 +746,7 @@ private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
     private var enteredFlags: Set<String> = []
     private var enteredWaiters: [String: CheckedContinuation<Void, Never>] = [:]
     private var orderedCalls: [String] = []
+    private var reasons: [String: [RewardCompletionReason?]] = [:]
 
     func setToken(_ token: String?, for serveId: String) { lock.lock(); tokens[serveId] = token; lock.unlock() }
     func setError(_ error: Error, for serveId: String) { lock.lock(); errors[serveId] = error; lock.unlock() }
@@ -646,11 +754,33 @@ private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
     func gate(_ serveId: String) { lock.lock(); gated.insert(serveId); lock.unlock() }
     func callCount(_ serveId: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[serveId] ?? 0 }
     var callOrder: [String] { lock.lock(); defer { lock.unlock() }; return orderedCalls }
+    func completionReasons(for serveId: String) -> [RewardCompletionReason?] {
+        lock.lock(); defer { lock.unlock() }
+        return reasons[serveId] ?? []
+    }
 
     func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String) async throws -> VerifyRewardResponse {
+        try await performVerification(serveId: serveId, completionReason: nil)
+    }
+
+    func verifyReward(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String,
+        completionReason: RewardCompletionReason?
+    ) async throws -> VerifyRewardResponse {
+        try await performVerification(serveId: serveId, completionReason: completionReason)
+    }
+
+    private func performVerification(
+        serveId: String,
+        completionReason: RewardCompletionReason?
+    ) async throws -> VerifyRewardResponse {
         lock.lock()
         counts[serveId, default: 0] += 1
         orderedCalls.append(serveId)
+        reasons[serveId, default: []].append(completionReason)
         let isGated = gated.contains(serveId)
         lock.unlock()
 
@@ -726,6 +856,7 @@ private final class ScriptedRewardStore: RewardVerificationStoring, @unchecked S
     private let lock = NSLock()
     private var results: [Bool]
     private var durable: [PendingVerification] = []
+    private var loads = 0
 
     init(saveResults: [Bool] = [], initial: [PendingVerification] = []) {
         results = saveResults
@@ -733,6 +864,7 @@ private final class ScriptedRewardStore: RewardVerificationStoring, @unchecked S
     }
     func load() -> DurableQueueLoad<PendingVerification> {
         lock.lock(); defer { lock.unlock() }
+        loads += 1
         return .loaded(durable)
     }
     func save(_ records: [PendingVerification]) -> Bool {
@@ -742,6 +874,7 @@ private final class ScriptedRewardStore: RewardVerificationStoring, @unchecked S
         return succeeds
     }
     var persisted: [PendingVerification] { lock.lock(); defer { lock.unlock() }; return durable }
+    var loadCount: Int { lock.lock(); defer { lock.unlock() }; return loads }
 }
 
 private final class RewardCallbackRecorder: @unchecked Sendable {
