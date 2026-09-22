@@ -49,8 +49,15 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var stack: [String]?
     var cacheHit: Bool?
     var retryCount: Int?
-    /// Store-exit click type for store_opened/returned/abandoned: cta | store_prompt | auto_redirect.
+    /// Store-exit click type: cta | store_prompt | install_banner | fallback_cta | auto_redirect.
     var trigger: String?
+    /// Terminal reason for a store dwell: sheet_dismissed | app_foreground | ad_closed.
+    var endEvent: String?
+    /// One-based store-open ordinal within a fullscreen presentation.
+    var opens: Int?
+    /// Cross-platform optional fields. Swift deliberately leaves both unset.
+    var contaminated: Bool?
+    var freeSpaceDeltaBytes: Int64?
     /// Native load source for load_success: preload | cache | network.
     var cacheSource: String?
     /// Wall-clock staleness, stamped at flush time = clock() - timestamp. Detects offline/queued events.
@@ -82,6 +89,9 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case cacheHit = "cache_hit"
         case retryCount = "retry_count"
         case trigger
+        case endEvent = "end_event"
+        case opens, contaminated
+        case freeSpaceDeltaBytes = "free_space_delta_bytes"
         case cacheSource = "cache_source"
         case eventAgeMs = "event_age_ms"
         case count

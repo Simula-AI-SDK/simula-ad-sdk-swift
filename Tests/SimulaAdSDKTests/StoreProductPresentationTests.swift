@@ -222,7 +222,8 @@ final class StoreProductPresentationTests: XCTestCase {
         XCTAssertEqual(outcomes, [AttributionRouteOutcome(
             path: .directStore,
             success: true,
-            failureClass: nil
+            failureClass: nil,
+            storeDwellRoute: .storeProductSheet
         )])
     }
 
@@ -251,7 +252,8 @@ final class StoreProductPresentationTests: XCTestCase {
             forName: .simulaAdExternalSheetDidDismiss,
             object: nil,
             queue: .main
-        ) { _ in
+        ) { notification in
+            XCTAssertTrue((notification.object as? StoreProductOwnershipToken) === owner)
             dismissNotifications += 1
             dismissed.fulfill()
         }
@@ -280,6 +282,108 @@ final class StoreProductPresentationTests: XCTestCase {
         ))
         await fulfillment(of: [dismissed], timeout: 2)
         XCTAssertEqual(dismissNotifications, 1)
+    }
+
+    @MainActor
+    func testMountBehindForeignSheetDoesNotInheritItsBlockedState() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
+        CreativeCTARouter.setViewControllerPresenterForTesting { _ in true }
+        let sheetOwner = StoreProductOwnershipToken()
+        let mountingPresentationOwner = StoreProductOwnershipToken()
+        defer { CreativeCTARouter.resetExternalPresentationStateForTesting() }
+
+        XCTAssertTrue(CreativeCTARouter.presentStoreProduct(
+            appID: "375380948",
+            ownershipToken: sheetOwner
+        ))
+        XCTAssertTrue(CreativeCTARouter.isExternalPresentationActive(
+            ownershipToken: sheetOwner
+        ))
+        XCTAssertFalse(CreativeCTARouter.isExternalPresentationActive(
+            ownershipToken: mountingPresentationOwner
+        ))
+
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: sheetOwner)
+        await Task.yield()
+        XCTAssertFalse(CreativeCTARouter.isExternalPresentationActive(
+            ownershipToken: mountingPresentationOwner
+        ))
+    }
+
+    @MainActor
+    func testFallbackAutomaticSheetUsesLifecycleScopeAndReturnsOnOwnedDismissal() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        CreativeCTARouter.setStoreProductControllerProviderForTesting {
+            SKStoreProductViewController()
+        }
+        CreativeCTARouter.setViewControllerPresenterForTesting { _ in true }
+        let lifecycle = AttributionRouteLifecycle()
+        lifecycle.activate()
+        var events: [StoreDwellLifecycleEvent] = []
+        var now = 1_000.0
+        let tracker = StoreExitTracker(
+            adId: "ad",
+            adFormat: "interstitial",
+            now: { now },
+            recorder: { events.append($0) }
+        )
+        let willPresent = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetWillPresent,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)
+                    === lifecycle.storeProductOwnership else { return }
+            tracker.onSheetPresented()
+        }
+        let didDismiss = NotificationCenter.default.addObserver(
+            forName: .simulaAdExternalSheetDidDismiss,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)
+                    === lifecycle.storeProductOwnership else { return }
+            now = 1_500
+            tracker.onSheetDismissed()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(willPresent)
+            NotificationCenter.default.removeObserver(didDismiss)
+            lifecycle.deactivate()
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+        let execution = AttributionRouteExecution(
+            isActive: { lifecycle.isActive },
+            onOutcome: { outcome in
+                guard let route = outcome.storeDwellRoute else { return }
+                tracker.recordStoreOpen(
+                    ClickSource.autoRedirect.storeDwellTrigger,
+                    route: route
+                )
+            }
+        )
+
+        openFallbackAutomaticRoute(
+            trackingUrl: "itms-apps://apps.apple.com/app/id375380948",
+            destination: .appstore,
+            storeOpen: .skstoreproduct,
+            storeUrl: nil,
+            attribution: nil,
+            lifecycle: lifecycle,
+            execution: execution
+        )
+        XCTAssertEqual(events.map(\.stage), ["store_opened"])
+        XCTAssertEqual(events.first?.trigger, "auto_redirect")
+
+        CreativeCTARouter.dismissStoreProduct(
+            ownershipToken: lifecycle.storeProductOwnership
+        )
+        await Task.yield()
+        XCTAssertEqual(events.map(\.stage), ["store_opened", "store_returned"])
+        XCTAssertEqual(events.last?.endEvent, .sheetDismissed)
     }
 
     @MainActor

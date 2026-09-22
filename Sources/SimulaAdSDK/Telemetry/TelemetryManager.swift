@@ -322,7 +322,11 @@ final class TelemetryManager: @unchecked Sendable {
         errorCode: String?,
         trigger: String? = nil,
         cacheSource: String? = nil,
-        breadcrumb: String? = nil
+        breadcrumb: String? = nil,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         recordLifecycle(
             stage: stage,
@@ -336,7 +340,11 @@ final class TelemetryManager: @unchecked Sendable {
             cacheSource: cacheSource,
             breadcrumb: breadcrumb,
             interactionId: nil,
-            clickSource: nil
+            clickSource: nil,
+            endEvent: endEvent,
+            opens: opens,
+            contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
     }
 
@@ -352,7 +360,11 @@ final class TelemetryManager: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil,
         interactionId: String?,
-        clickSource: String?
+        clickSource: String?,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         var e = newEvent(type: TelemetryType.lifecycle, name: stage)
         e.adFormat = adFormat
@@ -364,6 +376,10 @@ final class TelemetryManager: @unchecked Sendable {
         e.durationMs = durationMs
         e.errorCode = errorCode
         e.trigger = trigger
+        e.endEvent = endEvent
+        e.opens = opens
+        e.contaminated = contaminated
+        e.freeSpaceDeltaBytes = freeSpaceDeltaBytes
         e.cacheSource = cacheSource
         e.breadcrumb = breadcrumb
         let accumulatedFunnel = accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)

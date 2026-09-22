@@ -416,6 +416,11 @@ public final class SimulaRewardedAd {
         // with `self == nil` — and must still be able to enqueue an earned reward.
         let salvageSessionId = sessionId
         let salvageAdUnitId = adUnitId
+        let storeExit = StoreExitTracker(
+            adId: response.impressionId,
+            adFormat: Self.adFormat,
+            adUnitId: salvageAdUnitId
+        )
         let presentationOwner = WeakFullscreenPresentationOwner(self)
         let accountingCallbacks = fullscreenPresentationAccountingCallbacks(
             owner: presentationOwner,
@@ -474,6 +479,7 @@ public final class SimulaRewardedAd {
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
             admission: admission,
+            storeExitTracker: storeExit,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,
             trackingUrl: response.trackingUrl,
@@ -512,6 +518,7 @@ public final class SimulaRewardedAd {
             },
             onClose: { [weak self] earned, elapsedPlayTime, completionReason, presentationLease, originalKeyWindow in
                 guard let self else {
+                    storeExit.onAdClosed()
                     let terminalOutcome = admission.finish()
                     if terminalOutcome == .closed {
                         // The host destroyed this ad object while the playable was up. Preserve only
@@ -538,6 +545,7 @@ public final class SimulaRewardedAd {
                 self.releasePreparedVideo()
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
+                    storeExit.onAdClosed()
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
@@ -546,6 +554,7 @@ public final class SimulaRewardedAd {
                     earnedReward: earned
                 )
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    storeExit.onAdClosed()
                     self.discardFallbackPrefetch()
                     presentationLease.finishPostCloseTeardown()
                     return
@@ -564,8 +573,10 @@ public final class SimulaRewardedAd {
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     originalKeyWindow: originalKeyWindow,
+                    storeExitTracker: storeExit,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        storeExit.onAdClosed()
                         SimulaRewardedAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: salvageAdUnitId,
@@ -1012,6 +1023,7 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1028,6 +1040,7 @@ public final class SimulaRewardedAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1038,6 +1051,7 @@ public final class SimulaRewardedAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1054,6 +1068,7 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1065,6 +1080,7 @@ public final class SimulaRewardedAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1087,6 +1103,7 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1106,6 +1123,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1144,6 +1162,7 @@ public final class SimulaRewardedAd {
         response: RewardedInitResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1171,6 +1190,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil

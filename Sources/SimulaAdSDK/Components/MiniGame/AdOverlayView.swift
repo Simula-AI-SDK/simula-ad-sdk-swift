@@ -269,6 +269,8 @@ public struct AdOverlayView: View {
     var attribution: AdAttribution? = nil
     /// Presentation-owned routing state shared with configured and in-WebView automatic routes.
     var routeLifecycle: AttributionRouteLifecycle? = nil
+    /// Shared with the primary fullscreen surface so fallback opens continue the same ordinal series.
+    var storeExitTracker: StoreExitTracker? = nil
     /// Fires once after this screen's route lifecycle and lifecycle observers are mounted. This is
     /// deliberately independent of WebView readiness: END_SCREEN_N_OPEN means screen installation.
     var onScreenMounted: (() -> Bool)? = nil
@@ -414,6 +416,14 @@ public struct AdOverlayView: View {
                                 onWebContentProcessTerminated: { markLegacyHTMLPageFailed() },
                                 onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
+                                onAttributionRouteOutcome: { outcome in
+                                    if let route = outcome.storeDwellRoute {
+                                        storeExitTracker?.recordStoreOpen(
+                                            ClickSource.fallbackCTA.storeDwellTrigger,
+                                            route: route
+                                        )
+                                    }
+                                },
                                 attributionRouteLifecycle: activeRouteLifecycle,
                                 clickSource: .fallbackCTA,
                                 clickBeaconImpressionId: nativeClickBeaconImpressionId,
@@ -522,7 +532,9 @@ public struct AdOverlayView: View {
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
-            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive(
+                ownershipToken: activeRouteLifecycle.storeProductOwnership
+            )
             onPresentationBlockedChanged?(fallbackPresentationBlocked(
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented
@@ -590,24 +602,29 @@ public struct AdOverlayView: View {
         .modifier(AdCountdownLifecycle(
             onBackground: {
                 appForegrounded = false
+                storeExitTracker?.onAppAway()
                 onPresentationBlockedChanged?(true)
                 reconcileCountdown()
             },
             onForeground: {
                 appForegrounded = true
+                storeExitTracker?.onAppForeground()
                 onPresentationBlockedChanged?(storeSheetPresented)
                 reconcileCountdown()
             },
             onSheetPresent: {
                 storeSheetPresented = true
+                storeExitTracker?.onSheetPresented()
                 onPresentationBlockedChanged?(true)
                 reconcileCountdown()
             },
             onSheetDismiss: {
                 storeSheetPresented = false
+                storeExitTracker?.onSheetDismissed()
                 onPresentationBlockedChanged?(!appForegrounded)
                 reconcileCountdown()
-            }
+            },
+            sheetScope: activeRouteLifecycle.storeProductOwnership
         ))
     }
 
@@ -1106,7 +1123,14 @@ public struct AdOverlayView: View {
                     canCompleteAfterPresentationTeardown:
                         committedRouteTerminalAvailability(originatingScene: originatingScene),
                     onUIHandoffReleased: { updateClickHandoffPending(false) },
-                    onOutcome: { _ in }
+                    onOutcome: { outcome in
+                        if let route = outcome.storeDwellRoute {
+                            storeExitTracker?.recordStoreOpen(
+                                ClickSource.fallbackCTA.storeDwellTrigger,
+                                route: route
+                            )
+                        }
+                    }
                 )
                 routeCommittedUserHandoff(
                     coordinator: activeRouteLifecycle.automaticRoutes,
@@ -1299,14 +1323,21 @@ private struct AdCountdownLifecycle: ViewModifier {
     let onForeground: () -> Void
     let onSheetPresent: () -> Void
     let onSheetDismiss: () -> Void
+    let sheetScope: StoreProductOwnershipToken
 
     func body(content: Content) -> some View {
         #if os(iOS)
         content
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in onBackground() }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in onForeground() }
-            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in onSheetPresent() }
-            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in onSheetDismiss() }
+            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
+                guard (notification.object as? StoreProductOwnershipToken) === sheetScope else { return }
+                onSheetPresent()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
+                guard (notification.object as? StoreProductOwnershipToken) === sheetScope else { return }
+                onSheetDismiss()
+            }
         #else
         content
         #endif

@@ -493,6 +493,11 @@ public final class SimulaInterstitialAd {
 
         let presenter = InterstitialPresenter()
         let clickAdUnitId = adUnitId
+        let storeExit = StoreExitTracker(
+            adId: response.impressionId,
+            adFormat: Self.adFormat,
+            adUnitId: clickAdUnitId
+        )
         showStartNanos = DispatchTime.now().uptimeNanoseconds
         let presentationOwner = WeakFullscreenPresentationOwner(self)
         let accountingCallbacks = fullscreenPresentationAccountingCallbacks(
@@ -552,6 +557,7 @@ public final class SimulaInterstitialAd {
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
             admission: admission,
+            storeExitTracker: storeExit,
             onWillPresent: {
                 if response.prewarmSKProduct {
                     CreativeCTARouter.prewarmStoreProduct(
@@ -583,6 +589,7 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
+                    storeExit.onAdClosed()
                     let terminalOutcome = admission.finish()
                     if terminalOutcome == .closed {
                         SimulaInterstitialAd.recordFallbackOutcome(
@@ -598,11 +605,13 @@ public final class SimulaInterstitialAd {
                 self.releasePreparedVideo()
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
+                    storeExit.onAdClosed()
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
                 let postPrimaryPolicy = FullscreenPostPrimaryPolicy(terminalOutcome: terminalOutcome)
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    storeExit.onAdClosed()
                     self.discardFallbackPrefetch()
                     presentationLease.finishPostCloseTeardown()
                     return
@@ -619,8 +628,10 @@ public final class SimulaInterstitialAd {
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     originalKeyWindow: originalKeyWindow,
+                    storeExitTracker: storeExit,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        storeExit.onAdClosed()
                         SimulaInterstitialAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: clickAdUnitId,
@@ -955,6 +966,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -971,6 +983,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -981,6 +994,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -997,6 +1011,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1008,6 +1023,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1030,6 +1046,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1049,6 +1066,7 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1089,6 +1107,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1115,6 +1134,7 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil
