@@ -643,7 +643,7 @@ final class FallbackAdPresenter {
 
         self.originalKeyWindow = originalKeyWindow
 
-        let rootView = startsLoading ? loadingView() : adView(at: 0)
+        let rootView = startsLoading ? loadingView() : adView(at: 0, initialOriginatingScene: scene)
         let hosting = UIHostingController(rootView: rootView)
         hosting.view.backgroundColor = .black
         hosting.view.isOpaque = true
@@ -752,7 +752,7 @@ final class FallbackAdPresenter {
     }
 
     /// `.id` gives each screen fresh overlay state while the opaque host itself stays installed.
-    private func adView(at index: Int) -> AnyView {
+    private func adView(at index: Int, initialOriginatingScene: UIWindowScene? = nil) -> AnyView {
         guard ads.indices.contains(index) else { return loadingView() }
         let ad = ads[index]
         let videoRoute = ad.mediaType == .video ? fallbackVideoCTARoute(
@@ -779,6 +779,7 @@ final class FallbackAdPresenter {
                 : nil,
             videoPlayer: retainedVideoPlayer(at: index),
             videoPlanScope: videoPlanScope,
+            initialOriginatingScene: initialOriginatingScene ?? window?.windowScene,
             expectsVideoPlanNextStep: index + 1 < ads.count,
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,

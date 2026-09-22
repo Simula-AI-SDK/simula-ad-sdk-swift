@@ -840,6 +840,95 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertNil(ownership.activeRequest)
     }
 
+    func testMiniGameRetainedV2PresentationRecreatesScopeBeforeReconciliation() {
+        let recovery = miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: false
+        )
+
+        XCTAssertTrue(recovery.createScope)
+        XCTAssertFalse(recovery.reattachCurrentPlayer)
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: false
+        ), .reconcile)
+    }
+
+    func testMiniGameRetainedV2PlayerIsReattachedWithoutReconciliation() {
+        let recovery = miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: true
+        )
+
+        XCTAssertTrue(recovery.createScope)
+        XCTAssertTrue(recovery.reattachCurrentPlayer)
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: true
+        ), .none)
+    }
+
+    func testMiniGameScopeRecoveryIgnoresNonV2AndInactivePresentations() {
+        XCTAssertEqual(miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: false,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: true
+        ), MiniGameFallbackV2ScopeRecovery(createScope: false, reattachCurrentPlayer: false))
+        XCTAssertEqual(miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: false,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: false,
+            ownsCurrentPlayer: true
+        ), MiniGameFallbackV2ScopeRecovery(createScope: false, reattachCurrentPlayer: false))
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testMiniGameReattachedV2PlayerPreservesMuteAndRestoresTerminalClaims() {
+        let events: [VideoPlanTerminalEvent] = [.completion, .failure, .userClose]
+        for (index, event) in events.enumerated() {
+            let player = FullscreenVideoPlayer(
+                url: URL(fileURLWithPath: "/dev/null"),
+                posterURL: nil,
+                startsMuted: index.isMultiple(of: 2),
+                stallTimeout: FullscreenVideoPlayer.videoPlanV2StallTimeout
+            )
+            let expectedMuted = player.isMuted
+            let scope = VideoPlanPresentationScope()
+
+            reattachMiniGameFallbackV2Player(player, to: scope)
+
+            XCTAssertEqual(scope.isMuted, expectedMuted)
+            XCTAssertEqual(player.isMuted, expectedMuted)
+            XCTAssertTrue(scope.claimVideoTerminal(
+                playerID: player.videoPlanPresentationID,
+                event: event
+            ))
+            XCTAssertFalse(scope.claimVideoTerminal(
+                playerID: player.videoPlanPresentationID,
+                event: event
+            ))
+            scope.cancel()
+            player.stop()
+        }
+    }
+    #endif
+
     @MainActor
     func testMiniGameFallbackVideoReacquiresOnceAfterDisappearReappear() {
         final class Resource {}

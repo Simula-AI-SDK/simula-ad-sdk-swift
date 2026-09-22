@@ -206,7 +206,12 @@ struct VideoPlanOriginatingSceneState<Owner: Hashable & Sendable, SceneID: Hasha
         guard !cancelled else { return false }
         self.owner = owner
         self.generation = generation
-        sceneID = nil
+        return true
+    }
+
+    mutating func activate(owner: Owner, generation: UInt64, sceneID: SceneID) -> Bool {
+        guard activate(owner: owner, generation: generation) else { return false }
+        self.sceneID = sceneID
         return true
     }
 
@@ -233,6 +238,55 @@ struct VideoPlanOriginatingSceneState<Owner: Hashable & Sendable, SceneID: Hasha
         cancelled = true
         owner = nil
         sceneID = nil
+    }
+}
+
+@MainActor
+final class VideoPlanScenePresentationRetry<Scene: AnyObject> {
+    private let notificationCenter: NotificationCenter
+    private let retry: () -> Void
+    private weak var currentScene: Scene?
+    private var activationObserver: NSObjectProtocol?
+    private var cancelled = false
+
+    init(
+        notificationCenter: NotificationCenter,
+        activationNotification: Notification.Name,
+        retry: @escaping () -> Void
+    ) {
+        self.notificationCenter = notificationCenter
+        self.retry = retry
+        activationObserver = notificationCenter.addObserver(
+            forName: activationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            MainActor.assumeIsolated {
+                guard let self, !self.cancelled,
+                      let activatedScene = notification.object as? Scene,
+                      let currentScene = self.currentScene,
+                      activatedScene === currentScene else { return }
+                self.retry()
+            }
+        }
+    }
+
+    func updateScene(_ scene: Scene?) {
+        guard !cancelled else { return }
+        currentScene = scene
+        if scene != nil { retry() }
+    }
+
+    func cancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        currentScene = nil
+        if let activationObserver { notificationCenter.removeObserver(activationObserver) }
+        activationObserver = nil
+    }
+
+    deinit {
+        if let activationObserver { notificationCenter.removeObserver(activationObserver) }
     }
 }
 
@@ -467,6 +521,16 @@ final class VideoPlanPresentationScope {
     private var overlayFailureRecorded = false
     private var overlayPlacement = VideoPlanOverlayPlacementState()
     private var overlayClaim = SKOverlayPresentationClaim()
+    private var scenePresentationRetry: VideoPlanScenePresentationRetry<UIWindowScene>?
+
+    init() {
+        scenePresentationRetry = VideoPlanScenePresentationRetry(
+            notificationCenter: .default,
+            activationNotification: UIScene.didActivateNotification
+        ) { [weak self] in
+            self?.presentIfReady()
+        }
+    }
 
     func updateMuted(_ muted: Bool) {
         isMuted = muted
@@ -485,12 +549,29 @@ final class VideoPlanPresentationScope {
         guard !cancelled,
               originatingSceneState.update(scene.map(ObjectIdentifier.init)) else { return }
         originatingScene = scene
-        if scene != nil { presentIfReady() }
+        scenePresentationRetry?.updateScene(scene)
     }
 
-    func activateOriginatingSceneOwner(owner: VideoPlanBlockerOwner, generation: UInt64) {
-        guard !cancelled, originatingSceneState.activate(owner: owner, generation: generation) else { return }
-        originatingScene = nil
+    func activateOriginatingSceneOwner(
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64,
+        scene: UIWindowScene? = nil
+    ) {
+        guard !cancelled else { return }
+        let replacementScene = scene ?? originatingScene
+        guard let replacementScene else {
+            guard originatingSceneState.activate(owner: owner, generation: generation) else { return }
+            _ = originatingSceneState.update(nil, owner: owner, generation: generation)
+            scenePresentationRetry?.updateScene(nil)
+            return
+        }
+        guard originatingSceneState.activate(
+            owner: owner,
+            generation: generation,
+            sceneID: ObjectIdentifier(replacementScene)
+        ) else { return }
+        originatingScene = replacementScene
+        scenePresentationRetry?.updateScene(replacementScene)
     }
 
     func updateOriginatingScene(
@@ -504,12 +585,13 @@ final class VideoPlanPresentationScope {
             generation: generation
         ) else { return }
         originatingScene = scene
-        if scene != nil { presentIfReady() }
+        scenePresentationRetry?.updateScene(scene)
     }
 
     func deactivateOriginatingSceneOwner(owner: VideoPlanBlockerOwner, generation: UInt64) {
         guard originatingSceneState.deactivate(owner: owner, generation: generation) else { return }
         originatingScene = nil
+        scenePresentationRetry?.updateScene(nil)
     }
 
     func reserveLegacySKOverlay() -> SKOverlayPresentationClaim.Reservation? {
@@ -699,6 +781,8 @@ final class VideoPlanPresentationScope {
         presentationAdmission.cancel()
         originatingSceneState.cancel()
         originatingScene = nil
+        scenePresentationRetry?.cancel()
+        scenePresentationRetry = nil
         deadlineTask?.cancel()
         deadlineTask = nil
         if var clock {

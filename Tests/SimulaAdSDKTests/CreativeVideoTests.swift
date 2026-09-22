@@ -621,10 +621,11 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertTrue(state.activate(owner: "old", generation: 1))
         XCTAssertTrue(state.update("scene-old", owner: "old", generation: 1))
         XCTAssertTrue(state.activate(owner: "new", generation: 1))
-        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 1))
+
+        XCTAssertEqual(state.sceneID, "scene-old")
 
         XCTAssertFalse(state.update(nil, owner: "old", generation: 1))
-        XCTAssertEqual(state.sceneID, "scene-new")
+        XCTAssertEqual(state.sceneID, "scene-old")
     }
 
     func testVideoPlanStaleOldNonNilSceneCannotReplaceNewOwnerScene() {
@@ -632,10 +633,71 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertTrue(state.activate(owner: "old", generation: 1))
         XCTAssertTrue(state.update("scene-old", owner: "old", generation: 1))
         XCTAssertTrue(state.activate(owner: "new", generation: 2))
-        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 2))
 
         XCTAssertFalse(state.update("scene-stale", owner: "old", generation: 1))
+        XCTAssertEqual(state.sceneID, "scene-old")
+        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 2))
         XCTAssertEqual(state.sceneID, "scene-new")
+    }
+
+    func testVideoPlanStaleOwnerCannotDeactivateReplacementScene() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "old", generation: 1))
+        XCTAssertTrue(state.update("scene-old", owner: "old", generation: 1))
+        XCTAssertTrue(state.activate(owner: "new", generation: 2))
+        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 2))
+
+        XCTAssertFalse(state.deactivate(owner: "old", generation: 1))
+        XCTAssertEqual(state.sceneID, "scene-new")
+        XCTAssertEqual(state.owner, "new")
+        XCTAssertTrue(state.deactivate(owner: "new", generation: 2))
+        XCTAssertNil(state.sceneID)
+        XCTAssertNil(state.owner)
+    }
+
+    func testVideoPlanPersistentHostSceneSeedsReplacementAfterOldOwnerDisappears() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        var claim = SKOverlayPresentationClaim()
+        var presentations = 0
+        let hostScene = "host-scene"
+
+        func presentReadyOverlay() {
+            guard state.sceneID == hostScene, let reservation = claim.reserve() else { return }
+            presentations += 1
+            XCTAssertTrue(claim.succeed(reservation))
+        }
+
+        XCTAssertTrue(state.activate(owner: "old", generation: 1, sceneID: hostScene))
+        XCTAssertTrue(state.deactivate(owner: "old", generation: 1))
+        XCTAssertNil(state.sceneID)
+        presentReadyOverlay()
+        XCTAssertEqual(presentations, 0)
+
+        XCTAssertTrue(state.activate(owner: "replacement", generation: 2, sceneID: hostScene))
+        presentReadyOverlay()
+        XCTAssertEqual(presentations, 1)
+
+        XCTAssertFalse(state.update(nil, owner: "old", generation: 1))
+        XCTAssertFalse(state.update("stale-scene", owner: "old", generation: 1))
+        XCTAssertFalse(state.deactivate(owner: "old", generation: 1))
+        XCTAssertEqual(state.sceneID, hostScene)
+        presentReadyOverlay()
+        XCTAssertEqual(presentations, 1)
+    }
+
+    func testSceneReaderReplacementRejectsOldNilAndNonNilCallbacks() {
+        var state = AdOverlayWindowSceneState<String, String>()
+        state.activate(readerID: "old-reader")
+        XCTAssertTrue(state.update("old-scene", readerID: "old-reader"))
+
+        state.activate(readerID: "new-reader")
+        XCTAssertTrue(state.update("new-scene", readerID: "new-reader"))
+        XCTAssertFalse(state.update(nil, readerID: "old-reader"))
+        XCTAssertFalse(state.update("stale-scene", readerID: "old-reader"))
+        XCTAssertEqual(state.sceneID, "new-scene")
+
+        XCTAssertTrue(state.update(nil, readerID: "new-reader"))
+        XCTAssertNil(state.sceneID)
     }
 
     func testVideoPlanCurrentOwnerCanClearAndDeactivateScene() {
@@ -658,6 +720,73 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertTrue(state.update("scene-a", owner: "current", generation: 1))
         XCTAssertEqual(state.sceneID, "scene-a")
+    }
+
+    @MainActor
+    func testVideoPlanSameSceneUpdateRetriesPresentation() {
+        let center = NotificationCenter()
+        let scene = NSObject()
+        var retries = 0
+        let retry = VideoPlanScenePresentationRetry<NSObject>(
+            notificationCenter: center,
+            activationNotification: Notification.Name("scene-did-activate")
+        ) { retries += 1 }
+
+        retry.updateScene(scene)
+        retry.updateScene(scene)
+
+        XCTAssertEqual(retries, 2)
+    }
+
+    @MainActor
+    func testVideoPlanMatchingSceneActivationRetriesPresentation() {
+        let center = NotificationCenter()
+        let notification = Notification.Name("scene-did-activate")
+        let scene = NSObject()
+        var retries = 0
+        let retry = VideoPlanScenePresentationRetry<NSObject>(
+            notificationCenter: center,
+            activationNotification: notification
+        ) { retries += 1 }
+        retry.updateScene(scene)
+
+        center.post(name: notification, object: scene)
+
+        XCTAssertEqual(retries, 2)
+    }
+
+    @MainActor
+    func testVideoPlanNonmatchingAndCancelledSceneActivationAreIgnored() {
+        let center = NotificationCenter()
+        let notification = Notification.Name("scene-did-activate")
+        let scene = NSObject()
+        var retries = 0
+        let retry = VideoPlanScenePresentationRetry<NSObject>(
+            notificationCenter: center,
+            activationNotification: notification
+        ) { retries += 1 }
+        retry.updateScene(scene)
+
+        center.post(name: notification, object: NSObject())
+        XCTAssertEqual(retries, 1)
+
+        retry.cancel()
+        center.post(name: notification, object: scene)
+        retry.updateScene(scene)
+        XCTAssertEqual(retries, 1)
+    }
+
+    func testVideoPlanReadyOverlayCannotDuplicateSuccessfulPresentation() throws {
+        var claim = SKOverlayPresentationClaim()
+        var presentations = 0
+        let reservation = try XCTUnwrap(claim.reserve())
+        presentations += 1
+        XCTAssertTrue(claim.succeed(reservation))
+
+        if claim.reserve() != nil { presentations += 1 }
+
+        XCTAssertEqual(presentations, 1)
+        XCTAssertTrue(claim.consumed)
     }
 
     func testVideoPlanSceneCancellationRejectsDirectAndOwnedUpdates() {
@@ -1985,6 +2114,69 @@ final class CreativeVideoTests: XCTestCase {
             around: 2,
             preparedIndices: [1, 2]
         ), [1])
+    }
+
+    func testMiniGameV2PreparationFindsLeadingPlayablePlayableVideo() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"A"},{"type":"playable","rendered_html":"B"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":2}]}"#
+        )
+
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 0,
+            preparedIndices: []
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [2], discardIndices: []))
+    }
+
+    func testMiniGameV2PreparationTraversesGapsAndRecoversMissingToken() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":0},{"type":"playable","rendered_html":"A"},{"type":"playable","rendered_html":"B"},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":1}]}"#
+        )
+
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 1,
+            preparedIndices: []
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [3], discardIndices: []))
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 2,
+            preparedIndices: [3]
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: []))
+    }
+
+    func testMiniGameV2PreparationDoesNotDuplicateAndStaysBounded() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"A"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
+        )
+
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 0,
+            preparedIndices: [1]
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: []))
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 0,
+            preparedIndices: [1, 2]
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: [2]))
+    }
+
+    func testMiniGameV1PreparationPreservesCurrentAndNextParity() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"},{"type":"video","url":"https://cdn.example/three.mp4"}]}"#
+        )
+
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 0,
+            preparedIndices: []
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [0, 1], discardIndices: []))
+        XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
+            ads: ads,
+            around: 1,
+            preparedIndices: [0, 1, 2]
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: [0]))
     }
 
     #if os(iOS)

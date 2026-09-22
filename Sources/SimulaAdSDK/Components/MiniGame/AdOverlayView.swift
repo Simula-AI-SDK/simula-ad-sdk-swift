@@ -174,41 +174,82 @@ private struct AdOverlayVideoSurfaceIdentity: Hashable {
     let player: ObjectIdentifier
 }
 
+struct AdOverlayWindowSceneState<ReaderID: Hashable, SceneID: Hashable> {
+    private(set) var activeReaderID: ReaderID?
+    private(set) var sceneID: SceneID?
+
+    mutating func activate(readerID: ReaderID) {
+        activeReaderID = readerID
+    }
+
+    mutating func update(_ sceneID: SceneID?, readerID: ReaderID) -> Bool {
+        guard activeReaderID == readerID else { return false }
+        self.sceneID = sceneID
+        return true
+    }
+}
+
 #if os(iOS)
 final class AdOverlayWindowSceneView: UIView {
-    var onSceneChanged: ((UIWindowScene?) -> Void)?
+    let readerID = UUID()
+    var onSceneChanged: ((UUID, UIWindowScene?) -> Void)?
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
         let scene = window?.windowScene
+        let readerID = readerID
         let callback = onSceneChanged
         if let scene {
             DispatchQueue.main.async { [weak self] in
                 guard self?.window?.windowScene === scene else { return }
-                callback?(scene)
+                callback?(readerID, scene)
             }
         } else {
             // The callback must survive this view's deallocation so stale scene state is cleared.
-            DispatchQueue.main.async { callback?(nil) }
+            DispatchQueue.main.async { callback?(readerID, nil) }
         }
     }
 }
 
-private struct AdOverlayWindowSceneReader: UIViewRepresentable {
+@MainActor
+final class AdOverlayWindowSceneTracker {
+    private var state = AdOverlayWindowSceneState<UUID, ObjectIdentifier>()
+
+    func activate(readerID: UUID) {
+        state.activate(readerID: readerID)
+    }
+
+    func accept(scene: UIWindowScene?, readerID: UUID) -> Bool {
+        state.update(scene.map(ObjectIdentifier.init), readerID: readerID)
+    }
+}
+
+struct AdOverlayWindowSceneReader: UIViewRepresentable {
+    let tracker: AdOverlayWindowSceneTracker
     let onSceneChanged: (UIWindowScene?) -> Void
 
     func makeUIView(context: Context) -> AdOverlayWindowSceneView {
         let view = AdOverlayWindowSceneView()
         view.isUserInteractionEnabled = false
-        view.onSceneChanged = onSceneChanged
+        tracker.activate(readerID: view.readerID)
+        installCallback(on: view)
         return view
     }
 
     func updateUIView(_ view: AdOverlayWindowSceneView, context: Context) {
-        view.onSceneChanged = onSceneChanged
+        installCallback(on: view)
         guard let scene = view.window?.windowScene else { return }
+        let readerID = view.readerID
         DispatchQueue.main.async { [weak view] in
             guard view?.window?.windowScene === scene else { return }
+            guard tracker.accept(scene: scene, readerID: readerID) else { return }
+            onSceneChanged(scene)
+        }
+    }
+
+    private func installCallback(on view: AdOverlayWindowSceneView) {
+        view.onSceneChanged = { readerID, scene in
+            guard tracker.accept(scene: scene, readerID: readerID) else { return }
             onSceneChanged(scene)
         }
     }
@@ -252,6 +293,9 @@ public struct AdOverlayView: View {
     var onVideoStarted: (() -> Void)? = nil
     var videoPlayer: FullscreenVideoPlayer? = nil
     var videoPlanScope: VideoPlanPresentationScope? = nil
+    #if os(iOS)
+    var initialOriginatingScene: UIWindowScene? = nil
+    #endif
     /// True only when the owning response has another resolved presentation step after this slot.
     var expectsVideoPlanNextStep = false
     /// Height from the last game session (if bottom sheet mode). nil = fullscreen.
@@ -329,6 +373,7 @@ public struct AdOverlayView: View {
     @State private var videoPlanBlockerOwner = VideoPlanBlockerOwner()
     @State private var videoPlanBlockerGeneration: UInt64 = 0
     #if os(iOS)
+    @State private var sceneReaderTracker = AdOverlayWindowSceneTracker()
     @State private var originatingScene: UIWindowScene?
     #endif
     @State private var closing = false
@@ -394,7 +439,7 @@ public struct AdOverlayView: View {
     public var body: some View {
         ZStack {
             #if os(iOS)
-            AdOverlayWindowSceneReader { scene in
+            AdOverlayWindowSceneReader(tracker: sceneReaderTracker) { scene in
                 originatingScene = scene
                 videoPlanScope?.updateOriginatingScene(
                     scene,
@@ -589,17 +634,13 @@ public struct AdOverlayView: View {
                 storeSheetPresented: storeSheetPresented
             ))
             videoPlanBlockerGeneration &+= 1
+            let replacementScene = originatingScene ?? initialOriginatingScene
+            originatingScene = replacementScene
             videoPlanScope?.activateOriginatingSceneOwner(
                 owner: videoPlanBlockerOwner,
-                generation: videoPlanBlockerGeneration
+                generation: videoPlanBlockerGeneration,
+                scene: replacementScene
             )
-            if let originatingScene {
-                videoPlanScope?.updateOriginatingScene(
-                    originatingScene,
-                    owner: videoPlanBlockerOwner,
-                    generation: videoPlanBlockerGeneration
-                )
-            }
             videoPlayer?.attachVideoPlanScope(ad.usesVideoPlanV2 ? videoPlanScope : nil)
             videoPlanScope?.activateBlocker(
                 owner: videoPlanBlockerOwner,

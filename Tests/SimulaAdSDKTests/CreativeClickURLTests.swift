@@ -275,7 +275,7 @@ final class CreativeClickURLTests: XCTestCase {
     func testFallbackVideoSceneReaderDeliversDetachAfterViewDeallocates() async {
         let detached = expectation(description: "overlay scene detached")
         var reader: AdOverlayWindowSceneView? = AdOverlayWindowSceneView()
-        reader?.onSceneChanged = { captured in
+        reader?.onSceneChanged = { _, captured in
             XCTAssertNil(captured)
             detached.fulfill()
         }
