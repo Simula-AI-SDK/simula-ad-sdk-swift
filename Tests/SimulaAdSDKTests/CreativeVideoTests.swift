@@ -342,32 +342,28 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(
             videoMuteControlPlacement(
                 hasVideoChrome: true,
-                closePosition: .topLeft,
-                closeRelocatedToTopRight: false
+                effectiveClosePosition: .topLeft
             ),
             .topTrailing
         )
         XCTAssertEqual(
             videoMuteControlPlacement(
                 hasVideoChrome: true,
-                closePosition: .topRight,
-                closeRelocatedToTopRight: false
+                effectiveClosePosition: .topRight
             ),
             .topLeading
         )
         XCTAssertEqual(
             videoMuteControlPlacement(
                 hasVideoChrome: true,
-                closePosition: .bottomLeft,
-                closeRelocatedToTopRight: true
+                effectiveClosePosition: .bottomLeft
             ),
             .topLeading
         )
         XCTAssertEqual(
             videoMuteControlPlacement(
                 hasVideoChrome: false,
-                closePosition: .topLeft,
-                closeRelocatedToTopRight: false
+                effectiveClosePosition: .topLeft
             ),
             .bottomTrailing
         )
@@ -375,7 +371,7 @@ final class CreativeVideoTests: XCTestCase {
             videoMuteTopPadding(
                 hasVideoChrome: true,
                 storePromptVisible: true,
-                closePosition: .topRight
+                storePromptSharesMuteCorner: true
             ),
             64
         )
@@ -383,7 +379,7 @@ final class CreativeVideoTests: XCTestCase {
             videoMuteTopPadding(
                 hasVideoChrome: true,
                 storePromptVisible: true,
-                closePosition: .bottomLeft
+                storePromptSharesMuteCorner: false
             ),
             12
         )
@@ -501,6 +497,31 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
         XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
         XCTAssertFalse(arbiter.start(playerID: "clip-a"), "late first frame loses after close")
+    }
+
+    func testPreFirstFrameEscapeArbitratesCanonicalCloseExactlyOnce() throws {
+        let decision = try XCTUnwrap(videoPreFirstFrameEscapeDecision(
+            surface: .interstitial,
+            presentationMounted: true,
+            firstFrameAdmitted: false,
+            terminal: false
+        ))
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        var emitted: [(stage: String, reason: String)] = []
+
+        for _ in 0..<2 where arbiter.claimTerminal(
+            playerID: "clip-a",
+            event: decision.terminalEvent
+        ) {
+            emitted.append((decision.telemetryStage, decision.telemetryReason))
+        }
+
+        XCTAssertEqual(emitted.count, 1)
+        XCTAssertEqual(emitted.first?.stage, FullscreenVideoTelemetryStage.close)
+        XCTAssertEqual(emitted.first?.reason, FullscreenVideoTerminationReason.user)
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "stale-player", event: decision.terminalEvent))
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
     }
 
     func testVideoPlanNaturalTerminalWinsLaterUserClose() {
@@ -793,6 +814,135 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(resolvedVideoChromeStyle(
             requested: .feedCard, hasAppIcon: true, hasAppName: true
         ), .feedCard)
+    }
+
+    func testEffectiveVideoClosePositionRelocatesOnlyBottomLeftProgressBar() {
+        let treatments: [CloseTreatment] = [
+            .hidden, .countdownCircle, .progressBar, .rewardOrCloseLabel,
+        ]
+        let positions: [ClosePosition] = [.topRight, .topLeft, .bottomLeft]
+
+        for treatment in treatments {
+            for position in positions {
+                let expected: ClosePosition = treatment == .progressBar && position == .bottomLeft
+                    ? .topRight
+                    : position
+                XCTAssertEqual(
+                    effectiveVideoClosePosition(treatment: treatment, position: position),
+                    expected,
+                    "treatment=\(treatment) position=\(position)"
+                )
+                XCTAssertEqual(
+                    videoBottomProgressBarObstructsChrome(
+                        treatment: treatment,
+                        position: position
+                    ),
+                    treatment == .progressBar && position == .bottomLeft,
+                    "bottom obstruction treatment=\(treatment) position=\(position)"
+                )
+            }
+        }
+    }
+
+    func testBottomLeadingChromeClearanceCoversCompleteStyleAndPositionMatrix() {
+        let positions: [ClosePosition] = [.topRight, .topLeft, .bottomLeft]
+        let affectedStyles: [VideoChromeStyle] = [
+            .bottomBar, .bottomCard, .feedCard, .floatingPill,
+        ]
+
+        for position in positions {
+            for style in VideoChromeStyle.allCases {
+                let expected = position == .bottomLeft && affectedStyles.contains(style)
+                XCTAssertEqual(
+                    videoChromeNeedsBottomLeadingClearance(
+                        effectiveClosePosition: position,
+                        resolvedStyle: style
+                    ),
+                    expected,
+                    "position=\(position) style=\(style)"
+                )
+                let additional = videoChromeAdditionalLeadingPadding(
+                    effectiveClosePosition: position,
+                    resolvedStyle: style
+                )
+                XCTAssertEqual(additional, expected ? 100 : 0)
+                if expected { XCTAssertEqual(additional + 12, 112) }
+            }
+        }
+    }
+
+    func testPrimaryRelocationAndFallbackRawPositionHaveDistinctClearance() {
+        let primaryPosition = effectiveVideoClosePosition(
+            treatment: .progressBar,
+            position: .bottomLeft
+        )
+        let fallbackPosition = ClosePosition.bottomLeft
+        let affectedStyles: [VideoChromeStyle] = [
+            .bottomBar, .bottomCard, .feedCard, .floatingPill,
+        ]
+
+        for style in VideoChromeStyle.allCases {
+            XCTAssertFalse(videoChromeNeedsBottomLeadingClearance(
+                effectiveClosePosition: primaryPosition,
+                resolvedStyle: style
+            ), "primary style=\(style)")
+            XCTAssertEqual(
+                videoChromeNeedsBottomLeadingClearance(
+                    effectiveClosePosition: fallbackPosition,
+                    resolvedStyle: style
+                ),
+                affectedStyles.contains(style),
+                "fallback style=\(style)"
+            )
+        }
+    }
+
+    func testBottomProgressBarObstructionLiftsEveryChromeStyle() {
+        for style in VideoChromeStyle.allCases {
+            XCTAssertEqual(
+                videoChromeAdditionalBottomPadding(bottomProgressBarObstructsChrome: false),
+                0,
+                "unobstructed style=\(style)"
+            )
+            let additional = videoChromeAdditionalBottomPadding(
+                bottomProgressBarObstructsChrome: true
+            )
+            XCTAssertEqual(additional, 26, "obstructed style=\(style)")
+            XCTAssertEqual(additional + 12, 38, "total exclusion style=\(style)")
+        }
+    }
+
+    func testStorePromptMuteOverlapUsesConfiguredClosePosition() {
+        let positions: [ClosePosition] = [.topRight, .topLeft, .bottomLeft]
+        for position in positions {
+            XCTAssertEqual(
+                videoStorePromptSharesMuteCorner(configuredClosePosition: position),
+                position != .bottomLeft,
+                "position=\(position)"
+            )
+        }
+
+        for hasChrome in [false, true] {
+            for promptVisible in [false, true] {
+                for sharesCorner in [false, true] {
+                    XCTAssertEqual(
+                        videoMuteTopPadding(
+                            hasVideoChrome: hasChrome,
+                            storePromptVisible: promptVisible,
+                            storePromptSharesMuteCorner: sharesCorner
+                        ),
+                        hasChrome && promptVisible && sharesCorner ? 64 : 12
+                    )
+                }
+            }
+        }
+
+        let relocated = effectiveVideoClosePosition(
+            treatment: .progressBar,
+            position: .bottomLeft
+        )
+        XCTAssertEqual(relocated, .topRight)
+        XCTAssertFalse(videoStorePromptSharesMuteCorner(configuredClosePosition: .bottomLeft))
     }
 
     func testVideoAudioWatchAccountingAggregatesMutedAndUnmutedMediaTime() {

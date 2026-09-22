@@ -1226,25 +1226,40 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(canUseVideoControls(firstFrameAdmitted: true, displayAdmitted: true))
     }
 
-    func testPreFirstFrameEscapeRoutesEachSurfaceThroughItsExistingTerminalPath() {
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+    func testPreFirstFrameEscapeRoutesEachSurfaceAsCanonicalUserClose() {
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .interstitial,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .failInterstitialDisplay)
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .failInterstitialDisplay,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.user
+        ))
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .rewarded,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .finishRewardedUnearned)
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .finishRewardedUnearned,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.user
+        ))
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .fallback,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .requestFallbackFailureAdvance)
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .requestFallbackFailureAdvance,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.user
+        ))
     }
 
     func testPreFirstFrameEscapeRejectsUnmountedTerminalAndStalePostFrameTaps() {

@@ -939,12 +939,18 @@ private struct RewardedGameView: View {
                 behavior: videoTelemetryBehavior,
                 isVideoPlanV2: usesVideoPlanV2
             ),
-            closePosition: (close ?? CloseBehavior()).position,
-            closeRelocatedToTopRight: closeBarAtBottom(
-                (close ?? CloseBehavior()).treatment,
-                (close ?? CloseBehavior()).position
+            effectiveClosePosition: effectiveVideoClosePosition(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position
+            ),
+            bottomProgressBarObstructsChrome: videoBottomProgressBarObstructsChrome(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position
             ),
             storePromptVisible: storePromptVisible && !rewardEarned,
+            storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
+                configuredClosePosition: (close ?? CloseBehavior()).position
+            ),
             onMuteChanged: { muted in
                 guard usesVideoPlanV2 else { return }
                 videoPlanScope?.updateMuted(muted)
@@ -1100,13 +1106,14 @@ private struct RewardedGameView: View {
     }
 
     private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
-        guard videoPreFirstFrameEscapeAction(
+        guard let decision = videoPreFirstFrameEscapeDecision(
             surface: .rewarded,
             presentationMounted: viewAppeared && visible,
             firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .finishRewardedUnearned,
-              claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
+        ), decision.action == .finishRewardedUnearned,
+              claimVideoPlanTerminalIfNeeded(player: player, event: decision.terminalEvent) else { return }
+        recordVideoClose(player: player, reason: decision.telemetryReason)
         videoFailureHandled = true
         requestTerminalAdvance()
     }

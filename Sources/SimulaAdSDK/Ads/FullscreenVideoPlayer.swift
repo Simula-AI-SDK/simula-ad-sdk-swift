@@ -469,6 +469,13 @@ enum VideoPreFirstFrameEscapeAction: Equatable, Sendable {
     case requestFallbackFailureAdvance
 }
 
+struct VideoPreFirstFrameEscapeDecision: Equatable, Sendable {
+    let action: VideoPreFirstFrameEscapeAction
+    let terminalEvent: VideoPlanTerminalEvent
+    let telemetryStage: String
+    let telemetryReason: String
+}
+
 func shouldShowVideoPreFirstFrameEscape(
     firstFrameAdmitted: Bool,
     terminal: Bool
@@ -508,16 +515,37 @@ func videoPreFirstFrameEscapeAction(
     firstFrameAdmitted: Bool,
     terminal: Bool
 ) -> VideoPreFirstFrameEscapeAction {
+    videoPreFirstFrameEscapeDecision(
+        surface: surface,
+        presentationMounted: presentationMounted,
+        firstFrameAdmitted: firstFrameAdmitted,
+        terminal: terminal
+    )?.action ?? .none
+}
+
+func videoPreFirstFrameEscapeDecision(
+    surface: VideoPreFirstFrameEscapeSurface,
+    presentationMounted: Bool,
+    firstFrameAdmitted: Bool,
+    terminal: Bool
+) -> VideoPreFirstFrameEscapeDecision? {
     guard presentationMounted,
           shouldShowVideoPreFirstFrameEscape(
               firstFrameAdmitted: firstFrameAdmitted,
               terminal: terminal
-          ) else { return .none }
+          ) else { return nil }
+    let action: VideoPreFirstFrameEscapeAction
     switch surface {
-    case .interstitial: return .failInterstitialDisplay
-    case .rewarded: return .finishRewardedUnearned
-    case .fallback: return .requestFallbackFailureAdvance
+    case .interstitial: action = .failInterstitialDisplay
+    case .rewarded: action = .finishRewardedUnearned
+    case .fallback: action = .requestFallbackFailureAdvance
     }
+    return VideoPreFirstFrameEscapeDecision(
+        action: action,
+        terminalEvent: .userClose,
+        telemetryStage: FullscreenVideoTelemetryStage.close,
+        telemetryReason: FullscreenVideoTerminationReason.user
+    )
 }
 
 enum FullscreenVideoTelemetryStage {
@@ -721,6 +749,51 @@ func resolvedVideoChromeStyle(
     }
 }
 
+func effectiveVideoClosePosition(
+    treatment: CloseTreatment,
+    position: ClosePosition
+) -> ClosePosition {
+    videoBottomProgressBarObstructsChrome(treatment: treatment, position: position)
+        ? .topRight
+        : position
+}
+
+func videoBottomProgressBarObstructsChrome(
+    treatment: CloseTreatment,
+    position: ClosePosition
+) -> Bool {
+    treatment == .progressBar && position == .bottomLeft
+}
+
+func videoChromeNeedsBottomLeadingClearance(
+    effectiveClosePosition: ClosePosition,
+    resolvedStyle: VideoChromeStyle
+) -> Bool {
+    guard effectiveClosePosition == .bottomLeft else { return false }
+    switch resolvedStyle {
+    case .bottomBar, .bottomCard, .feedCard, .floatingPill:
+        return true
+    case .cornerCTA:
+        return false
+    }
+}
+
+func videoChromeAdditionalLeadingPadding(
+    effectiveClosePosition: ClosePosition,
+    resolvedStyle: VideoChromeStyle
+) -> Double {
+    // Existing 12pt outer padding plus 100pt reserves a conservative 112pt exclusion.
+    videoChromeNeedsBottomLeadingClearance(
+        effectiveClosePosition: effectiveClosePosition,
+        resolvedStyle: resolvedStyle
+    ) ? 100 : 0
+}
+
+func videoChromeAdditionalBottomPadding(bottomProgressBarObstructsChrome: Bool) -> Double {
+    // Existing 12pt outer padding plus 26pt clears the lifted 4pt bar with an 8pt gap.
+    bottomProgressBarObstructsChrome ? 26 : 0
+}
+
 func videoChromeConfiguration(
     creative: Creative?,
     behavior: AdBehavior?,
@@ -898,19 +971,22 @@ enum VideoMuteControlPlacement: Equatable {
 
 func videoMuteControlPlacement(
     hasVideoChrome: Bool,
-    closePosition: ClosePosition,
-    closeRelocatedToTopRight: Bool
+    effectiveClosePosition: ClosePosition
 ) -> VideoMuteControlPlacement {
     guard hasVideoChrome else { return .bottomTrailing }
-    return closePosition == .topLeft && !closeRelocatedToTopRight ? .topTrailing : .topLeading
+    return effectiveClosePosition == .topLeft ? .topTrailing : .topLeading
 }
 
 func videoMuteTopPadding(
     hasVideoChrome: Bool,
     storePromptVisible: Bool,
-    closePosition: ClosePosition
+    storePromptSharesMuteCorner: Bool
 ) -> Double {
-    hasVideoChrome && storePromptVisible && closePosition != .bottomLeft ? 64 : 12
+    hasVideoChrome && storePromptVisible && storePromptSharesMuteCorner ? 64 : 12
+}
+
+func videoStorePromptSharesMuteCorner(configuredClosePosition: ClosePosition) -> Bool {
+    configuredClosePosition != .bottomLeft
 }
 
 #if os(iOS)
@@ -2279,9 +2355,10 @@ struct FullscreenVideoSurface: View {
     let onFirstFrame: () -> Bool
     let controlsEnabled: Bool
     var chromeConfiguration: VideoChromeConfiguration? = nil
-    var closePosition: ClosePosition = .topRight
-    var closeRelocatedToTopRight = false
+    var effectiveClosePosition: ClosePosition = .topRight
+    var bottomProgressBarObstructsChrome = false
     var storePromptVisible = false
+    var storePromptSharesMuteCorner = false
     var onMuteChanged: ((Bool) -> Void)? = nil
     var telemetryPauseReason: () -> String = { FullscreenVideoTerminationReason.playback }
     var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
@@ -2299,9 +2376,22 @@ struct FullscreenVideoSurface: View {
     private var muteControlPlacement: VideoMuteControlPlacement {
         videoMuteControlPlacement(
             hasVideoChrome: chromeConfiguration != nil,
-            closePosition: closePosition,
-            closeRelocatedToTopRight: closeRelocatedToTopRight
+            effectiveClosePosition: effectiveClosePosition
         )
+    }
+
+    private var additionalBottomLeadingPadding: CGFloat {
+        guard let chromeConfiguration else { return 0 }
+        return CGFloat(videoChromeAdditionalLeadingPadding(
+            effectiveClosePosition: effectiveClosePosition,
+            resolvedStyle: chromeConfiguration.style
+        ))
+    }
+
+    private var additionalBottomPadding: CGFloat {
+        CGFloat(videoChromeAdditionalBottomPadding(
+            bottomProgressBarObstructsChrome: bottomProgressBarObstructsChrome
+        ))
     }
 
     var body: some View {
@@ -2357,7 +2447,7 @@ struct FullscreenVideoSurface: View {
                             .padding(.top, videoMuteTopPadding(
                                 hasVideoChrome: chromeConfiguration != nil,
                                 storePromptVisible: storePromptVisible,
-                                closePosition: closePosition
+                                storePromptSharesMuteCorner: storePromptSharesMuteCorner
                             ))
                     }
                     Spacer()
@@ -2367,13 +2457,15 @@ struct FullscreenVideoSurface: View {
                             .padding(.top, videoMuteTopPadding(
                                 hasVideoChrome: chromeConfiguration != nil,
                                 storePromptVisible: storePromptVisible,
-                                closePosition: closePosition
+                                storePromptSharesMuteCorner: storePromptSharesMuteCorner
                             ))
                     }
                 }
                 Spacer()
                 if controlsEnabled, let chromeConfiguration {
                     VideoCreativeChrome(configuration: chromeConfiguration, action: onTap)
+                        .padding(.leading, additionalBottomLeadingPadding)
+                        .padding(.bottom, additionalBottomPadding)
                         .padding(12)
                 } else if controlsEnabled {
                     HStack {

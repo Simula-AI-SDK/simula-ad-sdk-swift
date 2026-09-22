@@ -453,39 +453,43 @@ public struct AdOverlayView: View {
                                 presentationActive: hasAppeared && !closing
                                     && appForegrounded && !storeSheetPresented,
                                 onTap: { handleVideoClick() },
-                                 onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
-                                 controlsEnabled: pageFinished,
-                                  chromeConfiguration: videoChromeConfiguration(
-                                      creative: ad.creative,
-                                      behavior: ad.adBehavior,
-                                      isVideoPlanV2: ad.usesVideoPlanV2
-                                  ),
-                                  closePosition: closeBehavior.position,
-                                  onMuteChanged: { muted in
-                                     guard ad.usesVideoPlanV2 else { return }
-                                     videoPlanScope?.updateMuted(muted)
-                                     recordFullscreenVideoLifecycle(
-                                         stage: FullscreenVideoTelemetryStage.muteToggle,
-                                         adFormat: videoTelemetryAdFormat,
-                                         adUnitId: telemetryAdUnitId,
-                                         adId: adId.isEmpty ? nil : adId,
-                                         serveId: telemetryServeId,
-                                         isVideoPlanV2: ad.usesVideoPlanV2,
-                                         creative: ad.creative,
-                                         behavior: ad.adBehavior,
-                                         muted: muted,
-                                         mutedWatchMs: videoPlayer.mutedWatchMilliseconds,
-                                         unmutedWatchMs: videoPlayer.unmutedWatchMilliseconds,
-                                         videoPositionS: videoPlayer.playedSeconds,
-                                         durationS: videoPlayer.duration,
-                                         secondsSinceVideoStart: videoPlayer.secondsSinceVideoStart
-                                     )
-                                 },
-                                 telemetryPauseReason: { videoPauseReason },
-                                 onTelemetryEvent: ad.usesVideoPlanV2
-                                     ? { event in recordVideoSurfaceTelemetry(event, player: videoPlayer) }
-                                     : nil
-                             )
+                                onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
+                                controlsEnabled: pageFinished,
+                                chromeConfiguration: videoChromeConfiguration(
+                                    creative: ad.creative,
+                                    behavior: ad.adBehavior,
+                                    isVideoPlanV2: ad.usesVideoPlanV2
+                                ),
+                                effectiveClosePosition: closeBehavior.position,
+                                bottomProgressBarObstructsChrome: false,
+                                storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
+                                    configuredClosePosition: closeBehavior.position
+                                ),
+                                onMuteChanged: { muted in
+                                    guard ad.usesVideoPlanV2 else { return }
+                                    videoPlanScope?.updateMuted(muted)
+                                    recordFullscreenVideoLifecycle(
+                                        stage: FullscreenVideoTelemetryStage.muteToggle,
+                                        adFormat: videoTelemetryAdFormat,
+                                        adUnitId: telemetryAdUnitId,
+                                        adId: adId.isEmpty ? nil : adId,
+                                        serveId: telemetryServeId,
+                                        isVideoPlanV2: ad.usesVideoPlanV2,
+                                        creative: ad.creative,
+                                        behavior: ad.adBehavior,
+                                        muted: muted,
+                                        mutedWatchMs: videoPlayer.mutedWatchMilliseconds,
+                                        unmutedWatchMs: videoPlayer.unmutedWatchMilliseconds,
+                                        videoPositionS: videoPlayer.playedSeconds,
+                                        durationS: videoPlayer.duration,
+                                        secondsSinceVideoStart: videoPlayer.secondsSinceVideoStart
+                                    )
+                                },
+                                telemetryPauseReason: { videoPauseReason },
+                                onTelemetryEvent: ad.usesVideoPlanV2
+                                    ? { event in recordVideoSurfaceTelemetry(event, player: videoPlayer) }
+                                    : nil
+                            )
                                 .allowsHitTesting(!clickHandoffPending)
                                 .onReceive(videoPlayer.$status) { handleVideoStatus($0, player: videoPlayer) }
                                 .onReceive(videoPlayer.$playedSeconds) { updateVideoGate(player: videoPlayer, played: $0) }
@@ -1131,15 +1135,16 @@ public struct AdOverlayView: View {
 
     private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
         guard let identity = videoSurfaceIdentity(for: player),
-              videoPreFirstFrameEscapeAction(
+              let decision = videoPreFirstFrameEscapeDecision(
             surface: .fallback,
             presentationMounted: hasAppeared && !closing,
             firstFrameAdmitted: pageFinished || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .requestFallbackFailureAdvance,
+        ), decision.action == .requestFallbackFailureAdvance,
               firstFrameHandoff.canClaimPreFirstFrameFailure(identity),
-              claimVideoPlanTerminalIfNeeded(player: player, event: .failure),
+              claimVideoPlanTerminalIfNeeded(player: player, event: decision.terminalEvent),
               firstFrameHandoff.claimPreFirstFrameFailure(identity) else { return }
+        recordVideoClose(player: player, reason: decision.telemetryReason)
         markPageFailedAndAdvance()
     }
 

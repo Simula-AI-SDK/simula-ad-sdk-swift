@@ -716,9 +716,18 @@ private struct CreativeInterstitialView: View {
                 behavior: response.adBehavior,
                 isVideoPlanV2: usesVideoPlanV2
             ),
-            closePosition: closeConfig.position,
-            closeRelocatedToTopRight: closeBarAtBottom(closeConfig.treatment, closeConfig.position),
+            effectiveClosePosition: effectiveVideoClosePosition(
+                treatment: closeConfig.treatment,
+                position: closeConfig.position
+            ),
+            bottomProgressBarObstructsChrome: videoBottomProgressBarObstructsChrome(
+                treatment: closeConfig.treatment,
+                position: closeConfig.position
+            ),
             storePromptVisible: storePromptVisible && !closeEnabled,
+            storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
+                configuredClosePosition: closeConfig.position
+            ),
             onMuteChanged: { muted in
                 guard usesVideoPlanV2 else { return }
                 videoPlanScope?.updateMuted(muted)
@@ -883,13 +892,14 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
-        guard videoPreFirstFrameEscapeAction(
+        guard let decision = videoPreFirstFrameEscapeDecision(
             surface: .interstitial,
             presentationMounted: viewAppeared && visible,
             firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .failInterstitialDisplay,
-              claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
+        ), decision.action == .failInterstitialDisplay,
+              claimVideoPlanTerminalIfNeeded(player: player, event: decision.terminalEvent) else { return }
+        recordVideoClose(player: player, reason: decision.telemetryReason)
         videoFailureHandled = true
         requestPrimaryTerminalAdvance()
     }
@@ -1535,7 +1545,7 @@ let closeBottomBarLift: CGFloat = 26
 /// just above the info "i" (which keeps its corner spot). For every OTHER bottomLeft close the ✕ stays
 /// bottom-left. (The store prompt sits top-right for any bottomLeft close — see `StorePromptBadge`.)
 func closeBarAtBottom(_ treatment: CloseTreatment, _ position: ClosePosition) -> Bool {
-    treatment == .progressBar && position == .bottomLeft
+    videoBottomProgressBarObstructsChrome(treatment: treatment, position: position)
 }
 
 /// The `ad_behavior`-driven close button. Renders the assigned `treatment` at the configured
@@ -1574,8 +1584,7 @@ struct CloseButtonView: View {
     /// The ✕ honors its configured corner, EXCEPT progress_bar at bottom_left: the gate bar takes the
     /// bottom edge there, so the ✕ moves up to the top-right.
     private var cornerAlignment: Alignment {
-        if barAtBottom { return .topTrailing }
-        switch position {
+        switch effectiveVideoClosePosition(treatment: treatment, position: position) {
         case .topRight: return .topTrailing
         case .topLeft: return .topLeading
         case .bottomLeft: return .bottomLeading
