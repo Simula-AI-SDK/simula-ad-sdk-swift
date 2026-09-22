@@ -128,6 +128,50 @@ struct VideoPlanBlockerState: Equatable, Sendable {
     }
 }
 
+enum VideoPlanTerminalEvent: Equatable, Sendable {
+    case userClose
+    case completion
+    case failure
+}
+
+struct VideoPlanTerminalArbiter<PlayerID: Hashable & Sendable>: Sendable {
+    private(set) var currentPlayerID: PlayerID?
+    private(set) var generation: UInt64 = 0
+    private var startedGeneration: UInt64?
+    private var terminal: (generation: UInt64, event: VideoPlanTerminalEvent)?
+    private(set) var cancelled = false
+
+    @discardableResult
+    mutating func register(playerID: PlayerID) -> Bool {
+        guard !cancelled else { return false }
+        guard currentPlayerID != playerID else { return true }
+        currentPlayerID = playerID
+        generation &+= 1
+        startedGeneration = nil
+        terminal = nil
+        return true
+    }
+
+    mutating func start(playerID: PlayerID) -> Bool {
+        guard !cancelled, currentPlayerID == playerID,
+              startedGeneration != generation,
+              terminal == nil || terminal?.event == .completion else { return false }
+        startedGeneration = generation
+        return true
+    }
+
+    mutating func claimTerminal(playerID: PlayerID, event: VideoPlanTerminalEvent) -> Bool {
+        guard !cancelled, currentPlayerID == playerID,
+              terminal?.generation != generation else { return false }
+        terminal = (generation, event)
+        return true
+    }
+
+    mutating func cancel() {
+        cancelled = true
+    }
+}
+
 enum VideoPlanOverlayPhase: String, Equatable, Sendable {
     case video
     case nextStep = "next_step"
@@ -311,6 +355,7 @@ import UIKit
 final class VideoPlanPresentationScope {
     private(set) var isMuted = false
     private var watchAccounting = VideoPlanPresentationWatchAccounting<UUID>()
+    private var terminalArbiter = VideoPlanTerminalArbiter<UUID>()
 
     private var clock: VideoPlanSKOverlayClock?
     private var deadlineTask: Task<Void, Never>?
@@ -328,9 +373,32 @@ final class VideoPlanPresentationScope {
     private var overlayShownAt: TimeInterval?
     private var overlayFailureRecorded = false
     private var overlayPlacement = VideoPlanOverlayPlacementState()
+    private var overlayClaim = SKOverlayPresentationClaim()
 
     func updateMuted(_ muted: Bool) {
         isMuted = muted
+    }
+
+    @discardableResult
+    func registerVideoPlayer(playerID: UUID) -> Bool {
+        terminalArbiter.register(playerID: playerID)
+    }
+
+    func claimVideoTerminal(playerID: UUID, event: VideoPlanTerminalEvent) -> Bool {
+        terminalArbiter.claimTerminal(playerID: playerID, event: event)
+    }
+
+    func reserveLegacySKOverlay() -> SKOverlayPresentationClaim.Reservation? {
+        overlayClaim.reserve()
+    }
+
+    @discardableResult
+    func legacySKOverlayDidPresent(_ reservation: SKOverlayPresentationClaim.Reservation) -> Bool {
+        overlayClaim.succeed(reservation)
+    }
+
+    func legacySKOverlayDidFail(_ reservation: SKOverlayPresentationClaim.Reservation) {
+        overlayClaim.fail(reservation)
     }
 
     @discardableResult
@@ -347,6 +415,7 @@ final class VideoPlanPresentationScope {
     }
 
     func firstVideoFrame(
+        playerID: UUID,
         creative: Creative?,
         behavior: AdBehavior?,
         adFormat: String,
@@ -361,7 +430,8 @@ final class VideoPlanPresentationScope {
         originatingScene: UIWindowScene,
         blocked: Bool
     ) {
-        guard !cancelled, creative?.isVideoPlanV2Clip == true else { return }
+        guard !cancelled, creative?.isVideoPlanV2Clip == true,
+              terminalArbiter.start(playerID: playerID) else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let completion = handoffState.videoStarted(now: now) {
             recordHandoff(completion)
@@ -497,6 +567,7 @@ final class VideoPlanPresentationScope {
         guard !cancelled else { return }
         closePendingHandoffIfNeeded()
         cancelled = true
+        terminalArbiter.cancel()
         deadlineTask?.cancel()
         deadlineTask = nil
         if var clock {
@@ -593,6 +664,7 @@ final class VideoPlanPresentationScope {
               UIApplication.shared.applicationState == .active,
               originatingScene.activationState == .foregroundActive,
               #available(iOS 14.0, *) else { return }
+        guard let reservation = overlayClaim.reserve() else { return }
         let presented = SKOverlayPresenter.present(
             appID: appID,
             config: config,
@@ -600,7 +672,12 @@ final class VideoPlanPresentationScope {
             originatingScene: originatingScene
         )
         guard let presented else {
+            overlayClaim.fail(reservation)
             recordOverlayFailure("presentation_failed")
+            return
+        }
+        guard overlayClaim.succeed(reservation) else {
+            SKOverlayPresenter.dismiss(ownershipToken: presented)
             return
         }
         ownership = presented
@@ -652,6 +729,9 @@ final class VideoPlanPresentationScope {
     private(set) var isMuted = false
     private var watchAccounting = VideoPlanPresentationWatchAccounting<UUID>()
     func updateMuted(_ muted: Bool) { isMuted = muted }
+    @discardableResult
+    func registerVideoPlayer(playerID: UUID) -> Bool { false }
+    func claimVideoTerminal(playerID: UUID, event: VideoPlanTerminalEvent) -> Bool { false }
     @discardableResult
     func updateWatchAccounting(
         playerID: UUID,

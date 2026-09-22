@@ -64,6 +64,38 @@ struct SKOverlayPresentationState<Ownership> {
     }
 }
 
+struct SKOverlayPresentationClaim {
+    struct Reservation: Hashable {
+        fileprivate let id = UUID()
+    }
+
+    private var reservation: Reservation?
+    private(set) var consumed = false
+
+    mutating func reserve() -> Reservation? {
+        guard !consumed, reservation == nil else { return nil }
+        let reservation = Reservation()
+        self.reservation = reservation
+        return reservation
+    }
+
+    mutating func succeed(_ reservation: Reservation) -> Bool {
+        guard !consumed, self.reservation == reservation else { return false }
+        self.reservation = nil
+        consumed = true
+        return true
+    }
+
+    mutating func fail(_ reservation: Reservation) {
+        guard !consumed, self.reservation == reservation else { return }
+        self.reservation = nil
+    }
+}
+
+func isLegacySKOverlayEligible(usesVideoPlanV2: Bool) -> Bool {
+    !usesVideoPlanV2
+}
+
 func creativeRequestedSKOverlayConfig(from config: SKOverlayConfig?) -> SKOverlayConfig {
     SKOverlayConfig(
         enabled: true,

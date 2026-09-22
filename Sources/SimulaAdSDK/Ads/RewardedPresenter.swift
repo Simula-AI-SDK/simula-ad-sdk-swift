@@ -48,7 +48,6 @@ final class RewardedPresenter {
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
-        usesVideoPlanV2PresentationContract: Bool = false,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -94,7 +93,6 @@ final class RewardedPresenter {
             videoBehavior: videoBehavior,
             videoPlayer: videoPlayer,
             videoPlanScope: videoPlanScope,
-            usesVideoPlanV2PresentationContract: usesVideoPlanV2PresentationContract,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -155,7 +153,6 @@ final class RewardedPresenter {
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
-        usesVideoPlanV2PresentationContract: Bool = false,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -183,7 +180,6 @@ final class RewardedPresenter {
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
             videoPlanScope: videoPlanScope,
-            usesVideoPlanV2PresentationContract: usesVideoPlanV2PresentationContract,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -281,7 +277,6 @@ private struct RewardedGameView: View {
     let videoBehavior: VideoBehavior
     let videoPlayer: FullscreenVideoPlayer?
     let videoPlanScope: VideoPlanPresentationScope?
-    let usesVideoPlanV2PresentationContract: Bool
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
     /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
@@ -369,7 +364,6 @@ private struct RewardedGameView: View {
         videoBehavior: VideoBehavior,
         videoPlayer: FullscreenVideoPlayer?,
         videoPlanScope: VideoPlanPresentationScope?,
-        usesVideoPlanV2PresentationContract: Bool,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior?,
         storePrompt: StorePrompt?,
@@ -396,7 +390,6 @@ private struct RewardedGameView: View {
         self.videoBehavior = videoBehavior
         self.videoPlayer = videoPlayer
         self.videoPlanScope = videoPlanScope
-        self.usesVideoPlanV2PresentationContract = usesVideoPlanV2PresentationContract
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.close = close
@@ -449,7 +442,7 @@ private struct RewardedGameView: View {
         videoPlanScope != nil && creative?.isVideoPlanV2Clip == true
     }
     private var suppressesLegacySKOverlay: Bool {
-        usesVideoPlanV2PresentationContract
+        !isLegacySKOverlayEligible(usesVideoPlanV2: usesVideoPlanV2)
     }
     private var videoTelemetryBehavior: AdBehavior {
         AdBehavior(skoverlay: skOverlay, video: videoBehavior)
@@ -979,14 +972,22 @@ private struct RewardedGameView: View {
             .onReceive(player.$duration) { _ in updateVideoGate(player: player, played: player.playedSeconds) }
     }
 
-    private func handleVideoStatus(_ status: FullscreenVideoStatus, player: FullscreenVideoPlayer) {
+    private func handleVideoStatus(
+        _ status: FullscreenVideoStatus,
+        player: FullscreenVideoPlayer,
+        terminalAlreadyClaimed: Bool = false
+    ) {
         switch status {
         case .ready, .paused:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady, !videoCompletionHandled else { return }
+            guard primaryCreativeReady, !videoCompletionHandled,
+                  terminalAlreadyClaimed || claimVideoPlanTerminalIfNeeded(
+                      player: player,
+                      event: .completion
+                  ) else { return }
             videoCompletionHandled = true
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             recordFullscreenVideoLifecycle(
@@ -1009,7 +1010,8 @@ private struct RewardedGameView: View {
                 requestTerminal(earned: true)
             }
         case .failed(let reason):
-            guard !videoFailureHandled else { return }
+            guard !videoFailureHandled,
+                  claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
             videoFailureHandled = true
             admission.visualBecameUnavailable(owner: admissionOwner)
             recordFullscreenVideoLifecycle(
@@ -1054,6 +1056,8 @@ private struct RewardedGameView: View {
             }
             return true
         }
+        let ended = player.status == .ended
+        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         admission.visualBecameReady(owner: admissionOwner)
@@ -1072,6 +1076,7 @@ private struct RewardedGameView: View {
             onVideoStarted()
         }
         videoPlanScope?.firstVideoFrame(
+            playerID: player.videoPlanPresentationID,
             creative: creative,
             behavior: videoTelemetryBehavior,
             adFormat: "rewarded",
@@ -1086,7 +1091,11 @@ private struct RewardedGameView: View {
             originatingScene: originatingScene,
             blocked: !appForegrounded || storeSheetPresented
         )
-        updateVideoGate(player: player, played: player.playedSeconds)
+        if ended {
+            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
+        } else {
+            updateVideoGate(player: player, played: player.playedSeconds)
+        }
         return true
     }
 
@@ -1096,7 +1105,8 @@ private struct RewardedGameView: View {
             presentationMounted: viewAppeared && visible,
             firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .finishRewardedUnearned else { return }
+        ) == .finishRewardedUnearned,
+              claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
         videoFailureHandled = true
         requestTerminalAdvance()
     }
@@ -1341,14 +1351,34 @@ private struct RewardedGameView: View {
               UIApplication.shared.applicationState == .active,
               originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
+        var claimReservation: SKOverlayPresentationClaim.Reservation?
+        if let videoPlanScope {
+            guard let reservation = videoPlanScope.reserveLegacySKOverlay() else { return }
+            claimReservation = reservation
+        }
         guard let ownership = SKOverlayPresenter.present(
             appID: appID,
             config: config,
             attribution: attribution,
             originatingScene: originatingScene
-        ) else { return }
-        if !skOverlayState.install(ownership) {
+        ) else {
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        guard skOverlayState.install(ownership) else {
             SKOverlayPresenter.dismiss(ownershipToken: ownership)
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        if let claimReservation,
+           videoPlanScope?.legacySKOverlayDidPresent(claimReservation) != true {
+            if let installed = skOverlayState.dismiss() {
+                SKOverlayPresenter.dismiss(ownershipToken: installed)
+            }
         }
     }
 
@@ -1392,6 +1422,7 @@ private struct RewardedGameView: View {
             clickHandoffPending: clickHandoffPending
         ) else { return }
         if let player = videoPlayer, usesVideoPlanV2 {
+            guard claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) else { return }
             recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
             videoPlanScope?.handoffBegan()
         }
@@ -1434,6 +1465,17 @@ private struct RewardedGameView: View {
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason
         ))
+    }
+
+    private func claimVideoPlanTerminalIfNeeded(
+        player: FullscreenVideoPlayer,
+        event: VideoPlanTerminalEvent
+    ) -> Bool {
+        guard usesVideoPlanV2 else { return true }
+        return videoPlanScope?.claimVideoTerminal(
+            playerID: player.videoPlanPresentationID,
+            event: event
+        ) == true
     }
 
     private func requestTerminalAdvance() {

@@ -138,11 +138,19 @@ struct PendingFirstFrameHandoff<Token: Hashable> {
         return true
     }
 
+    func canFail(_ token: Token) -> Bool {
+        accepting && (active == nil || active == token) && terminal != token
+    }
+
     mutating func claimPreFirstFrameFailure(_ token: Token) -> Bool {
         guard accepting, active == token, admitted != token, terminal != token else { return false }
         pending = nil
         terminal = token
         return true
+    }
+
+    func canClaimPreFirstFrameFailure(_ token: Token) -> Bool {
+        accepting && active == token && admitted != token && terminal != token
     }
 
     func isTerminal(_ token: Token) -> Bool { terminal == token }
@@ -781,10 +789,18 @@ public struct AdOverlayView: View {
         case .ignore:
             return
         case .requestFailureAdvance:
+            #if os(iOS)
+            if ad.usesVideoPlanV2, let player = videoPlayer,
+               !claimVideoPlanTerminalIfNeeded(player: player, event: .failure) { return }
+            #endif
             firstFrameHandoff.invalidate()
             if let onCreativeFailure { onCreativeFailure() }
             else { onClose() }
         case .close:
+            #if os(iOS)
+            if ad.usesVideoPlanV2, let player = videoPlayer,
+               !claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) { return }
+            #endif
             firstFrameHandoff.invalidate()
             #if os(iOS)
             if ad.usesVideoPlanV2, let player = videoPlayer {
@@ -1019,7 +1035,11 @@ public struct AdOverlayView: View {
     }
 
     #if os(iOS)
-    private func handleVideoStatus(_ status: FullscreenVideoStatus, player: FullscreenVideoPlayer) {
+    private func handleVideoStatus(
+        _ status: FullscreenVideoStatus,
+        player: FullscreenVideoPlayer,
+        terminalAlreadyClaimed: Bool = false
+    ) {
         switch status {
         case .ready, .paused:
             updateVideoGate(player: player, played: player.playedSeconds)
@@ -1032,6 +1052,10 @@ public struct AdOverlayView: View {
                 handleVideoStatus(.failed(.playbackFailed), player: player)
                 return
             }
+            guard terminalAlreadyClaimed || claimVideoPlanTerminalIfNeeded(
+                player: player,
+                event: .completion
+            ) else { return }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             recordVideoCompleteIfNeeded()
             if ad.usesVideoPlanV2 {
@@ -1055,6 +1079,8 @@ public struct AdOverlayView: View {
         case .failed(let reason):
             guard !videoFailureHandled else { return }
             guard let identity = videoSurfaceIdentity(for: player),
+                  firstFrameHandoff.canFail(identity),
+                  claimVideoPlanTerminalIfNeeded(player: player, event: .failure),
                   firstFrameHandoff.fail(identity) else { return }
             videoFailureHandled = true
             _ = loadCoordinator.failCurrentLoad()
@@ -1111,6 +1137,8 @@ public struct AdOverlayView: View {
             firstFrameAdmitted: pageFinished || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
         ) == .requestFallbackFailureAdvance,
+              firstFrameHandoff.canClaimPreFirstFrameFailure(identity),
+              claimVideoPlanTerminalIfNeeded(player: player, event: .failure),
               firstFrameHandoff.claimPreFirstFrameFailure(identity) else { return }
         markPageFailedAndAdvance()
     }
@@ -1128,8 +1156,13 @@ public struct AdOverlayView: View {
         identity: AdOverlayVideoSurfaceIdentity
     ) -> Bool {
         guard hasAppeared, !closing, !videoFailureHandled, !pageFinished,
-              videoSurfaceIdentity(for: player) == identity,
-              loadCoordinator.finishCurrentLoad() else {
+              videoSurfaceIdentity(for: player) == identity else {
+            firstFrameHandoff.invalidate()
+            return false
+        }
+        let ended = player.status == .ended
+        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
+        guard loadCoordinator.finishCurrentLoad() else {
             firstFrameHandoff.invalidate()
             return false
         }
@@ -1153,6 +1186,7 @@ public struct AdOverlayView: View {
         }
         if ad.usesVideoPlanV2, let originatingScene {
             videoPlanScope?.firstVideoFrame(
+                playerID: player.videoPlanPresentationID,
                 creative: ad.creative,
                 behavior: ad.adBehavior,
                 adFormat: videoTelemetryAdFormat,
@@ -1168,10 +1202,12 @@ public struct AdOverlayView: View {
                 blocked: !appForegrounded || storeSheetPresented
             )
         }
-        let ended = player.status == .ended
-        updateVideoGate(player: player, played: player.playedSeconds, ended: ended)
-        if ended { recordVideoCompleteIfNeeded() }
         beginPresentationIfReady()
+        if ended {
+            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
+        } else {
+            updateVideoGate(player: player, played: player.playedSeconds)
+        }
         return true
     }
 
@@ -1306,6 +1342,17 @@ public struct AdOverlayView: View {
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason
         ))
+    }
+
+    private func claimVideoPlanTerminalIfNeeded(
+        player: FullscreenVideoPlayer,
+        event: VideoPlanTerminalEvent
+    ) -> Bool {
+        guard ad.usesVideoPlanV2 else { return true }
+        return videoPlanScope?.claimVideoTerminal(
+            playerID: player.videoPlanPresentationID,
+            event: event
+        ) == true
     }
 
     private func applyVideoPlanTerminal(

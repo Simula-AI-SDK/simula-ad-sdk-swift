@@ -1133,6 +1133,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     }
     var mutedWatchMilliseconds: Int { audioWatchAccounting.mutedMilliseconds }
     var unmutedWatchMilliseconds: Int { audioWatchAccounting.unmutedMilliseconds }
+    var videoPlanPresentationID: UUID { presentationWatchID }
     var secondsSinceVideoStart: Double? {
         firstFrameUptime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) }
     }
@@ -1140,6 +1141,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     func attachVideoPlanScope(_ scope: VideoPlanPresentationScope?) {
         guard usesProgressWatchdog else { return }
         videoPlanScope = scope
+        scope?.registerVideoPlayer(playerID: presentationWatchID)
         _ = reportPresentationWatchAccounting()
     }
 

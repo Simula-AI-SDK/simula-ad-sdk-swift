@@ -383,7 +383,7 @@ private struct CreativeInterstitialView: View {
         response.primaryUsesVideoPlanV2
     }
     private var suppressesLegacySKOverlay: Bool {
-        response.usesVideoPlanV2Contract
+        !isLegacySKOverlayEligible(usesVideoPlanV2: usesVideoPlanV2)
     }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
@@ -748,14 +748,22 @@ private struct CreativeInterstitialView: View {
             .onReceive(player.$duration) { _ in updateVideoGate(player: player, played: player.playedSeconds) }
     }
 
-    private func handleVideoStatus(_ status: FullscreenVideoStatus, player: FullscreenVideoPlayer) {
+    private func handleVideoStatus(
+        _ status: FullscreenVideoStatus,
+        player: FullscreenVideoPlayer,
+        terminalAlreadyClaimed: Bool = false
+    ) {
         switch status {
         case .ready, .paused:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady, !videoCompletionHandled else { return }
+            guard primaryCreativeReady, !videoCompletionHandled,
+                  terminalAlreadyClaimed || claimVideoPlanTerminalIfNeeded(
+                      player: player,
+                      event: .completion
+                  ) else { return }
             videoCompletionHandled = true
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             recordFullscreenVideoLifecycle(
@@ -779,7 +787,8 @@ private struct CreativeInterstitialView: View {
                 requestPrimaryTerminalAdvance()
             }
         case .failed(let reason):
-            guard !videoFailureHandled else { return }
+            guard !videoFailureHandled,
+                  claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
             videoFailureHandled = true
             handleSKANCreativeFailure()
             admission.visualBecameUnavailable(owner: admissionOwner)
@@ -826,11 +835,15 @@ private struct CreativeInterstitialView: View {
             }
             return true
         }
+        let ended = player.status == .ended
+        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         handleSKANCreativeReady()
         admission.visualBecameReady(owner: admissionOwner)
-        updateVideoGate(player: player, played: player.playedSeconds)
+        if !ended {
+            updateVideoGate(player: player, played: player.playedSeconds)
+        }
         if !videoStartRecorded {
             videoStartRecorded = true
             recordFullscreenVideoLifecycle(
@@ -847,6 +860,7 @@ private struct CreativeInterstitialView: View {
             onVideoStarted()
         }
         videoPlanScope?.firstVideoFrame(
+            playerID: player.videoPlanPresentationID,
             creative: response.creative,
             behavior: response.adBehavior,
             adFormat: "interstitial",
@@ -862,6 +876,9 @@ private struct CreativeInterstitialView: View {
             blocked: !appForegrounded || storeSheetPresented
         )
         fireAutoStoreRedirectIfCloseShown()
+        if ended {
+            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
+        }
         return true
     }
 
@@ -871,7 +888,8 @@ private struct CreativeInterstitialView: View {
             presentationMounted: viewAppeared && visible,
             firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .failInterstitialDisplay else { return }
+        ) == .failInterstitialDisplay,
+              claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
         videoFailureHandled = true
         requestPrimaryTerminalAdvance()
     }
@@ -1101,6 +1119,7 @@ private struct CreativeInterstitialView: View {
             clickHandoffPending: clickHandoffPending
         ) else { return }
         if let player = videoPlayer, usesVideoPlanV2 {
+            guard claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) else { return }
             recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
             videoPlanScope?.handoffBegan()
         }
@@ -1148,6 +1167,17 @@ private struct CreativeInterstitialView: View {
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason
         ))
+    }
+
+    private func claimVideoPlanTerminalIfNeeded(
+        player: FullscreenVideoPlayer,
+        event: VideoPlanTerminalEvent
+    ) -> Bool {
+        guard usesVideoPlanV2 else { return true }
+        return videoPlanScope?.claimVideoTerminal(
+            playerID: player.videoPlanPresentationID,
+            event: event
+        ) == true
     }
 
     /// Close-delay gate. The interstitial gates its close button on the server-driven
@@ -1424,14 +1454,34 @@ private struct CreativeInterstitialView: View {
               UIApplication.shared.applicationState == .active,
               originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
+        var claimReservation: SKOverlayPresentationClaim.Reservation?
+        if let videoPlanScope {
+            guard let reservation = videoPlanScope.reserveLegacySKOverlay() else { return }
+            claimReservation = reservation
+        }
         guard let ownership = SKOverlayPresenter.present(
             appID: appID,
             config: config,
             attribution: response.skanAttribution,
             originatingScene: originatingScene
-        ) else { return }
-        if !skOverlayState.install(ownership) {
+        ) else {
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        guard skOverlayState.install(ownership) else {
             SKOverlayPresenter.dismiss(ownershipToken: ownership)
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        if let claimReservation,
+           videoPlanScope?.legacySKOverlayDidPresent(claimReservation) != true {
+            if let installed = skOverlayState.dismiss() {
+                SKOverlayPresenter.dismiss(ownershipToken: installed)
+            }
         }
     }
 

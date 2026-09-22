@@ -493,6 +493,94 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(state.deactivate(owner: fallback, generation: 1), true)
     }
 
+    func testVideoPlanUserCloseWinsQueuedCompletionAndFailure() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-a", event: .userClose))
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
+        XCTAssertFalse(arbiter.start(playerID: "clip-a"), "late first frame loses after close")
+    }
+
+    func testVideoPlanNaturalTerminalWinsLaterUserClose() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
+        XCTAssertTrue(arbiter.start(playerID: "clip-a"), "retained end still admits its first frame")
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .userClose))
+    }
+
+    func testVideoPlanWinningFailureStillOwnsAutoAdvance() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        var advances = 0
+
+        if arbiter.claimTerminal(playerID: "clip-a", event: .failure) { advances += 1 }
+        if arbiter.claimTerminal(playerID: "clip-a", event: .userClose) { advances += 1 }
+
+        XCTAssertEqual(advances, 1)
+        XCTAssertFalse(arbiter.start(playerID: "clip-a"))
+    }
+
+    func testVideoPlanReplacementRejectsStalePriorPlayer() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.start(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.register(playerID: "clip-b"))
+
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
+        XCTAssertFalse(arbiter.start(playerID: "clip-a"))
+    }
+
+    func testVideoPlanNextClipHasIndependentTerminalClaim() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
+
+        XCTAssertTrue(arbiter.register(playerID: "clip-b"))
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-b", event: .failure))
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-b", event: .userClose))
+    }
+
+    func testVideoPlanReplacementPreservesPendingPredecessorHandoff() throws {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        var handoff = VideoPlanHandoffState<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.start(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
+        handoff.videoTerminated(origin: "clip-a", secondsSinceVideoStart: 3, now: 10)
+
+        XCTAssertTrue(arbiter.register(playerID: "clip-b"))
+        XCTAssertEqual(handoff.pendingOrigin, "clip-a")
+        XCTAssertTrue(arbiter.start(playerID: "clip-b"))
+        let completion = try XCTUnwrap(handoff.videoStarted(now: 10.25))
+
+        XCTAssertEqual(completion.origin, "clip-a")
+        XCTAssertEqual(completion.timing.msToNextStepReady, 250, accuracy: 0.001)
+    }
+
+    func testVideoPlanSamePlayerReattachmentDoesNotResetGeneration() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.start(playerID: "clip-a"))
+
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        XCTAssertFalse(arbiter.start(playerID: "clip-a"))
+        XCTAssertTrue(arbiter.claimTerminal(playerID: "clip-a", event: .completion))
+    }
+
+    func testVideoPlanCancellationRejectsLaterCallbacks() {
+        var arbiter = VideoPlanTerminalArbiter<String>()
+        XCTAssertTrue(arbiter.register(playerID: "clip-a"))
+        arbiter.cancel()
+
+        XCTAssertFalse(arbiter.start(playerID: "clip-a"))
+        XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
+        XCTAssertFalse(arbiter.register(playerID: "clip-b"))
+    }
+
     func testSKOverlayShownPhaseTracksVideoAndNextStepSeparately() {
         var duringVideo = VideoPlanOverlayPlacementState()
         duringVideo.videoBecameActive()
