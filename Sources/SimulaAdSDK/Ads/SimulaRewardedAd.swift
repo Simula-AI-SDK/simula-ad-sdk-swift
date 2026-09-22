@@ -508,6 +508,7 @@ public final class SimulaRewardedAd {
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
             videoPlanScope: videoPlanScope,
+            usesVideoPlanV2PresentationContract: response.usesVideoPlanV2Contract,
             admission: admission,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,

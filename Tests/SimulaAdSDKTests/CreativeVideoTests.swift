@@ -251,10 +251,13 @@ final class CreativeVideoTests: XCTestCase {
 
     func testPlayablePrimaryPreservesLaterV2FallbackFromFallbackRootMarker() throws {
         let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
+        let rewarded = try decodeRewarded(#"{"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
         let fallbacks = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"ES1"},{"type":"video","url":"https://cdn.example/es2.mp4","clip_index":2}]}"#)
 
         XCTAssertTrue(primary.usesVideoPlanV2Contract)
         XCTAssertFalse(primary.primaryUsesVideoPlanV2)
+        XCTAssertTrue(rewarded.usesVideoPlanV2Contract)
+        XCTAssertFalse(rewarded.primaryUsesVideoPlanV2)
         XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2Contract), [true, true])
         XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2), [false, true])
         XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [1])
@@ -312,6 +315,14 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(
             videoPlanTerminalAction(
                 reason: FullscreenVideoTerminationReason.failed,
+                expectsNextStep: true,
+                playbackStarted: false
+            ),
+            .preservePendingHandoff
+        )
+        XCTAssertEqual(
+            videoPlanTerminalAction(
+                reason: FullscreenVideoTerminationReason.failed,
                 expectsNextStep: false,
                 playbackStarted: false
             ),
@@ -324,6 +335,57 @@ final class CreativeVideoTests: XCTestCase {
                 playbackStarted: true
             ),
             .close(reason: "failed")
+        )
+    }
+
+    func testVideoMuteControlAvoidsTopLeftCloseAndBottomChrome() {
+        XCTAssertEqual(
+            videoMuteControlPlacement(
+                hasVideoChrome: true,
+                closePosition: .topLeft,
+                closeRelocatedToTopRight: false
+            ),
+            .topTrailing
+        )
+        XCTAssertEqual(
+            videoMuteControlPlacement(
+                hasVideoChrome: true,
+                closePosition: .topRight,
+                closeRelocatedToTopRight: false
+            ),
+            .topLeading
+        )
+        XCTAssertEqual(
+            videoMuteControlPlacement(
+                hasVideoChrome: true,
+                closePosition: .bottomLeft,
+                closeRelocatedToTopRight: true
+            ),
+            .topLeading
+        )
+        XCTAssertEqual(
+            videoMuteControlPlacement(
+                hasVideoChrome: false,
+                closePosition: .topLeft,
+                closeRelocatedToTopRight: false
+            ),
+            .bottomTrailing
+        )
+        XCTAssertEqual(
+            videoMuteTopPadding(
+                hasVideoChrome: true,
+                storePromptVisible: true,
+                closePosition: .topRight
+            ),
+            64
+        )
+        XCTAssertEqual(
+            videoMuteTopPadding(
+                hasVideoChrome: true,
+                storePromptVisible: true,
+                closePosition: .bottomLeft
+            ),
+            12
         )
     }
 
@@ -487,6 +549,12 @@ final class CreativeVideoTests: XCTestCase {
         var state = VideoPlanHandoffState<String>()
         state.videoTerminated(origin: "A", secondsSinceVideoStart: 4, now: 10)
 
+        let intermediateFailure = videoPlanTerminalAction(
+            reason: FullscreenVideoTerminationReason.failed,
+            expectsNextStep: true,
+            playbackStarted: false
+        )
+        XCTAssertEqual(intermediateFailure, .preservePendingHandoff)
         state.videoTerminated(origin: "B", secondsSinceVideoStart: nil, now: 10.2)
         XCTAssertEqual(state.pendingOrigin, "A")
 
@@ -997,6 +1065,22 @@ final class CreativeVideoTests: XCTestCase {
         gate.update(duration: 20, played: 2, ended: true)
         XCTAssertTrue(gate.isUnlocked)
         XCTAssertEqual(gate.earnedCompletionReason, .videoCompleted)
+    }
+
+    func testVideoCompletionSynchronouslyProducesEarnedTerminalOutcome() throws {
+        var gate = VideoPlaybackGate(configuredDelay: 30)
+        var completion = RewardCompletionState()
+
+        gate.update(duration: 20, played: 2, ended: true)
+        completion.earn(reason: try XCTUnwrap(gate.earnedCompletionReason))
+        let outcome = rewardedTerminalOutcome(
+            earned: completion.earned,
+            actualElapsedPlayTime: 2,
+            completionReason: completion.reason
+        )
+
+        XCTAssertTrue(outcome.earned)
+        XCTAssertEqual(outcome.completionReason, .videoCompleted)
     }
 
     func testVideoConfiguredGateUsesDurationElapsedReason() {

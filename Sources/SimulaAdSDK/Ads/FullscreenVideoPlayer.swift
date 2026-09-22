@@ -559,6 +559,7 @@ enum FullscreenVideoTerminationReason {
 enum VideoPlanTerminalAction: Equatable, Sendable {
     case handoff(reason: String)
     case close(reason: String)
+    case preservePendingHandoff
     case failExpectedNextStep
 }
 
@@ -570,7 +571,9 @@ func videoPlanTerminalAction(
     if reason == FullscreenVideoTerminationReason.completed {
         return expectsNextStep ? .handoff(reason: reason) : .close(reason: reason)
     }
-    if !playbackStarted { return .failExpectedNextStep }
+    if !playbackStarted {
+        return expectsNextStep ? .preservePendingHandoff : .failExpectedNextStep
+    }
     return expectsNextStep ? .handoff(reason: reason) : .close(reason: reason)
 }
 
@@ -885,6 +888,29 @@ struct StrongVideoAudioTrackRecords<Track: AnyObject> {
     mutating func retain(ids: Set<UUID>) {
         records.removeAll { !ids.contains($0.id) }
     }
+}
+
+enum VideoMuteControlPlacement: Equatable {
+    case topLeading
+    case topTrailing
+    case bottomTrailing
+}
+
+func videoMuteControlPlacement(
+    hasVideoChrome: Bool,
+    closePosition: ClosePosition,
+    closeRelocatedToTopRight: Bool
+) -> VideoMuteControlPlacement {
+    guard hasVideoChrome else { return .bottomTrailing }
+    return closePosition == .topLeft && !closeRelocatedToTopRight ? .topTrailing : .topLeading
+}
+
+func videoMuteTopPadding(
+    hasVideoChrome: Bool,
+    storePromptVisible: Bool,
+    closePosition: ClosePosition
+) -> Double {
+    hasVideoChrome && storePromptVisible && closePosition != .bottomLeft ? 64 : 12
 }
 
 #if os(iOS)
@@ -2251,6 +2277,9 @@ struct FullscreenVideoSurface: View {
     let onFirstFrame: () -> Bool
     let controlsEnabled: Bool
     var chromeConfiguration: VideoChromeConfiguration? = nil
+    var closePosition: ClosePosition = .topRight
+    var closeRelocatedToTopRight = false
+    var storePromptVisible = false
     var onMuteChanged: ((Bool) -> Void)? = nil
     var telemetryPauseReason: () -> String = { FullscreenVideoTerminationReason.playback }
     var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
@@ -2262,6 +2291,14 @@ struct FullscreenVideoSurface: View {
         videoSurfaceShowsFirstFrame(
             localPlayerIdentity: firstFrameHandoff.readyLayerPlayerIdentity,
             currentPlayerIdentity: ObjectIdentifier(videoPlayer)
+        )
+    }
+
+    private var muteControlPlacement: VideoMuteControlPlacement {
+        videoMuteControlPlacement(
+            hasVideoChrome: chromeConfiguration != nil,
+            closePosition: closePosition,
+            closeRelocatedToTopRight: closeRelocatedToTopRight
         )
     }
 
@@ -2312,11 +2349,25 @@ struct FullscreenVideoSurface: View {
 
             VStack {
                 HStack {
-                    if controlsEnabled, chromeConfiguration != nil {
+                    if controlsEnabled, muteControlPlacement == .topLeading {
                         muteButton
-                            .padding(12)
+                            .padding(.horizontal, 12)
+                            .padding(.top, videoMuteTopPadding(
+                                hasVideoChrome: chromeConfiguration != nil,
+                                storePromptVisible: storePromptVisible,
+                                closePosition: closePosition
+                            ))
                     }
                     Spacer()
+                    if controlsEnabled, muteControlPlacement == .topTrailing {
+                        muteButton
+                            .padding(.horizontal, 12)
+                            .padding(.top, videoMuteTopPadding(
+                                hasVideoChrome: chromeConfiguration != nil,
+                                storePromptVisible: storePromptVisible,
+                                closePosition: closePosition
+                            ))
+                    }
                 }
                 Spacer()
                 if controlsEnabled, let chromeConfiguration {

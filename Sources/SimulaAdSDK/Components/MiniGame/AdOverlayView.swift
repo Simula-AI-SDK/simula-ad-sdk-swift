@@ -447,12 +447,13 @@ public struct AdOverlayView: View {
                                 onTap: { handleVideoClick() },
                                  onFirstFrame: { handleVideoFirstFrame(player: videoPlayer) },
                                  controlsEnabled: pageFinished,
-                                 chromeConfiguration: videoChromeConfiguration(
-                                     creative: ad.creative,
-                                     behavior: ad.adBehavior,
-                                     isVideoPlanV2: ad.usesVideoPlanV2
-                                 ),
-                                 onMuteChanged: { muted in
+                                  chromeConfiguration: videoChromeConfiguration(
+                                      creative: ad.creative,
+                                      behavior: ad.adBehavior,
+                                      isVideoPlanV2: ad.usesVideoPlanV2
+                                  ),
+                                  closePosition: closeBehavior.position,
+                                  onMuteChanged: { muted in
                                      guard ad.usesVideoPlanV2 else { return }
                                      videoPlanScope?.updateMuted(muted)
                                      recordFullscreenVideoLifecycle(
@@ -468,7 +469,8 @@ public struct AdOverlayView: View {
                                          mutedWatchMs: videoPlayer.mutedWatchMilliseconds,
                                          unmutedWatchMs: videoPlayer.unmutedWatchMilliseconds,
                                          videoPositionS: videoPlayer.playedSeconds,
-                                         durationS: videoPlayer.duration
+                                         durationS: videoPlayer.duration,
+                                         secondsSinceVideoStart: videoPlayer.secondsSinceVideoStart
                                      )
                                  },
                                  telemetryPauseReason: { videoPauseReason },
@@ -910,7 +912,14 @@ public struct AdOverlayView: View {
         guard hasAppeared, !videoFailureHandled else { return }
         videoFailureHandled = true
         markPageFailed()
-        if ad.usesVideoPlanV2 { videoPlanScope?.nextStepFailed() }
+        if ad.usesVideoPlanV2,
+           videoPlanTerminalAction(
+               reason: FullscreenVideoTerminationReason.failed,
+               expectsNextStep: expectsVideoPlanNextStep,
+               playbackStarted: false
+           ) == .failExpectedNextStep {
+            videoPlanScope?.nextStepFailed()
+        }
         onCreativeFailure?()
     }
 
@@ -1301,11 +1310,14 @@ public struct AdOverlayView: View {
 
     private func applyVideoPlanTerminal(
         _ action: VideoPlanTerminalAction,
-        player: FullscreenVideoPlayer
+        player: FullscreenVideoPlayer?
     ) {
         switch action {
-        case .handoff(let reason): markVideoHandoff(player: player, reason: reason)
-        case .close(let reason): recordVideoClose(player: player, reason: reason)
+        case .handoff(let reason):
+            if let player { markVideoHandoff(player: player, reason: reason) }
+        case .close(let reason):
+            if let player { recordVideoClose(player: player, reason: reason) }
+        case .preservePendingHandoff: break
         case .failExpectedNextStep: videoPlanScope?.nextStepFailed()
         }
     }

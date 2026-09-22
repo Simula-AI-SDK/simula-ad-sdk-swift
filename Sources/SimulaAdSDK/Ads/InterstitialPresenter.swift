@@ -382,6 +382,9 @@ private struct CreativeInterstitialView: View {
     private var usesVideoPlanV2: Bool {
         response.primaryUsesVideoPlanV2
     }
+    private var suppressesLegacySKOverlay: Bool {
+        response.usesVideoPlanV2Contract
+    }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
             return videoPreFirstFrameChromeVisibility(
@@ -482,7 +485,7 @@ private struct CreativeInterstitialView: View {
             }
             reconcileGate()
             startStorePromptTrigger()
-            if !usesVideoPlanV2 { startSKOverlay() }
+            if !suppressesLegacySKOverlay { startSKOverlay() }
             videoPlanBlockerGeneration &+= 1
             videoPlanScope?.activateBlocker(
                 owner: videoPlanBlockerOwner,
@@ -713,6 +716,9 @@ private struct CreativeInterstitialView: View {
                 behavior: response.adBehavior,
                 isVideoPlanV2: usesVideoPlanV2
             ),
+            closePosition: closeConfig.position,
+            closeRelocatedToTopRight: closeBarAtBottom(closeConfig.treatment, closeConfig.position),
+            storePromptVisible: storePromptVisible && !closeEnabled,
             onMuteChanged: { muted in
                 guard usesVideoPlanV2 else { return }
                 videoPlanScope?.updateMuted(muted)
@@ -1357,6 +1363,7 @@ private struct CreativeInterstitialView: View {
     /// / `delayed` present automatically (after the optional `delay_seconds`); `onClick` waits for
     /// the CTA tap. iOS 14+ only — below that the config is simply ignored.
     private func startSKOverlay() {
+        guard !suppressesLegacySKOverlay else { return }
         let config = response.adBehavior?.skoverlay
         guard config?.enabled == true || skOverlayState.creativePresentationRequested,
               resolvedAppID == nil, !skOverlayResolutionStarted,
@@ -1400,6 +1407,7 @@ private struct CreativeInterstitialView: View {
     /// Presents the SKOverlay once the app id is known. Best-effort: a nil id (unresolvable store
     /// link) safely no-ops with sampled telemetry.
     private func presentSKOverlay(config: SKOverlayConfig) {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID?.isEmpty == false),
               let appID = resolvedAppID else {
             if resolvedAppID == nil || resolvedAppID?.isEmpty == true {
@@ -1429,7 +1437,7 @@ private struct CreativeInterstitialView: View {
 
     /// Presents an `onClick`-timed SKOverlay when the CTA is tapped (the app id was resolved on appear).
     private func presentSKOverlayOnClickIfNeeded() {
-        guard !usesVideoPlanV2 else { return }
+        guard !suppressesLegacySKOverlay else { return }
         guard let config = response.adBehavior?.skoverlay, config.enabled, config.timing == .onClick else { return }
         // If StoreOpen also selects SKStoreProductViewController, the sheet takes foreground while
         // this scene-owned overlay remains behind it. Both server-selected StoreKit surfaces retain
@@ -1438,6 +1446,7 @@ private struct CreativeInterstitialView: View {
     }
 
     private func showSKOverlayFromCreative() {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.requestCreativePresentation() else { return }
         endSKANViewThroughImpression()
         skOverlayTask?.cancel()
@@ -1447,7 +1456,8 @@ private struct CreativeInterstitialView: View {
     }
 
     private func presentRequestedSKOverlayIfNeeded() {
-        guard skOverlayState.creativePresentationRequested,
+        guard !suppressesLegacySKOverlay,
+              skOverlayState.creativePresentationRequested,
               resolvedAppID?.isEmpty == false else { return }
         presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: response.adBehavior?.skoverlay))
     }

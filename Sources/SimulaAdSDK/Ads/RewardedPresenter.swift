@@ -48,6 +48,7 @@ final class RewardedPresenter {
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
+        usesVideoPlanV2PresentationContract: Bool = false,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -93,6 +94,7 @@ final class RewardedPresenter {
             videoBehavior: videoBehavior,
             videoPlayer: videoPlayer,
             videoPlanScope: videoPlanScope,
+            usesVideoPlanV2PresentationContract: usesVideoPlanV2PresentationContract,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -153,6 +155,7 @@ final class RewardedPresenter {
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
+        usesVideoPlanV2PresentationContract: Bool = false,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -180,6 +183,7 @@ final class RewardedPresenter {
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
             videoPlanScope: videoPlanScope,
+            usesVideoPlanV2PresentationContract: usesVideoPlanV2PresentationContract,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -277,6 +281,7 @@ private struct RewardedGameView: View {
     let videoBehavior: VideoBehavior
     let videoPlayer: FullscreenVideoPlayer?
     let videoPlanScope: VideoPlanPresentationScope?
+    let usesVideoPlanV2PresentationContract: Bool
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
     /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
@@ -364,6 +369,7 @@ private struct RewardedGameView: View {
         videoBehavior: VideoBehavior,
         videoPlayer: FullscreenVideoPlayer?,
         videoPlanScope: VideoPlanPresentationScope?,
+        usesVideoPlanV2PresentationContract: Bool,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior?,
         storePrompt: StorePrompt?,
@@ -390,6 +396,7 @@ private struct RewardedGameView: View {
         self.videoBehavior = videoBehavior
         self.videoPlayer = videoPlayer
         self.videoPlanScope = videoPlanScope
+        self.usesVideoPlanV2PresentationContract = usesVideoPlanV2PresentationContract
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.close = close
@@ -440,6 +447,9 @@ private struct RewardedGameView: View {
     }
     private var usesVideoPlanV2: Bool {
         videoPlanScope != nil && creative?.isVideoPlanV2Clip == true
+    }
+    private var suppressesLegacySKOverlay: Bool {
+        usesVideoPlanV2PresentationContract
     }
     private var videoTelemetryBehavior: AdBehavior {
         AdBehavior(skoverlay: skOverlay, video: videoBehavior)
@@ -542,7 +552,7 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.activate()
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             reconcileTimer()
-            if !usesVideoPlanV2 { startSKOverlay() }
+            if !suppressesLegacySKOverlay { startSKOverlay() }
             videoPlanBlockerGeneration &+= 1
             videoPlanScope?.activateBlocker(
                 owner: videoPlanBlockerOwner,
@@ -936,6 +946,12 @@ private struct RewardedGameView: View {
                 behavior: videoTelemetryBehavior,
                 isVideoPlanV2: usesVideoPlanV2
             ),
+            closePosition: (close ?? CloseBehavior()).position,
+            closeRelocatedToTopRight: closeBarAtBottom(
+                (close ?? CloseBehavior()).treatment,
+                (close ?? CloseBehavior()).position
+            ),
+            storePromptVisible: storePromptVisible && !rewardEarned,
             onMuteChanged: { muted in
                 guard usesVideoPlanV2 else { return }
                 videoPlanScope?.updateMuted(muted)
@@ -1279,6 +1295,7 @@ private struct RewardedGameView: View {
     // MARK: SKOverlay
 
     private func startSKOverlay() {
+        guard !suppressesLegacySKOverlay else { return }
         let config = skOverlay
         guard config?.enabled == true || skOverlayState.creativePresentationRequested,
               resolvedAppID == nil, !skOverlayResolutionStarted,
@@ -1317,6 +1334,7 @@ private struct RewardedGameView: View {
     }
 
     private func presentSKOverlay(config: SKOverlayConfig) {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID?.isEmpty == false),
               let appID = resolvedAppID else { return }
         guard visible, attributionRouteLifecycle.isActive,
@@ -1335,7 +1353,7 @@ private struct RewardedGameView: View {
     }
 
     private func presentSKOverlayOnClickIfNeeded() {
-        guard !usesVideoPlanV2 else { return }
+        guard !suppressesLegacySKOverlay else { return }
         guard let config = skOverlay, config.enabled, config.timing == .onClick else { return }
         // A configured product sheet remains foreground when both StoreKit surfaces are selected;
         // the overlay stays exactly owned by this scene/presentation behind it.
@@ -1343,6 +1361,7 @@ private struct RewardedGameView: View {
     }
 
     private func showSKOverlayFromCreative() {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.requestCreativePresentation() else { return }
         skOverlayTask?.cancel()
         skOverlayTask = nil
@@ -1351,7 +1370,8 @@ private struct RewardedGameView: View {
     }
 
     private func presentRequestedSKOverlayIfNeeded() {
-        guard skOverlayState.creativePresentationRequested,
+        guard !suppressesLegacySKOverlay,
+              skOverlayState.creativePresentationRequested,
               resolvedAppID?.isEmpty == false else { return }
         presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: skOverlay))
     }
