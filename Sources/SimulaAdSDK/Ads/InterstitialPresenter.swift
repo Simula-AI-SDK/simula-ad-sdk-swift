@@ -844,6 +844,7 @@ private struct CreativeInterstitialView: View {
             }
             return true
         }
+        let admittedAt = ProcessInfo.processInfo.systemUptime
         let ended = player.status == .ended
         if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
@@ -853,36 +854,42 @@ private struct CreativeInterstitialView: View {
         if !ended {
             updateVideoGate(player: player, played: player.playedSeconds)
         }
-        if !videoStartRecorded {
-            videoStartRecorded = true
-            recordFullscreenVideoLifecycle(
-                stage: FullscreenVideoTelemetryStage.start,
-                adFormat: "interstitial", adUnitId: response.adUnitId,
-                adId: response.impressionId, serveId: response.impressionId,
-                isVideoPlanV2: usesVideoPlanV2,
-                creative: response.creative, behavior: response.adBehavior,
-                muted: player.isMuted,
-                videoPositionS: player.playedSeconds,
-                durationS: player.duration,
-                secondsSinceVideoStart: player.secondsSinceVideoStart
-            )
-            onVideoStarted()
-        }
-        videoPlanScope?.firstVideoFrame(
-            playerID: player.videoPlanPresentationID,
-            creative: response.creative,
-            behavior: response.adBehavior,
-            adFormat: "interstitial",
-            adUnitId: response.adUnitId,
-            adId: response.impressionId,
-            serveId: response.impressionId,
-            config: response.adBehavior?.skoverlay,
-            trackingUrl: response.trackingUrl,
-            destination: response.destinationKind,
-            storeUrl: response.iosStoreUrl,
-            attribution: response.skanAttribution,
-            originatingScene: originatingScene,
-            blocked: !appForegrounded || storeSheetPresented
+        runVideoFirstFrameStartSequence(
+            shouldRecordStart: !videoStartRecorded,
+            recordStart: {
+                videoStartRecorded = true
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.start,
+                    adFormat: "interstitial", adUnitId: response.adUnitId,
+                    adId: response.impressionId, serveId: response.impressionId,
+                    isVideoPlanV2: usesVideoPlanV2,
+                    creative: response.creative, behavior: response.adBehavior,
+                    muted: player.isMuted,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            startOverlay: {
+                videoPlanScope?.firstVideoFrame(
+                    playerID: player.videoPlanPresentationID,
+                    creative: response.creative,
+                    behavior: response.adBehavior,
+                    adFormat: "interstitial",
+                    adUnitId: response.adUnitId,
+                    adId: response.impressionId,
+                    serveId: response.impressionId,
+                    config: response.adBehavior?.skoverlay,
+                    trackingUrl: response.trackingUrl,
+                    destination: response.destinationKind,
+                    storeUrl: response.iosStoreUrl,
+                    attribution: response.skanAttribution,
+                    originatingScene: originatingScene,
+                    admittedAt: admittedAt,
+                    blocked: !appForegrounded || storeSheetPresented
+                )
+            },
+            notifyStarted: onVideoStarted
         )
         fireAutoStoreRedirectIfCloseShown()
         if ended {

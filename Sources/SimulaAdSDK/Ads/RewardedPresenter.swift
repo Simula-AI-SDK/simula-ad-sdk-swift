@@ -1062,40 +1062,47 @@ private struct RewardedGameView: View {
             }
             return true
         }
+        let admittedAt = ProcessInfo.processInfo.systemUptime
         let ended = player.status == .ended
         if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         admission.visualBecameReady(owner: admissionOwner)
-        if !videoStartRecorded {
-            videoStartRecorded = true
-            recordFullscreenVideoLifecycle(
-                stage: FullscreenVideoTelemetryStage.start,
-                adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
-                isVideoPlanV2: usesVideoPlanV2,
-                creative: creative, behavior: videoTelemetryBehavior,
-                muted: player.isMuted,
-                videoPositionS: player.playedSeconds,
-                durationS: player.duration,
-                secondsSinceVideoStart: player.secondsSinceVideoStart
-            )
-            onVideoStarted()
-        }
-        videoPlanScope?.firstVideoFrame(
-            playerID: player.videoPlanPresentationID,
-            creative: creative,
-            behavior: videoTelemetryBehavior,
-            adFormat: "rewarded",
-            adUnitId: adUnitId,
-            adId: impressionId,
-            serveId: serveId,
-            config: skOverlay,
-            trackingUrl: trackingUrl,
-            destination: destination,
-            storeUrl: storeUrl,
-            attribution: attribution,
-            originatingScene: originatingScene,
-            blocked: !appForegrounded || storeSheetPresented
+        runVideoFirstFrameStartSequence(
+            shouldRecordStart: !videoStartRecorded,
+            recordStart: {
+                videoStartRecorded = true
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.start,
+                    adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
+                    isVideoPlanV2: usesVideoPlanV2,
+                    creative: creative, behavior: videoTelemetryBehavior,
+                    muted: player.isMuted,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            startOverlay: {
+                videoPlanScope?.firstVideoFrame(
+                    playerID: player.videoPlanPresentationID,
+                    creative: creative,
+                    behavior: videoTelemetryBehavior,
+                    adFormat: "rewarded",
+                    adUnitId: adUnitId,
+                    adId: impressionId,
+                    serveId: serveId,
+                    config: skOverlay,
+                    trackingUrl: trackingUrl,
+                    destination: destination,
+                    storeUrl: storeUrl,
+                    attribution: attribution,
+                    originatingScene: originatingScene,
+                    admittedAt: admittedAt,
+                    blocked: !appForegrounded || storeSheetPresented
+                )
+            },
+            notifyStarted: onVideoStarted
         )
         if ended {
             handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)

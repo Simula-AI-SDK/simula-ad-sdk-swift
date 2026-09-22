@@ -158,6 +158,23 @@ func nextV2FallbackVideoIndex(in ads: [FallbackAd], after currentIndex: Int) -> 
     return ads.indices.dropFirst(currentIndex + 1).first { ads[$0].usesVideoPlanV2 }
 }
 
+func discardedFallbackVideoPreparationIndices(
+    in ads: [FallbackAd],
+    around currentIndex: Int,
+    preparedIndices: Set<Int>
+) -> [Int] {
+    let retainedIndices: Set<Int>
+    if ads.contains(where: \.usesVideoPlanV2Contract) {
+        let nextPreparedVideo = preparedIndices
+            .filter { $0 >= currentIndex && ads.indices.contains($0) && ads[$0].usesVideoPlanV2 }
+            .min()
+        retainedIndices = nextPreparedVideo.map { Set([$0]) } ?? []
+    } else {
+        retainedIndices = Set([currentIndex, currentIndex + 1])
+    }
+    return preparedIndices.subtracting(retainedIndices).sorted()
+}
+
 #if os(iOS)
 @MainActor
 func prepareUpcomingFallbackVideos(
@@ -860,14 +877,19 @@ final class FallbackAdPresenter {
     }
 
     private func prepareVideoPlayers(around currentIndex: Int) {
-        let retainedIndices = Set([currentIndex, currentIndex + 1])
-        let discardedIndices = videoPreparations.keys.filter { !retainedIndices.contains($0) }
+        let preparedIndices = Set(videoPreparations.keys)
+        let discardedIndices = discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: currentIndex,
+            preparedIndices: preparedIndices
+        )
         for playerIndex in discardedIndices {
             releaseVideoPreparation(at: playerIndex)
         }
         let v2 = ads.contains(where: \.usesVideoPlanV2Contract)
         guard !v2 else { return }
         // Preserve video_v1's eager current + next preparation exactly.
+        let retainedIndices = Set([currentIndex, currentIndex + 1])
         for playerIndex in retainedIndices where ads.indices.contains(playerIndex) {
             guard videoOwnershipIndex != playerIndex,
                   videoPreparations[playerIndex] == nil,

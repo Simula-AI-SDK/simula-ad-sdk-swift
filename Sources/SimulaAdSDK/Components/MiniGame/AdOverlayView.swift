@@ -394,7 +394,14 @@ public struct AdOverlayView: View {
     public var body: some View {
         ZStack {
             #if os(iOS)
-            AdOverlayWindowSceneReader { scene in originatingScene = scene }
+            AdOverlayWindowSceneReader { scene in
+                originatingScene = scene
+                videoPlanScope?.updateOriginatingScene(
+                    scene,
+                    owner: videoPlanBlockerOwner,
+                    generation: videoPlanBlockerGeneration
+                )
+            }
                 .frame(width: 0, height: 0)
             #endif
             // Backdrop: fully black full-screen (so the end screen's safe area is solid
@@ -573,9 +580,6 @@ public struct AdOverlayView: View {
         .hideStatusBar(shouldHideStatusBar)
         .onAppear {
             activeRouteLifecycle.activate()
-            #if os(iOS)
-            videoPlayer?.attachVideoPlanScope(ad.usesVideoPlanV2 ? videoPlanScope : nil)
-            #endif
             topSafeInset = isBottomSheet ? 0 : simulaTopSafeAreaInset()
             #if os(iOS)
             appForegrounded = UIApplication.shared.applicationState == .active
@@ -585,6 +589,18 @@ public struct AdOverlayView: View {
                 storeSheetPresented: storeSheetPresented
             ))
             videoPlanBlockerGeneration &+= 1
+            videoPlanScope?.activateOriginatingSceneOwner(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration
+            )
+            if let originatingScene {
+                videoPlanScope?.updateOriginatingScene(
+                    originatingScene,
+                    owner: videoPlanBlockerOwner,
+                    generation: videoPlanBlockerGeneration
+                )
+            }
+            videoPlayer?.attachVideoPlanScope(ad.usesVideoPlanV2 ? videoPlanScope : nil)
             videoPlanScope?.activateBlocker(
                 owner: videoPlanBlockerOwner,
                 generation: videoPlanBlockerGeneration,
@@ -635,6 +651,10 @@ public struct AdOverlayView: View {
             activeRouteLifecycle.deactivate()
             hasAppeared = false
             #if os(iOS)
+            videoPlanScope?.deactivateOriginatingSceneOwner(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration
+            )
             originatingScene = nil
             #endif
             loadWatchdogTask?.cancel()
@@ -1165,6 +1185,7 @@ public struct AdOverlayView: View {
             firstFrameHandoff.invalidate()
             return false
         }
+        let admittedAt = ProcessInfo.processInfo.systemUptime
         let ended = player.status == .ended
         if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         guard loadCoordinator.finishCurrentLoad() else {
@@ -1173,40 +1194,45 @@ public struct AdOverlayView: View {
         }
         adPageReady = true
         pageFinished = true
-        if !videoStartRecorded {
-            videoStartRecorded = true
-            recordFullscreenVideoLifecycle(
-                stage: FullscreenVideoTelemetryStage.start,
-                adFormat: videoTelemetryAdFormat,
-                adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
-                serveId: telemetryServeId,
-                isVideoPlanV2: ad.usesVideoPlanV2,
-                creative: ad.creative, behavior: ad.adBehavior,
-                muted: player.isMuted,
-                videoPositionS: player.playedSeconds,
-                durationS: player.duration,
-                secondsSinceVideoStart: player.secondsSinceVideoStart
-            )
-            onVideoStarted?()
-        }
-        if ad.usesVideoPlanV2, let originatingScene {
-            videoPlanScope?.firstVideoFrame(
-                playerID: player.videoPlanPresentationID,
-                creative: ad.creative,
-                behavior: ad.adBehavior,
-                adFormat: videoTelemetryAdFormat,
-                adUnitId: telemetryAdUnitId,
-                adId: adId.isEmpty ? nil : adId,
-                serveId: telemetryServeId,
-                config: ad.adBehavior.skoverlay,
-                trackingUrl: ctaTrackingUrl,
-                destination: ctaDestination,
-                storeUrl: ctaStoreUrl,
-                attribution: attribution,
-                originatingScene: originatingScene,
-                blocked: !appForegrounded || storeSheetPresented
-            )
-        }
+        runVideoFirstFrameStartSequence(
+            shouldRecordStart: !videoStartRecorded,
+            recordStart: {
+                videoStartRecorded = true
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.start,
+                    adFormat: videoTelemetryAdFormat,
+                    adUnitId: telemetryAdUnitId, adId: adId.isEmpty ? nil : adId,
+                    serveId: telemetryServeId,
+                    isVideoPlanV2: ad.usesVideoPlanV2,
+                    creative: ad.creative, behavior: ad.adBehavior,
+                    muted: player.isMuted,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            startOverlay: {
+                guard ad.usesVideoPlanV2 else { return }
+                videoPlanScope?.firstVideoFrame(
+                    playerID: player.videoPlanPresentationID,
+                    creative: ad.creative,
+                    behavior: ad.adBehavior,
+                    adFormat: videoTelemetryAdFormat,
+                    adUnitId: telemetryAdUnitId,
+                    adId: adId.isEmpty ? nil : adId,
+                    serveId: telemetryServeId,
+                    config: ad.adBehavior.skoverlay,
+                    trackingUrl: ctaTrackingUrl,
+                    destination: ctaDestination,
+                    storeUrl: ctaStoreUrl,
+                    attribution: attribution,
+                    originatingScene: nil,
+                    admittedAt: admittedAt,
+                    blocked: !appForegrounded || storeSheetPresented
+                )
+            },
+            notifyStarted: { onVideoStarted?() }
+        )
         beginPresentationIfReady()
         if ended {
             handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)

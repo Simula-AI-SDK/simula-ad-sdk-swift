@@ -602,6 +602,163 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertFalse(arbiter.register(playerID: "clip-b"))
     }
 
+    func testVideoPlanFirstFrameBeforeSceneIsProcessedOnce() {
+        var admission = VideoPlanPresentationAdmissionState<String>()
+        var scenes = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(admission.register(playerID: "clip-a"))
+
+        XCTAssertTrue(admission.admitFirstFrame(playerID: "clip-a"))
+        XCTAssertEqual(admission.admittedFirstFrameCount, 1)
+        XCTAssertNil(scenes.sceneID)
+        XCTAssertTrue(scenes.update("scene-a"))
+        XCTAssertEqual(scenes.sceneID, "scene-a")
+        XCTAssertFalse(admission.admitFirstFrame(playerID: "clip-a"))
+        XCTAssertEqual(admission.admittedFirstFrameCount, 1)
+    }
+
+    func testVideoPlanOldSceneClearCannotReplaceNewOwnerScene() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "old", generation: 1))
+        XCTAssertTrue(state.update("scene-old", owner: "old", generation: 1))
+        XCTAssertTrue(state.activate(owner: "new", generation: 1))
+        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 1))
+
+        XCTAssertFalse(state.update(nil, owner: "old", generation: 1))
+        XCTAssertEqual(state.sceneID, "scene-new")
+    }
+
+    func testVideoPlanStaleOldNonNilSceneCannotReplaceNewOwnerScene() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "old", generation: 1))
+        XCTAssertTrue(state.update("scene-old", owner: "old", generation: 1))
+        XCTAssertTrue(state.activate(owner: "new", generation: 2))
+        XCTAssertTrue(state.update("scene-new", owner: "new", generation: 2))
+
+        XCTAssertFalse(state.update("scene-stale", owner: "old", generation: 1))
+        XCTAssertEqual(state.sceneID, "scene-new")
+    }
+
+    func testVideoPlanCurrentOwnerCanClearAndDeactivateScene() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "current", generation: 3))
+        XCTAssertTrue(state.update("scene-a", owner: "current", generation: 3))
+        XCTAssertTrue(state.update(nil, owner: "current", generation: 3))
+        XCTAssertNil(state.sceneID)
+
+        XCTAssertTrue(state.update("scene-a", owner: "current", generation: 3))
+        XCTAssertTrue(state.deactivate(owner: "current", generation: 3))
+        XCTAssertNil(state.sceneID)
+        XCTAssertNil(state.owner)
+    }
+
+    func testVideoPlanSameSceneCallbackIsAcceptedForPresentationRetry() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "current", generation: 1))
+        XCTAssertTrue(state.update("scene-a", owner: "current", generation: 1))
+
+        XCTAssertTrue(state.update("scene-a", owner: "current", generation: 1))
+        XCTAssertEqual(state.sceneID, "scene-a")
+    }
+
+    func testVideoPlanSceneCancellationRejectsDirectAndOwnedUpdates() {
+        var state = VideoPlanOriginatingSceneState<String, String>()
+        XCTAssertTrue(state.activate(owner: "current", generation: 1))
+        state.cancel()
+
+        XCTAssertFalse(state.update("scene-a", owner: "current", generation: 1))
+        XCTAssertFalse(state.update("scene-a"))
+        XCTAssertFalse(state.activate(owner: "replacement", generation: 2))
+        XCTAssertNil(state.sceneID)
+    }
+
+    func testVideoPlanPendingPredecessorCompletesAtActualSceneIndependentFirstFrame() throws {
+        var admission = VideoPlanPresentationAdmissionState<String>()
+        var handoff = VideoPlanHandoffState<String>()
+        handoff.videoTerminated(origin: "clip-a", secondsSinceVideoStart: 3, now: 10)
+        XCTAssertTrue(admission.register(playerID: "clip-b"))
+
+        XCTAssertTrue(admission.admitFirstFrame(playerID: "clip-b"))
+        let completion = try XCTUnwrap(handoff.videoStarted(now: 10.25))
+        XCTAssertEqual(completion.origin, "clip-a")
+        XCTAssertEqual(completion.timing.msToNextStepReady, 250, accuracy: 0.001)
+        XCTAssertFalse(admission.admitFirstFrame(playerID: "clip-b"))
+        XCTAssertNil(handoff.videoStarted(now: 10.5))
+    }
+
+    func testVideoPlanFirstFrameCapturesHandoffBeforePreparationAdvancesClock() throws {
+        var admission = VideoPlanPresentationAdmissionState<String>()
+        var handoff = VideoPlanHandoffState<String>()
+        var now: TimeInterval = 10.25
+        handoff.videoTerminated(origin: "clip-a", secondsSinceVideoStart: 3, now: 10)
+        XCTAssertTrue(admission.register(playerID: "clip-b"))
+
+        let firstFrame = try XCTUnwrap(admitVideoPlanFirstFrame(
+            playerID: "clip-b",
+            admittedAt: now,
+            admission: &admission,
+            handoff: &handoff
+        ))
+        var events: [String] = []
+        runVideoFirstFrameStartSequence(
+            shouldRecordStart: true,
+            recordStart: { events.append("video_start") },
+            startOverlay: { events.append("skoverlay_shown") },
+            notifyStarted: {
+                events.append("on_video_started")
+                now = 20
+            }
+        )
+
+        let completion = try XCTUnwrap(firstFrame.completedHandoff)
+        XCTAssertEqual(events, ["video_start", "skoverlay_shown", "on_video_started"])
+        XCTAssertEqual(completion.origin, "clip-a")
+        XCTAssertEqual(completion.timing.msToNextStepReady, 250, accuracy: 0.001)
+        XCTAssertEqual(completion.timing.secondsSinceVideoStart, 3.25, accuracy: 0.001)
+        XCTAssertEqual(now, 20)
+        XCTAssertNil(admitVideoPlanFirstFrame(
+            playerID: "clip-b",
+            admittedAt: now,
+            admission: &admission,
+            handoff: &handoff
+        ))
+    }
+
+    func testVideoFirstFrameStartSequenceOrdersZeroDelayOverlayAfterStartExactlyOnce() {
+        var videoStartRecorded = false
+        var overlayShown = false
+        var events: [String] = []
+        let processFirstFrame = {
+            runVideoFirstFrameStartSequence(
+                shouldRecordStart: !videoStartRecorded,
+                recordStart: {
+                    videoStartRecorded = true
+                    events.append("video_start")
+                },
+                startOverlay: {
+                    guard !overlayShown else { return }
+                    overlayShown = true
+                    events.append("skoverlay_shown")
+                },
+                notifyStarted: { events.append("on_video_started") }
+            )
+        }
+
+        processFirstFrame()
+        processFirstFrame()
+
+        XCTAssertEqual(events, ["video_start", "skoverlay_shown", "on_video_started"])
+    }
+
+    func testVideoPlanTerminalCancellationRejectsLateSceneAndReplacementPlayer() {
+        var state = VideoPlanPresentationAdmissionState<String>()
+        XCTAssertTrue(state.register(playerID: "clip-a"))
+        XCTAssertTrue(state.claimTerminal(playerID: "clip-a", event: .userClose))
+        state.cancel()
+
+        XCTAssertFalse(state.admitFirstFrame(playerID: "clip-a"))
+        XCTAssertFalse(state.register(playerID: "clip-b"))
+    }
+
     func testSKOverlayShownPhaseTracksVideoAndNextStepSeparately() {
         var duringVideo = VideoPlanOverlayPlacementState()
         duringVideo.videoBecameActive()
@@ -1738,6 +1895,96 @@ final class CreativeVideoTests: XCTestCase {
         )
 
         XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0, 1])
+    }
+
+    func testV2PreparationAtCompactIndexTwoSurvivesFromFirstScreen() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"A"},{"type":"playable","rendered_html":"B"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":2}]}"#
+        )
+
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [2])
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 0,
+            preparedIndices: [2]
+        ), [])
+    }
+
+    func testNextV2PreparationSurvivesTraversalAcrossMultiplePlayables() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":0},{"type":"playable","rendered_html":"A"},{"type":"playable","rendered_html":"B"},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":1}]}"#
+        )
+
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 1,
+            preparedIndices: [3]
+        ), [])
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 2,
+            preparedIndices: [3]
+        ), [])
+    }
+
+    func testNextV2PreparationSurvivesOnePlayableGap() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":0},{"type":"playable","rendered_html":"A"},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
+        )
+
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 1,
+            preparedIndices: [2]
+        ), [])
+    }
+
+    func testVideoV1PreparationDiscardPolicyKeepsAdjacencyPruning() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"},{"type":"video","url":"https://cdn.example/three.mp4"}]}"#
+        )
+
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 0,
+            preparedIndices: [0, 1, 2]
+        ), [2])
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 1,
+            preparedIndices: [0, 1, 2]
+        ), [0])
+    }
+
+    func testV2PreparationRetentionUsesCompactIndexNotRawSourceIndex() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"bad"},{"type":"playable","rendered_html":"A"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":2}]}"#
+        )
+        XCTAssertEqual(ads.map(\.sourceIndex), [1, 2])
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [1])
+
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 0,
+            preparedIndices: [1]
+        ), [])
+    }
+
+    func testV2PreparationRetentionKeepsOnlyOneUpcomingToken() throws {
+        let ads = try decodeFallbacks(
+            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"A"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
+        )
+
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 0,
+            preparedIndices: [1, 2]
+        ), [2])
+        XCTAssertEqual(discardedFallbackVideoPreparationIndices(
+            in: ads,
+            around: 2,
+            preparedIndices: [1, 2]
+        ), [1])
     }
 
     #if os(iOS)

@@ -172,6 +172,70 @@ struct VideoPlanTerminalArbiter<PlayerID: Hashable & Sendable>: Sendable {
     }
 }
 
+struct VideoPlanPresentationAdmissionState<PlayerID: Hashable & Sendable>: Sendable {
+    private var terminalArbiter = VideoPlanTerminalArbiter<PlayerID>()
+    private(set) var admittedFirstFrameCount = 0
+
+    @discardableResult
+    mutating func register(playerID: PlayerID) -> Bool {
+        terminalArbiter.register(playerID: playerID)
+    }
+
+    mutating func admitFirstFrame(playerID: PlayerID) -> Bool {
+        guard terminalArbiter.start(playerID: playerID) else { return false }
+        admittedFirstFrameCount &+= 1
+        return true
+    }
+
+    mutating func claimTerminal(playerID: PlayerID, event: VideoPlanTerminalEvent) -> Bool {
+        terminalArbiter.claimTerminal(playerID: playerID, event: event)
+    }
+
+    mutating func cancel() {
+        terminalArbiter.cancel()
+    }
+}
+
+struct VideoPlanOriginatingSceneState<Owner: Hashable & Sendable, SceneID: Hashable & Sendable>: Sendable {
+    private(set) var owner: Owner?
+    private(set) var generation: UInt64 = 0
+    private(set) var sceneID: SceneID?
+    private(set) var cancelled = false
+
+    mutating func activate(owner: Owner, generation: UInt64) -> Bool {
+        guard !cancelled else { return false }
+        self.owner = owner
+        self.generation = generation
+        sceneID = nil
+        return true
+    }
+
+    mutating func update(_ sceneID: SceneID?) -> Bool {
+        guard !cancelled, owner == nil else { return false }
+        self.sceneID = sceneID
+        return true
+    }
+
+    mutating func update(_ sceneID: SceneID?, owner: Owner, generation: UInt64) -> Bool {
+        guard !cancelled, self.owner == owner, self.generation == generation else { return false }
+        self.sceneID = sceneID
+        return true
+    }
+
+    mutating func deactivate(owner: Owner, generation: UInt64) -> Bool {
+        guard !cancelled, self.owner == owner, self.generation == generation else { return false }
+        self.owner = nil
+        sceneID = nil
+        return true
+    }
+
+    mutating func cancel() {
+        cancelled = true
+        owner = nil
+        sceneID = nil
+    }
+}
+
 enum VideoPlanOverlayPhase: String, Equatable, Sendable {
     case video
     case nextStep = "next_step"
@@ -280,6 +344,31 @@ struct VideoPlanHandoffState<Origin> {
     }
 }
 
+struct VideoPlanFirstFrameAdmission<Origin> {
+    let completedHandoff: VideoPlanHandoffCompletion<Origin>?
+}
+
+func admitVideoPlanFirstFrame<PlayerID: Hashable & Sendable, Origin>(
+    playerID: PlayerID,
+    admittedAt: TimeInterval,
+    admission: inout VideoPlanPresentationAdmissionState<PlayerID>,
+    handoff: inout VideoPlanHandoffState<Origin>
+) -> VideoPlanFirstFrameAdmission<Origin>? {
+    guard admission.admitFirstFrame(playerID: playerID) else { return nil }
+    return VideoPlanFirstFrameAdmission(completedHandoff: handoff.videoStarted(now: admittedAt))
+}
+
+func runVideoFirstFrameStartSequence(
+    shouldRecordStart: Bool,
+    recordStart: () -> Void,
+    startOverlay: () -> Void,
+    notifyStarted: () -> Void
+) {
+    if shouldRecordStart { recordStart() }
+    startOverlay()
+    if shouldRecordStart { notifyStarted() }
+}
+
 struct VideoPlanHandoffTelemetry: Sendable {
     let adFormat: String
     let adUnitId: String?
@@ -355,7 +444,11 @@ import UIKit
 final class VideoPlanPresentationScope {
     private(set) var isMuted = false
     private var watchAccounting = VideoPlanPresentationWatchAccounting<UUID>()
-    private var terminalArbiter = VideoPlanTerminalArbiter<UUID>()
+    private var presentationAdmission = VideoPlanPresentationAdmissionState<UUID>()
+    private var originatingSceneState = VideoPlanOriginatingSceneState<
+        VideoPlanBlockerOwner,
+        ObjectIdentifier
+    >()
 
     private var clock: VideoPlanSKOverlayClock?
     private var deadlineTask: Task<Void, Never>?
@@ -381,11 +474,42 @@ final class VideoPlanPresentationScope {
 
     @discardableResult
     func registerVideoPlayer(playerID: UUID) -> Bool {
-        terminalArbiter.register(playerID: playerID)
+        presentationAdmission.register(playerID: playerID)
     }
 
     func claimVideoTerminal(playerID: UUID, event: VideoPlanTerminalEvent) -> Bool {
-        terminalArbiter.claimTerminal(playerID: playerID, event: event)
+        presentationAdmission.claimTerminal(playerID: playerID, event: event)
+    }
+
+    func updateOriginatingScene(_ scene: UIWindowScene?) {
+        guard !cancelled,
+              originatingSceneState.update(scene.map(ObjectIdentifier.init)) else { return }
+        originatingScene = scene
+        if scene != nil { presentIfReady() }
+    }
+
+    func activateOriginatingSceneOwner(owner: VideoPlanBlockerOwner, generation: UInt64) {
+        guard !cancelled, originatingSceneState.activate(owner: owner, generation: generation) else { return }
+        originatingScene = nil
+    }
+
+    func updateOriginatingScene(
+        _ scene: UIWindowScene?,
+        owner: VideoPlanBlockerOwner,
+        generation: UInt64
+    ) {
+        guard !cancelled, originatingSceneState.update(
+            scene.map(ObjectIdentifier.init),
+            owner: owner,
+            generation: generation
+        ) else { return }
+        originatingScene = scene
+        if scene != nil { presentIfReady() }
+    }
+
+    func deactivateOriginatingSceneOwner(owner: VideoPlanBlockerOwner, generation: UInt64) {
+        guard originatingSceneState.deactivate(owner: owner, generation: generation) else { return }
+        originatingScene = nil
     }
 
     func reserveLegacySKOverlay() -> SKOverlayPresentationClaim.Reservation? {
@@ -427,13 +551,19 @@ final class VideoPlanPresentationScope {
         destination: AdDestination,
         storeUrl: String?,
         attribution: AdAttribution?,
-        originatingScene: UIWindowScene,
+        originatingScene: UIWindowScene?,
+        admittedAt: TimeInterval,
         blocked: Bool
     ) {
         guard !cancelled, creative?.isVideoPlanV2Clip == true,
-              terminalArbiter.start(playerID: playerID) else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        if let completion = handoffState.videoStarted(now: now) {
+              let firstFrame = admitVideoPlanFirstFrame(
+                  playerID: playerID,
+                  admittedAt: admittedAt,
+                  admission: &presentationAdmission,
+                  handoff: &handoffState
+              ) else { return }
+        if let originatingScene { updateOriginatingScene(originatingScene) }
+        if let completion = firstFrame.completedHandoff {
             recordHandoff(completion)
         }
         overlayPlacement.videoBecameActive()
@@ -453,7 +583,6 @@ final class VideoPlanPresentationScope {
             )
             config = effective
             self.attribution = attribution
-            self.originatingScene = originatingScene
             clock = VideoPlanSKOverlayClock(delay: TimeInterval(effective.delaySeconds))
             resolveAppIDIfNeeded(
                 trackingUrl: trackingUrl,
@@ -462,7 +591,7 @@ final class VideoPlanPresentationScope {
             )
         }
         guard var clock else { return }
-        let action = clock.start(now: ProcessInfo.processInfo.systemUptime, blocked: blocked)
+        let action = clock.start(now: admittedAt, blocked: blocked)
         self.clock = clock
         apply(action)
     }
@@ -567,7 +696,9 @@ final class VideoPlanPresentationScope {
         guard !cancelled else { return }
         closePendingHandoffIfNeeded()
         cancelled = true
-        terminalArbiter.cancel()
+        presentationAdmission.cancel()
+        originatingSceneState.cancel()
+        originatingScene = nil
         deadlineTask?.cancel()
         deadlineTask = nil
         if var clock {
