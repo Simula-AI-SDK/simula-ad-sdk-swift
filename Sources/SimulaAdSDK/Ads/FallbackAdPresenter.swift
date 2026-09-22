@@ -22,6 +22,16 @@ enum FallbackOutcome: Equatable, Sendable {
     /// Fallback delivery is best-effort. Once the playable earned a reward, infrastructure/content
     /// unavailability must not revoke it; this keeps that policy explicit at the decision point.
     func shouldVerifyEarnedReward(_ earned: Bool) -> Bool { earned }
+
+    var videoPlanCloseReason: String? {
+        switch self {
+        case .completed: return nil
+        case .noContent: return FullscreenVideoTerminationReason.noNextStep
+        case .loadingTimeout: return FullscreenVideoTerminationReason.nextStepTimeout
+        case .fetchFailure, .presentationUnavailable, .hostUnavailable:
+            return FullscreenVideoTerminationReason.nextStepFailed
+        }
+    }
 }
 
 struct FallbackTelemetryIdentifiers: Equatable, Sendable {
@@ -132,7 +142,7 @@ func upcomingFallbackVideoIndices(
     _ ads: [FallbackAd],
     allowV2Preparation: Bool = true
 ) -> [Int] {
-    let usesVideoPlanV2 = ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+    let usesVideoPlanV2 = ads.contains(where: \.usesVideoPlanV2Contract)
     if usesVideoPlanV2 {
         guard allowV2Preparation else { return [] }
         return ads.indices.first(where: { ads[$0].usesVideoPlanV2 }).map { [$0] } ?? []
@@ -174,7 +184,7 @@ func prepareUpcomingFallbackVideos(
 func preparingImmediateV2FallbackIfNeeded(_ result: FallbackFetchResult) -> FallbackFetchResult {
     guard case .content(let ads, let existing) = result,
           existing.isEmpty,
-          ads.contains(where: { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }) else { return result }
+          ads.contains(where: \.usesVideoPlanV2Contract) else { return result }
     return .content(ads, preparedVideos: prepareUpcomingFallbackVideos(ads, allowV2Preparation: true))
 }
 
@@ -310,7 +320,7 @@ func canHandleFallbackScreenCallback(renderedIndex: Int, currentIndex: Int) -> B
     renderedIndex == currentIndex
 }
 
-struct FallbackFailureAdvanceState: Equatable, Sendable {
+struct FallbackTerminalAdvanceState: Equatable, Sendable {
     private(set) var pendingIndex: Int?
 
     mutating func request(index: Int, blocked: Bool) -> Bool {
@@ -458,7 +468,7 @@ final class FallbackAdPresenter {
     private var loadingGeneration: Int?
     private var clickHandoffIndex: Int?
     private var presentationBlockedIndex: Int?
-    private var failureAdvanceState = FallbackFailureAdvanceState()
+    private var terminalAdvanceState = FallbackTerminalAdvanceState()
     private var videoPlanScope: VideoPlanPresentationScope?
     /// Retain only process-pooled preparation tokens for the current and immediately-next fallback.
     private var videoPreparations: [Int: FullscreenVideoPreparationToken] = [:]
@@ -609,7 +619,7 @@ final class FallbackAdPresenter {
         self.telemetryAdUnitId = telemetryAdUnitId
         self.telemetryServeId = telemetryServeId
         self.videoPlanScope = videoPlanScope
-            ?? (ads.contains(where: \.usesVideoPlanV2) ? VideoPlanPresentationScope() : nil)
+            ?? (ads.contains(where: \.usesVideoPlanV2Contract) ? VideoPlanPresentationScope() : nil)
         self.presentationLease = presentationLease
         isLoading = startsLoading
         if !startsLoading { loadingGeneration = nil }
@@ -665,7 +675,7 @@ final class FallbackAdPresenter {
                 return
             }
             self.ads = ads
-            if videoPlanScope == nil, ads.contains(where: \.usesVideoPlanV2) {
+            if videoPlanScope == nil, ads.contains(where: \.usesVideoPlanV2Contract) {
                 videoPlanScope = VideoPlanPresentationScope()
             }
             videoPreparations = preparedVideos
@@ -743,15 +753,16 @@ final class FallbackAdPresenter {
         return AnyView(AdOverlayView(
             ad: ad,
             onClose: { [weak self] in self?.advance(from: index) },
-            onCreativeFailure: { [weak self] in self?.advanceAfterCreativeFailure(from: index) },
+            onCreativeFailure: { [weak self] in self?.advanceAfterTerminal(from: index) },
             onVideoCompleted: ad.usesVideoPlanV2
-                ? { [weak self] in self?.advanceAfterCreativeFailure(from: index) }
+                ? { [weak self] in self?.advanceAfterTerminal(from: index) }
                 : nil,
             onVideoStarted: ad.usesVideoPlanV2
                 ? { [weak self] in self?.prepareImmediateNextVideo(after: index) }
                 : nil,
             videoPlayer: retainedVideoPlayer(at: index),
             videoPlanScope: videoPlanScope,
+            expectsVideoPlanNextStep: index + 1 < ads.count,
             adId: ad.adId,
             nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
             closeBehavior: ad.closeBehavior,
@@ -765,7 +776,7 @@ final class FallbackAdPresenter {
                     self.clickHandoffIndex = index
                 } else if self.clickHandoffIndex == index {
                     self.clickHandoffIndex = nil
-                    self.completePendingCreativeFailureIfPossible(at: index)
+                    self.completePendingTerminalAdvanceIfPossible(at: index)
                 }
             },
             onPresentationBlockedChanged: { [weak self] blocked in
@@ -774,7 +785,7 @@ final class FallbackAdPresenter {
                     self.presentationBlockedIndex = index
                 } else if self.presentationBlockedIndex == index {
                     self.presentationBlockedIndex = nil
-                    self.completePendingCreativeFailureIfPossible(at: index)
+                    self.completePendingTerminalAdvanceIfPossible(at: index)
                 }
             },
             ctaTrackingUrl: usesVideoRoute ? videoRoute?.trackingUrl : ctaTrackingUrl,
@@ -819,7 +830,7 @@ final class FallbackAdPresenter {
               ) else { return }
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
-        failureAdvanceState.clear()
+        terminalAdvanceState.clear()
         releaseVideoPreparation(at: index)
         index += 1
         if index < ads.count {
@@ -827,14 +838,13 @@ final class FallbackAdPresenter {
             hostingController?.rootView = adView(at: index)
         } else {
             guard let outcome = presentationCoordinator.completedPresentedContent() else { return }
-            videoPlanScope?.nextStepFailed()
             dismiss(outcome: outcome)
         }
     }
 
-    private func advanceAfterCreativeFailure(from renderedIndex: Int) {
+    private func advanceAfterTerminal(from renderedIndex: Int) {
         guard window != nil, renderedIndex == index else { return }
-        guard failureAdvanceState.request(
+        guard terminalAdvanceState.request(
             index: renderedIndex,
             blocked: clickHandoffIndex == renderedIndex || presentationBlockedIndex == renderedIndex
         ) else { return }
@@ -842,10 +852,10 @@ final class FallbackAdPresenter {
         advance(from: renderedIndex)
     }
 
-    private func completePendingCreativeFailureIfPossible(at renderedIndex: Int) {
+    private func completePendingTerminalAdvanceIfPossible(at renderedIndex: Int) {
         guard clickHandoffIndex != renderedIndex,
               presentationBlockedIndex != renderedIndex,
-              let pendingIndex = failureAdvanceState.blockersDidClear(currentIndex: renderedIndex) else { return }
+              let pendingIndex = terminalAdvanceState.blockersDidClear(currentIndex: renderedIndex) else { return }
         advance(from: pendingIndex)
     }
 
@@ -855,8 +865,7 @@ final class FallbackAdPresenter {
         for playerIndex in discardedIndices {
             releaseVideoPreparation(at: playerIndex)
         }
-        let v2 = videoPlanScope != nil
-            || ads.contains { $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2 }
+        let v2 = ads.contains(where: \.usesVideoPlanV2Contract)
         guard !v2 else { return }
         // Preserve video_v1's eager current + next preparation exactly.
         for playerIndex in retainedIndices where ads.indices.contains(playerIndex) {
@@ -912,6 +921,7 @@ final class FallbackAdPresenter {
         videoOwnership = ownership
         if ads[playerIndex].usesVideoPlanV2, let player = ownership.resource {
             player.setMuted(videoPlanScope?.isMuted ?? false)
+            player.attachVideoPlanScope(videoPlanScope)
         }
         return ownership.resource
     }
@@ -943,9 +953,10 @@ final class FallbackAdPresenter {
         loadingGeneration = nil
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
-        failureAdvanceState.clear()
+        terminalAdvanceState.clear()
         let videoPlanScope = videoPlanScope
         self.videoPlanScope = nil
+        videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
         videoPlanScope?.cancel()
         releaseVideoOwnership()
         videoPreparations.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }

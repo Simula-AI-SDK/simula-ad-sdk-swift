@@ -173,7 +173,7 @@ public struct MiniGameMenu: View {
     @State private var fallbackAds: [FallbackAd] = []
     @State private var fallbackAdIndex = 0
     @State private var fallbackVideoPlayer: FullscreenVideoPlayer?
-    @State private var fallbackFailureAdvanceState = FallbackFailureAdvanceState()
+    @State private var fallbackTerminalAdvanceState = FallbackTerminalAdvanceState()
     @State private var fallbackClickHandoffPending = false
     @State private var fallbackPresentationBlocked = false
     @State private var fallbackVideoPlanScope: VideoPlanPresentationScope?
@@ -316,15 +316,16 @@ public struct MiniGameMenu: View {
                 AdOverlayView(
                     ad: fallbackAd,
                     onClose: { handleAdIframeClose(from: renderedIndex) },
-                    onCreativeFailure: { handleFallbackCreativeFailure(from: renderedIndex) },
+                    onCreativeFailure: { handleFallbackTerminalAdvance(from: renderedIndex) },
                     onVideoCompleted: fallbackAd.usesVideoPlanV2
-                        ? { handleFallbackCreativeFailure(from: renderedIndex) }
+                        ? { handleFallbackTerminalAdvance(from: renderedIndex) }
                         : nil,
                     onVideoStarted: fallbackAd.usesVideoPlanV2
                         ? { prepareNextMiniGameFallbackVideo(after: renderedIndex) }
                         : nil,
                     videoPlayer: fallbackVideoPlayer,
                     videoPlanScope: fallbackVideoPlanScope,
+                    expectsVideoPlanNextStep: renderedIndex + 1 < fallbackAds.count,
                     playableHeightDp: lastGameWasBottomSheet ? lastGameHeightDp : nil,
                     playableBorderColor: theme.resolvedPlayableBorderColor,
                     adId: fallbackAd.adId,
@@ -739,9 +740,9 @@ public struct MiniGameMenu: View {
         if !ads.isEmpty {
             fallbackAds = ads
             fallbackVideoPlanScope?.cancel()
-            fallbackVideoPlanScope = ads.contains {
-                $0.usesVideoPlanV2Contract || $0.usesVideoPlanV2
-            } ? VideoPlanPresentationScope() : nil
+            fallbackVideoPlanScope = ads.contains(where: \.usesVideoPlanV2Contract)
+                ? VideoPlanPresentationScope()
+                : nil
             fallbackAdIndex = 0
             resetFallbackAdvanceState()
             prepareCurrentFallbackVideo()
@@ -794,15 +795,14 @@ public struct MiniGameMenu: View {
             showAdOverlay = false
             fallbackAds = []
             fallbackAdIndex = 0
-            fallbackVideoPlanScope?.nextStepFailed()
             fallbackVideoPlanScope?.cancel()
             fallbackVideoPlanScope = nil
         }
     }
 
-    private func handleFallbackCreativeFailure(from renderedIndex: Int) {
+    private func handleFallbackTerminalAdvance(from renderedIndex: Int) {
         guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
-        guard fallbackFailureAdvanceState.request(
+        guard fallbackTerminalAdvanceState.request(
             index: renderedIndex,
             blocked: fallbackClickHandoffPending || fallbackPresentationBlocked
         ) else { return }
@@ -812,25 +812,25 @@ public struct MiniGameMenu: View {
     private func updateFallbackClickHandoff(_ pending: Bool, renderedIndex: Int) {
         guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
         fallbackClickHandoffPending = pending
-        completeDeferredFallbackFailureIfPossible(renderedIndex: renderedIndex)
+        completeDeferredFallbackAdvanceIfPossible(renderedIndex: renderedIndex)
     }
 
     private func updateFallbackPresentationBlocker(_ blocked: Bool, renderedIndex: Int) {
         guard showAdOverlay, renderedIndex == fallbackAdIndex else { return }
         fallbackPresentationBlocked = blocked
-        completeDeferredFallbackFailureIfPossible(renderedIndex: renderedIndex)
+        completeDeferredFallbackAdvanceIfPossible(renderedIndex: renderedIndex)
     }
 
-    private func completeDeferredFallbackFailureIfPossible(renderedIndex: Int) {
+    private func completeDeferredFallbackAdvanceIfPossible(renderedIndex: Int) {
         guard !fallbackClickHandoffPending, !fallbackPresentationBlocked,
-              let pendingIndex = fallbackFailureAdvanceState.blockersDidClear(
+              let pendingIndex = fallbackTerminalAdvanceState.blockersDidClear(
                   currentIndex: renderedIndex
               ) else { return }
         handleAdIframeClose(from: pendingIndex)
     }
 
     private func resetFallbackAdvanceState() {
-        fallbackFailureAdvanceState.clear()
+        fallbackTerminalAdvanceState.clear()
         fallbackClickHandoffPending = false
         fallbackPresentationBlocked = false
     }
@@ -905,6 +905,7 @@ public struct MiniGameMenu: View {
         fallbackVideoPlayer = ownership.resource
         if fallbackAds[fallbackAdIndex].usesVideoPlanV2 {
             fallbackVideoPlayer?.setMuted(fallbackVideoPlanScope?.isMuted ?? false)
+            fallbackVideoPlayer?.attachVideoPlanScope(fallbackVideoPlanScope)
         }
         #endif
     }
@@ -936,7 +937,7 @@ public struct MiniGameMenu: View {
 
     private func prepareFallbackVideos(around index: Int) {
         #if os(iOS)
-        guard fallbackVideoPlanScope == nil else { return }
+        guard !fallbackAds.contains(where: \.usesVideoPlanV2Contract) else { return }
         for candidate in index...(index + 1) where fallbackAds.indices.contains(candidate) {
             guard fallbackVideoTokens[candidate] == nil,
                   case .video(let url, let posterURL) = fallbackAds[candidate].creativeContent else { continue }

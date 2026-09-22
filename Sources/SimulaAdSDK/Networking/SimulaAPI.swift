@@ -767,6 +767,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     public let bidAmt: Double
 
     var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var primaryUsesVideoPlanV2: Bool {
+        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+    }
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
     public var destinationKind: AdDestination {
@@ -1035,6 +1038,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     public let bidAmt: Double
 
     var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var primaryUsesVideoPlanV2: Bool {
+        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+    }
 
     /// The advertiser destination kind (App Store vs web); defaults to `.appstore`.
     public var destinationKind: AdDestination {
@@ -1302,8 +1308,10 @@ public struct FallbackAd: Sendable {
         AdDestination(rawValue: destination ?? "") ?? .appstore
     }
     var mediaType: CreativeMediaType { .from(type) }
-    var usesVideoPlanV2: Bool { creative?.usesVideoPlanV2 == true }
     var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var usesVideoPlanV2: Bool {
+        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+    }
     var hasIOSItemRoutingFields: Bool {
         [trackingUrl, iosStoreUrl].contains {
             $0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false

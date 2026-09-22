@@ -393,8 +393,7 @@ public final class SimulaInterstitialAd {
             }
             #if os(iOS)
             releasePreparedVideo()
-            let usesVideoPlanV2 = response.usesVideoPlanV2Contract
-                && response.creative?.usesVideoPlanV2 == true
+            let usesVideoPlanV2 = response.primaryUsesVideoPlanV2
             switch reserveFullscreenVideoPreparation(
                 for: creative,
                 startsMuted: !usesVideoPlanV2,
@@ -540,8 +539,7 @@ public final class SimulaInterstitialAd {
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
-        let primaryUsesVideoPlanV2 = response.usesVideoPlanV2Contract
-            && response.creative?.usesVideoPlanV2 == true
+        let primaryUsesVideoPlanV2 = response.primaryUsesVideoPlanV2
         if response.creative?.mediaType == .video {
             guard case .video(let url, let posterURL)? = response.creativeContent else {
                 admission.stop()
@@ -623,6 +621,9 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
+                    videoPlanScope?.closePendingHandoff(
+                        reason: FallbackOutcome.hostUnavailable.videoPlanCloseReason
+                    )
                     videoPlanScope?.cancel()
                     let terminalOutcome = admission.finish()
                     if terminalOutcome == .closed {
@@ -666,6 +667,7 @@ public final class SimulaInterstitialAd {
                     originalKeyWindow: originalKeyWindow,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
                         videoPlanScope?.cancel()
                         SimulaInterstitialAd.recordFallbackOutcome(
                             outcome,

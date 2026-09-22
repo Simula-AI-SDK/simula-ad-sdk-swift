@@ -651,9 +651,9 @@ public struct Creative: Sendable, Equatable, Decodable {
     }
 
     var mediaType: CreativeMediaType { .from(type) }
-    /// `clip_index` is emitted only by the fully planned V2 response. Do not infer V2 from a video
-    /// URL: doing so would silently change `video_v1` sequencing and audio behavior.
-    var usesVideoPlanV2: Bool { mediaType == .video && clipIndex != nil }
+    /// Slot-level V2 metadata. This never activates V2 by itself; callers must also require the
+    /// canonical response-level `video_plan_version` marker.
+    var isVideoPlanV2Clip: Bool { mediaType == .video && clipIndex != nil }
 
     var videoChromeTitle: String? {
         appName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
@@ -879,9 +879,9 @@ public enum OverlayPosition: Sendable, Equatable {
     }
 }
 
-/// SKOverlay (iOS) / Play Install Prompt (Android) config (`skoverlay` node): a native,
-/// SDK-presented install banner, independent of the creative click handler. Gated by the OS
-/// capability handshake — the backend won't assign it below iOS 14 / Android API 21.
+/// Native install-overlay config (`skoverlay` node), independent of the creative click handler.
+/// SKOverlay itself is iOS-only; Android uses its separate Play Install Prompt implementation.
+/// The backend gates assignment through the platform capability handshake.
 public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let timing: OverlayTiming

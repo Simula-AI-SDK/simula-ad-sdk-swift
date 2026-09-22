@@ -100,6 +100,15 @@ final class FallbackOutcomeTests: XCTestCase {
         }
     }
 
+    func testFallbackOutcomesUseCanonicalExpectedStepCloseReasons() {
+        XCTAssertNil(FallbackOutcome.completed.videoPlanCloseReason)
+        XCTAssertEqual(FallbackOutcome.noContent.videoPlanCloseReason, "no_next_step")
+        XCTAssertEqual(FallbackOutcome.loadingTimeout.videoPlanCloseReason, "next_step_timeout")
+        XCTAssertEqual(FallbackOutcome.fetchFailure.videoPlanCloseReason, "next_step_failed")
+        XCTAssertEqual(FallbackOutcome.presentationUnavailable.videoPlanCloseReason, "next_step_failed")
+        XCTAssertEqual(FallbackOutcome.hostUnavailable.videoPlanCloseReason, "next_step_failed")
+    }
+
     func testFallbackTelemetryIdentifierContractMatchesEachAdFormat() {
         XCTAssertEqual(
             FallbackTelemetryIdentifiers.rewarded(impressionId: "rewarded-impression"),

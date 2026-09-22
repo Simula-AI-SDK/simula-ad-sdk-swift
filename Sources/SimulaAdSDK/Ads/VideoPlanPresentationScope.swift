@@ -3,6 +3,11 @@ import Foundation
 let maxVideoPlanSKOverlayDelaySeconds = 60
 let defaultVideoPlanSKOverlayDelaySeconds = 3
 
+func videoPlanOverlayUsesPresentationWatchTotals(stage: String) -> Bool {
+    stage == FullscreenVideoTelemetryStage.skoverlayDismissed
+        || stage == FullscreenVideoTelemetryStage.skoverlayFailed
+}
+
 func effectiveVideoPlanSKOverlayConfig(
     isVideoPlanV2: Bool,
     config: SKOverlayConfig?
@@ -256,6 +261,48 @@ struct VideoPlanOverlayTelemetry: Sendable {
     let behavior: AdBehavior?
 }
 
+struct VideoPlanPresentationWatchTotals: Equatable, Sendable {
+    var mutedMilliseconds = 0
+    var unmutedMilliseconds = 0
+}
+
+/// Aggregates cumulative per-player snapshots without counting the same media interval twice.
+struct VideoPlanPresentationWatchAccounting<PlayerID: Hashable & Sendable>: Sendable {
+    private var latestByPlayer: [PlayerID: VideoPlanPresentationWatchTotals] = [:]
+    private(set) var totals = VideoPlanPresentationWatchTotals()
+
+    @discardableResult
+    mutating func update(
+        playerID: PlayerID,
+        mutedMilliseconds: Int,
+        unmutedMilliseconds: Int
+    ) -> VideoPlanPresentationWatchTotals {
+        let snapshot = VideoPlanPresentationWatchTotals(
+            mutedMilliseconds: max(0, mutedMilliseconds),
+            unmutedMilliseconds: max(0, unmutedMilliseconds)
+        )
+        let previous = latestByPlayer[playerID] ?? VideoPlanPresentationWatchTotals()
+        totals.mutedMilliseconds = addingWithoutOverflow(
+            totals.mutedMilliseconds,
+            max(0, snapshot.mutedMilliseconds - previous.mutedMilliseconds)
+        )
+        totals.unmutedMilliseconds = addingWithoutOverflow(
+            totals.unmutedMilliseconds,
+            max(0, snapshot.unmutedMilliseconds - previous.unmutedMilliseconds)
+        )
+        latestByPlayer[playerID] = VideoPlanPresentationWatchTotals(
+            mutedMilliseconds: max(previous.mutedMilliseconds, snapshot.mutedMilliseconds),
+            unmutedMilliseconds: max(previous.unmutedMilliseconds, snapshot.unmutedMilliseconds)
+        )
+        return totals
+    }
+
+    private func addingWithoutOverflow(_ value: Int, _ delta: Int) -> Int {
+        let (sum, overflow) = value.addingReportingOverflow(delta)
+        return overflow ? Int.max : sum
+    }
+}
+
 #if os(iOS)
 import StoreKit
 import UIKit
@@ -263,6 +310,7 @@ import UIKit
 @MainActor
 final class VideoPlanPresentationScope {
     private(set) var isMuted = false
+    private var watchAccounting = VideoPlanPresentationWatchAccounting<UUID>()
 
     private var clock: VideoPlanSKOverlayClock?
     private var deadlineTask: Task<Void, Never>?
@@ -285,6 +333,19 @@ final class VideoPlanPresentationScope {
         isMuted = muted
     }
 
+    @discardableResult
+    func updateWatchAccounting(
+        playerID: UUID,
+        mutedMilliseconds: Int,
+        unmutedMilliseconds: Int
+    ) -> VideoPlanPresentationWatchTotals {
+        watchAccounting.update(
+            playerID: playerID,
+            mutedMilliseconds: mutedMilliseconds,
+            unmutedMilliseconds: unmutedMilliseconds
+        )
+    }
+
     func firstVideoFrame(
         creative: Creative?,
         behavior: AdBehavior?,
@@ -300,7 +361,7 @@ final class VideoPlanPresentationScope {
         originatingScene: UIWindowScene,
         blocked: Bool
     ) {
-        guard !cancelled, creative?.usesVideoPlanV2 == true else { return }
+        guard !cancelled, creative?.isVideoPlanV2Clip == true else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let completion = handoffState.videoStarted(now: now) {
             recordHandoff(completion)
@@ -358,8 +419,12 @@ final class VideoPlanPresentationScope {
     }
 
     func nextStepFailed() {
+        closePendingHandoff(reason: FullscreenVideoTerminationReason.nextStepFailed)
+    }
+
+    func closePendingHandoff(reason: String?) {
         guard !cancelled else { return }
-        closePendingHandoffIfNeeded(reasonOverride: "next_step_failed")
+        closePendingHandoffIfNeeded(reasonOverride: reason)
     }
 
     private func completePendingHandoff(now: TimeInterval) {
@@ -371,6 +436,7 @@ final class VideoPlanPresentationScope {
         _ completion: VideoPlanHandoffCompletion<VideoPlanHandoffTelemetry>
     ) {
         let pendingHandoff = completion.origin
+        let watchTotals = watchAccounting.totals
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.handoff,
             adFormat: pendingHandoff.adFormat,
@@ -381,8 +447,8 @@ final class VideoPlanPresentationScope {
             creative: pendingHandoff.creative,
             behavior: pendingHandoff.behavior,
             muted: pendingHandoff.muted,
-            mutedWatchMs: pendingHandoff.mutedWatchMs,
-            unmutedWatchMs: pendingHandoff.unmutedWatchMs,
+            mutedWatchMs: watchTotals.mutedMilliseconds,
+            unmutedWatchMs: watchTotals.unmutedMilliseconds,
             videoPositionS: pendingHandoff.videoPositionS,
             durationS: pendingHandoff.durationS,
             reason: pendingHandoff.reason,
@@ -449,6 +515,7 @@ final class VideoPlanPresentationScope {
 
     private func closePendingHandoffIfNeeded(reasonOverride: String? = nil) {
         guard let pendingHandoff = handoffState.closePending() else { return }
+        let watchTotals = watchAccounting.totals
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.close,
             adFormat: pendingHandoff.adFormat,
@@ -459,8 +526,8 @@ final class VideoPlanPresentationScope {
             creative: pendingHandoff.creative,
             behavior: pendingHandoff.behavior,
             muted: pendingHandoff.muted,
-            mutedWatchMs: pendingHandoff.mutedWatchMs,
-            unmutedWatchMs: pendingHandoff.unmutedWatchMs,
+            mutedWatchMs: watchTotals.mutedMilliseconds,
+            unmutedWatchMs: watchTotals.unmutedMilliseconds,
             videoPositionS: pendingHandoff.videoPositionS,
             durationS: pendingHandoff.durationS,
             reason: reasonOverride ?? pendingHandoff.reason,
@@ -557,6 +624,10 @@ final class VideoPlanPresentationScope {
         on: String? = nil
     ) {
         guard let telemetry = overlayTelemetry else { return }
+        // Overlay shown is non-terminal and carries no presentation watch totals. Terminal overlay
+        // events are explicitly presentation-wide because they close the presentation-owned overlay.
+        let includesPresentationTotals = videoPlanOverlayUsesPresentationWatchTotals(stage: stage)
+        let watchTotals = includesPresentationTotals ? watchAccounting.totals : nil
         recordFullscreenVideoLifecycle(
             stage: stage,
             adFormat: telemetry.adFormat,
@@ -567,6 +638,8 @@ final class VideoPlanPresentationScope {
             creative: telemetry.creative,
             behavior: telemetry.behavior,
             muted: isMuted,
+            mutedWatchMs: watchTotals?.mutedMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds,
             errorCode: error,
             visibleS: visibleS,
             on: on
@@ -577,11 +650,25 @@ final class VideoPlanPresentationScope {
 @MainActor
 final class VideoPlanPresentationScope {
     private(set) var isMuted = false
+    private var watchAccounting = VideoPlanPresentationWatchAccounting<UUID>()
     func updateMuted(_ muted: Bool) { isMuted = muted }
+    @discardableResult
+    func updateWatchAccounting(
+        playerID: UUID,
+        mutedMilliseconds: Int,
+        unmutedMilliseconds: Int
+    ) -> VideoPlanPresentationWatchTotals {
+        watchAccounting.update(
+            playerID: playerID,
+            mutedMilliseconds: mutedMilliseconds,
+            unmutedMilliseconds: unmutedMilliseconds
+        )
+    }
     func videoTerminated(_ telemetry: VideoPlanHandoffTelemetry) {}
     func handoffBegan() {}
     func playableStepReady() {}
     func nextStepFailed() {}
+    func closePendingHandoff(reason: String?) {}
     func activateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
     func updateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64, blocked: Bool) {}
     func deactivateBlocker(owner: VideoPlanBlockerOwner, generation: UInt64) {}

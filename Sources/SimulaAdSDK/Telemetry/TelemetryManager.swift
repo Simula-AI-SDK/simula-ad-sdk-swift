@@ -63,8 +63,8 @@ struct CarrierInfo: Sendable {
 ///   error. Failed batches retry with exponential backoff.
 /// - **Bounded**: the buffer caps at `maxBuffer` (oldest non-critical event dropped) and distinct
 ///   error signatures at `maxErrorSignatures`; both surface a `dropped` meta event.
-/// - **Sampled / killable**: perf is sampled per session at `sampleRate`; the whole pipeline
-///   honors `isEnabled` (host opt-out always wins; the server can additionally disable it).
+/// - **Sampled / killable**: perf, including video telemetry, is sampled per session and each event
+///   carries `sample_rate`; the whole pipeline honors `isEnabled` (host opt-out always wins).
 ///
 /// `@unchecked Sendable` is safe: all mutable state is guarded by `lock`, and the async send
 /// happens off the lock. Collaborators are injected so the engine is exercised with an isolated

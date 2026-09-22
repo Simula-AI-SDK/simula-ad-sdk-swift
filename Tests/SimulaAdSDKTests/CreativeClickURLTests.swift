@@ -337,7 +337,7 @@ final class CreativeClickURLTests: XCTestCase {
     }
 
     func testRepeatedFailedVideoCloseWhileBlockedAdvancesExactlyOnceAfterBlockersClear() {
-        var state = FallbackFailureAdvanceState()
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 1, blocked: true))
         XCTAssertEqual(
             fallbackCloseRequestAction(

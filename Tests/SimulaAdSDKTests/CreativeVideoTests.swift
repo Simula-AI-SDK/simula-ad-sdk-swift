@@ -89,7 +89,7 @@ final class CreativeVideoTests: XCTestCase {
     func testVideoPlanV2CreativeAndStyleDecode() throws {
         let response = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,
+          "ad_inserted":true,"video_plan_version":"video_plan_v2",
           "creative":{
             "type":"video","url":"https://cdn.example/ad.mp4","cta":"Play Now",
             "app_icon_url":"https://cdn.example/icon.png","app_name":"Example Game",
@@ -100,7 +100,8 @@ final class CreativeVideoTests: XCTestCase {
         """#)
         let creative = try XCTUnwrap(response.creative)
 
-        XCTAssertTrue(creative.usesVideoPlanV2)
+        XCTAssertTrue(creative.isVideoPlanV2Clip)
+        XCTAssertTrue(response.primaryUsesVideoPlanV2)
         XCTAssertEqual(creative.cta, "Play Now")
         XCTAssertEqual(creative.appIconUrl, "https://cdn.example/icon.png")
         XCTAssertEqual(creative.appName, "Example Game")
@@ -168,7 +169,8 @@ final class CreativeVideoTests: XCTestCase {
         }
         """#)
 
-        XCTAssertFalse(response.creative?.usesVideoPlanV2 == true)
+        XCTAssertFalse(response.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(response.primaryUsesVideoPlanV2)
         XCTAssertNil(videoChromeConfiguration(
             creative: response.creative,
             behavior: response.adBehavior,
@@ -177,9 +179,37 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: false, status: .ended))
     }
 
+    func testClipMetadataNeverActivatesV2WithoutCanonicalResponseMarker() throws {
+        let interstitial = try decodeInterstitial(#"{"ad_inserted":true,"creative":{"type":"video","url":"https://cdn.example/a.mp4","clip_index":0,"video_plan_version":"video_plan_v2"}}"#)
+        let rewarded = try decodeRewarded(#"{"creative":{"type":"video","url":"https://cdn.example/b.mp4","clip_index":1}}"#)
+        let fallbacks = try decodeFallbacks(#"{"ads":[{"video_plan_version":"video_plan_v2","type":"video","url":"https://cdn.example/c.mp4","clip_index":2}]}"#)
+
+        XCTAssertTrue(interstitial.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(interstitial.primaryUsesVideoPlanV2)
+        XCTAssertTrue(rewarded.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(rewarded.primaryUsesVideoPlanV2)
+        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2Contract), [false])
+        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2), [false])
+        XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [0], "Markerless clips retain V1 preparation")
+    }
+
+    func testCanonicalMarkerStillRequiresVideoAndValidClipIndexPerSlot() throws {
+        let missing = try decodeInterstitial(#"{"ad_inserted":true,"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/a.mp4"}}"#)
+        let malformed = try decodeRewarded(#"{"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/b.mp4","clip_index":"1"}}"#)
+        let playable = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"HTML","clip_index":0}]}"#)
+
+        XCTAssertTrue(missing.usesVideoPlanV2Contract)
+        XCTAssertFalse(missing.primaryUsesVideoPlanV2)
+        XCTAssertTrue(malformed.usesVideoPlanV2Contract)
+        XCTAssertFalse(malformed.primaryUsesVideoPlanV2)
+        XCTAssertEqual(playable.map(\.usesVideoPlanV2Contract), [true])
+        XCTAssertEqual(playable.map(\.usesVideoPlanV2), [false])
+        XCTAssertEqual(upcomingFallbackVideoIndices(playable), [])
+    }
+
     func testNestedFallbackCreativePreservesV2SemanticIndexAndChrome() throws {
         let ads = try decodeFallbacks(#"""
-        {"ads":[{
+        {"video_plan_version":"video_plan_v2","ads":[{
           "ad_id":"es2",
           "creative":{"type":"video","url":"https://cdn.example/es2.mp4","cta":"Get","app_icon_url":"https://cdn.example/icon.png","app_name":"Game","video_pool":"trailer","clip_index":2},
           "ad_behavior":{"video":{"style":"floating_pill"}}
@@ -211,11 +241,23 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertEqual(primary.creativeContent, .playable(html: "PRIMARY"))
         XCTAssertTrue(primary.usesVideoPlanV2Contract)
-        XCTAssertFalse(primary.creative?.usesVideoPlanV2 == true)
+        XCTAssertFalse(primary.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(primary.primaryUsesVideoPlanV2)
         XCTAssertEqual(fallbacks.map(\.sourceIndex), [0, 1])
         XCTAssertEqual(fallbacks.map(\.renderedHtml), ["ES1", "ES2"])
         XCTAssertEqual(fallbacks.map { $0.creative?.clipIndex }, [1, 2])
         XCTAssertEqual(fallbacks.map(\.mediaType), [.playable, .playable])
+    }
+
+    func testPlayablePrimaryPreservesLaterV2FallbackFromFallbackRootMarker() throws {
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
+        let fallbacks = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"ES1"},{"type":"video","url":"https://cdn.example/es2.mp4","clip_index":2}]}"#)
+
+        XCTAssertTrue(primary.usesVideoPlanV2Contract)
+        XCTAssertFalse(primary.primaryUsesVideoPlanV2)
+        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2Contract), [true, true])
+        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2), [false, true])
+        XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [1])
     }
 
     func testVideoPlanSKOverlayDefaultsClampAndStayV2Only() {
@@ -233,6 +275,72 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertNil(effectiveVideoPlanSKOverlayConfig(
             isVideoPlanV2: true,
             config: SKOverlayConfig(enabled: false)
+        ))
+    }
+
+    func testCanonicalVideoTerminationReasonVocabulary() {
+        XCTAssertEqual(
+            FullscreenVideoTerminationReason.canonicalVocabulary,
+            Set([
+                "completed", "failed", "user", "no_next_step", "next_step_failed",
+                "next_step_timeout", "backgrounded", "store_presented",
+                "audio_interruption", "playback",
+            ])
+        )
+    }
+
+    func testFinalCompletedVideoClosesWithoutStartingHandoff() {
+        XCTAssertEqual(
+            videoPlanTerminalAction(
+                reason: FullscreenVideoTerminationReason.completed,
+                expectsNextStep: false,
+                playbackStarted: true
+            ),
+            .close(reason: "completed")
+        )
+        XCTAssertEqual(
+            videoPlanTerminalAction(
+                reason: FullscreenVideoTerminationReason.completed,
+                expectsNextStep: true,
+                playbackStarted: true
+            ),
+            .handoff(reason: "completed")
+        )
+    }
+
+    func testExpectedStepFailureIsDistinctFromStartedFinalClipFailure() {
+        XCTAssertEqual(
+            videoPlanTerminalAction(
+                reason: FullscreenVideoTerminationReason.failed,
+                expectsNextStep: false,
+                playbackStarted: false
+            ),
+            .failExpectedNextStep
+        )
+        XCTAssertEqual(
+            videoPlanTerminalAction(
+                reason: FullscreenVideoTerminationReason.failed,
+                expectsNextStep: false,
+                playbackStarted: true
+            ),
+            .close(reason: "failed")
+        )
+    }
+
+    func testFallbackVideoTelemetryUsesBaseAdFormat() {
+        XCTAssertEqual(fallbackVideoTelemetryAdFormat("interstitial"), "interstitial")
+        XCTAssertEqual(fallbackVideoTelemetryAdFormat("rewarded"), "rewarded")
+    }
+
+    func testOnlyTerminalOverlayEventsCarryPresentationWatchTotals() {
+        XCTAssertFalse(videoPlanOverlayUsesPresentationWatchTotals(
+            stage: FullscreenVideoTelemetryStage.skoverlayShown
+        ))
+        XCTAssertTrue(videoPlanOverlayUsesPresentationWatchTotals(
+            stage: FullscreenVideoTelemetryStage.skoverlayDismissed
+        ))
+        XCTAssertTrue(videoPlanOverlayUsesPresentationWatchTotals(
+            stage: FullscreenVideoTelemetryStage.skoverlayFailed
         ))
     }
 
@@ -484,10 +592,14 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertEqual(canonical.creative?.videoPool, "ugc")
         XCTAssertEqual(alias.creative?.videoPool, "gameplay")
-        XCTAssertTrue(canonical.creative?.usesVideoPlanV2 == true)
-        XCTAssertFalse(invalid.creative?.usesVideoPlanV2 == true)
+        XCTAssertTrue(canonical.creative?.isVideoPlanV2Clip == true)
+        XCTAssertTrue(canonical.primaryUsesVideoPlanV2)
+        XCTAssertTrue(alias.primaryUsesVideoPlanV2)
+        XCTAssertFalse(invalid.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(invalid.primaryUsesVideoPlanV2)
         XCTAssertTrue(playable.usesVideoPlanV2Contract)
-        XCTAssertFalse(playable.creative?.usesVideoPlanV2 == true)
+        XCTAssertFalse(playable.creative?.isVideoPlanV2Clip == true)
+        XCTAssertFalse(playable.primaryUsesVideoPlanV2)
     }
 
     func testFallbackNestedAndFlatMetadataMergePerField() throws {
@@ -535,6 +647,71 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertEqual(accounting.unmutedMilliseconds, 2_000)
         XCTAssertEqual(accounting.mutedMilliseconds, 1_250)
+    }
+
+    func testPresentationWatchAccountingAggregatesTwoClipsThroughFailurePlayableAndClose() {
+        var accounting = VideoPlanPresentationWatchAccounting<String>()
+
+        XCTAssertEqual(
+            accounting.update(playerID: "clip-1", mutedMilliseconds: 0, unmutedMilliseconds: 400),
+            VideoPlanPresentationWatchTotals(mutedMilliseconds: 0, unmutedMilliseconds: 400)
+        )
+        XCTAssertEqual(
+            accounting.update(playerID: "clip-1", mutedMilliseconds: 0, unmutedMilliseconds: 1_250),
+            VideoPlanPresentationWatchTotals(mutedMilliseconds: 0, unmutedMilliseconds: 1_250)
+        )
+
+        // Clip 2 fails after muted playback. A playable handoff and close add no video watch time.
+        XCTAssertEqual(
+            accounting.update(playerID: "clip-2", mutedMilliseconds: 350, unmutedMilliseconds: 0),
+            VideoPlanPresentationWatchTotals(mutedMilliseconds: 350, unmutedMilliseconds: 1_250)
+        )
+        XCTAssertEqual(
+            accounting.update(playerID: "clip-2", mutedMilliseconds: 900, unmutedMilliseconds: 0),
+            VideoPlanPresentationWatchTotals(mutedMilliseconds: 900, unmutedMilliseconds: 1_250)
+        )
+        XCTAssertEqual(accounting.totals.mutedMilliseconds, 900)
+        XCTAssertEqual(accounting.totals.unmutedMilliseconds, 1_250)
+    }
+
+    func testPresentationWatchAccountingDeduplicatesSnapshotsTerminalRetriesAndViewRecreation() {
+        var accounting = VideoPlanPresentationWatchAccounting<String>()
+
+        for _ in 0..<3 {
+            _ = accounting.update(
+                playerID: "clip-1-player",
+                mutedMilliseconds: 0,
+                unmutedMilliseconds: 1_000
+            )
+        }
+        // A stale recreated view cannot move a cumulative player snapshot backwards.
+        _ = accounting.update(
+            playerID: "clip-1-player",
+            mutedMilliseconds: 0,
+            unmutedMilliseconds: 700
+        )
+        _ = accounting.update(
+            playerID: "clip-1-player",
+            mutedMilliseconds: 0,
+            unmutedMilliseconds: 1_200
+        )
+
+        // A replacement player is a distinct attempt; its eligible playback counts once too.
+        for _ in 0..<2 {
+            _ = accounting.update(
+                playerID: "clip-1-retry-player",
+                mutedMilliseconds: 300,
+                unmutedMilliseconds: 0
+            )
+        }
+
+        XCTAssertEqual(
+            accounting.totals,
+            VideoPlanPresentationWatchTotals(
+                mutedMilliseconds: 300,
+                unmutedMilliseconds: 1_200
+            )
+        )
     }
 
     func testFinalVideoPlaybackAccountsMutedTail() {

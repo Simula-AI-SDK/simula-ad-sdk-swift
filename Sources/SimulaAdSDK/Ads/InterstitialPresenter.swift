@@ -119,6 +119,7 @@ final class InterstitialPresenter {
         self.onClose = onClose
         self.videoPlayer = videoPlayer
         self.videoPreparationOwnership = videoPreparationOwnership
+        videoPlayer?.attachVideoPlanScope(videoPlanScope)
 
         // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
         // hosting controller + window created below.
@@ -379,7 +380,7 @@ private struct CreativeInterstitialView: View {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
     }
     private var usesVideoPlanV2: Bool {
-        response.usesVideoPlanV2Contract && response.creative?.usesVideoPlanV2 == true
+        response.primaryUsesVideoPlanV2
     }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
@@ -764,12 +765,12 @@ private struct CreativeInterstitialView: View {
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
-            markVideoHandoff(player: player, reason: "complete")
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
                 status: status
             ) {
-                requestPrimaryCreativeFailure()
+                requestPrimaryTerminalAdvance()
             }
         case .failed(let reason):
             guard !videoFailureHandled else { return }
@@ -795,8 +796,8 @@ private struct CreativeInterstitialView: View {
                 errorCode: reason.rawValue,
                 breadcrumb: "surface=interstitial"
             )
-            markVideoHandoff(player: player, reason: "failed")
-            requestPrimaryCreativeFailure()
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.failed)
+            requestPrimaryTerminalAdvance()
         case .preparing:
             break
         }
@@ -866,7 +867,7 @@ private struct CreativeInterstitialView: View {
             terminal: videoFailureHandled || player.status.isTerminal
         ) == .failInterstitialDisplay else { return }
         videoFailureHandled = true
-        requestPrimaryCreativeFailure()
+        requestPrimaryTerminalAdvance()
     }
 
     private func updateVideoGate(
@@ -892,10 +893,12 @@ private struct CreativeInterstitialView: View {
     }
 
     private var videoPauseReason: String {
-        if !appForegrounded { return "backgrounded" }
-        if storeSheetPresented { return "store_presented" }
-        if videoPlayer?.hasActiveAudioInterruption == true { return "audio_interruption" }
-        return "playback"
+        if !appForegrounded { return FullscreenVideoTerminationReason.backgrounded }
+        if storeSheetPresented { return FullscreenVideoTerminationReason.storePresented }
+        if videoPlayer?.hasActiveAudioInterruption == true {
+            return FullscreenVideoTerminationReason.audioInterruption
+        }
+        return FullscreenVideoTerminationReason.playback
     }
 
     private func recordVideoSurfaceTelemetry(
@@ -938,12 +941,12 @@ private struct CreativeInterstitialView: View {
         )
     }
 
-    private func requestPrimaryCreativeFailure() {
+    private func requestPrimaryTerminalAdvance() {
         guard let _ = terminalState.request(true, blocked: terminalBlocked) else { return }
-        performPrimaryCreativeFailure()
+        performPrimaryTerminalAdvance()
     }
 
-    private func performPrimaryCreativeFailure() {
+    private func performPrimaryTerminalAdvance() {
         guard visible else { return }
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
@@ -960,7 +963,7 @@ private struct CreativeInterstitialView: View {
 
     private func completeDeferredTerminalIfPossible() {
         guard let _ = terminalState.blockersDidChange(blocked: terminalBlocked) else { return }
-        performPrimaryCreativeFailure()
+        performPrimaryTerminalAdvance()
     }
 
     private func handleVideoClick() {
@@ -1092,7 +1095,7 @@ private struct CreativeInterstitialView: View {
             clickHandoffPending: clickHandoffPending
         ) else { return }
         if let player = videoPlayer, usesVideoPlanV2 {
-            recordVideoClose(player: player, reason: "user")
+            recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
             videoPlanScope?.handoffBegan()
         }
         endSKANViewThroughImpression()
@@ -1104,6 +1107,7 @@ private struct CreativeInterstitialView: View {
     }
 
     private func recordVideoClose(player: FullscreenVideoPlayer, reason: String) {
+        let watchTotals = player.flushPresentationWatchAccounting()
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.close,
             adFormat: "interstitial", adUnitId: response.adUnitId,
@@ -1111,8 +1115,8 @@ private struct CreativeInterstitialView: View {
             isVideoPlanV2: usesVideoPlanV2,
             creative: response.creative, behavior: response.adBehavior,
             muted: player.isMuted,
-            mutedWatchMs: player.mutedWatchMilliseconds,
-            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
             videoPositionS: player.playedSeconds,
             durationS: player.duration,
             reason: reason,
@@ -1122,6 +1126,7 @@ private struct CreativeInterstitialView: View {
 
     private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
         guard usesVideoPlanV2 else { return }
+        _ = player.flushPresentationWatchAccounting()
         videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
             adFormat: "interstitial",
             adUnitId: response.adUnitId,

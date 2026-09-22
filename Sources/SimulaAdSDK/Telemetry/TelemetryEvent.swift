@@ -55,6 +55,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var cacheSource: String?
     /// Planned-video dimensions. Nil on legacy `video_v1` and non-video events.
     var clipIndex: Int?
+    /// SDK/player mute state; the hardware silent switch and host audio routing can still make an
+    /// unmuted clip inaudible, so this does not guarantee audibility.
     var muted: Bool?
     var impressionId: String?
     var style: String?
@@ -78,7 +80,8 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var eventAgeMs: Int?
     /// Occurrence count for a deduped error signature (mutable so repeats aggregate in place).
     var count: Int?
-    /// Effective performance sampling rate when this event entered the buffer.
+    /// Video lifecycle telemetry is sampled with other performance events and carries this effective
+    /// rate so backend aggregation can compensate for sampling.
     var sampleRate: Double?
 
     enum CodingKeys: String, CodingKey {

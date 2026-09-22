@@ -538,6 +538,42 @@ enum FullscreenVideoTelemetryStage {
     static let skoverlayFailed = "skoverlay_failed"
 }
 
+enum FullscreenVideoTerminationReason {
+    static let completed = "completed"
+    static let failed = "failed"
+    static let user = "user"
+    static let noNextStep = "no_next_step"
+    static let nextStepFailed = "next_step_failed"
+    static let nextStepTimeout = "next_step_timeout"
+    static let backgrounded = "backgrounded"
+    static let storePresented = "store_presented"
+    static let audioInterruption = "audio_interruption"
+    static let playback = "playback"
+
+    static let canonicalVocabulary: Set<String> = [
+        completed, failed, user, noNextStep, nextStepFailed, nextStepTimeout,
+        backgrounded, storePresented, audioInterruption, playback,
+    ]
+}
+
+enum VideoPlanTerminalAction: Equatable, Sendable {
+    case handoff(reason: String)
+    case close(reason: String)
+    case failExpectedNextStep
+}
+
+func videoPlanTerminalAction(
+    reason: String,
+    expectsNextStep: Bool,
+    playbackStarted: Bool
+) -> VideoPlanTerminalAction {
+    if reason == FullscreenVideoTerminationReason.completed {
+        return expectsNextStep ? .handoff(reason: reason) : .close(reason: reason)
+    }
+    if !playbackStarted { return .failExpectedNextStep }
+    return expectsNextStep ? .handoff(reason: reason) : .close(reason: reason)
+}
+
 struct VideoQuartileState: Equatable, Sendable {
     private var emitted: Set<Int> = []
 
@@ -571,7 +607,7 @@ struct VideoPauseTelemetryState: Equatable, Sendable {
 
     mutating func resume(now: TimeInterval) -> (reason: String, pausedMs: Double)? {
         guard let startedAt, now.isFinite, now >= startedAt else { return nil }
-        let result = (reason ?? "playback", (now - startedAt) * 1_000)
+        let result = (reason ?? FullscreenVideoTerminationReason.playback, (now - startedAt) * 1_000)
         self.startedAt = nil
         reason = nil
         return result
@@ -687,7 +723,7 @@ func videoChromeConfiguration(
     behavior: AdBehavior?,
     isVideoPlanV2: Bool
 ) -> VideoChromeConfiguration? {
-    guard isVideoPlanV2, let creative, creative.usesVideoPlanV2 else { return nil }
+    guard isVideoPlanV2, let creative, creative.isVideoPlanV2Clip else { return nil }
     let iconURL = validatedCreativeURL(creative.appIconUrl)
     let title = creative.videoChromeTitle
     return VideoChromeConfiguration(
@@ -858,7 +894,7 @@ import SwiftUI
 import UIKit
 
 /// Reference-counted because the next clip can become active before the prior player is released.
-/// The host's exact category/mode/options are restored when the last V2 player leaves playback.
+/// AVAudioSession activation is host-shared and intentionally never force-deactivated by the SDK.
 @MainActor
 private final class VideoAudioSessionCoordinator {
     static let shared = VideoAudioSessionCoordinator()
@@ -1060,6 +1096,8 @@ final class FullscreenVideoPlayer: ObservableObject {
     private var ownsAudioSessionClaim = false
     private var progressWatchdog: VideoProgressWatchdog
     private var firstFrameUptime: TimeInterval?
+    private let presentationWatchID = UUID()
+    private weak var videoPlanScope: VideoPlanPresentationScope?
 
     var isStopped: Bool { stopped }
     var hasAdmittedFirstVisualFrame: Bool { firstFrameDeadline.admitted }
@@ -1071,6 +1109,35 @@ final class FullscreenVideoPlayer: ObservableObject {
     var unmutedWatchMilliseconds: Int { audioWatchAccounting.unmutedMilliseconds }
     var secondsSinceVideoStart: Double? {
         firstFrameUptime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) }
+    }
+
+    func attachVideoPlanScope(_ scope: VideoPlanPresentationScope?) {
+        guard usesProgressWatchdog else { return }
+        videoPlanScope = scope
+        _ = reportPresentationWatchAccounting()
+    }
+
+    @discardableResult
+    func flushPresentationWatchAccounting() -> VideoPlanPresentationWatchTotals? {
+        guard usesProgressWatchdog else { return nil }
+        if !stopped, firstFrameDeadline.admitted {
+            let finalSnapshot = finalizeVideoPlayback(
+                clock: &visiblePlaybackClock,
+                accounting: &audioWatchAccounting,
+                finalMediaTime: player.currentTime().seconds,
+                isMuted: isMuted
+            )
+            playedSeconds = finalSnapshot.playedSeconds
+        }
+        return reportPresentationWatchAccounting()
+    }
+
+    private func reportPresentationWatchAccounting() -> VideoPlanPresentationWatchTotals? {
+        videoPlanScope?.updateWatchAccounting(
+            playerID: presentationWatchID,
+            mutedMilliseconds: audioWatchAccounting.mutedMilliseconds,
+            unmutedMilliseconds: audioWatchAccounting.unmutedMilliseconds
+        )
     }
 
     func fireInterruptionFallbackForTests() {
@@ -1195,6 +1262,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     func setMuted(_ muted: Bool) {
         guard !stopped, muted != isMuted else { return }
         audioWatchAccounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
+        _ = reportPresentationWatchAccounting()
         if !muted {
             audioTrackIsolation.unmute()
             isMuted = false
@@ -1233,6 +1301,7 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     func stop() {
         guard !stopped else { return }
+        _ = flushPresentationWatchAccounting()
         stopped = true
         wantsPlayback = false
         requiresUserResume = false
@@ -1411,8 +1480,10 @@ final class FullscreenVideoPlayer: ObservableObject {
         guard !stopped, firstFrameDeadline.admitted else { return }
         let seconds = time.seconds
         if seconds.isFinite, seconds >= 0 {
-            playedSeconds = visiblePlaybackClock.update(mediaTime: seconds)
-            audioWatchAccounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
+            let updatedPlayedSeconds = visiblePlaybackClock.update(mediaTime: seconds)
+            audioWatchAccounting.update(playedSeconds: updatedPlayedSeconds, isMuted: isMuted)
+            _ = reportPresentationWatchAccounting()
+            playedSeconds = updatedPlayedSeconds
         }
     }
 
@@ -1488,6 +1559,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             isMuted: isMuted
         )
         playedSeconds = finalSnapshot.playedSeconds
+        _ = reportPresentationWatchAccounting()
         wantsPlayback = false
         playbackTimeoutWorkItem?.cancel()
         playbackTimeoutWorkItem = nil
@@ -1504,6 +1576,7 @@ final class FullscreenVideoPlayer: ObservableObject {
 
     private func fail(_ reason: FullscreenVideoFailure) {
         guard !stopped, !isFailed, status != .ended else { return }
+        _ = flushPresentationWatchAccounting()
         firstFrameDeadline.fail()
         preparationTimeoutWorkItem?.cancel()
         preparationTimeoutWorkItem = nil
@@ -2179,7 +2252,7 @@ struct FullscreenVideoSurface: View {
     let controlsEnabled: Bool
     var chromeConfiguration: VideoChromeConfiguration? = nil
     var onMuteChanged: ((Bool) -> Void)? = nil
-    var telemetryPauseReason: () -> String = { "playback" }
+    var telemetryPauseReason: () -> String = { FullscreenVideoTerminationReason.playback }
     var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
     @State private var firstFrameHandoff = VideoSurfaceFirstFrameHandoffState()
     @State private var quartileState = VideoQuartileState()

@@ -719,8 +719,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ))
     }
 
-    func testFallbackFailureAdvanceWaitsForHandoff() {
-        var state = FallbackFailureAdvanceState()
+    func testFallbackTerminalAdvanceWaitsForHandoff() {
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 2, blocked: true))
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 2), 2)
@@ -728,8 +728,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(state.request(index: 3, blocked: false))
     }
 
-    func testFallbackFailureAdvanceAlsoWaitsForStoreSheet() {
-        var state = FallbackFailureAdvanceState()
+    func testFallbackTerminalAdvanceAlsoWaitsForStoreSheet() {
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 0, blocked: true))
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 0), 0)
@@ -759,8 +759,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ))
     }
 
-    func testDeclarativeFallbackFailureWaitsUntilEveryRouteBlockerClears() {
-        var state = FallbackFailureAdvanceState()
+    func testDeclarativeFallbackTerminalWaitsUntilEveryRouteBlockerClears() {
+        var state = FallbackTerminalAdvanceState()
         let clickPending = true
         let sheetPresented = true
         XCTAssertFalse(state.request(index: 1, blocked: clickPending || sheetPresented))
@@ -1350,7 +1350,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ), .requestFallbackFailureAdvance)
         var handoff = PendingFirstFrameHandoff<String>()
         handoff.activate("current-player")
-        var advance = FallbackFailureAdvanceState()
+        var advance = FallbackTerminalAdvanceState()
 
         XCTAssertTrue(handoff.claimPreFirstFrameFailure("current-player"))
         XCTAssertFalse(advance.request(index: 1, blocked: true))

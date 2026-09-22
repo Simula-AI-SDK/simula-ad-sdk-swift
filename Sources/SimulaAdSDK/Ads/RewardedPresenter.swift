@@ -74,6 +74,7 @@ final class RewardedPresenter {
         self.onClose = onClose
         self.videoPlayer = videoPlayer
         self.videoPreparationOwnership = videoPreparationOwnership
+        videoPlayer?.attachVideoPlanScope(videoPlanScope)
 
         // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
         // orientation lock, and device/audio/orientation queries. Owned here so the orientation
@@ -438,7 +439,7 @@ private struct RewardedGameView: View {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
     }
     private var usesVideoPlanV2: Bool {
-        videoPlanScope != nil && creative?.usesVideoPlanV2 == true
+        videoPlanScope != nil && creative?.isVideoPlanV2Clip == true
     }
     private var videoTelemetryBehavior: AdBehavior {
         AdBehavior(skoverlay: skOverlay, video: videoBehavior)
@@ -984,7 +985,7 @@ private struct RewardedGameView: View {
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
-            markVideoHandoff(player: player, reason: "complete")
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
                 status: status
@@ -1013,8 +1014,8 @@ private struct RewardedGameView: View {
                 errorCode: reason.rawValue,
                 breadcrumb: "surface=rewarded"
             )
-            markVideoHandoff(player: player, reason: "failed")
-            requestCreativeFailure()
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.failed)
+            requestTerminalAdvance()
         case .preparing:
             break
         }
@@ -1081,7 +1082,7 @@ private struct RewardedGameView: View {
             terminal: videoFailureHandled || player.status.isTerminal
         ) == .finishRewardedUnearned else { return }
         videoFailureHandled = true
-        requestCreativeFailure()
+        requestTerminalAdvance()
     }
 
     private func updateVideoGate(
@@ -1106,10 +1107,12 @@ private struct RewardedGameView: View {
     }
 
     private var videoPauseReason: String {
-        if !appForegrounded { return "backgrounded" }
-        if storeSheetPresented { return "store_presented" }
-        if videoPlayer?.hasActiveAudioInterruption == true { return "audio_interruption" }
-        return "playback"
+        if !appForegrounded { return FullscreenVideoTerminationReason.backgrounded }
+        if storeSheetPresented { return FullscreenVideoTerminationReason.storePresented }
+        if videoPlayer?.hasActiveAudioInterruption == true {
+            return FullscreenVideoTerminationReason.audioInterruption
+        }
+        return FullscreenVideoTerminationReason.playback
     }
 
     private func recordVideoSurfaceTelemetry(
@@ -1369,13 +1372,14 @@ private struct RewardedGameView: View {
             clickHandoffPending: clickHandoffPending
         ) else { return }
         if let player = videoPlayer, usesVideoPlanV2 {
-            recordVideoClose(player: player, reason: "user")
+            recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
             videoPlanScope?.handoffBegan()
         }
         requestTerminal(earned: earned)
     }
 
     private func recordVideoClose(player: FullscreenVideoPlayer, reason: String) {
+        let watchTotals = player.flushPresentationWatchAccounting()
         recordFullscreenVideoLifecycle(
             stage: FullscreenVideoTelemetryStage.close,
             adFormat: "rewarded", adUnitId: adUnitId,
@@ -1383,8 +1387,8 @@ private struct RewardedGameView: View {
             isVideoPlanV2: usesVideoPlanV2,
             creative: creative, behavior: videoTelemetryBehavior,
             muted: player.isMuted,
-            mutedWatchMs: player.mutedWatchMilliseconds,
-            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
             videoPositionS: player.playedSeconds,
             durationS: player.duration,
             reason: reason,
@@ -1394,6 +1398,7 @@ private struct RewardedGameView: View {
 
     private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
         guard usesVideoPlanV2 else { return }
+        _ = player.flushPresentationWatchAccounting()
         videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
             adFormat: "rewarded",
             adUnitId: adUnitId,
@@ -1411,7 +1416,7 @@ private struct RewardedGameView: View {
         ))
     }
 
-    private func requestCreativeFailure() {
+    private func requestTerminalAdvance() {
         requestTerminal(earned: rewardEarned)
     }
 
