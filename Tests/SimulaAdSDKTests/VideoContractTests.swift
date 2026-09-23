@@ -1013,14 +1013,11 @@ final class VideoAssetCacheTests: XCTestCase {
         oldURLs.append(partial)
         let cache = VideoAssetCache(rootURL: root, downloader: FakeVideoDownloader(bytes: 8))
 
-        let current = try XCTUnwrap(URL(string: "https://cdn.example/current.mp4"))
-        var lease = try? await cache.acquire(current)
-        for _ in 0..<100 where oldURLs.contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-            await Task.yield()
-        }
+        try await cache.waitUntilMaintenanceComplete()
         XCTAssertTrue(oldURLs.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
-        if lease == nil { lease = try await cache.acquire(current) }
-        lease?.release()
+        let current = try XCTUnwrap(URL(string: "https://cdn.example/current.mp4"))
+        let lease = try await cache.acquire(current)
+        lease.release()
         await cache.waitUntilIdle()
     }
 

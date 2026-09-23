@@ -161,6 +161,7 @@ actor VideoAssetCache {
     private var cacheIndex: [String: CacheFile] = [:]
     private var cacheIndexReady = false
     private var maintenanceContinuationScheduled = false
+    private var maintenanceWaiters: [CheckedContinuation<Void, Never>] = []
     private var backgroundWorkerCount = 0
 
     init(
@@ -205,6 +206,14 @@ actor VideoAssetCache {
                 maintenanceContinuationScheduled ||
                 backgroundWorkerCount > 0 {
             await Task.yield()
+        }
+    }
+
+    func waitUntilMaintenanceComplete() async throws {
+        try prepareDirectory()
+        guard maintenanceContinuationScheduled else { return }
+        await withCheckedContinuation { continuation in
+            maintenanceWaiters.append(continuation)
         }
     }
 
@@ -473,7 +482,9 @@ actor VideoAssetCache {
     private func prepareDirectory() throws {
         try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
         try? (rootURL as NSURL).setResourceValue(true, forKey: .isExcludedFromBackupKey)
+        guard !cacheIndexReady, !maintenanceContinuationScheduled else { return }
         scanMaintenanceBatch()
+        if !cacheIndexReady { scheduleMaintenanceContinuation() }
     }
 
     private func validAsset(at url: URL) -> Bool {
@@ -607,7 +618,6 @@ actor VideoAssetCache {
             }
         }
         enforceFileCountLimit()
-        if !cacheIndexReady { scheduleMaintenanceContinuation() }
     }
 
     private func scheduleMaintenanceContinuation() {
@@ -617,18 +627,19 @@ actor VideoAssetCache {
         Task { [weak self] in
             guard let self else { return }
             await self.runMaintenanceContinuation()
-            await self.backgroundWorkerFinished()
         }
     }
 
     private func runMaintenanceContinuation() async {
-        await Task.yield()
-        continueMaintenance()
-    }
-
-    private func continueMaintenance() {
+        while !cacheIndexReady {
+            await Task.yield()
+            scanMaintenanceBatch()
+        }
         maintenanceContinuationScheduled = false
-        scanMaintenanceBatch()
+        backgroundWorkerFinished()
+        let waiters = maintenanceWaiters
+        maintenanceWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     private func backgroundWorkerFinished() {
