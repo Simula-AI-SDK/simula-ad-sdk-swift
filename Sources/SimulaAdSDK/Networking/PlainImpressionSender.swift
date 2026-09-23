@@ -100,6 +100,12 @@ final class BoundedPublicNetworkHostResolver: PublicNetworkHostResolving, @unche
     private let monotonicNow: @Sendable () -> TimeInterval
     private let lookup: @Sendable (String) -> [String]?
 
+    internal var pendingRequestCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return pending.count
+    }
+
     init(
         maximumWorkers: Int = publicNetworkResolverMaximumWorkers,
         maximumPending: Int = publicNetworkResolverMaximumPending,

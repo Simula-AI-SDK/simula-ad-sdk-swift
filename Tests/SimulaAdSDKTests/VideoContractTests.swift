@@ -703,7 +703,7 @@ final class VideoContractTests: XCTestCase {
         let active = Task { try await resolver.resolve("active.example", deadline: deadline) }
         XCTAssertEqual(workerStarted.wait(timeout: .now() + 1), .success)
         let queued = Task { try await resolver.resolve("queued.example", deadline: deadline) }
-        await Task.yield()
+        while resolver.pendingRequestCount == 0 { await Task.yield() }
 
         do {
             _ = try await resolver.resolve("overflow.example", deadline: deadline)
