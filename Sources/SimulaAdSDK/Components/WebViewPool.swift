@@ -405,11 +405,12 @@ func creativeUserActivationScriptSource(
         } catch (_) { return true; }
       }
 
-      function isExternalHTTPCTA(url) {
+      function isExternalCTA(url) {
         if (isInternalCTA(url) || isSameOriginCTA(url)) { return false; }
         try {
           var protocol = new URL(url, document.baseURI).protocol;
-          return protocol === 'http:' || protocol === 'https:';
+          return protocol === 'http:' || protocol === 'https:' ||
+            protocol === 'itms-apps:' || protocol === 'itms-appss:';
         } catch (_) { return false; }
       }
 
@@ -453,7 +454,7 @@ func creativeUserActivationScriptSource(
 
       function forwardCTA(value) {
         var url = resolvedURL(value);
-        if (!url || !isExternalHTTPCTA(url)) { return false; }
+        if (!url || !isExternalCTA(url)) { return false; }
         return claimGesture({
           type: 'SIMULA_CTA_OPEN',
           url: url,
@@ -473,7 +474,7 @@ func creativeUserActivationScriptSource(
         var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
         if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
         if (forwardCTA(anchor.href)) { event.preventDefault(); }
-      }, false);
+      }, true);
     })();
     """
 }
