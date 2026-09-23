@@ -316,6 +316,16 @@ enum VideoTimeControlEvent: Equatable, Sendable {
     case unknown
 }
 
+#if os(iOS)
+private enum FullscreenVideoObserverEvent: Sendable {
+    case ended
+    case failedToPlayToEnd
+    case applicationActive(Bool)
+    case audioInterruptionBegan
+    case audioInterruptionEnded(shouldResume: Bool)
+}
+#endif
+
 enum VideoTimeControlEffect: Equatable, Sendable {
     case beganPlaying
     case paused
@@ -1174,7 +1184,7 @@ private final class VideoAudioTrackIsolation {
             object: item,
             queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.mediaSelectionDidChange() }
+            self?.enqueueMediaSelectionDidChange()
         }
     }
 
@@ -1222,6 +1232,14 @@ private final class VideoAudioTrackIsolation {
         // Preserve baselines captured before the SDK disabled existing tracks. The notification may
         // reflect our own disabled state; only newly identifiable audio tracks capture a new baseline.
         reconcile { policy, snapshots in policy.tracksDidChange(snapshots) }
+    }
+
+    private nonisolated func enqueueMediaSelectionDidChange() {
+        Task { @MainActor [weak self] in self?.deliverMediaSelectionDidChange() }
+    }
+
+    private func deliverMediaSelectionDidChange() {
+        mediaSelectionDidChange()
     }
 
     private func snapshots() -> [VideoAudioTrackSnapshot<UUID>] {
@@ -1580,36 +1598,79 @@ final class FullscreenVideoPlayer: ObservableObject {
                 forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
                 queue: .main
             ) { [weak self] time in
+                // This callback only publishes the coalesced 4 Hz progress sample. Keep it direct so
+                // a second queued high-frequency update path cannot accumulate behind the player.
                 MainActor.assumeIsolated { self?.handlePeriodicTime(time) }
             }
             notificationObservers.append(center.addObserver(
                 forName: .AVPlayerItemDidPlayToEndTime,
                 object: item,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.handleEnded() } })
+            ) { [weak self] _ in self?.enqueueObserverEvent(.ended) })
             notificationObservers.append(center.addObserver(
                 forName: .AVPlayerItemFailedToPlayToEndTime,
                 object: item,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.fail(.playbackFailed) } })
+            ) { [weak self] _ in self?.enqueueObserverEvent(.failedToPlayToEnd) })
         }
         notificationObservers.append(center.addObserver(
             forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in MainActor.assumeIsolated { self?.receiveApplicationActiveState(false) } })
+        ) { [weak self] _ in self?.enqueueObserverEvent(.applicationActive(false)) })
         notificationObservers.append(center.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in MainActor.assumeIsolated { self?.receiveApplicationActiveState(true) } })
+        ) { [weak self] _ in self?.enqueueObserverEvent(.applicationActive(true)) })
         notificationObservers.append(center.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            MainActor.assumeIsolated { self?.handleAudioInterruption(notification) }
+            self?.enqueueAudioInterruption(notification)
         })
+    }
+
+    /// AVFoundation and UIKit deliver these notifications on main, but publishing terminal or
+    /// lifecycle state inside their callback can synchronously tear down the player from SwiftUI.
+    /// Keep the Task body to one named actor method for affected Swift optimizer versions.
+    private nonisolated func enqueueObserverEvent(_ event: FullscreenVideoObserverEvent) {
+        Task { @MainActor [weak self] in self?.deliverObserverEvent(event) }
+    }
+
+    private nonisolated func enqueueAudioInterruption(_ notification: Notification) {
+        guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            enqueueObserverEvent(.audioInterruptionBegan)
+        case .ended:
+            enqueueObserverEvent(.audioInterruptionEnded(
+                shouldResume: videoInterruptionShouldResume(notification.userInfo)
+            ))
+        @unknown default:
+            break
+        }
+    }
+
+    private func deliverObserverEvent(_ event: FullscreenVideoObserverEvent) {
+        switch event {
+        case .ended:
+            handleEnded()
+        case .failedToPlayToEnd:
+            fail(.playbackFailed)
+        case .applicationActive(let active):
+            receiveApplicationActiveState(active)
+        case .audioInterruptionBegan:
+            receiveAudioInterruption(type: .began)
+        case .audioInterruptionEnded(let shouldResume):
+            receiveAudioInterruptionEnded(shouldResume: shouldResume)
+        }
+    }
+
+    func enqueueEndedObserverCallbackForTests() {
+        enqueueObserverEvent(.ended)
     }
 
     private func removeObservers() {
@@ -1863,12 +1924,6 @@ final class FullscreenVideoPlayer: ObservableObject {
         reconcilePlayback()
     }
 
-    private func handleAudioInterruption(_ notification: Notification) {
-        guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
-        receiveAudioInterruption(type: type, userInfo: notification.userInfo)
-    }
-
     func receiveAudioInterruption(
         type: AVAudioSession.InterruptionType,
         userInfo: [AnyHashable: Any]? = nil
@@ -1881,18 +1936,25 @@ final class FullscreenVideoPlayer: ObservableObject {
             reconcilePlayback()
             scheduleUnmatchedInterruptionFallback()
         case .ended:
-            interruptionFallbackWorkItem?.cancel()
-            interruptionFallbackWorkItem = nil
-            audioInterrupted = false
-            let action = videoInterruptionEndAction(
-                pausedByInterruption: interruptionPausedPlayback,
-                userInfo: userInfo
-            )
-            interruptionPausedPlayback = false
-            applyInterruptionEndAction(action)
+            receiveAudioInterruptionEnded(shouldResume: videoInterruptionShouldResume(userInfo))
         @unknown default:
             break
         }
+    }
+
+    private func receiveAudioInterruptionEnded(shouldResume: Bool) {
+        interruptionFallbackWorkItem?.cancel()
+        interruptionFallbackWorkItem = nil
+        audioInterrupted = false
+        let action = videoInterruptionEndAction(
+            pausedByInterruption: interruptionPausedPlayback,
+            userInfo: [
+                AVAudioSessionInterruptionOptionKey:
+                    shouldResume ? AVAudioSession.InterruptionOptions.shouldResume.rawValue : 0,
+            ]
+        )
+        interruptionPausedPlayback = false
+        applyInterruptionEndAction(action)
     }
 
     func applyInterruptionEndAction(_ action: VideoInterruptionEndAction) {

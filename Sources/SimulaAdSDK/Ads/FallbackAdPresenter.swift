@@ -379,6 +379,38 @@ enum FallbackCreativeFailureResolution: Equatable, Sendable {
     case finishUnavailable
 }
 
+enum FallbackLoadingSurface: Equatable, Sendable {
+    case initialFetch(generation: Int)
+    case videoPreparation(index: Int, generation: UUID)
+}
+
+enum FallbackLoadingSkipResolution: Equatable, Sendable {
+    case cancelInitialFetch
+    case resolveVideoPreparationFailure(FallbackCreativeFailureResolution)
+    case stale
+}
+
+func fallbackLoadingSkipResolution(
+    surface: FallbackLoadingSurface,
+    activeInitialFetchGeneration: Int?,
+    currentIndex: Int,
+    currentVideoPreparationGeneration: UUID?,
+    screenCount: Int
+) -> FallbackLoadingSkipResolution {
+    switch surface {
+    case .initialFetch(let generation):
+        return activeInitialFetchGeneration == generation ? .cancelInitialFetch : .stale
+    case .videoPreparation(let renderedIndex, let generation):
+        guard renderedIndex == currentIndex,
+              currentVideoPreparationGeneration == generation else { return .stale }
+        return .resolveVideoPreparationFailure(fallbackCreativeFailureResolution(
+            renderedIndex: renderedIndex,
+            currentIndex: currentIndex,
+            screenCount: screenCount
+        ))
+    }
+}
+
 func fallbackCreativeFailureResolution(
     renderedIndex: Int,
     currentIndex: Int,
@@ -707,7 +739,8 @@ final class FallbackAdPresenter {
 
         self.originalKeyWindow = originalKeyWindow
 
-        let hosting = UIHostingController(rootView: loadingView())
+        let loadingSurface = loadingGeneration.map(FallbackLoadingSurface.initialFetch)
+        let hosting = UIHostingController(rootView: loadingView(surface: loadingSurface))
         hosting.view.backgroundColor = .black
         hosting.view.isOpaque = true
 
@@ -816,7 +849,7 @@ final class FallbackAdPresenter {
 
     /// `.id` gives each screen fresh overlay state while the opaque host itself stays installed.
     private func adView(at index: Int, initialOriginatingScene: UIWindowScene? = nil) -> AnyView {
-        guard ads.indices.contains(index) else { return loadingView() }
+        guard ads.indices.contains(index) else { return loadingView(surface: nil) }
         let ad = ads[index]
         let isFinalScreen = index == ads.indices.last
         let videoRoute = ad.mediaType == .video ? fallbackVideoCTARoute(
@@ -895,36 +928,56 @@ final class FallbackAdPresenter {
         ).id(index))
     }
 
-    private func loadingView() -> AnyView {
+    private func loadingView(surface: FallbackLoadingSurface?) -> AnyView {
         AnyView(
             ZStack {
                 Color.black
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                Button(action: { [weak self] in self?.cancelLoadingSurface() }) {
-                    Text("Skip")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 14)
-                        .frame(height: 36)
-                        .background(Color.white.opacity(0.16))
-                        .clipShape(Capsule())
+                if let surface {
+                    Button(action: { [weak self] in self?.cancelLoadingSurface(surface: surface) }) {
+                        Text("Skip")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .frame(height: 36)
+                            .background(Color.white.opacity(0.16))
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 }
-                .buttonStyle(.plain)
-                .padding(16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
             .ignoresSafeArea()
         )
     }
 
-    private func cancelLoadingSurface() {
-        guard window != nil,
-              let outcome = presentationCoordinator.presentationUnavailable() else { return }
-        let cancelFetch = onLoadingTimeout
-        onLoadingTimeout = nil
-        cancelFetch?()
-        dismiss(outcome: outcome)
+    private func cancelLoadingSurface(surface: FallbackLoadingSurface) {
+        guard window != nil else { return }
+        switch fallbackLoadingSkipResolution(
+            surface: surface,
+            activeInitialFetchGeneration: isLoading ? loadingGeneration : nil,
+            currentIndex: index,
+            currentVideoPreparationGeneration: videoPreparationGenerations[index],
+            screenCount: ads.count
+        ) {
+        case .cancelInitialFetch:
+            guard let outcome = presentationCoordinator.presentationUnavailable() else { return }
+            let cancelFetch = onLoadingTimeout
+            onLoadingTimeout = nil
+            cancelFetch?()
+            dismiss(outcome: outcome)
+        case .resolveVideoPreparationFailure(.advance),
+             .resolveVideoPreparationFailure(.finishUnavailable):
+            let failedIndex = index
+            releaseVideoPreparation(at: failedIndex)
+            failCreativeAfterTerminal(from: failedIndex)
+        case .resolveVideoPreparationFailure(.ignore):
+            return
+        case .stale:
+            return
+        }
     }
 
     /// Reveal the next screen on each close tap; tear down after the last one.
@@ -1018,8 +1071,15 @@ final class FallbackAdPresenter {
             isVideo: ads[index].mediaType == .video,
             hasPreparedPlayer: currentPlayer != nil
         ) == .prepare {
-            hostingController?.rootView = loadingView()
             scheduleVideoPreparation(at: index)
+            guard let generation = videoPreparationGenerations[index] else {
+                failCreativeAfterTerminal(from: index)
+                return
+            }
+            hostingController?.rootView = loadingView(surface: .videoPreparation(
+                index: index,
+                generation: generation
+            ))
             armCurrentVideoPreparationDeadline(at: index)
             return
         }

@@ -2,6 +2,7 @@ import XCTest
 @testable import SimulaAdSDK
 #if os(iOS)
 import AVFoundation
+import Combine
 #endif
 
 final class FullscreenPresentationAdmissionTests: XCTestCase {
@@ -2254,10 +2255,44 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             object: nil,
             userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
         )
+        XCTAssertFalse(
+            player.hasActiveAudioInterruption,
+            "notification delivery must return before publishing interruption state"
+        )
         await waitUntil { player.hasActiveAudioInterruption }
         XCTAssertEqual(player.status, .preparing)
         XCTAssertFalse(player.status.isTerminal)
         XCTAssertTrue(player.hasActiveAudioInterruption)
+    }
+
+    @MainActor
+    func testTerminalObserverSchedulesTeardownAfterCallbackReturnsExactlyOnce() async {
+        let player = FullscreenVideoPlayer.makeStateTestingPlayer(
+            url: URL(fileURLWithPath: "/dev/null"),
+            posterURL: nil
+        )
+        XCTAssertTrue(player.admitFirstVisualFrame())
+        var callbackReturned = false
+        var terminalPublications = 0
+        var teardownRanAfterCallback = false
+        let observation = player.$status.dropFirst().sink { status in
+            guard status.isTerminal else { return }
+            terminalPublications += 1
+            teardownRanAfterCallback = callbackReturned
+            player.stop()
+        }
+
+        player.enqueueEndedObserverCallbackForTests()
+        XCTAssertFalse(player.isStopped)
+        XCTAssertEqual(terminalPublications, 0)
+        callbackReturned = true
+        await waitUntil { player.isStopped }
+
+        player.enqueueEndedObserverCallbackForTests()
+        await Task.yield()
+        XCTAssertTrue(teardownRanAfterCallback)
+        XCTAssertEqual(terminalPublications, 1)
+        withExtendedLifetime(observation) {}
     }
 
     @MainActor
