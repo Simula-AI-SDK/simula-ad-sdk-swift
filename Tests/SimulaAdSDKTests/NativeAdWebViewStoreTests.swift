@@ -49,7 +49,16 @@ final class NativeAdWebViewStoreTests: XCTestCase {
         let newId = UUID().uuidString
         let first = attach(oldId, key: "creative-a")
 
-        NativeAdWebViewStore.shared.rebind(first.webView, from: oldId, to: newId, creativeKey: "creative-b")
+        NativeAdWebViewStore.shared.rebind(
+            first.webView,
+            from: oldId,
+            to: newId,
+            creativeKey: "creative-b",
+            clickSource: .fallbackCTA
+        )
+        XCTAssertTrue(first.webView.configuration.userContentController.userScripts.contains {
+            $0.source.contains("var slotClickSource = 'fallback_cta'")
+        })
         // The new creative finishes loading in the same view.
         NativeAdWebViewStore.markLoadSucceeded(viewID: ObjectIdentifier(first.webView))
 

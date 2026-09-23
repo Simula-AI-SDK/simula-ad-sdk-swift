@@ -45,6 +45,76 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         }
     }
 
+    #if os(iOS)
+    @MainActor
+    func testAudioCoordinatorFinalReleaseOnlyClearsSDKAccounting() {
+        var activations = 0
+        let coordinator = VideoAudioSessionCoordinator(activate: { activations += 1; return true })
+
+        XCTAssertTrue(coordinator.claim())
+        XCTAssertTrue(coordinator.claim())
+        XCTAssertEqual(activations, 1)
+        coordinator.release()
+        XCTAssertTrue(coordinator.claim(), "overlapping claims must share the existing activation")
+        XCTAssertEqual(activations, 1)
+        coordinator.release()
+        coordinator.release()
+        coordinator.release()
+        XCTAssertTrue(coordinator.claim(), "final release must permit a later best-effort activation")
+        XCTAssertEqual(activations, 2)
+        coordinator.release()
+    }
+
+    @MainActor
+    func testAudioCoordinatorFailedActivationCreatesNoLogicalClaim() {
+        var activations = 0
+        let coordinator = VideoAudioSessionCoordinator(activate: {
+            activations += 1
+            return activations > 1
+        })
+
+        XCTAssertFalse(coordinator.claim())
+        coordinator.release()
+        XCTAssertTrue(coordinator.claim())
+        XCTAssertEqual(activations, 2)
+        coordinator.release()
+    }
+
+    @MainActor
+    func testIdleTimerCoordinatorRestoresHostValueAfterOverlappingTerminalReleases() {
+        var hostValue = false
+        var writes: [Bool] = []
+        let coordinator = VideoIdleTimerCoordinator(
+            read: { hostValue },
+            write: { hostValue = $0; writes.append($0) }
+        )
+        coordinator.claim()
+        coordinator.claim()
+        coordinator.release()
+        XCTAssertTrue(hostValue)
+        coordinator.release()
+        XCTAssertFalse(hostValue)
+        XCTAssertEqual(writes, [true, false])
+    }
+
+    @MainActor
+    func testIdleTimerCoordinatorDoesNotOverwriteHostChange() {
+        var hostValue = false
+        var writes: [Bool] = []
+        let coordinator = VideoIdleTimerCoordinator(
+            read: { hostValue },
+            write: { hostValue = $0; writes.append($0) }
+        )
+        coordinator.claim()
+        hostValue = false
+
+        coordinator.release()
+
+        XCTAssertFalse(hostValue)
+        XCTAssertEqual(writes, [true])
+    }
+    #endif
+
     func testVideoFailureNeverEarnsBeforeGateEvenAfterFirstFrame() {
         let beforeFrame = rewardedTerminalOutcome(earned: false, actualElapsedPlayTime: 0)
         let afterFrame = rewardedTerminalOutcome(earned: false, actualElapsedPlayTime: 2.5)
@@ -735,8 +805,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(state.blockersDidClear(currentIndex: 0), 0)
     }
 
-    func testFallbackHTMLCountdownStartsAtMountWhileVideoWaitsForFirstFrame() {
-        XCTAssertTrue(shouldRunFallbackCountdown(
+    func testFallbackCountdownWaitsForRenderAdmissionAndEveryBlocker() {
+        XCTAssertFalse(shouldRunFallbackCountdown(
             isVideo: false,
             pageFinished: false,
             hasAppeared: true,
@@ -751,11 +821,33 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             storeSheetPresented: false
         ))
         XCTAssertTrue(shouldRunFallbackCountdown(
-            isVideo: true,
+            isVideo: false,
             pageFinished: true,
             hasAppeared: true,
             appForegrounded: true,
             storeSheetPresented: false
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: false,
+            storeSheetPresented: false
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: true
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false,
+            clickHandoffPending: true
         ))
     }
 
@@ -2393,15 +2485,15 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testFallbackPreparedTokenReleasePreventsPlayerReuse() throws {
+    func testFallbackPreparedTokenReleaseInvalidatesPlayerAndToken() throws {
         let url = URL(fileURLWithPath: "/dev/null")
         let pool = FullscreenVideoPreparationPool.shared
         let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil))
         let first = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
         pool.returnToPrepared(token)
         releasePreparedFallbackVideos(in: .content([], preparedVideos: [0: token]))
-        let replacement = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
-        XCTAssertFalse(first === replacement)
+        XCTAssertNil(pool.claim(token, url: url, posterURL: nil))
+        XCTAssertTrue(first.isStopped)
         pool.release(token)
     }
 

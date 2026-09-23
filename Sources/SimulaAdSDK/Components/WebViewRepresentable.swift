@@ -310,7 +310,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 impressionId: impressionId,
                 creativeKey: storeCreativeKey,
                 delegate: coordinator,
-                onMessage: onMessage
+                onMessage: onMessage,
+                clickSource: clickSource
             )
             webView = attach.webView
             if attach.alreadyLoaded {
@@ -331,7 +332,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                 delegate: coordinator,
                 onMessage: onMessage,
                 surface: telemetryAdFormat,
-                exposesStoreAPI: bridge != nil && !externalClickOnly
+                exposesStoreAPI: bridge != nil && !externalClickOnly,
+                clickSource: clickSource
             )
         }
         // The coordinator needs the web view to post `GET_*` replies back into the page.
@@ -396,7 +398,8 @@ struct WebViewRepresentable: UIViewRepresentable {
                     webView,
                     from: oldId,
                     to: retainedImpressionId,
-                    creativeKey: storeCreativeKey
+                    creativeKey: storeCreativeKey,
+                    clickSource: clickSource
                 )
             }
             coordinator.retainedImpressionId = retainedImpressionId
@@ -421,7 +424,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             coordinator.currentURL = nil
             coordinator.currentBaseURL = baseURL
             coordinator.realLoadStarted = true
-            coordinator.trackRequestedNavigation(webView.loadHTMLString(html, baseURL: baseURL))
+            coordinator.trackRequestedNavigation(webView.loadHTMLString(
+                html,
+                baseURL: baseURL
+            ))
         } else if let url = url, url != currentURL {
             coordinator.currentURL = url
             coordinator.currentHTML = nil
@@ -642,14 +648,17 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// handing off to StoreKit/Safari. Returning false means this delegate path must not route.
         private func routeClaimedClick(
             userActivated: Bool,
+            identity: HTMLClickIdentity? = nil,
             storeDismissible: Bool = false,
             route: @escaping @MainActor (AttributionRouteExecution) -> Void
         ) -> Bool {
             let now = ProcessInfo.processInfo.systemUptime
+            let resolved = resolvedClickInteraction(identity: identity, fallbackSource: clickSource)
             guard let interaction = clickClaim.claim(
                 userActivated: userActivated,
-                source: clickSource,
-                now: now
+                source: resolved.source,
+                now: now,
+                interactionId: resolved.id
             ) else { return false }
             let lifecycle = attributionRouteLifecycle
             let automaticRoutes = lifecycle?.automaticRoutes ?? ownedAutomaticRoutes
@@ -657,7 +666,7 @@ struct WebViewRepresentable: UIViewRepresentable {
             guard let automaticUserHandoff = automaticRoutes.beginUserHandoff(
                 scope: automaticRouteScope
             ) else { return false }
-            let source = clickSource
+            let source = resolved.source
             let routeID = UUID()
             let terminalOutcome = onAttributionRouteOutcome
             let execution = makeCreativeAttributionRouteExecution(
@@ -902,7 +911,7 @@ struct WebViewRepresentable: UIViewRepresentable {
         /// the legacy `onMessageReceived` callback (game iframe).
         func handleMessage(_ message: WebViewForwardedMessage) {
             switch message {
-            case .userActivatedCTA(let url):
+            case .userActivatedCTA(let url, let identity):
                 guard CreativeCTAOpenMessage.isAllowed(
                     url,
                     destination: ctaDestination,
@@ -914,9 +923,9 @@ struct WebViewRepresentable: UIViewRepresentable {
                         fallback: url,
                         fallbackStoreURL: validatedDirectAppStoreURL(url.absoluteString)
                     )
-                _ = routeClaimedClick(userActivated: true, route: route)
+                _ = routeClaimedClick(userActivated: true, identity: identity, route: route)
                 return
-            case .userActivatedStoreOpen:
+            case .userActivatedStoreOpen(let identity):
                 guard bridge != nil, !externalClickOnly,
                       hasTrustedCreativeStoreDestination(
                     trackingUrl: ctaTrackingUrl,
@@ -925,6 +934,7 @@ struct WebViewRepresentable: UIViewRepresentable {
                 ) else { return }
                 _ = routeClaimedClick(
                     userActivated: true,
+                    identity: identity,
                     storeDismissible: true,
                     route: creativeStoreRoute()
                 )
@@ -1207,7 +1217,10 @@ struct WebViewRepresentable: UIViewRepresentable {
             if !renderRecoveryAttempted {
                 if let html = currentHTML {
                     renderRecoveryAttempted = true
-                    trackRequestedNavigation(webView.loadHTMLString(html, baseURL: currentBaseURL))
+                    trackRequestedNavigation(webView.loadHTMLString(
+                        html,
+                        baseURL: currentBaseURL
+                    ))
                     return
                 }
                 if let url = currentURL {

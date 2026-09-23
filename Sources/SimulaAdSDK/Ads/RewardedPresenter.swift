@@ -16,6 +16,7 @@ final class RewardedPresenter {
     private var creativeBridge: CreativeBridge?
     private var videoPlayer: FullscreenVideoPlayer?
     private var videoPreparationOwnership: FullscreenVideoPreparationOwnership?
+    private var videoAssetLease: VideoAssetLease?
     /// Fired once on teardown with whether the reward was earned and the measured
     /// play time, so the caller can verify the play server-side.
     private var onClose: ((Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void)?
@@ -45,8 +46,10 @@ final class RewardedPresenter {
         renderedHtml: String = "",
         creative: Creative? = nil,
         videoBehavior: VideoBehavior = VideoBehavior(),
+        progressBarBehavior: ProgressBarBehavior = ProgressBarBehavior(),
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
@@ -61,6 +64,7 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
         onVideoStarted: @escaping () -> Void = {},
+        onRewardGateOpened: @escaping () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
         onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -74,6 +78,7 @@ final class RewardedPresenter {
         self.onClose = onClose
         self.videoPlayer = videoPlayer
         self.videoPreparationOwnership = videoPreparationOwnership
+        self.videoAssetLease = videoAssetLease
         videoPlayer?.attachVideoPlanScope(videoPlanScope)
 
         // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
@@ -91,6 +96,7 @@ final class RewardedPresenter {
             renderedHtml: renderedHtml,
             creative: creative,
             videoBehavior: videoBehavior,
+            progressBarBehavior: progressBarBehavior,
             videoPlayer: videoPlayer,
             videoPlanScope: videoPlanScope,
             admission: admission,
@@ -106,6 +112,7 @@ final class RewardedPresenter {
             previewHTML: previewHTML,
             bridge: bridge,
             onVideoStarted: onVideoStarted,
+            onRewardGateOpened: onRewardGateOpened,
             onClick: onClick,
             onFinish: { [weak self] earned, elapsed, completionReason in
                 self?.dismiss(
@@ -150,8 +157,10 @@ final class RewardedPresenter {
         renderedHtml: String = "",
         creative: Creative? = nil,
         videoBehavior: VideoBehavior = VideoBehavior(),
+        progressBarBehavior: ProgressBarBehavior = ProgressBarBehavior(),
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
@@ -166,6 +175,7 @@ final class RewardedPresenter {
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
         onVideoStarted: @escaping () -> Void = {},
+        onRewardGateOpened: @escaping () -> Void = {},
         onClick: @escaping () -> Void,
         onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -177,8 +187,10 @@ final class RewardedPresenter {
             renderedHtml: renderedHtml,
             creative: creative,
             videoBehavior: videoBehavior,
+            progressBarBehavior: progressBarBehavior,
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
+            videoAssetLease: videoAssetLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
             close: close,
@@ -193,6 +205,7 @@ final class RewardedPresenter {
             previewHTML: previewHTML,
             onWillPresent: onWillPresent,
             onVideoStarted: onVideoStarted,
+            onRewardGateOpened: onRewardGateOpened,
             onClick: { _ in onClick() },
             onClose: onClose
         )
@@ -224,6 +237,9 @@ final class RewardedPresenter {
         } else {
             _ = videoPreparationOwnership?.releaseFromPresentation()
         }
+        let videoAssetLease = videoAssetLease
+        self.videoAssetLease = nil
+        videoAssetLease?.release()
         window = nil
         originalKeyWindow = nil
         let callback = onClose
@@ -275,6 +291,7 @@ private struct RewardedGameView: View {
     let renderedHtml: String
     let creative: Creative?
     let videoBehavior: VideoBehavior
+    let progressBarBehavior: ProgressBarBehavior
     let videoPlayer: FullscreenVideoPlayer?
     let videoPlanScope: VideoPlanPresentationScope?
     let admission: FullscreenPresentationAdmission
@@ -303,6 +320,7 @@ private struct RewardedGameView: View {
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
     let onVideoStarted: () -> Void
+    let onRewardGateOpened: () -> Void
     /// Fired on a user-gesture CTA / store-prompt tap (the CLICKED signal); parity with the interstitial.
     let onClick: (ClickInteraction) -> Void
     let onFinish: (Bool, Double, RewardCompletionReason?) -> Void
@@ -362,6 +380,7 @@ private struct RewardedGameView: View {
         renderedHtml: String,
         creative: Creative?,
         videoBehavior: VideoBehavior,
+        progressBarBehavior: ProgressBarBehavior,
         videoPlayer: FullscreenVideoPlayer?,
         videoPlanScope: VideoPlanPresentationScope?,
         admission: FullscreenPresentationAdmission,
@@ -377,6 +396,7 @@ private struct RewardedGameView: View {
         previewHTML: String?,
         bridge: CreativeBridge,
         onVideoStarted: @escaping () -> Void,
+        onRewardGateOpened: @escaping () -> Void,
         onClick: @escaping (ClickInteraction) -> Void,
         onFinish: @escaping (Bool, Double, RewardCompletionReason?) -> Void
     ) {
@@ -388,6 +408,7 @@ private struct RewardedGameView: View {
         self.renderedHtml = renderedHtml
         self.creative = creative
         self.videoBehavior = videoBehavior
+        self.progressBarBehavior = progressBarBehavior
         self.videoPlayer = videoPlayer
         self.videoPlanScope = videoPlanScope
         self.admission = admission
@@ -404,6 +425,7 @@ private struct RewardedGameView: View {
         self.previewHTML = previewHTML
         self.bridge = bridge
         self.onVideoStarted = onVideoStarted
+        self.onRewardGateOpened = onRewardGateOpened
         self.onClick = onClick
         self.onFinish = onFinish
         _videoGate = State(initialValue: VideoPlaybackGate(
@@ -439,13 +461,18 @@ private struct RewardedGameView: View {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
     }
     private var usesVideoPlanV2: Bool {
-        videoPlanScope != nil && creative?.isVideoPlanV2Clip == true
+        videoPlanScope != nil && creative?.mediaType == .video
     }
     private var suppressesLegacySKOverlay: Bool {
         !isLegacySKOverlayEligible(usesVideoPlanV2: usesVideoPlanV2)
     }
     private var videoTelemetryBehavior: AdBehavior {
-        AdBehavior(skoverlay: skOverlay, video: videoBehavior)
+        AdBehavior(
+            skoverlay: skOverlay,
+            video: videoBehavior,
+            reward: RewardBehavior(),
+            progressBar: progressBarBehavior
+        )
     }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
@@ -486,6 +513,7 @@ private struct RewardedGameView: View {
                     treatment: (close ?? CloseBehavior()).treatment,
                     position: (close ?? CloseBehavior()).position,
                     progressBarColor: (close ?? CloseBehavior()).progressBarColor,
+                    progressBarStyle: videoTelemetryBehavior.progressBar.style,
                     action: (close ?? CloseBehavior()).action,
                     isRewardCopy: true,
                     enabled: canDismissFullscreen(
@@ -494,6 +522,8 @@ private struct RewardedGameView: View {
                     ),
                     remaining: secondsLeft,
                     progress: closeProgressAnim,
+                    mediaProgress: videoMediaProgress,
+                    gateFraction: videoGateFraction,
                     onClose: { finish(earned: true) }
                 )
                 // Identity keyed to the pause generation — see `closeGateGeneration`.
@@ -846,6 +876,7 @@ private struct RewardedGameView: View {
             onStoreDismissRequest: { dismissSKOverlay() },
             storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
+            clickSource: .primaryUnknown,
             clickBeaconImpressionId: impressionId,
             bridge: bridge,
             attribution: attribution,
@@ -962,7 +993,7 @@ private struct RewardedGameView: View {
                     muted: muted,
                     mutedWatchMs: player.mutedWatchMilliseconds,
                     unmutedWatchMs: player.unmutedWatchMilliseconds,
-                    videoPositionS: player.playedSeconds,
+                    videoPositionS: player.currentMediaPositionSeconds,
                     durationS: player.duration,
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
@@ -974,7 +1005,9 @@ private struct RewardedGameView: View {
         )
             .allowsHitTesting(!clickHandoffPending)
             .onReceive(player.$status) { handleVideoStatus($0, player: player) }
-            .onReceive(player.$playedSeconds) { updateVideoGate(player: player, played: $0) }
+            .onReceive(player.$mediaPositionSeconds) { _ in
+                updateVideoGate(player: player, played: player.playedSeconds)
+            }
             .onReceive(player.$duration) { _ in updateVideoGate(player: player, played: player.playedSeconds) }
     }
 
@@ -1004,7 +1037,7 @@ private struct RewardedGameView: View {
                 muted: player.isMuted,
                 mutedWatchMs: player.mutedWatchMilliseconds,
                 unmutedWatchMs: player.unmutedWatchMilliseconds,
-                videoPositionS: player.playedSeconds,
+                videoPositionS: player.currentMediaPositionSeconds,
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
@@ -1029,7 +1062,7 @@ private struct RewardedGameView: View {
                 mutedWatchMs: player.mutedWatchMilliseconds,
                 unmutedWatchMs: player.unmutedWatchMilliseconds,
                 errorCode: reason.rawValue,
-                videoPositionS: player.playedSeconds,
+                videoPositionS: player.currentMediaPositionSeconds,
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
@@ -1078,7 +1111,7 @@ private struct RewardedGameView: View {
                     isVideoPlanV2: usesVideoPlanV2,
                     creative: creative, behavior: videoTelemetryBehavior,
                     muted: player.isMuted,
-                    videoPositionS: player.playedSeconds,
+                    videoPositionS: player.currentMediaPositionSeconds,
                     durationS: player.duration,
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
@@ -1131,8 +1164,14 @@ private struct RewardedGameView: View {
         ended: Bool = false
     ) {
         guard primaryCreativeReady else { return }
-        videoGate.update(duration: player.duration, played: played, ended: ended)
-        closeProgressAnim = videoGate.progress
+        videoGate.update(
+            duration: player.duration,
+            played: played,
+            mediaPosition: player.currentMediaPositionSeconds,
+            ended: ended
+        )
+        let progress = videoGate.progress
+        if closeProgressAnim != progress { closeProgressAnim = progress }
         if primaryCreativeReady, shouldShowVideoStorePrompt(
             enabled: storePrompt?.enabled == true,
             reachedMidpoint: videoGate.reachedAssetMidpoint,
@@ -1144,6 +1183,17 @@ private struct RewardedGameView: View {
             earnReward(reason: reason)
             storePromptVisible = false
         }
+    }
+
+    private var videoMediaProgress: Double {
+        guard let player = videoPlayer, let duration = player.duration,
+              duration.isFinite, duration > 0 else { return closeProgressAnim }
+        return min(1, max(0, player.mediaPositionSeconds / duration))
+    }
+
+    private var videoGateFraction: Double {
+        guard let duration = videoPlayer?.duration else { return 1 }
+        return progressBarGateFraction(gateSeconds: gateDuration, mediaDuration: duration)
     }
 
     private var videoPauseReason: String {
@@ -1184,7 +1234,7 @@ private struct RewardedGameView: View {
             muted: player.isMuted,
             mutedWatchMs: player.mutedWatchMilliseconds,
             unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             quartile: quartile,
             reason: reason,
@@ -1196,7 +1246,7 @@ private struct RewardedGameView: View {
     }
 
     private func earnReward(reason: RewardCompletionReason) {
-        rewardCompletion.earn(reason: reason)
+        if rewardCompletion.earn(reason: reason) { onRewardGateOpened() }
     }
 
     private func handleVideoClick() {
@@ -1438,7 +1488,6 @@ private struct RewardedGameView: View {
         if let player = videoPlayer, usesVideoPlanV2 {
             guard claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) else { return }
             recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
-            videoPlanScope?.handoffBegan()
         }
         requestTerminal(earned: earned)
     }
@@ -1454,7 +1503,7 @@ private struct RewardedGameView: View {
             muted: player.isMuted,
             mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
             unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             reason: reason,
             secondsSinceVideoStart: player.secondsSinceVideoStart
@@ -1463,7 +1512,7 @@ private struct RewardedGameView: View {
 
     private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
         guard usesVideoPlanV2 else { return }
-        _ = player.flushPresentationWatchAccounting()
+        let watchTotals = player.flushPresentationWatchAccounting()
         videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
             adFormat: "rewarded",
             adUnitId: adUnitId,
@@ -1472,9 +1521,9 @@ private struct RewardedGameView: View {
             creative: creative,
             behavior: videoTelemetryBehavior,
             muted: player.isMuted,
-            mutedWatchMs: player.mutedWatchMilliseconds,
-            unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason

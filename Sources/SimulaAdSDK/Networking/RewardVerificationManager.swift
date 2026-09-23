@@ -170,6 +170,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private var startupTriggerTask: Task<Void, Never>?
     private var pendingRemovalServeIds: Set<String> = []
     private var pendingCallbacks: [(@Sendable (Result<String?, Error>) -> Void, Result<String?, Error>)] = []
+    private var pendingPersistenceCallbacks: [String: [@Sendable () -> Void]] = [:]
     private var pendingNetworkRetryDelay: TimeInterval?
     private var unsupportedCompletionReasonReported = false
     private let maxPendingEnqueues = 100
@@ -276,6 +277,26 @@ public final class RewardVerificationManager: @unchecked Sendable {
         completionReason: RewardCompletionReason?,
         completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
     ) {
+        queueVerification(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            completionReason: completionReason,
+            onPersisted: nil,
+            completion: completion
+        )
+    }
+
+    func queueVerification(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String = "",
+        completionReason: RewardCompletionReason?,
+        onPersisted: (@Sendable () -> Void)?,
+        completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
+    ) {
         executor.async { [weak self] in
             self?.enqueueOnExecutor(
                 serveId: serveId,
@@ -283,6 +304,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 elapsedPlayTime: elapsedPlayTime,
                 adUnitId: adUnitId,
                 completionReason: completionReason,
+                onPersisted: onPersisted,
                 completion: completion
             )
         }
@@ -294,6 +316,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
         elapsedPlayTime: Double,
         adUnitId: String,
         completionReason: RewardCompletionReason?,
+        onPersisted: (@Sendable () -> Void)?,
         completion: (@Sendable (Result<String?, Error>) -> Void)?
     ) {
         guard elapsedPlayTime.isFinite, elapsedPlayTime >= 0 else {
@@ -307,6 +330,9 @@ public final class RewardVerificationManager: @unchecked Sendable {
         guard !pendingRemovalServeIds.contains(serveId) else { return }
         let loaded = loadIfNeeded()
         if let completion { activeCallbacks[serveId] = completion }
+        if let onPersisted {
+            pendingPersistenceCallbacks[serveId, default: []].append(onPersisted)
+        }
         guard loaded else {
             if !pendingQueue.contains(where: { $0.serveId == serveId }) {
                 guard pendingQueue.count < maxPendingEnqueues else {
@@ -315,6 +341,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                         breadcrumb: "queue=reward_verification"
                     )
                     let callback = activeCallbacks.removeValue(forKey: serveId)
+                    pendingPersistenceCallbacks.removeValue(forKey: serveId)
                     callbackQueue.async {
                         callback?(.failure(SimulaAPIError.invalidResponse))
                     }
@@ -349,6 +376,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
             isDirty = true
             persistIfNeeded()
         } else if !isDirty {
+            dispatchPersistenceCallbacks(for: serveId)
             processOrScheduleRetry()
         }
     }
@@ -417,6 +445,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 adUnitId: task.adUnitId ?? "",
                 completionReason: task.completionReason
             )
+            guard response.verified else { throw SimulaAPIError.invalidResponse }
             result = .success(response.token)
         } catch {
             result = .failure(error)
@@ -544,6 +573,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
     private func durabilityCommitted() {
         pendingRemovalServeIds.removeAll()
+        let persistenceCallbacks = pendingPersistenceCallbacks.values.flatMap { $0 }
+        pendingPersistenceCallbacks.removeAll()
+        persistenceCallbacks.forEach { callback in
+            callbackQueue.async { callback() }
+        }
         let callbacks = pendingCallbacks
         pendingCallbacks.removeAll()
         for (callback, result) in callbacks {
@@ -554,6 +588,13 @@ public final class RewardVerificationManager: @unchecked Sendable {
             scheduleRetry(after: delay)
         } else {
             processOrScheduleRetry()
+        }
+    }
+
+    private func dispatchPersistenceCallbacks(for serveId: String) {
+        let callbacks = pendingPersistenceCallbacks.removeValue(forKey: serveId) ?? []
+        callbacks.forEach { callback in
+            callbackQueue.async { callback() }
         }
     }
 

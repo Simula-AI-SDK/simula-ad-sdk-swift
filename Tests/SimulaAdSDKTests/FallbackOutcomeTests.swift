@@ -2,6 +2,12 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class FallbackOutcomeTests: XCTestCase {
+    func testFallbackVideoNeverMountsWithoutPreparedPlayer() {
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: true, hasPreparedPlayer: false), .prepare)
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: true, hasPreparedPlayer: true), .mount)
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: false, hasPreparedPlayer: false), .mount)
+    }
+
     func testFallbackAdvanceRequiresCurrentScreenWithoutPendingClickRoute() {
         XCTAssertTrue(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: nil))
         XCTAssertFalse(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: 0))
@@ -47,7 +53,7 @@ final class FallbackOutcomeTests: XCTestCase {
 
     func testPresentedFallbackCompletionIsDistinctAndExactlyOnce() {
         var coordinator = FallbackPresentationCoordinator()
-        coordinator.beginPresenting()
+        _ = coordinator.beginPresenting()
 
         XCTAssertEqual(coordinator.completedPresentedContent(), .completed)
         XCTAssertNil(coordinator.completedPresentedContent())
@@ -74,7 +80,7 @@ final class FallbackOutcomeTests: XCTestCase {
 
     func testNoScenePresentationFailureIsUnavailableOnce() {
         var coordinator = FallbackPresentationCoordinator()
-        coordinator.beginPresenting()
+        _ = coordinator.beginPresenting()
 
         XCTAssertEqual(coordinator.presentationUnavailable(), .presentationUnavailable)
         XCTAssertNil(coordinator.presentationUnavailable())
@@ -82,6 +88,47 @@ final class FallbackOutcomeTests: XCTestCase {
             FallbackOutcome.presentationUnavailable.unavailableReason,
             "presentation_unavailable"
         )
+    }
+
+    func testCreativeFailureAdvancesUntilFinalScreenThenResolvesUnavailable() {
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 0, currentIndex: 0, screenCount: 2),
+            .advance
+        )
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 1, currentIndex: 1, screenCount: 2),
+            .finishUnavailable
+        )
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 0, currentIndex: 1, screenCount: 2),
+            .ignore
+        )
+    }
+
+    @MainActor
+    func testFailedFinalPlayableEarnsInternallyButSubmitsOnlyAtUnitClose() {
+        var submissions = 0
+        let claim = UnitEndRewardClaim()
+        claim.primaryGateDidOpen()
+        claim.fallbackDidResolve(renderableScreenCount: 2)
+        claim.fallbackGateDidOpen(isFinal: false)
+
+        claim.fallbackBecameUnavailable()
+        claim.fallbackBecameUnavailable()
+        claim.fallbackDeliveryDidFinish()
+
+        XCTAssertTrue(claim.earned)
+        XCTAssertEqual(submissions, 0)
+        XCTAssertTrue(claim.consumeAtUnitClose(
+            onEarn: { submissions += 1 },
+            enqueueVerification: { submissions += 1 }
+        ))
+        XCTAssertEqual(submissions, 2)
+        XCTAssertFalse(claim.consumeAtUnitClose(
+            onEarn: { submissions += 1 },
+            enqueueVerification: { submissions += 1 }
+        ))
+        XCTAssertEqual(submissions, 2)
     }
 
     func testRewardedUnavailableOutcomesFailOpenOnlyForEarnedReward() {

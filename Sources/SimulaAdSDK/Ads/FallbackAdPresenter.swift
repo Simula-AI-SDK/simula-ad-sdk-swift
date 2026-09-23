@@ -34,6 +34,15 @@ enum FallbackOutcome: Equatable, Sendable {
     }
 }
 
+enum FallbackVideoReadiness: Equatable, Sendable {
+    case mount
+    case prepare
+}
+
+func fallbackVideoReadiness(isVideo: Bool, hasPreparedPlayer: Bool) -> FallbackVideoReadiness {
+    isVideo && !hasPreparedPlayer ? .prepare : .mount
+}
+
 struct FallbackTelemetryIdentifiers: Equatable, Sendable {
     let adId: String
     let serveId: String?
@@ -175,34 +184,61 @@ func discardedFallbackVideoPreparationIndices(
     return preparedIndices.subtracting(retainedIndices).sorted()
 }
 
+func boundedFallbackVideoPreparationIndices(
+    in ads: [FallbackAd],
+    around currentIndex: Int,
+    preparedIndices: Set<Int>
+) -> Set<Int> {
+    let eligible = [currentIndex, currentIndex + 1].filter { index in
+        ads.indices.contains(index) && ads[index].mediaType == .video
+    }
+    return preparedIndices.intersection(eligible.prefix(2))
+}
+
 #if os(iOS)
 @MainActor
 func prepareUpcomingFallbackVideos(
     _ ads: [FallbackAd],
     allowV2Preparation: Bool = true
-) -> [Int: FullscreenVideoPreparationToken] {
+) async -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
-    for index in upcomingFallbackVideoIndices(ads, allowV2Preparation: allowV2Preparation) {
-        let ad = ads[index]
-        guard case .video(let url, let posterURL) = ad.creativeContent else { continue }
-        prepared[index] = FullscreenVideoPreparationPool.shared.prepare(
-            url: url,
-            posterURL: posterURL,
-            startsMuted: !ad.usesVideoPlanV2,
-            stallTimeout: ad.usesVideoPlanV2
-                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
-                : FullscreenVideoPlayer.preparationTimeout
-        )
+    let indices = ads.indices.prefix(1).filter { index in
+        allowV2Preparation && !ads[index].usesVideoPlanV2Contract && ads[index].mediaType == .video
+    }
+    for index in indices {
+        if let token = await prepareFallbackVideo(ads[index]) { prepared[index] = token }
     }
     return prepared
 }
 
 @MainActor
+func prepareFallbackVideo(_ ad: FallbackAd) async -> FullscreenVideoPreparationToken? {
+    guard case .video(let remoteURL, let posterURL) = ad.creativeContent else { return nil }
+    let lease: VideoAssetLease
+    do { lease = try await VideoAssetCache.shared.acquire(remoteURL) }
+    catch { return nil }
+    guard !Task.isCancelled else {
+        lease.release()
+        return nil
+    }
+    let token = FullscreenVideoPreparationPool.shared.prepare(
+        url: lease.localURL,
+        posterURL: posterURL,
+        startsMuted: !ad.usesVideoPlanV2,
+        stallTimeout: ad.usesVideoPlanV2
+            ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+            : FullscreenVideoPlayer.preparationTimeout,
+        assetLease: lease
+    )
+    if token == nil { lease.release() }
+    return token
+}
+
+@MainActor
 func preparingImmediateV2FallbackIfNeeded(_ result: FallbackFetchResult) -> FallbackFetchResult {
-    guard case .content(let ads, let existing) = result,
-          existing.isEmpty,
-          ads.contains(where: \.usesVideoPlanV2Contract) else { return result }
-    return .content(ads, preparedVideos: prepareUpcomingFallbackVideos(ads, allowV2Preparation: true))
+    // Contract 2 fallback payloads are playable-only, so no fallback video can become eligible
+    // after the primary first frame.
+    result
 }
 
 @MainActor
@@ -337,6 +373,22 @@ func canHandleFallbackScreenCallback(renderedIndex: Int, currentIndex: Int) -> B
     renderedIndex == currentIndex
 }
 
+enum FallbackCreativeFailureResolution: Equatable, Sendable {
+    case ignore
+    case advance
+    case finishUnavailable
+}
+
+func fallbackCreativeFailureResolution(
+    renderedIndex: Int,
+    currentIndex: Int,
+    screenCount: Int
+) -> FallbackCreativeFailureResolution {
+    guard renderedIndex == currentIndex, screenCount > 0,
+          (0..<screenCount).contains(currentIndex) else { return .ignore }
+    return currentIndex + 1 < screenCount ? .advance : .finishUnavailable
+}
+
 struct FallbackTerminalAdvanceState: Equatable, Sendable {
     private(set) var pendingIndex: Int?
 
@@ -441,6 +493,7 @@ import UIKit
 @MainActor
 final class FallbackAdPresenter {
     private static let loadingDeadlineNanos: UInt64 = 2_000_000_000
+    private static let videoPreparationDeadlineNanos: UInt64 = 10_000_000_000
     private var window: UIWindow?
     /// One opaque host survives loading and every screen swap. Replacing its root view lets SwiftUI
     /// dismantle the previous representable before creating the next one, so only one fallback
@@ -467,6 +520,7 @@ final class FallbackAdPresenter {
     private var currentRouteLifecycle: AttributionRouteLifecycle?
     /// Fired when a user taps an end-screen CTA — surfaces the publisher click on the parent ad.
     private var onAdClick: ((ClickInteraction) -> Void)?
+    private var onFallbackGateOpened: ((Bool) -> Void)?
     /// The primary serve's CTA routing context, threaded into each end screen's WebView so its CTA
     /// opens deterministically (in-app store sheet from the raw `ios_store_url` + background tracker
     /// fire) instead of resolving the tracker's redirect chain. Defaults keep today's behavior.
@@ -486,6 +540,7 @@ final class FallbackAdPresenter {
     private var clickHandoffIndex: Int?
     private var presentationBlockedIndex: Int?
     private var terminalAdvanceState = FallbackTerminalAdvanceState()
+    private var terminalFailureIndex: Int?
     private var videoPlanScope: VideoPlanPresentationScope?
     /// Retain only process-pooled preparation tokens for the current and immediately-next fallback.
     private var videoPreparations: [Int: FullscreenVideoPreparationToken] = [:]
@@ -494,6 +549,9 @@ final class FallbackAdPresenter {
         FullscreenVideoPlayer,
         FullscreenVideoPreparationToken
     >?
+    private var videoPreparationTasks: [Int: Task<Void, Never>] = [:]
+    private var videoPreparationGenerations: [Int: UUID] = [:]
+    private var currentVideoPreparationDeadlineTask: Task<Void, Never>?
 
     /// Presents the fallback ad screens in order. Returns `true` if they were presented; `false`
     /// when `ads` is empty or no window scene was available (`onFinish` is then never called).
@@ -509,6 +567,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        onFallbackGateOpened: ((Bool) -> Void)? = nil,
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
@@ -517,7 +576,7 @@ final class FallbackAdPresenter {
         onFinish: @escaping (FallbackOutcome) -> Void
     ) -> Bool {
         guard acceptPreparedFallbackContent(ads: ads, preparedVideos: preparedVideos) else { return false }
-        videoPreparations = preparedVideos
+        videoPreparations = boundedPreparedVideos(preparedVideos, ads: ads, around: 0)
         _ = presentationCoordinator.beginPresenting()
         let didPresent = beginPresentation(
             ads: ads,
@@ -530,6 +589,7 @@ final class FallbackAdPresenter {
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
+            onFallbackGateOpened: onFallbackGateOpened,
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
@@ -556,6 +616,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil,
         onAdClick: ((ClickInteraction) -> Void)? = nil,
+        onFallbackGateOpened: ((Bool) -> Void)? = nil,
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
@@ -577,6 +638,7 @@ final class FallbackAdPresenter {
             attribution: attribution,
             autoStoreRedirect: autoStoreRedirect,
             onAdClick: onAdClick,
+            onFallbackGateOpened: onFallbackGateOpened,
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
@@ -610,6 +672,7 @@ final class FallbackAdPresenter {
         attribution: AdAttribution?,
         autoStoreRedirect: AutoStoreRedirect?,
         onAdClick: ((ClickInteraction) -> Void)?,
+        onFallbackGateOpened: ((Bool) -> Void)?,
         telemetryAdFormat: String,
         telemetryAdUnitId: String?,
         telemetryServeId: String?,
@@ -632,6 +695,7 @@ final class FallbackAdPresenter {
         self.attribution = attribution
         self.autoStoreRedirect = autoStoreRedirect
         self.onAdClick = onAdClick
+        self.onFallbackGateOpened = onFallbackGateOpened
         self.telemetryAdFormat = telemetryAdFormat
         self.telemetryAdUnitId = telemetryAdUnitId
         self.telemetryServeId = telemetryServeId
@@ -643,8 +707,7 @@ final class FallbackAdPresenter {
 
         self.originalKeyWindow = originalKeyWindow
 
-        let rootView = startsLoading ? loadingView() : adView(at: 0, initialOriginatingScene: scene)
-        let hosting = UIHostingController(rootView: rootView)
+        let hosting = UIHostingController(rootView: loadingView())
         hosting.view.backgroundColor = .black
         hosting.view.isOpaque = true
 
@@ -654,9 +717,10 @@ final class FallbackAdPresenter {
         // end screen's safe area and during the rootViewController swap between screens.
         window.backgroundColor = .black
         window.rootViewController = hosting
-        window.makeKeyAndVisible()
         self.window = window
         hostingController = hosting
+        if !startsLoading { installCurrentScreen(initialOriginatingScene: scene) }
+        window.makeKeyAndVisible()
         retainedWhilePresenting = self
         // Hide the status bar in hosts that opted out of VC-based appearance (e.g. React Native),
         // where `.hideStatusBar` in the end-screen view is a no-op. No-op in native hosts.
@@ -695,10 +759,9 @@ final class FallbackAdPresenter {
             if videoPlanScope == nil, ads.contains(where: \.usesVideoPlanV2Contract) {
                 videoPlanScope = VideoPlanPresentationScope()
             }
-            videoPreparations = preparedVideos
+            videoPreparations = boundedPreparedVideos(preparedVideos, ads: ads, around: 0)
             index = 0
-            prepareVideoPlayers(around: 0)
-            hostingController?.rootView = adView(at: index)
+            installCurrentScreen()
         case .finish(let outcome):
             dismiss(outcome: outcome)
         case .stale:
@@ -755,6 +818,7 @@ final class FallbackAdPresenter {
     private func adView(at index: Int, initialOriginatingScene: UIWindowScene? = nil) -> AnyView {
         guard ads.indices.contains(index) else { return loadingView() }
         let ad = ads[index]
+        let isFinalScreen = index == ads.indices.last
         let videoRoute = ad.mediaType == .video ? fallbackVideoCTARoute(
             ad: ad,
             parentTrackingUrl: ctaTrackingUrl,
@@ -770,13 +834,16 @@ final class FallbackAdPresenter {
         return AnyView(AdOverlayView(
             ad: ad,
             onClose: { [weak self] in self?.advance(from: index) },
-            onCreativeFailure: { [weak self] in self?.advanceAfterTerminal(from: index) },
+            onCreativeFailure: { [weak self] in self?.failCreativeAfterTerminal(from: index) },
             onVideoCompleted: ad.usesVideoPlanV2
                 ? { [weak self] in self?.advanceAfterTerminal(from: index) }
                 : nil,
             onVideoStarted: ad.usesVideoPlanV2
                 ? { [weak self] in self?.prepareImmediateNextVideo(after: index) }
                 : nil,
+            onGateOpened: onFallbackGateOpened.map { callback in
+                { callback(isFinalScreen) }
+            },
             videoPlayer: retainedVideoPlayer(at: index),
             videoPlanScope: videoPlanScope,
             initialOriginatingScene: initialOriginatingScene ?? window?.windowScene,
@@ -817,6 +884,7 @@ final class FallbackAdPresenter {
                     renderedIndex: index,
                     currentIndex: self.index
                 ) else { return false }
+                self.prepareImmediateNextVideo(after: index)
                 self.fireAutoStoreRedirectIfMatching(
                     renderedIndex: index,
                     sourceIndex: ad.sourceIndex,
@@ -833,9 +901,30 @@ final class FallbackAdPresenter {
                 Color.black
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                Button(action: { [weak self] in self?.cancelLoadingSurface() }) {
+                    Text("Skip")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: 36)
+                        .background(Color.white.opacity(0.16))
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
             .ignoresSafeArea()
         )
+    }
+
+    private func cancelLoadingSurface() {
+        guard window != nil,
+              let outcome = presentationCoordinator.presentationUnavailable() else { return }
+        let cancelFetch = onLoadingTimeout
+        onLoadingTimeout = nil
+        cancelFetch?()
+        dismiss(outcome: outcome)
     }
 
     /// Reveal the next screen on each close tap; tear down after the last one.
@@ -852,8 +941,7 @@ final class FallbackAdPresenter {
         releaseVideoPreparation(at: index)
         index += 1
         if index < ads.count {
-            prepareVideoPlayers(around: index)
-            hostingController?.rootView = adView(at: index)
+            installCurrentScreen()
         } else {
             guard let outcome = presentationCoordinator.completedPresentedContent() else { return }
             dismiss(outcome: outcome)
@@ -862,6 +950,7 @@ final class FallbackAdPresenter {
 
     private func advanceAfterTerminal(from renderedIndex: Int) {
         guard window != nil, renderedIndex == index else { return }
+        terminalFailureIndex = nil
         guard terminalAdvanceState.request(
             index: renderedIndex,
             blocked: clickHandoffIndex == renderedIndex || presentationBlockedIndex == renderedIndex
@@ -870,56 +959,166 @@ final class FallbackAdPresenter {
         advance(from: renderedIndex)
     }
 
+    private func failCreativeAfterTerminal(from renderedIndex: Int) {
+        guard window != nil, renderedIndex == index else { return }
+        terminalFailureIndex = renderedIndex
+        guard terminalAdvanceState.request(
+            index: renderedIndex,
+            blocked: clickHandoffIndex == renderedIndex || presentationBlockedIndex == renderedIndex
+        ) else { return }
+        resolveCreativeFailure(from: renderedIndex)
+    }
+
+    private func resolveCreativeFailure(from renderedIndex: Int) {
+        terminalFailureIndex = nil
+        switch fallbackCreativeFailureResolution(
+            renderedIndex: renderedIndex,
+            currentIndex: index,
+            screenCount: ads.count
+        ) {
+        case .ignore:
+            return
+        case .advance:
+            clickHandoffIndex = nil
+            advance(from: renderedIndex)
+        case .finishUnavailable:
+            guard let outcome = presentationCoordinator.presentationUnavailable() else { return }
+            dismiss(outcome: outcome)
+        }
+    }
+
     private func completePendingTerminalAdvanceIfPossible(at renderedIndex: Int) {
         guard clickHandoffIndex != renderedIndex,
               presentationBlockedIndex != renderedIndex,
               let pendingIndex = terminalAdvanceState.blockersDidClear(currentIndex: renderedIndex) else { return }
-        advance(from: pendingIndex)
+        if terminalFailureIndex == pendingIndex {
+            resolveCreativeFailure(from: pendingIndex)
+        } else {
+            advance(from: pendingIndex)
+        }
     }
 
     private func prepareVideoPlayers(around currentIndex: Int) {
-        let preparedIndices = Set(videoPreparations.keys)
-        let discardedIndices = discardedFallbackVideoPreparationIndices(
-            in: ads,
-            around: currentIndex,
-            preparedIndices: preparedIndices
-        )
+        let retained = Set([currentIndex, currentIndex + 1])
+        let discardedIndices = videoPreparations.keys.filter { !retained.contains($0) }
         for playerIndex in discardedIndices {
             releaseVideoPreparation(at: playerIndex)
         }
-        let v2 = ads.contains(where: \.usesVideoPlanV2Contract)
-        guard !v2 else { return }
-        // Preserve video_v1's eager current + next preparation exactly.
-        let retainedIndices = Set([currentIndex, currentIndex + 1])
-        for playerIndex in retainedIndices where ads.indices.contains(playerIndex) {
-            guard videoOwnershipIndex != playerIndex,
-                  videoPreparations[playerIndex] == nil,
-                  case .video(let url, let posterURL) = ads[playerIndex].creativeContent else { continue }
-            videoPreparations[playerIndex] = FullscreenVideoPreparationPool.shared.prepare(
-                url: url,
-                posterURL: posterURL
+        for playerIndex in videoPreparationTasks.keys.filter({ !retained.contains($0) }) {
+            videoPreparationGenerations.removeValue(forKey: playerIndex)
+            videoPreparationTasks.removeValue(forKey: playerIndex)?.cancel()
+        }
+    }
+
+    private func installCurrentScreen(initialOriginatingScene: UIWindowScene? = nil) {
+        guard window != nil, ads.indices.contains(index) else { return }
+        prepareVideoPlayers(around: index)
+        let currentPlayer = ads[index].mediaType == .video ? retainedVideoPlayer(at: index) : nil
+        if fallbackVideoReadiness(
+            isVideo: ads[index].mediaType == .video,
+            hasPreparedPlayer: currentPlayer != nil
+        ) == .prepare {
+            hostingController?.rootView = loadingView()
+            scheduleVideoPreparation(at: index)
+            armCurrentVideoPreparationDeadline(at: index)
+            return
+        }
+        currentVideoPreparationDeadlineTask?.cancel()
+        currentVideoPreparationDeadlineTask = nil
+        hostingController?.rootView = adView(
+            at: index,
+            initialOriginatingScene: initialOriginatingScene
+        )
+    }
+
+    private func boundedPreparedVideos(
+        _ prepared: [Int: FullscreenVideoPreparationToken],
+        ads: [FallbackAd],
+        around currentIndex: Int
+    ) -> [Int: FullscreenVideoPreparationToken] {
+        let retained = boundedFallbackVideoPreparationIndices(
+            in: ads,
+            around: currentIndex,
+            preparedIndices: Set(prepared.keys)
+        )
+        for (index, token) in prepared where !retained.contains(index) {
+            FullscreenVideoPreparationPool.shared.release(token)
+        }
+        return prepared.filter { retained.contains($0.key) }
+    }
+
+    private func prepareImmediateNextVideo(after currentIndex: Int) {
+        scheduleVideoPreparation(at: currentIndex + 1)
+    }
+
+    private func scheduleVideoPreparation(at playerIndex: Int) {
+        guard ads.indices.contains(playerIndex), ads[playerIndex].mediaType == .video,
+              videoPreparations[playerIndex] == nil,
+              videoOwnershipIndex != playerIndex,
+              videoPreparationTasks[playerIndex] == nil else { return }
+        let ad = ads[playerIndex]
+        let generation = UUID()
+        videoPreparationGenerations[playerIndex] = generation
+        videoPreparationTasks[playerIndex] = Task { [weak self] in
+            _ = await self?.runVideoPreparation(
+                at: playerIndex,
+                ad: ad,
+                generation: generation
             )
         }
     }
 
-    private func prepareImmediateNextVideo(after currentIndex: Int) {
-        guard videoOwnershipIndex == currentIndex,
-              let nextIndex = nextV2FallbackVideoIndex(in: ads, after: currentIndex),
-              videoPreparations[nextIndex] == nil,
-              case .video(let url, let posterURL) = ads[nextIndex].creativeContent else { return }
-        videoPreparations[nextIndex] = FullscreenVideoPreparationPool.shared.prepare(
-            url: url,
-            posterURL: posterURL,
-            startsMuted: !(ads[nextIndex].usesVideoPlanV2),
-            stallTimeout: ads[nextIndex].usesVideoPlanV2
-                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
-                : FullscreenVideoPlayer.preparationTimeout
-        )
+    private func runVideoPreparation(
+        at playerIndex: Int,
+        ad: FallbackAd,
+        generation: UUID
+    ) async {
+        let token = await prepareFallbackVideo(ad)
+        guard videoPreparationGenerations[playerIndex] == generation else {
+            FullscreenVideoPreparationPool.shared.release(token)
+            return
+        }
+        videoPreparationGenerations.removeValue(forKey: playerIndex)
+        videoPreparationTasks.removeValue(forKey: playerIndex)
+        guard !Task.isCancelled, window != nil,
+              ads.indices.contains(playerIndex),
+              ads[playerIndex].adId == ad.adId,
+              playerIndex == index || playerIndex == index + 1 else {
+            FullscreenVideoPreparationPool.shared.release(token)
+            return
+        }
+        guard let token else {
+            if playerIndex == index { failCreativeAfterTerminal(from: playerIndex) }
+            return
+        }
+        videoPreparations[playerIndex] = token
+        if playerIndex == index { installCurrentScreen() }
+    }
+
+    private func armCurrentVideoPreparationDeadline(at playerIndex: Int) {
+        guard let generation = videoPreparationGenerations[playerIndex] else { return }
+        currentVideoPreparationDeadlineTask?.cancel()
+        currentVideoPreparationDeadlineTask = Task { [weak self] in
+            _ = await self?.runCurrentVideoPreparationDeadline(
+                at: playerIndex,
+                generation: generation
+            )
+        }
+    }
+
+    private func runCurrentVideoPreparationDeadline(at playerIndex: Int, generation: UUID) async {
+        do { try await Task.sleep(nanoseconds: Self.videoPreparationDeadlineNanos) } catch { return }
+        guard !Task.isCancelled, window != nil, index == playerIndex,
+              videoPreparationGenerations[playerIndex] == generation else { return }
+        videoPreparationGenerations.removeValue(forKey: playerIndex)
+        videoPreparationTasks.removeValue(forKey: playerIndex)?.cancel()
+        currentVideoPreparationDeadlineTask = nil
+        failCreativeAfterTerminal(from: playerIndex)
     }
 
     private func retainedVideoPlayer(at playerIndex: Int) -> FullscreenVideoPlayer? {
         guard ads.indices.contains(playerIndex),
-              case .video(let url, let posterURL) = ads[playerIndex].creativeContent else {
+              case .video(_, let posterURL) = ads[playerIndex].creativeContent else {
             releaseVideoOwnership()
             return nil
         }
@@ -931,10 +1130,15 @@ final class FallbackAdPresenter {
             return player
         }
         releaseVideoOwnership()
+        guard let token = videoPreparations.removeValue(forKey: playerIndex) else { return nil }
+        guard let localURL = FullscreenVideoPreparationPool.shared.localURL(for: token) else {
+            FullscreenVideoPreparationPool.shared.release(token)
+            return nil
+        }
         let ownership = makeFallbackVideoOwnership(
-            url: url,
+            url: localURL,
             posterURL: posterURL,
-            token: videoPreparations.removeValue(forKey: playerIndex),
+            token: token,
             startsMuted: !ads[playerIndex].usesVideoPlanV2,
             stallTimeout: ads[playerIndex].usesVideoPlanV2
                 ? FullscreenVideoPlayer.videoPlanV2StallTimeout
@@ -950,6 +1154,12 @@ final class FallbackAdPresenter {
     }
 
     private func releaseVideoPreparation(at playerIndex: Int) {
+        videoPreparationGenerations.removeValue(forKey: playerIndex)
+        videoPreparationTasks.removeValue(forKey: playerIndex)?.cancel()
+        if playerIndex == index {
+            currentVideoPreparationDeadlineTask?.cancel()
+            currentVideoPreparationDeadlineTask = nil
+        }
         if videoOwnershipIndex == playerIndex { releaseVideoOwnership() }
         FullscreenVideoPreparationPool.shared.release(videoPreparations.removeValue(forKey: playerIndex))
     }
@@ -977,10 +1187,16 @@ final class FallbackAdPresenter {
         clickHandoffIndex = nil
         presentationBlockedIndex = nil
         terminalAdvanceState.clear()
+        terminalFailureIndex = nil
         let videoPlanScope = videoPlanScope
         self.videoPlanScope = nil
         videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
         videoPlanScope?.cancel()
+        videoPreparationTasks.values.forEach { $0.cancel() }
+        videoPreparationTasks.removeAll()
+        videoPreparationGenerations.removeAll()
+        currentVideoPreparationDeadlineTask?.cancel()
+        currentVideoPreparationDeadlineTask = nil
         releaseVideoOwnership()
         videoPreparations.values.forEach { FullscreenVideoPreparationPool.shared.release($0) }
         videoPreparations.removeAll()
@@ -991,6 +1207,7 @@ final class FallbackAdPresenter {
         originalKeyWindow = nil
         let callback = onFinish
         onFinish = nil
+        onFallbackGateOpened = nil
         let presentationLease = presentationLease
         self.presentationLease = nil
         retainedWhilePresenting = nil

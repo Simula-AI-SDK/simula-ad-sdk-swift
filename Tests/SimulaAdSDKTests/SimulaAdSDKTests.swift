@@ -767,8 +767,8 @@ final class SimulaAdSDKTests: XCTestCase {
         XCTAssertEqual(SKOverlayConfig(delaySeconds: -1).delaySeconds, 0)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: 12).delaySeconds, 12)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: 60).delaySeconds, 60)
-        XCTAssertEqual(SKOverlayConfig(delaySeconds: 300).delaySeconds, 300)
-        XCTAssertEqual(SKOverlayConfig(delaySeconds: 301).delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 300).delaySeconds, 60)
+        XCTAssertEqual(SKOverlayConfig(delaySeconds: 301).delaySeconds, 60)
         XCTAssertEqual(SKOverlayConfig(delaySeconds: Int.max).delaySeconds, maxSKOverlayDelaySeconds)
     }
 
@@ -846,13 +846,15 @@ final class SimulaAdSDKTests: XCTestCase {
         #if os(iOS)
         XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, true)
         XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, true)
-        XCTAssertEqual(obj["video_v1"] as? Bool, true)
-        XCTAssertEqual(DeviceCapabilities.current.dictionary["video_v1"] as? Bool, true)
+        XCTAssertNil(obj["video_v1"])
+        XCTAssertNil(DeviceCapabilities.current.dictionary["video_v1"])
+        XCTAssertNil(obj["video_plan_v2"])
         #else
         XCTAssertEqual(obj["native_click_beacon_v1"] as? Bool, false)
         XCTAssertEqual(DeviceCapabilities.current.dictionary["native_click_beacon_v1"] as? Bool, false)
-        XCTAssertEqual(obj["video_v1"] as? Bool, false)
-        XCTAssertEqual(DeviceCapabilities.current.dictionary["video_v1"] as? Bool, false)
+        XCTAssertNil(obj["video_v1"])
+        XCTAssertNil(DeviceCapabilities.current.dictionary["video_v1"])
+        XCTAssertNil(obj["video_plan_v2"])
         #endif
     }
 
