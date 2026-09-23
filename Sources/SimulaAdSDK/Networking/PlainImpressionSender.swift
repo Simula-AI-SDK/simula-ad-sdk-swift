@@ -6,6 +6,7 @@ import Darwin
 
 let plainImpressionTimeout: TimeInterval = 5
 let plainImpressionMaxRedirects = 5
+let plainImpressionFailureSignature = "impression_url:get_failed"
 let publicNetworkResolverMaximumWorkers = 2
 let publicNetworkResolverMaximumPending = 16
 
@@ -404,27 +405,32 @@ func resolvePublicNetworkHost(_ host: String) -> [String]? {
 private struct PlainImpressionTaskState {
     let deadline: TimeInterval
     var redirects: Int
+    var successfulStatus = false
 }
 
 private final class PlainImpressionSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let resolver: PublicNetworkHostResolving
     private let monotonicNow: @Sendable () -> TimeInterval
+    private let recordFailure: @Sendable () -> Void
     private let lock = NSLock()
     private var states: [Int: PlainImpressionTaskState] = [:]
     private var pendingStarts = 0
 
     init(
         resolver: PublicNetworkHostResolving,
-        monotonicNow: @escaping @Sendable () -> TimeInterval
+        monotonicNow: @escaping @Sendable () -> TimeInterval,
+        recordFailure: @escaping @Sendable () -> Void
     ) {
         self.resolver = resolver
         self.monotonicNow = monotonicNow
+        self.recordFailure = recordFailure
     }
 
     func send(_ url: URL, using session: URLSession) {
         lock.lock()
         guard pendingStarts < publicNetworkResolverMaximumPending else {
             lock.unlock()
+            recordFailure()
             return
         }
         pendingStarts += 1
@@ -433,7 +439,10 @@ private final class PlainImpressionSessionDelegate: NSObject, URLSessionDataDele
         Task(priority: .utility) { [weak self, weak session] in
             guard let self else { return }
             defer { self.finishPendingStart() }
-            guard let session else { return }
+            guard let session else {
+                self.recordFailure()
+                return
+            }
             let request: URLRequest?
             do {
                 request = try await deadlineAdmittedPublicNetworkRequest(
@@ -443,9 +452,13 @@ private final class PlainImpressionSessionDelegate: NSObject, URLSessionDataDele
                     resolver: self.resolver
                 )
             } catch {
+                self.recordFailure()
                 return
             }
-            guard let request, self.remaining(deadline: deadline) != nil else { return }
+            guard let request, self.remaining(deadline: deadline) != nil else {
+                self.recordFailure()
+                return
+            }
             let task = session.dataTask(with: request)
             self.register(taskIdentifier: task.taskIdentifier, deadline: deadline)
             task.resume()
@@ -500,8 +513,23 @@ private final class PlainImpressionSessionDelegate: NSObject, URLSessionDataDele
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {}
 
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let status = (response as? HTTPURLResponse)?.statusCode
+        markResponse(
+            taskIdentifier: dataTask.taskIdentifier,
+            successful: status.map { (200...299).contains($0) } == true
+        )
+        completionHandler(.allow)
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        remove(taskIdentifier: task.taskIdentifier)
+        guard let state = remove(taskIdentifier: task.taskIdentifier) else { return }
+        if error != nil || !state.successfulStatus { recordFailure() }
     }
 
     private func register(taskIdentifier: Int, deadline: TimeInterval) {
@@ -523,8 +551,18 @@ private final class PlainImpressionSessionDelegate: NSObject, URLSessionDataDele
         return true
     }
 
-    private func remove(taskIdentifier: Int) {
-        lock.lock(); states.removeValue(forKey: taskIdentifier); lock.unlock()
+    private func markResponse(taskIdentifier: Int, successful: Bool) {
+        lock.lock()
+        if var state = states[taskIdentifier] {
+            state.successfulStatus = successful
+            states[taskIdentifier] = state
+        }
+        lock.unlock()
+    }
+
+    private func remove(taskIdentifier: Int) -> PlainImpressionTaskState? {
+        lock.lock(); defer { lock.unlock() }
+        return states.removeValue(forKey: taskIdentifier)
     }
 
     private func remaining(deadline: TimeInterval) -> TimeInterval? {
@@ -550,6 +588,9 @@ final class PlainImpressionSender: @unchecked Sendable {
         resolver: @escaping ImpressionHostResolver,
         monotonicNow: @escaping @Sendable () -> TimeInterval = {
             ProcessInfo.processInfo.systemUptime
+        },
+        recordFailure: @escaping @Sendable () -> Void = {
+            Telemetry.shared.recordError(signature: plainImpressionFailureSignature)
         }
     ) {
         self.init(
@@ -558,7 +599,8 @@ final class PlainImpressionSender: @unchecked Sendable {
                 resolveSynchronously: resolver,
                 monotonicNow: monotonicNow
             ),
-            monotonicNow: monotonicNow
+            monotonicNow: monotonicNow,
+            recordFailure: recordFailure
         )
     }
 
@@ -567,6 +609,9 @@ final class PlainImpressionSender: @unchecked Sendable {
         resolver: PublicNetworkHostResolving = BoundedPublicNetworkHostResolver.shared,
         monotonicNow: @escaping @Sendable () -> TimeInterval = {
             ProcessInfo.processInfo.systemUptime
+        },
+        recordFailure: @escaping @Sendable () -> Void = {
+            Telemetry.shared.recordError(signature: plainImpressionFailureSignature)
         }
     ) {
         let configuration = configuration ?? URLSessionConfiguration.ephemeral
@@ -578,7 +623,8 @@ final class PlainImpressionSender: @unchecked Sendable {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         let delegate = PlainImpressionSessionDelegate(
             resolver: resolver,
-            monotonicNow: monotonicNow
+            monotonicNow: monotonicNow,
+            recordFailure: recordFailure
         )
         self.delegate = delegate
         self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)

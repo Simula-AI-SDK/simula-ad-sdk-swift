@@ -553,9 +553,13 @@ private struct RewardedGameView: View {
             AdInfoReportOverlay(
                 adId: impressionId,
                 apiKey: apiKey,
-                // A genuine bottom-left ✕ shares the bottom-left corner with the "i" (shrink its hit area);
-                // a progress_bar bottom ✕ relocates to top-right, leaving the "i" its full hit area.
-                closeAtBottomLeft: (close ?? CloseBehavior()).position == .bottomLeft && !closeBarAtBottom((close ?? CloseBehavior()).treatment, (close ?? CloseBehavior()).position)
+                // A genuine bottom-left control shares the corner with the "i" (shrink its hit area).
+                // Any bottom bar relocates that control, leaving the disclosure its full hit area.
+                closeAtBottomLeft: (close ?? CloseBehavior()).position == .bottomLeft && !closeBarAtBottom(
+                    (close ?? CloseBehavior()).treatment,
+                    (close ?? CloseBehavior()).position,
+                    progressBarStyle: progressBarBehavior.style
+                )
             )
         }
         .opacity(visible ? 1 : 0)
@@ -972,11 +976,13 @@ private struct RewardedGameView: View {
             ),
             effectiveClosePosition: effectiveVideoClosePosition(
                 treatment: (close ?? CloseBehavior()).treatment,
-                position: (close ?? CloseBehavior()).position
+                position: (close ?? CloseBehavior()).position,
+                progressBarStyle: progressBarBehavior.style
             ),
             bottomProgressBarObstructsChrome: videoBottomProgressBarObstructsChrome(
                 treatment: (close ?? CloseBehavior()).treatment,
-                position: (close ?? CloseBehavior()).position
+                position: (close ?? CloseBehavior()).position,
+                progressBarStyle: progressBarBehavior.style
             ),
             storePromptVisible: storePromptVisible && !rewardEarned,
             storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(

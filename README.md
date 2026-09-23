@@ -81,9 +81,11 @@ activate the process-global `AVAudioSession` when unmuted playback needs it, but
 its player and clears only SDK logical accounting. Overlapping SDK playback remains reference-counted,
 and idle-timer ownership is independently released and restored to the host's prior value.
 
-For rewarded contract-2 units, `ad_behavior.reward.earn_at = "unit_end"` earns once at the final
-renderable screen gate and verifies once when the entire unit closes using
-`completion_reason = "unit_end"`. A response with `verified: false` is a verification failure.
+For rewarded contract-2 units, `ad_behavior.reward.earn_at = "unit_end"` establishes reward
+authority only at the final gate: the primary gate when no fallback is authoritative, or the final
+renderable fallback gate/end when fallback screens exist. Host-object teardown does not promote an
+earlier gate. The publisher callback and one verification are deferred until the whole unit closes,
+using `completion_reason = "unit_end"`. A response with `verified: false` is a verification failure.
 
 An optional validated top-level `impression_url` is requested once at the existing two-second
 impression commit. This measurement request is a plain bounded unauthenticated GET with no SDK,

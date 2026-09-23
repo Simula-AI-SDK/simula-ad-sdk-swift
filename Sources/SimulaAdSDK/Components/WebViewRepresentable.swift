@@ -1,3 +1,26 @@
+import Foundation
+
+func webViewURLsHaveSameHTTPOrigin(
+    targetURL: URL,
+    currentURL: URL?,
+    currentBaseURL: URL?
+) -> Bool {
+    func normalizedOrigin(_ url: URL) -> (scheme: String, host: String, port: Int)? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(),
+              !host.isEmpty else { return nil }
+        return (scheme, host, url.port ?? (scheme == "http" ? 80 : 443))
+    }
+
+    guard let sourceURL = currentURL ?? currentBaseURL,
+          let source = normalizedOrigin(sourceURL),
+          let target = normalizedOrigin(targetURL) else { return false }
+    return source.scheme == target.scheme
+        && source.host == target.host
+        && source.port == target.port
+}
+
 struct WebNavigationTracker<Token: Hashable> {
     private(set) var active: Token?
     private(set) var requested: Token?
@@ -752,12 +775,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             isPopup: Bool,
             userActivated: Bool
         ) -> CreativePopupRouteAdmission {
-            let scheme = url.scheme?.lowercased() ?? ""
-            let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
-            let targetHost = url.host?.lowercased() ?? ""
-            let sameOriginHTTP = (scheme == "http" || scheme == "https")
-                && !targetHost.isEmpty
-                && currentHost == targetHost
+            let sameOriginHTTP = webViewURLsHaveSameHTTPOrigin(
+                targetURL: url,
+                currentURL: currentURL,
+                currentBaseURL: currentBaseURL
+            )
             return creativeAutomaticRouteAdmission(
                 isPopup: isPopup,
                 userActivated: userActivated,
@@ -1195,13 +1217,13 @@ struct WebViewRepresentable: UIViewRepresentable {
             // The creative's web-content process crashed/was jettisoned (commonly an OS reclaim while
             // backgrounded). Record it; the SDK survives (WKWebView is sandboxed, so the host app is
             // never taken down with it).
+            onWebContentProcessTerminated?()
             Telemetry.shared.recordError(
                 signature: "webview:render_gone",
                 errorCode: "render_terminated",
                 breadcrumb: telemetryAdFormat
             )
             bridge?.stop()
-            onWebContentProcessTerminated?()
             // A renderer death is a real pressure signal: drain idle views and suppress retention /
             // explicit minigame prewarm for the cooldown. Ordinary backgrounding does not do this.
             WebViewPool.shared.handleRendererDeath()
@@ -1331,6 +1353,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                     destination: ctaDestination,
                     externalClickOnly: true
                 ) {
+                    if webViewURLsHaveSameHTTPOrigin(
+                        targetURL: url,
+                        currentURL: currentURL,
+                        currentBaseURL: currentBaseURL
+                    ) {
+                        decisionHandler(.allow)
+                        return
+                    }
                     // Prefer the server tracking URL (attribution-preserving); fall back to the tapped URL.
                     _ = routeClaimedClick(
                         userActivated: true,
@@ -1445,9 +1475,11 @@ struct WebViewRepresentable: UIViewRepresentable {
             // SFSafariViewController (other).
             if userActivated,
                scheme == "http" || scheme == "https" {
-                let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
-                let targetHost = url.host?.lowercased() ?? ""
-                if !targetHost.isEmpty && currentHost != targetHost {
+                if !webViewURLsHaveSameHTTPOrigin(
+                    targetURL: url,
+                    currentURL: currentURL,
+                    currentBaseURL: currentBaseURL
+                ) {
                     _ = routeClaimedClick(
                         userActivated: true,
                         route: creativeCTARoute(
@@ -1491,6 +1523,14 @@ struct WebViewRepresentable: UIViewRepresentable {
                 }
                 // Native ad: target="_blank" / window.open follows the serve's store-open policy.
                 if externalClickOnly {
+                    if webViewURLsHaveSameHTTPOrigin(
+                        targetURL: url,
+                        currentURL: currentURL,
+                        currentBaseURL: currentBaseURL
+                    ) {
+                        if userActivated { webView.load(URLRequest(url: url)) }
+                        return nil
+                    }
                     // Prefer the server tracking URL (attribution-preserving); fall back to this URL.
                     _ = routeClaimedClick(
                         userActivated: userActivated,
@@ -1500,9 +1540,11 @@ struct WebViewRepresentable: UIViewRepresentable {
                 }
                 let scheme = url.scheme?.lowercased() ?? ""
                 if scheme == "http" || scheme == "https" {
-                    let currentHost = (currentURL ?? currentBaseURL)?.host?.lowercased() ?? ""
-                    let targetHost = url.host?.lowercased() ?? ""
-                    if !targetHost.isEmpty && currentHost != targetHost {
+                    if !webViewURLsHaveSameHTTPOrigin(
+                        targetURL: url,
+                        currentURL: currentURL,
+                        currentBaseURL: currentBaseURL
+                    ) {
                         // Cross-domain → deterministic store route when the serve supplied its raw
                         // store link, else resolve redirects then route. Router entry point is
                         // `@MainActor`; this delegate runs on main, so hop explicitly rather than

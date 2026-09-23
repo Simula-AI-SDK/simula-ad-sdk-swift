@@ -70,6 +70,64 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("window.open = function()"))
     }
 
+    func testDocumentStartCTAInterceptionLeavesSameOriginAndInternalNavigationToWebKit() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce")
+
+        XCTAssertTrue(source.contains("function documentHTTPOrigin()"))
+        XCTAssertTrue(source.contains("function isSameOriginCTA(url)"))
+        XCTAssertTrue(source.contains("function isInternalCTA(url)"))
+        XCTAssertTrue(source.contains("function isExternalHTTPCTA(url)"))
+        XCTAssertTrue(source.contains("protocol === 'http:' || protocol === 'https:'"))
+        for scheme in ["about:", "data:", "blob:", "javascript:"] {
+            XCTAssertTrue(source.contains("protocol === '\(scheme)'"), scheme)
+        }
+        XCTAssertTrue(source.contains("if (!url || !isExternalHTTPCTA(url)) { return false; }"))
+        XCTAssertTrue(source.contains("return originalOpen.apply(window, arguments);"))
+        XCTAssertTrue(source.contains("if (forwardCTA(anchor.href)) { event.preventDefault(); }"))
+        XCTAssertFalse(source.contains("window.__simulaNativeSlotSource"), "srcdoc frames use the installed semantic source")
+    }
+
+    func testWebViewHTTPOriginIncludesSchemeHostAndEffectivePort() throws {
+        let current = try XCTUnwrap(URL(string: "https://Example.COM/path"))
+
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "https://example.com:443/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "http://example.com/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "https://example.com:444/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "http://example.com:80/other")),
+            currentURL: try XCTUnwrap(URL(string: "http://example.com/path")),
+            currentBaseURL: nil
+        ))
+    }
+
+    func testWebViewHTTPOriginFallsBackToCurrentBaseURL() throws {
+        let target = try XCTUnwrap(URL(string: "https://creative.example:443/next"))
+        let base = try XCTUnwrap(URL(string: "https://CREATIVE.example/root/"))
+
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: target,
+            currentURL: nil,
+            currentBaseURL: base
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: target,
+            currentURL: try XCTUnwrap(URL(string: "https://other.example/root/")),
+            currentBaseURL: base
+        ), "currentURL takes precedence when both sources are present")
+    }
+
     func testOpenStoreSharesWindowOpenGestureClaimWhileDismissDoesNotClaim() {
         let source = creativeUserActivationScriptSource(nonce: "nonce")
         let openStore = source.range(of: "function openStore()")

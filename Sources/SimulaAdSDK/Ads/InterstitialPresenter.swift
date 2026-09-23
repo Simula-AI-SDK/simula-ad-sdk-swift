@@ -35,6 +35,14 @@ struct ViewThroughImpressionLifecycleState<Impression> {
         guard impression != nil else { return }
         end(perform: perform)
     }
+
+    mutating func rendererTerminated(perform: (Impression) -> Void) {
+        isCreativeReady = false
+        didAttemptStart = false
+        guard let impression else { return }
+        self.impression = nil
+        perform(impression)
+    }
 }
 
 #if os(iOS)
@@ -426,7 +434,10 @@ private struct CreativeInterstitialView: View {
                     treatment: closeConfig.treatment,
                     position: closeConfig.position,
                     progressBarColor: closeConfig.progressBarColor,
-                    progressBarStyle: response.adBehavior?.progressBar.style ?? .single,
+                    progressBarStyle: effectiveVideoProgressBarStyle(
+                        isContract2Video: usesVideoPlanV2,
+                        configured: response.adBehavior?.progressBar.style ?? .single
+                    ),
                     action: closeConfig.action,
                     isRewardCopy: isRewardCopy,
                     enabled: canDismissFullscreen(
@@ -466,9 +477,16 @@ private struct CreativeInterstitialView: View {
             AdInfoReportOverlay(
                 adId: response.impressionId,
                 apiKey: apiKey,
-                // A genuine bottom-left ✕ shares the bottom-left corner with the "i" (shrink its hit area);
-                // a progress_bar bottom ✕ relocates to top-right, leaving the "i" its full hit area.
-                closeAtBottomLeft: closeConfig.position == .bottomLeft && !closeBarAtBottom(closeConfig.treatment, closeConfig.position)
+                // A genuine bottom-left control shares the corner with the "i" (shrink its hit area).
+                // Any bottom bar relocates that control, leaving the disclosure its full hit area.
+                closeAtBottomLeft: closeConfig.position == .bottomLeft && !closeBarAtBottom(
+                    closeConfig.treatment,
+                    closeConfig.position,
+                    progressBarStyle: effectiveVideoProgressBarStyle(
+                        isContract2Video: usesVideoPlanV2,
+                        configured: response.adBehavior?.progressBar.style ?? .single
+                    )
+                )
             )
         }
         .opacity(visible ? 1 : 0)
@@ -650,6 +668,7 @@ private struct CreativeInterstitialView: View {
             onNavigationFinished: { handlePlayableReady() },
             onNavigationFailed: { _ in handleLegacyHTMLBillingCallback(.navigationFailed) },
             onWebContentProcessTerminated: {
+                handleSKANRendererTermination()
                 handleLegacyHTMLBillingCallback(.webContentProcessTerminated)
             },
             onAdClick: { handleHtmlClick($0) },
@@ -730,11 +749,19 @@ private struct CreativeInterstitialView: View {
             ),
             effectiveClosePosition: effectiveVideoClosePosition(
                 treatment: closeConfig.treatment,
-                position: closeConfig.position
+                position: closeConfig.position,
+                progressBarStyle: effectiveVideoProgressBarStyle(
+                    isContract2Video: usesVideoPlanV2,
+                    configured: response.adBehavior?.progressBar.style ?? .single
+                )
             ),
             bottomProgressBarObstructsChrome: videoBottomProgressBarObstructsChrome(
                 treatment: closeConfig.treatment,
-                position: closeConfig.position
+                position: closeConfig.position,
+                progressBarStyle: effectiveVideoProgressBarStyle(
+                    isContract2Video: usesVideoPlanV2,
+                    configured: response.adBehavior?.progressBar.style ?? .single
+                )
             ),
             storePromptVisible: storePromptVisible && !closeEnabled,
             storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
@@ -1106,8 +1133,11 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleSKANRendererTermination() {
-        skanViewThrough.markCreativeNotReady()
-        endSKANViewThroughImpressionIfStarted()
+        skanViewThrough.rendererTerminated { impression in
+            SKAdNetwork.endImpression(impression) { error in
+                recordInterstitialSKANViewThroughOperation(name: "skan_view_end", error: error)
+            }
+        }
     }
 
     private func startSKANViewThroughImpression() {
@@ -1578,16 +1608,22 @@ private struct CreativeInterstitialView: View {
 
 /// Height of the `progressBar` gate bar.
 let closeProgressBarHeight: CGFloat = 4
-/// When the gate bar sits at the bottom (progressBar at bottomLeft), raise it this far above the safe
-/// edge so it clears the bottom-left info "i" (a 16pt circle inset 6pt from the corner ≈ 22pt tall).
+/// When a progress bar sits at the bottom, raise it this far above the safe edge so it clears the
+/// bottom-left info "i" (a 16pt circle inset 6pt from the corner ≈ 22pt tall).
 let closeBottomBarLift: CGFloat = 26
 
-/// True for the `progressBar` treatment pinned to `bottomLeft`: the gate bar then spans the bottom,
-/// so the ✕ moves up to the top-right (it can't sit on the bar) and the bar itself is raised to sit
-/// just above the info "i" (which keeps its corner spot). For every OTHER bottomLeft close the ✕ stays
-/// bottom-left. (The store prompt sits top-right for any bottomLeft close — see `StorePromptBadge`.)
-func closeBarAtBottom(_ treatment: CloseTreatment, _ position: ClosePosition) -> Bool {
-    videoBottomProgressBarObstructsChrome(treatment: treatment, position: position)
+/// True when either the close treatment or the independent two-tone style puts a bar on a configured
+/// `bottomLeft` edge. The close control moves to top-right and the bar sits above the disclosure.
+func closeBarAtBottom(
+    _ treatment: CloseTreatment,
+    _ position: ClosePosition,
+    progressBarStyle: ProgressBarStyle = .single
+) -> Bool {
+    videoBottomProgressBarObstructsChrome(
+        treatment: treatment,
+        position: position,
+        progressBarStyle: progressBarStyle
+    )
 }
 
 /// The `ad_behavior`-driven close button. Renders the assigned `treatment` at the configured
@@ -1623,13 +1659,18 @@ struct CloseButtonView: View {
     /// Fill tint for the ring / bar. Validated upstream, so `Color(hex:)` always gets clean input.
     private var tint: Color { Color(hex: progressBarColor) }
 
-    /// For the progress_bar treatment, the gate bar takes the bottom edge when pinned bottom_left.
-    private var barAtBottom: Bool { closeBarAtBottom(treatment, position) }
+    /// A configured bottom-left bar uses the bottom edge regardless of close treatment.
+    private var barAtBottom: Bool {
+        closeBarAtBottom(treatment, position, progressBarStyle: progressBarStyle)
+    }
 
-    /// The ✕ honors its configured corner, EXCEPT progress_bar at bottom_left: the gate bar takes the
-    /// bottom edge there, so the ✕ moves up to the top-right.
+    /// The close control honors its configured corner unless a bottom bar relocates it to top-right.
     private var cornerAlignment: Alignment {
-        switch effectiveVideoClosePosition(treatment: treatment, position: position) {
+        switch effectiveVideoClosePosition(
+            treatment: treatment,
+            position: position,
+            progressBarStyle: progressBarStyle
+        ) {
         case .topRight: return .topTrailing
         case .topLeft: return .topLeading
         case .bottomLeft: return .bottomLeading
@@ -1638,8 +1679,8 @@ struct CloseButtonView: View {
 
     var body: some View {
         ZStack {
-            // `progress_bar` treatment: a full-width bar, shown during the delay and tinted by color.
-            // Pinned to the top edge by default; at bottom_left it sits on the bottom edge instead.
+            // Full-width gate/two-tone bar. It is top-pinned by default and bottom-pinned when the
+            // configured bottom-left edge is obstructed.
             if shouldMountProgressBar(
                 treatment: treatment,
                 style: progressBarStyle,

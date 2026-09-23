@@ -309,6 +309,21 @@ final class UnitEndRewardClaim {
     }
 }
 
+@MainActor
+@discardableResult
+/// Host teardown may consume a unit-end reward that already crossed its authoritative end. It must
+/// never resolve missing fallback authority or promote an open primary gate into an earned reward.
+func consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+    _ claim: UnitEndRewardClaim?,
+    onEarn: () -> Void,
+    enqueueVerification: () -> Void
+) -> Bool {
+    claim?.consumeAtUnitClose(
+        onEarn: onEarn,
+        enqueueVerification: enqueueVerification
+    ) ?? false
+}
+
 struct RewardedEarlyCompletionState: Equatable, Sendable {
     private(set) var pending = false
     private(set) var consumed = false

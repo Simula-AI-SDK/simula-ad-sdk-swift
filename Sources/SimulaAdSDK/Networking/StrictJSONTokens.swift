@@ -1,5 +1,8 @@
 import Foundation
 
+let fullscreenResponseMaximumBytes = 10 * 1024 * 1024
+let strictJSONMaximumNestingDepth = 64
+
 extension CodingUserInfoKey {
     static var simulaStrictJSONTokens: CodingUserInfoKey? {
         CodingUserInfoKey(rawValue: "com.simula.strict-json-tokens")
@@ -43,8 +46,9 @@ func isCanonicalJSONInteger(_ token: String) -> Bool {
     return true
 }
 
-/// Captures the original lexical token for every JSON scalar. Foundation's `JSONDecoder` accepts
-/// `2.0` and `2e0` as `Int(2)`, so exact protocol markers must be checked before typed decoding.
+/// Captures original lexical tokens only for protocol fields that require exact integers.
+/// Foundation's `JSONDecoder` accepts `2.0` and `2e0` as `Int(2)`, while retaining every scalar
+/// would duplicate large inline HTML strings. Parsing is depth-bounded before Foundation decoding.
 struct StrictJSONTokenMap {
     private let bytes: [UInt8]
     private var index = 0
@@ -54,45 +58,46 @@ struct StrictJSONTokenMap {
         bytes = Array(data)
     }
 
-    static func parse(_ data: Data) -> [String: String] {
+    static func parse(_ data: Data) -> [String: String]? {
+        guard data.count <= fullscreenResponseMaximumBytes else { return nil }
         var parser = StrictJSONTokenMap(data: data)
-        guard parser.parseValue(path: "") else { return [:] }
+        guard parser.parseValue(path: "", depth: 0) else { return nil }
         parser.skipWhitespace()
-        return parser.index == parser.bytes.count ? parser.tokens : [:]
+        return parser.index == parser.bytes.count ? parser.tokens : nil
     }
 
-    private mutating func parseValue(path: String) -> Bool {
+    private mutating func parseValue(path: String, depth: Int) -> Bool {
+        guard depth <= strictJSONMaximumNestingDepth else { return false }
         skipWhitespace()
         guard index < bytes.count else { return false }
         switch bytes[index] {
-        case 123: return parseObject(path: path)
-        case 91: return parseArray(path: path)
+        case 123: return parseObject(path: path, depth: depth)
+        case 91: return parseArray(path: path, depth: depth)
         case 34:
-            let start = index
-            guard parseString() != nil else { return false }
-            tokens[path] = String(decoding: bytes[start..<index], as: UTF8.self)
-            return true
+            // Exact-token fields are numeric. Skip all string values in-place so large inline
+            // `rendered_html` values never create a second Data/String allocation.
+            return skipString()
         default:
             let start = index
             while index < bytes.count, ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index]) {
                 index += 1
             }
             guard index > start else { return false }
-            tokens[path] = String(decoding: bytes[start..<index], as: UTF8.self)
+            captureToken(path: path, start: start)
             return true
         }
     }
 
-    private mutating func parseObject(path: String) -> Bool {
+    private mutating func parseObject(path: String, depth: Int) -> Bool {
         index += 1
         skipWhitespace()
         if consume(125) { return true }
         while index < bytes.count {
-            guard let key = parseString() else { return false }
+            guard let key = parseKey() else { return false }
             skipWhitespace()
             guard consume(58) else { return false }
             let childPath = path.isEmpty ? key : "\(path).\(key)"
-            guard parseValue(path: childPath) else { return false }
+            guard parseValue(path: childPath, depth: depth + 1) else { return false }
             skipWhitespace()
             if consume(125) { return true }
             guard consume(44) else { return false }
@@ -101,13 +106,13 @@ struct StrictJSONTokenMap {
         return false
     }
 
-    private mutating func parseArray(path: String) -> Bool {
+    private mutating func parseArray(path: String, depth: Int) -> Bool {
         index += 1
         skipWhitespace()
         if consume(93) { return true }
         var item = 0
         while index < bytes.count {
-            guard parseValue(path: "\(path)[\(item)]") else { return false }
+            guard parseValue(path: "\(path)[\(item)]", depth: depth + 1) else { return false }
             item += 1
             skipWhitespace()
             if consume(93) { return true }
@@ -117,7 +122,44 @@ struct StrictJSONTokenMap {
         return false
     }
 
-    private mutating func parseString() -> String? {
+    private mutating func captureToken(path: String, start: Int) {
+        guard Self.requiresExactToken(path) else { return }
+        tokens[path] = String(decoding: bytes[start..<index], as: UTF8.self)
+    }
+
+    private static func requiresExactToken(_ path: String) -> Bool {
+        if path == "video_contract" || path == "ad_behavior.skoverlay.delay_seconds" {
+            return true
+        }
+        let parts = path.split(separator: ".").map(String.init)
+        if parts.count == 3 {
+            return parts[0] == "creative"
+                && isIndexed(parts[1], name: "segments")
+                && parts[2] == "clip_index"
+        }
+        if parts.count == 4 {
+            let fallbackOverlay = isIndexed(parts[0], name: "ads")
+                && parts[1] == "ad_behavior"
+                && parts[2] == "skoverlay"
+                && parts[3] == "delay_seconds"
+            let fallbackSegment = isIndexed(parts[0], name: "ads")
+                && parts[1] == "creative"
+                && isIndexed(parts[2], name: "segments")
+                && parts[3] == "clip_index"
+            return fallbackOverlay || fallbackSegment
+        }
+        return false
+    }
+
+    private static func isIndexed(_ component: String, name: String) -> Bool {
+        let prefix = "\(name)["
+        guard component.hasPrefix(prefix), component.hasSuffix("]") else { return false }
+        let start = component.index(component.startIndex, offsetBy: prefix.count)
+        let end = component.index(before: component.endIndex)
+        return start < end && component[start..<end].allSatisfy(\.isNumber)
+    }
+
+    private mutating func parseKey() -> String? {
         guard consume(34) else { return nil }
         let contentStart = index
         var escaped = false
@@ -132,15 +174,32 @@ struct StrictJSONTokenMap {
             } else if byte == 34 {
                 let raw = Data(bytes[contentStart..<index])
                 index += 1
-                // JSON keys in this protocol are ASCII. Reject escaped keys rather than guessing a
-                // path; typed decoding still handles the payload, but no exact marker is activated.
-                guard !raw.contains(92) else { return nil }
+                // Exact protocol keys are ASCII. An escaped key gets an intentionally non-matching
+                // path while typed decoding still handles it.
+                if raw.contains(92) { return "__escaped_json_key__" }
                 return String(data: raw, encoding: .utf8)
             } else {
                 index += 1
             }
         }
         return nil
+    }
+
+    private mutating func skipString() -> Bool {
+        guard consume(34) else { return false }
+        var escaped = false
+        while index < bytes.count {
+            let byte = bytes[index]
+            index += 1
+            if escaped {
+                escaped = false
+            } else if byte == 92 {
+                escaped = true
+            } else if byte == 34 {
+                return true
+            }
+        }
+        return false
     }
 
     private mutating func skipWhitespace() {
@@ -155,7 +214,10 @@ struct StrictJSONTokenMap {
 }
 
 func decodeFullscreenPayload<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
-    let tokens = StrictJSONTokenMap.parse(data)
+    guard data.count <= fullscreenResponseMaximumBytes,
+          let tokens = StrictJSONTokenMap.parse(data) else {
+        throw SimulaAPIError.invalidResponse
+    }
     let contract2 = tokens["video_contract"].flatMap { token in
         isCanonicalJSONInteger(token) ? Int(token) : nil
     } == 2

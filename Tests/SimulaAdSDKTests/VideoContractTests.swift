@@ -7,6 +7,10 @@ final class VideoContractTests: XCTestCase {
         try decodeFullscreenPayload(AdLoadResponse.self, from: Data(json.utf8))
     }
 
+    private func decodeRewarded(_ json: String) throws -> RewardedInitResponse {
+        try decodeFullscreenPayload(RewardedInitResponse.self, from: Data(json.utf8))
+    }
+
     func testOnlyExactNumericRootActivatesContractTwo() throws {
         let active = try decodeInterstitial(
             #"{"ad_inserted":true,"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/a.mp4"}}"#
@@ -57,12 +61,23 @@ final class VideoContractTests: XCTestCase {
         XCTAssertEqual(activeVideoSegment(in: segments, at: 80)?.clipIndex, 1)
     }
 
-    func testSegmentsDecodeLossilyAndAllowOneMillisecondBoundaryDrift() throws {
+    func testSegmentClipIndexRequiresLexicalJSONIntegerWithoutDroppingVideo() throws {
+        for token in ["0.0", "0e0", "\"0\"", "true"] {
+            let response = try decodeInterstitial(
+                "{\"ad_inserted\":true,\"video_contract\":2,\"creative\":{" +
+                    "\"type\":\"video\",\"url\":\"https://cdn.example/a.mp4\"," +
+                    "\"segments\":[{\"clip_index\":\(token),\"video_pool\":\"ugc\"," +
+                    "\"start_seconds\":0,\"end_seconds\":1}]}}"
+            )
+            XCTAssertNotNil(response.creativeContent, token)
+            XCTAssertEqual(response.creative?.segments, [], token)
+        }
+    }
+
+    func testSegmentsAllowOneMillisecondBoundaryDrift() throws {
         let response = try decodeInterstitial(#"""
         {"ad_inserted":true,"video_contract":2,"creative":{
           "type":"video","url":"https://cdn.example/a.mp4","segments":[
-            false,
-            {"clip_index":"bad","video_pool":"bad","start_seconds":0,"end_seconds":1},
             {"clip_index":0,"video_pool":"ugc","start_seconds":0.0009,"end_seconds":2.5},
             {"clip_index":1,"video_pool":"gameplay","start_seconds":2.5009,"end_seconds":8}
           ]}}
@@ -86,6 +101,24 @@ final class VideoContractTests: XCTestCase {
           ]}}
         """#)
         XCTAssertEqual(reversedWithinTolerance.creative?.segments, [])
+    }
+
+    func testAnyMalformedSegmentInvalidatesInterleavedAndTrailingListsWithoutDroppingVideo() throws {
+        let segmentLists = [
+            #"[{"clip_index":0,"video_pool":"a","start_seconds":0,"end_seconds":1},false,{"clip_index":1,"video_pool":"b","start_seconds":1,"end_seconds":2}]"#,
+            #"[{"clip_index":0,"video_pool":"a","start_seconds":0,"end_seconds":1},{"clip_index":1,"video_pool":"b","start_seconds":1,"end_seconds":2},{"clip_index":"2","video_pool":"c","start_seconds":2,"end_seconds":3}]"#,
+            #"[{"clip_index":0,"video_pool":"a","start_seconds":0,"end_seconds":1},{"clip_index":1,"video_pool":"b","start_seconds":1,"end_seconds":2},null]"#,
+        ]
+
+        for segments in segmentLists {
+            let response = try decodeInterstitial(
+                "{\"ad_inserted\":true,\"video_contract\":2,\"creative\":{" +
+                    "\"type\":\"video\",\"url\":\"https://cdn.example/a.mp4\"," +
+                    "\"segments\":\(segments)}}"
+            )
+            XCTAssertNotNil(response.creativeContent, segments)
+            XCTAssertEqual(response.creative?.segments, [], segments)
+        }
     }
 
     func testMalformedNonFiniteUnsortedAndGappedSegmentsFailClosedWithoutDroppingCreative() throws {
@@ -141,7 +174,10 @@ final class VideoContractTests: XCTestCase {
         let response = try decodeInterstitial(
             #"{"ad_inserted":true,"ad_behavior":{"skoverlay":{"delay_seconds":999}}}"#
         )
-        XCTAssertEqual(response.adBehavior?.skoverlay?.delaySeconds, 60)
+        XCTAssertEqual(response.adBehavior?.skoverlay?.delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(enabled: true, delaySeconds: -1).delaySeconds, 0)
+        XCTAssertEqual(SKOverlayConfig(enabled: true, delaySeconds: 300).delaySeconds, 300)
+        XCTAssertEqual(SKOverlayConfig(enabled: true, delaySeconds: 999).delaySeconds, 300)
     }
 
     func testClickIdentityIsReusedOrMintedWithSemanticFallback() {
@@ -160,9 +196,41 @@ final class VideoContractTests: XCTestCase {
         )
 
         XCTAssertEqual(supplied.id, "00000000-0000-4000-8000-000000000001")
-        XCTAssertEqual(supplied.source.rawValue, "html_cta")
+        XCTAssertEqual(supplied.source, .primaryUnknown)
         XCTAssertEqual(invalid.id, "minted")
         XCTAssertEqual(invalid.source, .endScreen2Unknown)
+    }
+
+    func testClickSourceGoldenListExactlyMatchesBackendAndPreservesValidHTMLID() {
+        let id = "00000000-0000-4000-8000-000000000001"
+        let backendGolden = [
+            "auto_redirect", "companion", "cta", "end_screen",
+            "end_screen_ad_1_backdrop", "end_screen_ad_1_cta",
+            "end_screen_ad_2_backdrop", "end_screen_ad_2_cta",
+            "end_screen_ad_2_interested_button", "fallback_cta", "install_banner",
+            "interstitial", "native", "native_backdrop", "native_cta", "playable",
+            "primary_cta", "primary_unknown", "rewarded", "sdk", "store_prompt",
+            "video_preview_cta", "end_screen_1_unknown", "end_screen_2_unknown",
+        ]
+        XCTAssertEqual(ClickSource.contract2AllowedSources.map(\.rawValue).sorted(), backendGolden.sorted())
+        for rawSource in backendGolden {
+            let source = ClickSource(rawValue: rawSource)
+            XCTAssertEqual(
+                resolvedClickInteraction(
+                    identity: HTMLClickIdentity(interactionId: id, clickSource: source.rawValue),
+                    fallbackSource: .endScreen1Unknown
+                ),
+                ClickInteraction(id: id, source: source)
+            )
+        }
+        for source in [nil, "html_cta", "future_source", "bad source"] {
+            let interaction = resolvedClickInteraction(
+                identity: HTMLClickIdentity(interactionId: id, clickSource: source),
+                fallbackSource: .endScreen1Unknown
+            )
+            XCTAssertEqual(interaction.id, id)
+            XCTAssertEqual(interaction.source, .endScreen1Unknown)
+        }
     }
 
     func testClickIdentityAcceptsRFC4122VersionsOneThroughFiveAndRejectsOtherVariants() {
@@ -323,6 +391,85 @@ final class VideoContractTests: XCTestCase {
             style: .single,
             dismissUnlocked: true
         ))
+        for treatment in [CloseTreatment.hidden, .countdownCircle, .rewardOrCloseLabel] {
+            XCTAssertTrue(shouldMountProgressBar(
+                treatment: treatment,
+                style: .twoTone,
+                dismissUnlocked: false
+            ))
+            XCTAssertTrue(shouldMountProgressBar(
+                treatment: treatment,
+                style: .twoTone,
+                dismissUnlocked: true
+            ))
+        }
+    }
+
+    func testContractTwoTwoToneMountsForDefaultAndHiddenCloseInBothFormats() throws {
+        let payloads = [
+            #"{"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/a.mp4"},"ad_behavior":{"close":{"treatment":"hidden"},"progress_bar":{"style":"two_tone"}}}"#,
+            #"{"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/a.mp4"},"ad_behavior":{"progress_bar":{"style":"two_tone"}}}"#,
+        ]
+        for payload in payloads {
+            let interstitial = try decodeInterstitial(payload)
+            let rewarded = try decodeRewarded(payload)
+            for (isContract2Video, style) in [
+                (interstitial.primaryUsesVideoPlanV2, interstitial.adBehavior?.progressBar.style),
+                (rewarded.primaryUsesVideoPlanV2, rewarded.adBehavior?.progressBar.style),
+            ] {
+                let effective = effectiveVideoProgressBarStyle(
+                    isContract2Video: isContract2Video,
+                    configured: style ?? .single
+                )
+                XCTAssertEqual(effective, .twoTone)
+                XCTAssertTrue(shouldMountProgressBar(
+                    treatment: .hidden,
+                    style: effective,
+                    dismissUnlocked: true
+                ))
+            }
+        }
+    }
+
+    func testMissingAndMalformedMarkersKeepV1VideoAndDisableContractTwoOwnership() throws {
+        for marker in [nil, "2.0", "2e0", "\"2\"", "true"] {
+            let markerField = marker.map { "\"video_contract\":\($0)," } ?? ""
+            let response = try decodeInterstitial(
+                "{\"ad_inserted\":true,\(markerField)\"impression_url\":\"https://measure.example/p\"," +
+                    "\"creative\":{\"type\":\"video\",\"url\":\"https://cdn.example/a.mp4\"," +
+                    "\"segments\":[{\"clip_index\":0,\"video_pool\":\"ugc\"," +
+                    "\"start_seconds\":0,\"end_seconds\":1}]}," +
+                    "\"ad_behavior\":{\"progress_bar\":{\"style\":\"two_tone\"}}}"
+            )
+            XCTAssertNotNil(response.creativeContent, marker ?? "missing")
+            XCTAssertFalse(response.primaryUsesVideoPlanV2, marker ?? "missing")
+            XCTAssertEqual(response.creative?.segments, [], marker ?? "missing")
+            XCTAssertNil(response.validatedImpressionURL, marker ?? "missing")
+            XCTAssertEqual(
+                effectiveVideoProgressBarStyle(
+                    isContract2Video: response.primaryUsesVideoPlanV2,
+                    configured: response.adBehavior?.progressBar.style ?? .single
+                ),
+                .single,
+                marker ?? "missing"
+            )
+        }
+    }
+
+    func testImpressionURLIsOwnedOnlyByExactContractTwoMarker() throws {
+        let active = try decodeInterstitial(
+            #"{"video_contract":2,"impression_url":"https://measure.example/p"}"#
+        )
+        XCTAssertEqual(active.validatedImpressionURL?.absoluteString, "https://measure.example/p")
+        for marker in ["2.0", "2e0", "\"2\"", "true"] {
+            let response = try decodeInterstitial(
+                "{\"video_contract\":\(marker),\"impression_url\":\"https://measure.example/p\"}"
+            )
+            XCTAssertNil(response.validatedImpressionURL, marker)
+        }
+        XCTAssertNil(try decodeInterstitial(
+            #"{"impression_url":"https://measure.example/p"}"#
+        ).validatedImpressionURL)
     }
 
     func testMediaTimelineDrivesMidpointSegmentsAndTwoToneWhileWatchTimeStaysSeparate() {
@@ -482,6 +629,27 @@ final class VideoContractTests: XCTestCase {
         wait(for: [received], timeout: 1)
     }
 
+    func testPlainImpressionFailureReportsLowCardinalityEventExactlyOnce() throws {
+        XCTAssertEqual(plainImpressionFailureSignature, "impression_url:get_failed")
+        XCTAssertFalse(plainImpressionFailureSignature.contains("measure.example"))
+        XCTAssertFalse(plainImpressionFailureSignature.contains("?"))
+        let failed = expectation(description: "failure telemetry")
+        failed.assertForOverFulfill = true
+        ImpressionURLProtocol.recorder.install({ _ in }, statusCode: 500)
+        defer { ImpressionURLProtocol.recorder.install(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ImpressionURLProtocol.self]
+        let sender = PlainImpressionSender(
+            configuration: configuration,
+            resolver: { _ in ["8.8.8.8"] },
+            recordFailure: { failed.fulfill() }
+        )
+
+        sender.send(try XCTUnwrap(URL(string: "https://measure.example/private?token=secret")))
+
+        wait(for: [failed], timeout: 1)
+    }
+
     func testBlockedResolverReturnsAtAbsoluteDeadlineWithoutWaitingForWorker() async throws {
         let blocker = DispatchSemaphore(value: 0)
         let resolver = BoundedPublicNetworkHostResolver(
@@ -581,14 +749,23 @@ private final class ImpressionTestOwner {}
 private final class ImpressionRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: ((URLRequest) -> Void)?
+    private var responseStatusCode = 204
 
-    func install(_ handler: ((URLRequest) -> Void)?) {
-        lock.lock(); self.handler = handler; lock.unlock()
+    func install(_ handler: ((URLRequest) -> Void)?, statusCode: Int = 204) {
+        lock.lock()
+        self.handler = handler
+        responseStatusCode = statusCode
+        lock.unlock()
     }
 
     func record(_ request: URLRequest) {
         lock.lock(); let handler = handler; lock.unlock()
         handler?(request)
+    }
+
+    var statusCode: Int {
+        lock.lock(); defer { lock.unlock() }
+        return responseStatusCode
     }
 }
 
@@ -602,7 +779,7 @@ private final class ImpressionURLProtocol: URLProtocol {
         Self.recorder.record(request)
         if let response = HTTPURLResponse(
             url: request.url ?? URL(fileURLWithPath: "/"),
-            statusCode: 204,
+            statusCode: Self.recorder.statusCode,
             httpVersion: nil,
             headerFields: nil
         ) {
@@ -876,6 +1053,47 @@ final class VideoAssetCacheTests: XCTestCase {
                 self.callbackClassification(.network(.invalidResponse)),
                 "network:invalid_response"
             )
+        }
+    }
+
+    func testStrictTokenMapRetainsOnlyRequiredExactNumericPaths() throws {
+        let html = String(repeating: "x", count: 100_000)
+        let data = Data(#"""
+        {"video_contract":2,"rendered_html":"\#(html)","bid_amt":4.5,
+         "ad_behavior":{"close":{"delay_seconds":8},"skoverlay":{"delay_seconds":3}},
+         "creative":{"segments":[{"clip_index":0,"video_pool":"ugc","start_seconds":0,"end_seconds":1}]},
+         "ads":[{"ad_behavior":{"skoverlay":{"delay_seconds":4}},
+                  "creative":{"segments":[{"clip_index":1,"video_pool":"gameplay","start_seconds":1,"end_seconds":2}]}}]}
+        """#.utf8)
+        let tokens = try XCTUnwrap(StrictJSONTokenMap.parse(data))
+
+        XCTAssertEqual(tokens, [
+            "video_contract": "2",
+            "ad_behavior.skoverlay.delay_seconds": "3",
+            "creative.segments[0].clip_index": "0",
+            "ads[0].ad_behavior.skoverlay.delay_seconds": "4",
+            "ads[0].creative.segments[0].clip_index": "1",
+        ])
+        XCTAssertNil(tokens["rendered_html"])
+        XCTAssertNil(tokens["bid_amt"])
+    }
+
+    func testFullscreenPayloadRejectsOversizeAndExcessiveNestingBeforeTypedDecode() {
+        let oversized = Data(repeating: 32, count: fullscreenResponseMaximumBytes + 1)
+        XCTAssertThrowsError(try decodeFullscreenPayload(AdLoadResponse.self, from: oversized)) {
+            guard case SimulaAPIError.invalidResponse = $0 else {
+                return XCTFail("Expected invalid response, got \($0)")
+            }
+        }
+
+        let nesting = strictJSONMaximumNestingDepth + 2
+        let deep = String(repeating: "[", count: nesting)
+            + "0"
+            + String(repeating: "]", count: nesting)
+        XCTAssertThrowsError(try decodeFullscreenPayload(AdLoadResponse.self, from: Data(deep.utf8))) {
+            guard case SimulaAPIError.invalidResponse = $0 else {
+                return XCTFail("Expected invalid response, got \($0)")
+            }
         }
     }
 

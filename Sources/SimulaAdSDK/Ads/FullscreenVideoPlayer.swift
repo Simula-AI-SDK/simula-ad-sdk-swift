@@ -492,12 +492,19 @@ let twoToneProgressTrackHex = "#3A3A40"
 let twoToneProgressGateHex = "#1186F2"
 let twoToneProgressPostGateHex = "#1156B6"
 
+func effectiveVideoProgressBarStyle(
+    isContract2Video: Bool,
+    configured: ProgressBarStyle
+) -> ProgressBarStyle {
+    isContract2Video ? configured : .single
+}
+
 func shouldMountProgressBar(
     treatment: CloseTreatment,
     style: ProgressBarStyle,
     dismissUnlocked: Bool
 ) -> Bool {
-    treatment == .progressBar && (!dismissUnlocked || style == .twoTone)
+    style == .twoTone || (treatment == .progressBar && !dismissUnlocked)
 }
 
 func canUseVideoControls(firstFrameAdmitted: Bool, displayAdmitted: Bool) -> Bool {
@@ -813,18 +820,24 @@ func resolvedVideoChromeStyle(
 
 func effectiveVideoClosePosition(
     treatment: CloseTreatment,
-    position: ClosePosition
+    position: ClosePosition,
+    progressBarStyle: ProgressBarStyle = .single
 ) -> ClosePosition {
-    videoBottomProgressBarObstructsChrome(treatment: treatment, position: position)
+    videoBottomProgressBarObstructsChrome(
+        treatment: treatment,
+        position: position,
+        progressBarStyle: progressBarStyle
+    )
         ? .topRight
         : position
 }
 
 func videoBottomProgressBarObstructsChrome(
     treatment: CloseTreatment,
-    position: ClosePosition
+    position: ClosePosition,
+    progressBarStyle: ProgressBarStyle = .single
 ) -> Bool {
-    treatment == .progressBar && position == .bottomLeft
+    position == .bottomLeft && (treatment == .progressBar || progressBarStyle == .twoTone)
 }
 
 func videoChromeNeedsBottomLeadingClearance(
@@ -861,7 +874,7 @@ func videoChromeConfiguration(
     behavior: AdBehavior?,
     isVideoPlanV2: Bool
 ) -> VideoChromeConfiguration? {
-    guard isVideoPlanV2, let creative, creative.isVideoPlanV2Clip else { return nil }
+    guard isVideoPlanV2, let creative, creative.mediaType == .video else { return nil }
     let iconURL = validatedCreativeURL(creative.appIconUrl)
     let title = creative.videoChromeTitle
     return VideoChromeConfiguration(

@@ -76,6 +76,28 @@ enum FallbackFetchResult: Sendable {
     }
 }
 
+let fallbackFetchMaximumAttempts = 2
+let fallbackFetchRetryDelay: TimeInterval = 0.25
+
+func fetchFallbackAdsWithRetry(
+    fetch: @escaping @Sendable () async throws -> [FallbackAd],
+    sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { delay in
+        try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+    }
+) async throws -> [FallbackAd] {
+    for attempt in 1...fallbackFetchMaximumAttempts {
+        try Task.checkCancellation()
+        do {
+            return try await fetch()
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            guard attempt < fallbackFetchMaximumAttempts else { throw error }
+            try await sleep(fallbackFetchRetryDelay)
+        }
+    }
+    throw SimulaAPIError.invalidResponse
+}
+
 @MainActor
 final class FallbackPrefetchOwnership {
     private(set) var consumedByLoadingPresenter = false

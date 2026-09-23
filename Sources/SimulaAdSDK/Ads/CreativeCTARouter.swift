@@ -145,14 +145,47 @@ struct ClickSource: RawRepresentable, Codable, Sendable, Hashable {
 
     init(rawValue: String) { self.rawValue = rawValue }
 
-    static let primaryCTA = ClickSource(rawValue: "primary_cta")
-    static let storePrompt = ClickSource(rawValue: "store_prompt")
-    static let installBanner = ClickSource(rawValue: "install_banner")
-    static let fallbackCTA = ClickSource(rawValue: "fallback_cta")
     static let autoRedirect = ClickSource(rawValue: "auto_redirect")
+    static let companion = ClickSource(rawValue: "companion")
+    static let cta = ClickSource(rawValue: "cta")
+    static let endScreen = ClickSource(rawValue: "end_screen")
+    static let endScreenAd1Backdrop = ClickSource(rawValue: "end_screen_ad_1_backdrop")
+    static let endScreenAd1CTA = ClickSource(rawValue: "end_screen_ad_1_cta")
+    static let endScreenAd2Backdrop = ClickSource(rawValue: "end_screen_ad_2_backdrop")
+    static let endScreenAd2CTA = ClickSource(rawValue: "end_screen_ad_2_cta")
+    static let endScreenAd2InterestedButton = ClickSource(rawValue: "end_screen_ad_2_interested_button")
+    static let fallbackCTA = ClickSource(rawValue: "fallback_cta")
+    static let installBanner = ClickSource(rawValue: "install_banner")
+    static let interstitial = ClickSource(rawValue: "interstitial")
+    static let native = ClickSource(rawValue: "native")
+    static let nativeBackdrop = ClickSource(rawValue: "native_backdrop")
+    static let nativeCTA = ClickSource(rawValue: "native_cta")
+    static let playable = ClickSource(rawValue: "playable")
+    static let primaryCTA = ClickSource(rawValue: "primary_cta")
     static let primaryUnknown = ClickSource(rawValue: "primary_unknown")
+    static let rewarded = ClickSource(rawValue: "rewarded")
+    static let sdk = ClickSource(rawValue: "sdk")
+    static let storePrompt = ClickSource(rawValue: "store_prompt")
+    static let videoPreviewCTA = ClickSource(rawValue: "video_preview_cta")
     static let endScreen1Unknown = ClickSource(rawValue: "end_screen_1_unknown")
     static let endScreen2Unknown = ClickSource(rawValue: "end_screen_2_unknown")
+
+    /// Exact backend `click_contract.py` / `routes/tracking.py` vocabulary. Do not normalize aliases:
+    /// HTML-owned Contract 2 interactions must preserve the backend-authored source byte-for-byte.
+    static let contract2AllowedSources: Set<ClickSource> = [
+        .autoRedirect, .companion, .cta, .endScreen,
+        .endScreenAd1Backdrop, .endScreenAd1CTA,
+        .endScreenAd2Backdrop, .endScreenAd2CTA, .endScreenAd2InterestedButton,
+        .fallbackCTA, .installBanner, .interstitial, .native, .nativeBackdrop, .nativeCTA,
+        .playable, .primaryCTA, .primaryUnknown, .rewarded, .sdk, .storePrompt,
+        .videoPreviewCTA, .endScreen1Unknown, .endScreen2Unknown,
+    ]
+
+    static func contract2(_ rawValue: String?) -> ClickSource? {
+        guard let rawValue else { return nil }
+        let source = ClickSource(rawValue: rawValue)
+        return contract2AllowedSources.contains(source) ? source : nil
+    }
 }
 
 struct HTMLClickIdentity: Equatable, Sendable {
@@ -189,7 +222,7 @@ func resolvedClickInteraction(
 ) -> ClickInteraction {
     return ClickInteraction(
         id: validatedRFC4122ClickID(identity?.interactionId) ?? makeID(),
-        source: validatedClickToken(identity?.clickSource).map(ClickSource.init(rawValue:)) ?? fallbackSource
+        source: ClickSource.contract2(identity?.clickSource) ?? fallbackSource
     )
 }
 

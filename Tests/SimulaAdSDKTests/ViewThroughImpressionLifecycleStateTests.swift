@@ -127,4 +127,46 @@ final class ViewThroughImpressionLifecycleStateTests: XCTestCase {
         XCTAssertTrue(viewThrough.didEnd)
         XCTAssertNil(viewThrough.impression)
     }
+
+    func testRendererDeathEndsCurrentImpressionAndRestartsOnlyAfterRecoveryReadiness() {
+        var state = ViewThroughImpressionLifecycleState<NSObject>()
+        let first = NSObject()
+        let recovered = NSObject()
+        var started: [NSObject] = []
+        var ended: [NSObject] = []
+
+        state.markCreativeReady()
+        state.start(makeImpression: { first }) { started.append($0) }
+        state.rendererTerminated { ended.append($0) }
+        state.start(makeImpression: { recovered }) { started.append($0) }
+
+        XCTAssertEqual(started.count, 1, "a dead renderer cannot restart before didFinish readiness")
+        XCTAssertTrue(ended.first === first)
+        XCTAssertFalse(state.isCreativeReady)
+
+        state.markCreativeReady()
+        state.start(makeImpression: { recovered }) { started.append($0) }
+        XCTAssertEqual(started.count, 2)
+        XCTAssertTrue(started.last === recovered)
+    }
+
+    func testRepeatedRendererDeathEndsEachActiveCycleAtMostOnce() {
+        var state = ViewThroughImpressionLifecycleState<NSObject>()
+        let first = NSObject()
+        let recovered = NSObject()
+        var ended: [NSObject] = []
+
+        state.markCreativeReady()
+        state.start(makeImpression: { first }) { _ in }
+        state.rendererTerminated { ended.append($0) }
+        state.rendererTerminated { ended.append($0) }
+        XCTAssertEqual(ended.count, 1)
+
+        state.markCreativeReady()
+        state.start(makeImpression: { recovered }) { _ in }
+        state.rendererTerminated { ended.append($0) }
+        state.rendererTerminated { ended.append($0) }
+        XCTAssertEqual(ended.count, 2)
+        XCTAssertTrue(ended.last === recovered)
+    }
 }

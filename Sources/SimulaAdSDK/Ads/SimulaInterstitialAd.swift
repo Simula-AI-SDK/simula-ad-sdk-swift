@@ -1039,7 +1039,9 @@ public final class SimulaInterstitialAd {
     ) async -> FallbackFetchResult {
         let result: FallbackFetchResult
         do {
-            let ads = try await api.fetchFallbacks(impressionId: impressionId)
+            let ads = try await fetchFallbackAdsWithRetry {
+                try await api.fetchFallbacks(impressionId: impressionId)
+            }
             result = ads.isEmpty
                 ? .noContent
                 : .content(ads, preparedVideos: await prepareUpcomingFallbackVideos(

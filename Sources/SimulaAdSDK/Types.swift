@@ -436,9 +436,10 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 /// trap the user with no exit. Keep this independent from SKOverlay timing and bounded at 60s.
 let maxCloseDelaySeconds = 60
 
-/// Independent cap for delayed SKOverlay presentation. It intentionally does not reuse the close
-/// gate's safety constant: changing close-button experiment arms must not change install timing.
+/// Contract 2 narrows install-overlay timing to one minute. The public/legacy model keeps its
+/// historical five-minute range; exact Contract 2 payload decoding applies this stricter limit.
 let maxSKOverlayDelaySeconds = 60
+let maxLegacySKOverlayDelaySeconds = 300
 
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
@@ -605,31 +606,38 @@ private struct RawVideoSegment: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        clipIndex = try c.decode(Int.self, forKey: .clipIndex)
+        guard let exactIndex = exactJSONInteger(for: decoder, key: CodingKeys.clipIndex) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .clipIndex,
+                in: c,
+                debugDescription: "clip_index must be a lexical JSON integer"
+            )
+        }
+        clipIndex = exactIndex
         videoPool = try c.decode(String.self, forKey: .videoPool)
         startSeconds = try c.decode(Double.self, forKey: .startSeconds)
         endSeconds = try c.decode(Double.self, forKey: .endSeconds)
     }
 }
 
-private struct LossyVideoSegments: Decodable {
+private struct StrictVideoSegments: Decodable {
     let items: [RawVideoSegment]
 
     init(from decoder: Decoder) throws {
         var container = try decoder.unkeyedContainer()
         var decoded: [RawVideoSegment] = []
         while !container.isAtEnd {
-            if let item = try? container.decode(RawVideoSegment.self) {
-                decoded.append(item)
-            } else {
-                _ = try? container.decode(DiscardedJSONValue.self)
+            guard decoded.count < 3 else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "segments must contain at most three entries"
+                )
             }
+            decoded.append(try container.decode(RawVideoSegment.self))
         }
         items = decoded
     }
 }
-
-private struct DiscardedJSONValue: Decodable {}
 
 private func validatedVideoSegments(_ raw: [RawVideoSegment]) -> [VideoSegment] {
     guard !raw.isEmpty, raw.count <= 3 else { return [] }
@@ -810,9 +818,13 @@ public struct Creative: Sendable, Equatable, Decodable {
         )
         let decodedIndex = try? c.decode(Int.self, forKey: .clipIndex)
         self.clipIndex = decodedIndex.flatMap { (0...2).contains($0) ? $0 : nil }
-        self.segments = validatedVideoSegments(
-            (try? c.decode(LossyVideoSegments.self, forKey: .segments).items) ?? []
-        )
+        let contract2 = CodingUserInfoKey.simulaVideoContract2
+            .flatMap { decoder.userInfo[$0] as? Bool } == true
+        self.segments = contract2
+            ? validatedVideoSegments(
+                (try? c.decode(StrictVideoSegments.self, forKey: .segments).items) ?? []
+            )
+            : []
         self.adUnitType = .from(try? c.decode(String.self, forKey: .adUnitType))
     }
 
@@ -1007,7 +1019,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     ) {
         self.enabled = enabled
         self.timing = timing
-        self.delaySeconds = min(maxSKOverlayDelaySeconds, max(0, delaySeconds))
+        self.delaySeconds = min(maxLegacySKOverlayDelaySeconds, max(0, delaySeconds))
         self.position = position
         self.dismissible = dismissible
     }
@@ -1029,7 +1041,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
             self.delaySeconds = exact.flatMap { (0...maxSKOverlayDelaySeconds).contains($0) ? $0 : nil } ?? 3
         } else {
             self.delaySeconds = min(
-                maxSKOverlayDelaySeconds,
+                maxLegacySKOverlayDelaySeconds,
                 max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
             )
         }

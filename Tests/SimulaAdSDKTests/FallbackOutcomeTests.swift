@@ -218,6 +218,94 @@ final class FallbackOutcomeTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testHostTeardownCannotPromoteOpenPrimaryGateWithUnresolvedOrRenderableFallback() {
+        for configure in [
+            { (claim: UnitEndRewardClaim) in claim.primaryGateDidOpen() },
+            { (claim: UnitEndRewardClaim) in
+                claim.primaryGateDidOpen()
+                claim.fallbackDidResolve(renderableScreenCount: 2)
+            },
+        ] {
+            let claim = UnitEndRewardClaim()
+            configure(claim)
+            var callbacks = 0
+
+            XCTAssertFalse(consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+                claim,
+                onEarn: { callbacks += 1 },
+                enqueueVerification: { callbacks += 1 }
+            ))
+            XCTAssertFalse(claim.earned)
+            XCTAssertEqual(callbacks, 0)
+        }
+    }
+
+    @MainActor
+    func testHostTeardownConsumesAlreadyAuthoritativeFinalFallbackRewardOnce() {
+        let claim = UnitEndRewardClaim()
+        claim.primaryGateDidOpen()
+        claim.fallbackDidResolve(renderableScreenCount: 2)
+        claim.fallbackGateDidOpen(isFinal: true)
+        var events: [String] = []
+
+        XCTAssertTrue(consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+            claim,
+            onEarn: { events.append("earned") },
+            enqueueVerification: { events.append("queue") }
+        ))
+        XCTAssertFalse(consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+            claim,
+            onEarn: { events.append("duplicate") },
+            enqueueVerification: { events.append("duplicate") }
+        ))
+        XCTAssertEqual(events, ["earned", "queue"])
+    }
+
+    func testFallbackFetchRetriesOnceAfterBoundedDelay() async {
+        let recorder = FallbackRetryRecorder()
+        do {
+            _ = try await fetchFallbackAdsWithRetry(
+                fetch: {
+                    await recorder.recordAttempt()
+                    throw URLError(.timedOut)
+                },
+                sleep: { delay in await recorder.recordDelay(delay) }
+            )
+            XCTFail("Expected final fetch failure")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        let attemptCount = await recorder.attemptCount
+        let delays = await recorder.delays
+        XCTAssertEqual(attemptCount, fallbackFetchMaximumAttempts)
+        XCTAssertEqual(delays, [fallbackFetchRetryDelay])
+    }
+
+    func testFallbackFetchCancellationStopsBeforeSecondAttempt() async {
+        let recorder = FallbackRetryRecorder()
+        let task = Task {
+            try await fetchFallbackAdsWithRetry(
+                fetch: {
+                    await recorder.recordAttempt()
+                    throw URLError(.timedOut)
+                },
+                sleep: { _ in try await Task.sleep(nanoseconds: 10_000_000_000) }
+            )
+        }
+        while await recorder.attemptCount == 0 { await Task.yield() }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let attemptCount = await recorder.attemptCount
+        XCTAssertEqual(attemptCount, 1)
+    }
+
     func testFallbackOutcomesUseCanonicalExpectedStepCloseReasons() {
         XCTAssertNil(FallbackOutcome.completed.videoPlanCloseReason)
         XCTAssertEqual(FallbackOutcome.noContent.videoPlanCloseReason, "no_next_step")
@@ -261,4 +349,12 @@ final class FallbackOutcomeTests: XCTestCase {
             .presentContent
         )
     }
+}
+
+private actor FallbackRetryRecorder {
+    private(set) var attemptCount = 0
+    private(set) var delays: [TimeInterval] = []
+
+    func recordAttempt() { attemptCount += 1 }
+    func recordDelay(_ delay: TimeInterval) { delays.append(delay) }
 }

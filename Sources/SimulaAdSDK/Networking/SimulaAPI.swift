@@ -788,7 +788,9 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
     /// surfaced on the paid event when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
-    var validatedImpressionURL: URL? { validatedCreativeURL(impressionUrl) }
+    var validatedImpressionURL: URL? {
+        usesVideoPlanV2Contract ? validatedCreativeURL(impressionUrl) : nil
+    }
 
     /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
     /// value means the payload carries no renderable creative (no-fill).
@@ -1070,7 +1072,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
     /// when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
-    var validatedImpressionURL: URL? { validatedCreativeURL(impressionUrl) }
+    var validatedImpressionURL: URL? {
+        usesVideoPlanV2Contract ? validatedCreativeURL(impressionUrl) : nil
+    }
 
     public var htmlCreative: String? {
         let value = renderedHtml.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1828,6 +1832,18 @@ public final class SimulaAPI: @unchecked Sendable {
         }
     }
 
+    private func boundedFullscreenData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await boundedURLSessionData(
+                for: request,
+                using: session,
+                maximumBytes: fullscreenResponseMaximumBytes
+            )
+        } catch BoundedURLSessionDataError.responseTooLarge {
+            throw SimulaAPIError.invalidResponse
+        }
+    }
+
     // MARK: - Create Session
 
     /// Creates a server session and returns its id. The request uses the process environment selected
@@ -2096,8 +2112,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         )
 
-        let (data, response) = try await session.data(for: request)
-
+        let (data, response) = try await boundedFullscreenData(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
@@ -2238,7 +2253,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         )
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await boundedFullscreenData(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
@@ -2384,8 +2399,7 @@ public final class SimulaAPI: @unchecked Sendable {
         request.httpMethod = "GET"
         applyHeaders(makeHeaders(), to: &request)
 
-        let (data, response) = try await session.data(for: request)
-
+        let (data, response) = try await boundedFullscreenData(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             throw SimulaAPIError.httpError(

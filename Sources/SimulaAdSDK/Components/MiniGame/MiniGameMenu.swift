@@ -824,7 +824,13 @@ public struct MiniGameMenu: View {
             return
         }
         let ads: [FallbackAd]
-        do { ads = try await api.fetchFallbacks(impressionId: request.serveId) } catch { ads = [] }
+        do {
+            ads = try await fetchFallbackAdsWithRetry {
+                try await api.fetchFallbacks(impressionId: request.serveId)
+            }
+        } catch {
+            ads = []
+        }
         let resolution = fallbackFetchOwnership.resolve(
             request,
             taskCancelled: Task.isCancelled,

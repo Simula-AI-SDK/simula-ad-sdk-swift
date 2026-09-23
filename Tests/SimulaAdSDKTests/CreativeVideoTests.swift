@@ -94,21 +94,24 @@ final class CreativeVideoTests: XCTestCase {
           "creative":{
             "type":"video","url":"https://cdn.example/ad.mp4","cta":"Play Now",
             "app_icon_url":"https://cdn.example/icon.png","app_name":"Example Game",
-            "subtitle":"Build your city","video_pool":"ugc","clip_index":0
+            "subtitle":"Build your city","segments":[
+              {"clip_index":0,"video_pool":"ugc","start_seconds":0,"end_seconds":5}
+            ]
           },
           "ad_behavior":{"video":{"style":"bottom_card"}}
         }
         """#)
         let creative = try XCTUnwrap(response.creative)
 
-        XCTAssertTrue(creative.isVideoPlanV2Clip)
+        XCTAssertFalse(creative.isVideoPlanV2Clip)
         XCTAssertTrue(response.primaryUsesVideoPlanV2)
         XCTAssertEqual(creative.cta, "Play Now")
         XCTAssertEqual(creative.appIconUrl, "https://cdn.example/icon.png")
         XCTAssertEqual(creative.appName, "Example Game")
         XCTAssertEqual(creative.subtitle, "Build your city")
-        XCTAssertEqual(creative.videoPool, "ugc")
-        XCTAssertEqual(creative.clipIndex, 0)
+        XCTAssertNil(creative.videoPool)
+        XCTAssertNil(creative.clipIndex)
+        XCTAssertEqual(creative.segments.map(\.videoPool), ["ugc"])
         XCTAssertEqual(response.adBehavior?.video.style, .bottomCard)
         XCTAssertEqual(
             videoChromeConfiguration(
@@ -132,8 +135,39 @@ final class CreativeVideoTests: XCTestCase {
             ["bottom_bar", "floating_pill", "bottom_card", "corner_cta", "feed_card"]
         )
         for style in VideoChromeStyle.allCases {
-            let data = Data(#"{"style":"\#(style.rawValue)"}"#.utf8)
-            XCTAssertEqual(try JSONDecoder().decode(VideoBehavior.self, from: data).style, style)
+            let payload = #"""
+            {
+              "ad_inserted":true,"video_contract":2,
+              "creative":{
+                "type":"video","url":"https://cdn.example/ad.mp4","cta":"Install Now",
+                "app_icon_url":"https://cdn.example/icon.png","app_name":"Example Game",
+                "segments":[
+                  {"clip_index":0,"video_pool":"ugc","start_seconds":0,"end_seconds":5}
+                ]
+              },
+              "ad_behavior":{"video":{"style":"\#(style.rawValue)"}}
+            }
+            """#
+            let interstitial = try decodeInterstitial(payload)
+            let rewarded = try decodeRewarded(payload)
+
+            for (creative, behavior, isVideoPlanV2, format) in [
+                (interstitial.creative, interstitial.adBehavior, interstitial.primaryUsesVideoPlanV2, "interstitial"),
+                (rewarded.creative, rewarded.adBehavior, rewarded.primaryUsesVideoPlanV2, "rewarded"),
+            ] {
+                XCTAssertNil(creative?.videoPool, format)
+                XCTAssertNil(creative?.clipIndex, format)
+                XCTAssertEqual(creative?.segments.count, 1, format)
+                XCTAssertEqual(
+                    videoChromeConfiguration(
+                        creative: creative,
+                        behavior: behavior,
+                        isVideoPlanV2: isVideoPlanV2
+                    )?.style,
+                    style,
+                    "\(format): \(style.rawValue)"
+                )
+            }
         }
         XCTAssertEqual(
             try JSONDecoder().decode(VideoBehavior.self, from: Data(#"{"style":"future"}"#.utf8)).style,
@@ -145,14 +179,19 @@ final class CreativeVideoTests: XCTestCase {
     func testTitleOnlyChromeDoesNotManufactureSubtitle() throws {
         let response = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,
-          "creative":{"type":"video","url":"https://cdn.example/ad.mp4","app_name":"Title","clip_index":0}
+          "ad_inserted":true,"video_contract":2,
+          "creative":{
+            "type":"video","url":"https://cdn.example/ad.mp4","app_name":"Title",
+            "segments":[
+              {"clip_index":0,"video_pool":"ugc","start_seconds":0,"end_seconds":5}
+            ]
+          }
         }
         """#)
         let config = videoChromeConfiguration(
             creative: response.creative,
             behavior: response.adBehavior,
-            isVideoPlanV2: true
+            isVideoPlanV2: response.primaryUsesVideoPlanV2
         )
 
         XCTAssertEqual(config?.title, "Title")
@@ -206,6 +245,11 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(playable.map(\.usesVideoPlanV2Contract), [true])
         XCTAssertEqual(playable.map(\.usesVideoPlanV2), [false])
         XCTAssertEqual(upcomingFallbackVideoIndices(playable), [])
+        XCTAssertNil(videoChromeConfiguration(
+            creative: playable.first?.creative,
+            behavior: playable.first?.adBehavior,
+            isVideoPlanV2: playable.first?.usesVideoPlanV2Contract == true
+        ))
     }
 
     func testContractTwoDropsFallbackVideoSlots() throws {
@@ -1121,6 +1165,50 @@ final class CreativeVideoTests: XCTestCase {
                     "bottom obstruction treatment=\(treatment) position=\(position)"
                 )
             }
+        }
+    }
+
+    func testIndependentTwoToneBarIsBottomObstructionForEveryBottomLeftCloseTreatment() {
+        let treatments: [CloseTreatment] = [
+            .hidden, .countdownCircle, .progressBar, .rewardOrCloseLabel,
+        ]
+        for treatment in treatments {
+            XCTAssertTrue(videoBottomProgressBarObstructsChrome(
+                treatment: treatment,
+                position: .bottomLeft,
+                progressBarStyle: .twoTone
+            ))
+            XCTAssertEqual(
+                effectiveVideoClosePosition(
+                    treatment: treatment,
+                    position: .bottomLeft,
+                    progressBarStyle: .twoTone
+                ),
+                .topRight
+            )
+            #if os(iOS)
+            XCTAssertTrue(closeBarAtBottom(
+                treatment,
+                .bottomLeft,
+                progressBarStyle: .twoTone
+            ))
+            #endif
+        }
+
+        for position in [ClosePosition.topLeft, .topRight] {
+            XCTAssertFalse(videoBottomProgressBarObstructsChrome(
+                treatment: .hidden,
+                position: position,
+                progressBarStyle: .twoTone
+            ))
+            XCTAssertEqual(
+                effectiveVideoClosePosition(
+                    treatment: .countdownCircle,
+                    position: position,
+                    progressBarStyle: .twoTone
+                ),
+                position
+            )
         }
     }
 

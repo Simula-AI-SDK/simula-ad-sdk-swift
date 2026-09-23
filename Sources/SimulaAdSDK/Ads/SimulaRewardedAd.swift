@@ -456,7 +456,7 @@ public final class SimulaRewardedAd {
         self.videoPlanScope = videoPlanScope
         primaryV2VideoStarted = false
         showStartNanos = DispatchTime.now().uptimeNanoseconds
-        // Captured by value for the teardown salvage: the presenters self-retain while on
+        // Captured by value for authoritative teardown consumption: presenters self-retain while on
         // screen, so the close flow below can run after the host destroyed this ad object —
         // with `self == nil` — and must still be able to enqueue an earned reward.
         let salvageSessionId = sessionId
@@ -548,7 +548,10 @@ public final class SimulaRewardedAd {
             renderedHtml: response.renderedHtml,
             creative: response.creative,
             videoBehavior: response.adBehavior?.video ?? VideoBehavior(),
-            progressBarBehavior: response.adBehavior?.progressBar ?? ProgressBarBehavior(),
+            progressBarBehavior: ProgressBarBehavior(style: effectiveVideoProgressBarStyle(
+                isContract2Video: primaryUsesVideoPlanV2,
+                configured: response.adBehavior?.progressBar.style ?? .single
+            )),
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
             videoAssetLease: preparedVideoLease,
@@ -609,14 +612,14 @@ public final class SimulaRewardedAd {
                         // The host destroyed this ad object while the playable was up. Preserve only
                         // a reward that the creative had genuinely earned before teardown.
                         let outcome = FallbackOutcome.hostUnavailable
-                        unitEndReward?.fallbackBecameUnavailable()
                         SimulaRewardedAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: salvageAdUnitId,
                             impressionId: response.impressionId
                         )
                         if let unitEndReward {
-                            unitEndReward.consumeAtUnitClose(
+                            consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+                                unitEndReward,
                                 onEarn: {
                                     SimulaRewardedAd.recordUnitEndRewardEarned(
                                         adUnitId: salvageAdUnitId,
@@ -688,26 +691,17 @@ public final class SimulaRewardedAd {
                     onFallbackFinished: { [weak self] outcome in
                         videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
                         videoPlanScope?.cancel()
-                        if outcome == .completed {
-                            unitEndReward?.fallbackDeliveryDidFinish()
-                        } else {
-                            unitEndReward?.fallbackBecameUnavailable()
-                        }
                         SimulaRewardedAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: salvageAdUnitId,
                             impressionId: response.impressionId
                         )
-                        let verifyEarned = outcome.shouldVerifyEarnedReward(
-                            unitEndReward?.earned ?? postPrimaryPolicy.verifiesEarnedReward
-                        )
-                        self?.videoPlanScope = nil
-                        guard postPrimaryPolicy.notifiesPublisherClose else { return }
                         guard let self else {
                             // The host destroyed this ad object during the fallback screens (they
-                            // self-retain and stay up): still salvage the earned reward.
+                            // self-retain and stay up): salvage only authority earned before teardown.
                             if let unitEndReward {
-                                unitEndReward.consumeAtUnitClose(
+                                consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+                                    unitEndReward,
                                     onEarn: {
                                         SimulaRewardedAd.recordUnitEndRewardEarned(
                                             adUnitId: salvageAdUnitId,
@@ -727,7 +721,9 @@ public final class SimulaRewardedAd {
                                 )
                             } else {
                                 SimulaRewardedAd.salvageReward(
-                                    earned: verifyEarned,
+                                    earned: outcome.shouldVerifyEarnedReward(
+                                        postPrimaryPolicy.verifiesEarnedReward
+                                    ),
                                     impressionId: response.impressionId,
                                     sessionId: salvageSessionId,
                                     elapsedPlayTime: elapsedPlayTime,
@@ -737,6 +733,16 @@ public final class SimulaRewardedAd {
                             }
                             return
                         }
+                        if outcome == .completed {
+                            unitEndReward?.fallbackDeliveryDidFinish()
+                        } else {
+                            unitEndReward?.fallbackBecameUnavailable()
+                        }
+                        let verifyEarned = outcome.shouldVerifyEarnedReward(
+                            unitEndReward?.earned ?? postPrimaryPolicy.verifiesEarnedReward
+                        )
+                        self.videoPlanScope = nil
+                        guard postPrimaryPolicy.notifiesPublisherClose else { return }
                         // CLOSE fires after fallback delivery terminates (after the last screen for
                         // `.completed`), then reward earn/verification — preserving event order.
                         self.delegate?.rewardedDidClose(self)
@@ -1186,13 +1192,15 @@ public final class SimulaRewardedAd {
                     )
                 }
             ) { [weak self] result in
-                switch result {
-                case .content(let ads, _):
-                    unitEndReward?.fallbackDidResolve(renderableScreenCount: ads.count)
-                case .noContent:
-                    unitEndReward?.fallbackDidResolve(renderableScreenCount: 0)
-                case .failure:
-                    unitEndReward?.fallbackBecameUnavailable()
+                if self != nil {
+                    switch result {
+                    case .content(let ads, _):
+                        unitEndReward?.fallbackDidResolve(renderableScreenCount: ads.count)
+                    case .noContent:
+                        unitEndReward?.fallbackDidResolve(renderableScreenCount: 0)
+                    case .failure:
+                        unitEndReward?.fallbackBecameUnavailable()
+                    }
                 }
                 if ownership.consumedByLoadingPresenter { return true }
                 guard self?.fallbackPrefetchToken == token else { return false }
@@ -1228,7 +1236,9 @@ public final class SimulaRewardedAd {
     ) async -> FallbackFetchResult {
         let result: FallbackFetchResult
         do {
-            let ads = try await api.fetchFallbacks(impressionId: impressionId)
+            let ads = try await fetchFallbackAdsWithRetry {
+                try await api.fetchFallbacks(impressionId: impressionId)
+            }
             result = ads.isEmpty
                 ? .noContent
                 : .content(ads, preparedVideos: await prepareUpcomingFallbackVideos(

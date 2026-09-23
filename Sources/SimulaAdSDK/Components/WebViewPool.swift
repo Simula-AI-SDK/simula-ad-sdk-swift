@@ -380,6 +380,39 @@ func creativeUserActivationScriptSource(
         catch (_) { return null; }
       }
 
+      function documentHTTPOrigin() {
+        try {
+          var origin = window.location && window.location.origin;
+          if (!origin || origin === 'null') { return null; }
+          var parsed = new URL(origin);
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') { return null; }
+          return parsed.origin;
+        } catch (_) { return null; }
+      }
+
+      function isSameOriginCTA(url) {
+        var origin = documentHTTPOrigin();
+        if (!origin) { return false; }
+        try { return new URL(url, document.baseURI).origin === origin; }
+        catch (_) { return false; }
+      }
+
+      function isInternalCTA(url) {
+        try {
+          var protocol = new URL(url, document.baseURI).protocol;
+          return protocol === 'about:' || protocol === 'data:' || protocol === 'blob:' ||
+            protocol === 'javascript:';
+        } catch (_) { return true; }
+      }
+
+      function isExternalHTTPCTA(url) {
+        if (isInternalCTA(url) || isSameOriginCTA(url)) { return false; }
+        try {
+          var protocol = new URL(url, document.baseURI).protocol;
+          return protocol === 'http:' || protocol === 'https:';
+        } catch (_) { return false; }
+      }
+
       function claimGesture(message, identityFactory) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
@@ -420,7 +453,7 @@ func creativeUserActivationScriptSource(
 
       function forwardCTA(value) {
         var url = resolvedURL(value);
-        if (!url) { return false; }
+        if (!url || !isExternalHTTPCTA(url)) { return false; }
         return claimGesture({
           type: 'SIMULA_CTA_OPEN',
           url: url,
