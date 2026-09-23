@@ -1301,7 +1301,14 @@ final class VideoAssetCacheTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(clock.now, videoAssetDownloadTimeout)
         await downloader.releaseAll()
         first.cancel()
-        _ = try? await first.value
+        // The transfer can finish before cancellation; its Task retains the returned lease.
+        // Release it explicitly before waiting for the cache's lease count to reach zero.
+        do {
+            let lease = try await first.value
+            lease.release()
+        } catch {
+            // Cancellation/timeout already reconciles the unsuccessful acquire.
+        }
         await cache.waitUntilIdle()
     }
 

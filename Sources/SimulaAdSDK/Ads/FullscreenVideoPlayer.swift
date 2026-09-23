@@ -1296,7 +1296,7 @@ final class FullscreenVideoPlayer: ObservableObject {
     @Published private(set) var duration: TimeInterval?
     private(set) var playedSeconds: TimeInterval = 0
     @Published private(set) var mediaPositionSeconds: TimeInterval = 0
-    @Published private(set) var isMuted = true
+    @Published private(set) var isMuted = false
     @Published private(set) var requiresUserResume = false
 
     let player: AVPlayer
@@ -1394,7 +1394,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         self.init(
             url: url,
             posterURL: posterURL,
-            startsMuted: true,
+            startsMuted: false,
             stallTimeout: Self.preparationTimeout,
             mediaObservationEnabled: true
         )
@@ -1419,7 +1419,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         FullscreenVideoPlayer(
             url: url,
             posterURL: posterURL,
-            startsMuted: true,
+            startsMuted: false,
             stallTimeout: Self.preparationTimeout,
             mediaObservationEnabled: false
         )
@@ -2184,7 +2184,7 @@ final class FullscreenVideoPreparationPool {
     func prepare(
         url: URL,
         posterURL: URL?,
-        startsMuted: Bool = true,
+        startsMuted: Bool = false,
         stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout,
         assetLease: VideoAssetLease? = nil
     ) -> FullscreenVideoPreparationToken? {
@@ -2216,7 +2216,7 @@ final class FullscreenVideoPreparationPool {
         _ token: FullscreenVideoPreparationToken,
         url: URL,
         posterURL: URL?,
-        startsMuted: Bool = true,
+        startsMuted: Bool = false,
         stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
     ) -> FullscreenVideoPlayer? {
         if entries[token]?.active == true { return nil }
@@ -2351,7 +2351,7 @@ final class FullscreenVideoPreparationOwnership {
     func claim(
         url: URL,
         posterURL: URL?,
-        startsMuted: Bool = true,
+        startsMuted: Bool = false,
         stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
     ) -> FullscreenVideoPlayer? {
         guard state == .ad else { return nil }
@@ -2414,7 +2414,7 @@ enum FullscreenVideoPreparationReservation {
 @MainActor
 func reserveFullscreenVideoPreparation(
     for creative: FullscreenCreativeContent,
-    startsMuted: Bool = true,
+    startsMuted: Bool = false,
     stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout,
     assetLease: VideoAssetLease? = nil
 ) -> FullscreenVideoPreparationReservation {

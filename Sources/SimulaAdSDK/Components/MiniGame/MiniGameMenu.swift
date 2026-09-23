@@ -1073,7 +1073,7 @@ public struct MiniGameMenu: View {
             url: localURL,
             posterURL: posterURL,
             token: token,
-            startsMuted: !fallbackAds[fallbackAdIndex].usesVideoPlanV2,
+            startsMuted: false,
             stallTimeout: fallbackAds[fallbackAdIndex].usesVideoPlanV2
                 ? FullscreenVideoPlayer.videoPlanV2StallTimeout
                 : FullscreenVideoPlayer.preparationTimeout

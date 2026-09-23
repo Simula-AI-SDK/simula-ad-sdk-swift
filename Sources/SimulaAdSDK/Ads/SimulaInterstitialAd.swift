@@ -411,7 +411,7 @@ public final class SimulaInterstitialAd {
             }
             switch reserveFullscreenVideoPreparation(
                 for: localCreative,
-                startsMuted: !usesVideoPlanV2,
+                startsMuted: false,
                 stallTimeout: usesVideoPlanV2
                     ? FullscreenVideoPlayer.videoPlanV2StallTimeout
                     : FullscreenVideoPlayer.preparationTimeout,
@@ -582,7 +582,7 @@ public final class SimulaInterstitialAd {
                 failDisplay(.notReady)
                 return
             }
-            let startsMuted = !primaryUsesVideoPlanV2
+            let startsMuted = false
             let stallTimeout = primaryUsesVideoPlanV2
                 ? FullscreenVideoPlayer.videoPlanV2StallTimeout
                 : FullscreenVideoPlayer.preparationTimeout

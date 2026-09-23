@@ -2227,17 +2227,53 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     @MainActor
     func testPlayerMuteDefenseRemainsSynchronizedAcrossExplicitToggle() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
-        XCTAssertTrue(player.isMuted)
-        XCTAssertTrue(player.player.isMuted)
+        XCTAssertFalse(player.isMuted)
+        XCTAssertFalse(player.player.isMuted)
         XCTAssertTrue(player.admitFirstVisualFrame())
 
         player.toggleMuted()
-        XCTAssertFalse(player.isMuted)
-        XCTAssertFalse(player.player.isMuted)
-        player.toggleMuted()
         XCTAssertTrue(player.isMuted)
         XCTAssertTrue(player.player.isMuted)
+        player.toggleMuted()
+        XCTAssertFalse(player.isMuted)
+        XCTAssertFalse(player.player.isMuted)
         player.stop()
+    }
+
+    @MainActor
+    func testLegacyAndV2ColdFallbackVideosStartUnmuted() throws {
+        for timeout in [FullscreenVideoPlayer.preparationTimeout, FullscreenVideoPlayer.videoPlanV2StallTimeout] {
+            let ownership = makeFallbackVideoOwnership(
+                url: URL(fileURLWithPath: "/dev/null"),
+                posterURL: nil,
+                token: nil,
+                stallTimeout: timeout
+            )
+            defer { ownership.release() }
+            let player = try XCTUnwrap(ownership.resource)
+            XCTAssertFalse(player.isMuted)
+            XCTAssertFalse(player.player.isMuted)
+        }
+    }
+
+    @MainActor
+    func testLegacyAndV2PreparedVideosStartUnmutedAndPreserveUserMuteOnReuse() throws {
+        let url = URL(fileURLWithPath: "/dev/null")
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        for timeout in [FullscreenVideoPlayer.preparationTimeout, FullscreenVideoPlayer.videoPlanV2StallTimeout] {
+            let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil, stallTimeout: timeout))
+            defer { pool.release(token) }
+            let player = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil, stallTimeout: timeout))
+            XCTAssertFalse(player.isMuted)
+            XCTAssertFalse(player.player.isMuted)
+
+            player.setMuted(true)
+            pool.returnToPrepared(token)
+            let reclaimed = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil, stallTimeout: timeout))
+            XCTAssertTrue(reclaimed === player)
+            XCTAssertTrue(reclaimed.isMuted)
+            XCTAssertTrue(reclaimed.player.isMuted)
+        }
     }
 
     @MainActor

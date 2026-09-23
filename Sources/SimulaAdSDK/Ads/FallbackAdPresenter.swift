@@ -244,7 +244,7 @@ func prepareFallbackVideo(_ ad: FallbackAd) async -> FullscreenVideoPreparationT
     let token = FullscreenVideoPreparationPool.shared.prepare(
         url: lease.localURL,
         posterURL: posterURL,
-        startsMuted: !ad.usesVideoPlanV2,
+        startsMuted: false,
         stallTimeout: ad.usesVideoPlanV2
             ? FullscreenVideoPlayer.videoPlanV2StallTimeout
             : FullscreenVideoPlayer.preparationTimeout,
@@ -328,7 +328,7 @@ func makeFallbackVideoOwnership(
     url: URL,
     posterURL: URL?,
     token: FullscreenVideoPreparationToken?,
-    startsMuted: Bool = true,
+    startsMuted: Bool = false,
     stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout
 ) -> FallbackVideoOwnership<FullscreenVideoPlayer, FullscreenVideoPreparationToken> {
     makeFallbackVideoOwnership(
@@ -354,7 +354,7 @@ func makeFallbackVideoOwnership(
     url: URL,
     posterURL: URL?,
     token: FullscreenVideoPreparationToken?,
-    startsMuted: Bool = true,
+    startsMuted: Bool = false,
     stallTimeout: TimeInterval = FullscreenVideoPlayer.preparationTimeout,
     pool: FullscreenVideoPreparationPool,
     makePlayer: (URL, URL?) -> FullscreenVideoPlayer
@@ -1218,7 +1218,7 @@ final class FallbackAdPresenter {
             url: localURL,
             posterURL: posterURL,
             token: token,
-            startsMuted: !ads[playerIndex].usesVideoPlanV2,
+            startsMuted: false,
             stallTimeout: ads[playerIndex].usesVideoPlanV2
                 ? FullscreenVideoPlayer.videoPlanV2StallTimeout
                 : FullscreenVideoPlayer.preparationTimeout
