@@ -1071,40 +1071,70 @@ import Combine
 import SwiftUI
 import UIKit
 
-/// Reference-counted so overlapping SDK playback shares one best-effort activation.
-///
-/// Activation is intentionally asymmetric: AVAudioSession is process-global and exposes no
-/// ownership proof, so releasing the final SDK claim only clears SDK accounting. Player teardown
-/// pauses/stops playback separately, and the SDK never calls `setActive(false)`.
+/// One process-wide serial activation, with bounded, cancellable claims on the main actor.
+/// A stalled audio daemon never blocks UI or causes additional activation workers to accumulate.
+/// The SDK never deactivates the process-global session, which may also belong to the host.
 @MainActor
 final class VideoAudioSessionCoordinator {
     static let shared = VideoAudioSessionCoordinator()
-    private var claims = 0
-    private let activate: () -> Bool
+    private static let activationQueue = DispatchQueue(label: "ad.simula.video.audio", qos: .userInitiated)
+    private static let maximumClaims = 16
+    private var claims = Set<UUID>()
+    private var pending: [UUID: (Bool) -> Void] = [:]
+    private var deadlines: [UUID: DispatchWorkItem] = [:]
+    private var activated = false
+    private var activating = false
+    private let activate: @Sendable () -> Bool
+    private let claimTimeout: TimeInterval
 
     convenience init() {
         self.init(activate: { (try? AVAudioSession.sharedInstance().setActive(true)) != nil })
     }
 
-    init(activate: @escaping () -> Bool) {
+    init(claimTimeout: TimeInterval = 10, activate: @escaping @Sendable () -> Bool) {
         self.activate = activate
+        self.claimTimeout = claimTimeout
     }
 
-    func claim() -> Bool {
-        if claims > 0 {
-            claims += 1
-            return true
+    func claim(completion: @escaping (Bool) -> Void) -> UUID? {
+        guard claims.count < Self.maximumClaims else { return nil }
+        let id = UUID()
+        claims.insert(id)
+        pending[id] = completion
+        let deadline = DispatchWorkItem { [weak self] in self?.finishClaim(id, success: false) }
+        deadlines[id] = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + claimTimeout, execute: deadline)
+        if activated {
+            DispatchQueue.main.async { [weak self] in self?.finishClaim(id, success: true) }
+        } else if !activating {
+            activating = true
+            let operation = activate
+            Self.activationQueue.async { [weak self] in
+                let success = operation()
+                DispatchQueue.main.async { self?.activationFinished(success) }
+            }
         }
-        if activate() {
-            claims = 1
-            return true
-        }
-        return false
+        return id
     }
 
-    func release() {
-        guard claims > 0 else { return }
-        claims -= 1
+    func release(_ id: UUID) {
+        claims.remove(id)
+        pending.removeValue(forKey: id)
+        deadlines.removeValue(forKey: id)?.cancel()
+        if claims.isEmpty { activated = false }
+    }
+
+    private func activationFinished(_ success: Bool) {
+        activating = false
+        activated = success && !claims.isEmpty
+        for id in Array(pending.keys) { finishClaim(id, success: success) }
+    }
+
+    private func finishClaim(_ id: UUID, success: Bool) {
+        guard let completion = pending.removeValue(forKey: id), claims.contains(id) else { return }
+        deadlines.removeValue(forKey: id)?.cancel()
+        if !success { release(id) }
+        completion(success)
     }
 }
 
@@ -1327,7 +1357,8 @@ final class FullscreenVideoPlayer: ObservableObject {
     private let mediaObservationEnabled: Bool
     private let usesManagedAudioSession: Bool
     private let usesProgressWatchdog: Bool
-    private var ownsAudioSessionClaim = false
+    private var audioSessionClaim: UUID?
+    private var audioSessionReady = false
     private var ownsIdleTimerClaim = false
     private var progressWatchdog: VideoProgressWatchdog
     private var firstFrameUptime: TimeInterval?
@@ -1466,9 +1497,9 @@ final class FullscreenVideoPlayer: ObservableObject {
             player.removeTimeObserver(periodicTimeObserver)
         }
         notificationObservers.forEach(NotificationCenter.default.removeObserver)
-        if ownsAudioSessionClaim {
+        if let audioSessionClaim {
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { VideoAudioSessionCoordinator.shared.release() }
+                MainActor.assumeIsolated { VideoAudioSessionCoordinator.shared.release(audioSessionClaim) }
             }
         }
         if ownsIdleTimerClaim {
@@ -1586,10 +1617,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         progressWatchdogWorkItem?.cancel()
         progressWatchdogWorkItem = nil
         player.pause()
-        if ownsAudioSessionClaim {
-            releaseAudioSessionClaim()
-            releaseIdleTimerClaim()
-        }
+        releaseAudioSessionClaim()
         releaseIdleTimerClaim()
         audioTrackIsolation.teardown()
         player.replaceCurrentItem(with: nil)
@@ -2038,8 +2066,14 @@ final class FullscreenVideoPlayer: ObservableObject {
                 VideoIdleTimerCoordinator.shared.claim()
                 ownsIdleTimerClaim = true
             }
-            if !isMuted, usesManagedAudioSession, !ownsAudioSessionClaim {
-                ownsAudioSessionClaim = VideoAudioSessionCoordinator.shared.claim()
+            if !isMuted, usesManagedAudioSession, !audioSessionReady {
+                if audioSessionClaim == nil {
+                    audioSessionClaim = VideoAudioSessionCoordinator.shared.claim { [weak self] success in
+                        self?.audioSessionActivationFinished(success)
+                    }
+                    if audioSessionClaim == nil { fail(.playbackFailed) }
+                }
+                return
             }
             scheduleFirstFrameTimeoutIfNeeded()
             if isMuted { audioTrackIsolation.prepareMutedPlayback() }
@@ -2056,10 +2090,21 @@ final class FullscreenVideoPlayer: ObservableObject {
         }
     }
 
+    private func audioSessionActivationFinished(_ success: Bool) {
+        guard audioSessionClaim != nil, !stopped, !isFailed, status != .ended else { return }
+        guard success else {
+            releaseAudioSessionClaim()
+            fail(.playbackFailed)
+            return
+        }
+        audioSessionReady = true
+        reconcilePlayback()
+    }
+
     private func releaseAudioSessionClaim() {
-        guard ownsAudioSessionClaim else { return }
-        ownsAudioSessionClaim = false
-        VideoAudioSessionCoordinator.shared.release()
+        if let audioSessionClaim { VideoAudioSessionCoordinator.shared.release(audioSessionClaim) }
+        audioSessionClaim = nil
+        audioSessionReady = false
     }
 
     private func releaseIdleTimerClaim() {

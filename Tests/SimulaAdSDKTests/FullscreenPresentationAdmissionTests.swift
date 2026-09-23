@@ -47,38 +47,93 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     #if os(iOS)
-    @MainActor
-    func testAudioCoordinatorFinalReleaseOnlyClearsSDKAccounting() {
-        var activations = 0
-        let coordinator = VideoAudioSessionCoordinator(activate: { activations += 1; return true })
+    private final class AudioActivationProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var ranOnMain = false
+        let gate = DispatchSemaphore(value: 0)
 
-        XCTAssertTrue(coordinator.claim())
-        XCTAssertTrue(coordinator.claim())
-        XCTAssertEqual(activations, 1)
-        coordinator.release()
-        XCTAssertTrue(coordinator.claim(), "overlapping claims must share the existing activation")
-        XCTAssertEqual(activations, 1)
-        coordinator.release()
-        coordinator.release()
-        coordinator.release()
-        XCTAssertTrue(coordinator.claim(), "final release must permit a later best-effort activation")
-        XCTAssertEqual(activations, 2)
-        coordinator.release()
+        func activate() -> Bool {
+            lock.lock()
+            count += 1
+            ranOnMain = ranOnMain || Thread.isMainThread
+            lock.unlock()
+            gate.wait()
+            return true
+        }
+
+        var snapshot: (count: Int, ranOnMain: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (count, ranOnMain)
+        }
     }
 
     @MainActor
-    func testAudioCoordinatorFailedActivationCreatesNoLogicalClaim() {
-        var activations = 0
-        let coordinator = VideoAudioSessionCoordinator(activate: {
-            activations += 1
-            return activations > 1
-        })
+    func testAudioCoordinatorCoalescesOffMainAndCancelsStaleClaims() async throws {
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var cancelledDelivered = false
+        var delivered = false
+        let cancelled = try XCTUnwrap(coordinator.claim { _ in cancelledDelivered = true })
+        let live = try XCTUnwrap(coordinator.claim { success in delivered = success })
+        await waitUntil { probe.snapshot.count == 1 }
+        XCTAssertFalse(probe.snapshot.ranOnMain)
+        XCTAssertFalse(delivered, "a stalled activation must return to the main actor immediately")
+        coordinator.release(cancelled)
+        probe.gate.signal()
+        await waitUntil { delivered }
+        XCTAssertFalse(cancelledDelivered)
+        XCTAssertEqual(probe.snapshot.count, 1)
 
-        XCTAssertFalse(coordinator.claim())
-        coordinator.release()
-        XCTAssertTrue(coordinator.claim())
-        XCTAssertEqual(activations, 2)
-        coordinator.release()
+        var overlappingDelivered = false
+        let overlapping = try XCTUnwrap(coordinator.claim { success in overlappingDelivered = success })
+        await waitUntil { overlappingDelivered }
+        XCTAssertEqual(probe.snapshot.count, 1, "active claims reuse the existing activation")
+        coordinator.release(live)
+        coordinator.release(overlapping)
+        var laterDelivered = false
+        let later = try XCTUnwrap(coordinator.claim { success in laterDelivered = success })
+        await waitUntil { probe.snapshot.count == 2 }
+        probe.gate.signal()
+        await waitUntil { laterDelivered }
+        coordinator.release(later)
+    }
+
+    @MainActor
+    func testAudioCoordinatorFailedActivationAndBoundedPendingClaims() async throws {
+        let failing = VideoAudioSessionCoordinator(activate: { false })
+        var failed = false
+        let claim = try XCTUnwrap(failing.claim { success in failed = !success })
+        await waitUntil { failed }
+        failing.release(claim)
+
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var ids: [UUID] = []
+        for _ in 0..<16 {
+            ids.append(try XCTUnwrap(coordinator.claim { _ in XCTFail("cancelled claim delivered") }))
+        }
+        XCTAssertNil(coordinator.claim { _ in XCTFail("rejected claim delivered") })
+        await waitUntil { probe.snapshot.count == 1 }
+        for id in ids { coordinator.release(id) }
+        probe.gate.signal()
+    }
+
+    @MainActor
+    func testAudioActivationDeadlineFiresWhileWorkerIsBlocked() async throws {
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(claimTimeout: 0.01, activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var results: [Bool] = []
+        let claim = try XCTUnwrap(coordinator.claim { results.append($0) })
+        await waitUntil { probe.snapshot.count == 1 }
+        await waitUntil { !results.isEmpty }
+        XCTAssertEqual(results, [false])
+        XCTAssertFalse(probe.snapshot.ranOnMain)
+        coordinator.release(claim)
     }
 
     @MainActor
