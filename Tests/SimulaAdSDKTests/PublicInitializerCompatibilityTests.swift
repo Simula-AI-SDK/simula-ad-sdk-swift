@@ -7,16 +7,35 @@ final class PublicInitializerCompatibilityTests: XCTestCase {
             DeviceCapabilities.init(osVersion:storekitAvailable:skanVersion:adAttributionKitAvailable:)
         let five: (String, Bool, String, Bool, Bool) -> DeviceCapabilities =
             DeviceCapabilities.init(osVersion:storekitAvailable:skanVersion:adAttributionKitAvailable:nativeClickBeaconV1:)
+        let six: (String, Bool, String, Bool, Bool, Bool) -> DeviceCapabilities =
+            DeviceCapabilities.init(osVersion:storekitAvailable:skanVersion:adAttributionKitAvailable:nativeClickBeaconV1:videoV1:)
         XCTAssertFalse(four("17", true, "4.0", false).videoV1)
         XCTAssertFalse(five("17", true, "4.0", false, true).videoV1)
+        XCTAssertFalse(six("17", true, "4.0", false, true, true).videoPlanV2)
     }
 
     func testLegacyCreativeInitializerSymbolRemainsCallable() {
         let initializer: (String, String?, AdUnitType) -> Creative =
             Creative.init(type:bundleUrl:adUnitType:)
+        let videoInitializer: (String, String?, String?, String?, AdUnitType) -> Creative =
+            Creative.init(type:bundleUrl:url:posterUrl:adUnitType:)
         let creative = initializer("playable", "https://bundle", .rewarded)
         XCTAssertNil(creative.url)
         XCTAssertNil(creative.posterUrl)
+        XCTAssertEqual(
+            videoInitializer("video", nil, "https://cdn/video.mp4", nil, .interstitial).url,
+            "https://cdn/video.mp4"
+        )
+    }
+
+    func testLegacyAdBehaviorInitializerSymbolRemainsCallable() {
+        let initializer: (
+            CloseBehavior, StoreOpen, StorePrompt?, SKOverlayConfig?, AutoStoreRedirect?
+        ) -> AdBehavior = AdBehavior.init(close:storeOpen:storePrompt:skoverlay:autoStoreRedirect:)
+        XCTAssertEqual(
+            initializer(CloseBehavior(), .external, nil, nil, nil).video.style,
+            .cornerCTA
+        )
     }
 
     func testLegacyFallbackInitializerSymbolsRemainCallable() {

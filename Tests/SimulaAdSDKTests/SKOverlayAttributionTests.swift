@@ -12,6 +12,14 @@ import StoreKit
 /// return nil exactly then.
 final class SKOverlayAttributionTests: XCTestCase {
 
+    private func decodeInterstitial(_ json: String) throws -> AdLoadResponse {
+        try JSONDecoder().decode(AdLoadResponse.self, from: Data(json.utf8))
+    }
+
+    private func decodeFallbacks(_ json: String) throws -> [FallbackAd] {
+        try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
+    }
+
     func testOverlayOwnershipDismissesOnlyMatchingOwnerAndScene() {
         var ownership = SKOverlayOwnershipState<String, String>()
         ownership.install(owner: "first", scene: "scene-a")
@@ -55,6 +63,92 @@ final class SKOverlayAttributionTests: XCTestCase {
         XCTAssertFalse(state.creativePresentationRequested)
         XCTAssertFalse(state.requestCreativePresentation())
         XCTAssertFalse(state.canPresent(hasResolvedAppID: true))
+    }
+
+    func testPresentationClaimLegacyThenVideo() throws {
+        var claim = SKOverlayPresentationClaim()
+        let legacy = try XCTUnwrap(claim.reserve())
+
+        XCTAssertTrue(claim.succeed(legacy))
+        XCTAssertNil(claim.reserve())
+        XCTAssertTrue(claim.consumed)
+    }
+
+    func testPresentationClaimVideoThenLegacy() throws {
+        var claim = SKOverlayPresentationClaim()
+        let video = try XCTUnwrap(claim.reserve())
+
+        XCTAssertTrue(claim.succeed(video))
+        XCTAssertNil(claim.reserve())
+    }
+
+    func testPresentationClaimFailureReleasesReservation() throws {
+        var claim = SKOverlayPresentationClaim()
+        let legacy = try XCTUnwrap(claim.reserve())
+
+        claim.fail(legacy)
+
+        XCTAssertNotNil(claim.reserve())
+        XCTAssertFalse(claim.consumed)
+    }
+
+    func testPresentationClaimStaleFailureCannotReopenSuccess() throws {
+        var claim = SKOverlayPresentationClaim()
+        let stale = try XCTUnwrap(claim.reserve())
+        claim.fail(stale)
+        let winner = try XCTUnwrap(claim.reserve())
+        XCTAssertTrue(claim.succeed(winner))
+
+        claim.fail(stale)
+
+        XCTAssertNil(claim.reserve())
+        XCTAssertTrue(claim.consumed)
+    }
+
+    func testRejectedLocalInstallDismissesAndReleasesMatchingClaim() throws {
+        var presentation = SKOverlayPresentationState<String>()
+        XCTAssertTrue(presentation.install("existing"))
+        var claim = SKOverlayPresentationClaim()
+        let reservation = try XCTUnwrap(claim.reserve())
+
+        let installed = presentation.install("rejected")
+        if !installed { claim.fail(reservation) }
+
+        XCTAssertFalse(installed)
+        XCTAssertEqual(presentation.ownership, "existing")
+        XCTAssertNotNil(claim.reserve())
+        XCTAssertFalse(claim.consumed)
+    }
+
+    func testV2AllPlayablePrimaryRemainsLegacyEligible() throws {
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable","clip_index":0}}"#)
+
+        XCTAssertTrue(primary.usesVideoPlanV2Contract)
+        XCTAssertFalse(primary.primaryUsesVideoPlanV2)
+        XCTAssertTrue(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))
+    }
+
+    func testV2PlayablePrimaryLegacySuccessClaimsLaterVideoOverlay() throws {
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
+        let fallbacks = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/video.mp4","clip_index":1}]}"#)
+        XCTAssertTrue(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))
+        XCTAssertTrue(try XCTUnwrap(fallbacks.first).usesVideoPlanV2)
+        var claim = SKOverlayPresentationClaim()
+        let legacy = try XCTUnwrap(claim.reserve())
+
+        XCTAssertTrue(claim.succeed(legacy))
+        XCTAssertNil(claim.reserve(), "the later scoped video cannot replace a successful legacy overlay")
+    }
+
+    func testV2VideoPrimaryIsScopedOnly() throws {
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/video.mp4","clip_index":0}}"#)
+
+        XCTAssertTrue(primary.primaryUsesVideoPlanV2)
+        XCTAssertFalse(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))
+        var claim = SKOverlayPresentationClaim()
+        let scoped = try XCTUnwrap(claim.reserve())
+        XCTAssertTrue(claim.succeed(scoped))
+        XCTAssertNil(claim.reserve())
     }
 
     func testCreativeRequestedOverlayDoesNotRequireExperimentConfig() {

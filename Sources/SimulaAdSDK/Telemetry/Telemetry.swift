@@ -314,6 +314,64 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
+    func recordVideoLifecycle(
+        stage: String,
+        adFormat: String,
+        adUnitId: String?,
+        adId: String?,
+        serveId: String?,
+        errorCode: String? = nil,
+        clipIndex: Int?,
+        muted: Bool?,
+        impressionId: String? = nil,
+        style: String? = nil,
+        skoverlayEnabled: Bool? = nil,
+        skoverlayDelaySeconds: Int? = nil,
+        videoPositionS: Double? = nil,
+        pool: String? = nil,
+        durationS: Double? = nil,
+        quartile: Int? = nil,
+        reason: String? = nil,
+        pausedMs: Double? = nil,
+        watchedS: Double? = nil,
+        secondsUnmuted: Double? = nil,
+        secondsMuted: Double? = nil,
+        msToNextStepReady: Double? = nil,
+        secondsSinceVideoStart: Double? = nil,
+        on: String? = nil,
+        visibleS: Double? = nil,
+        error: String? = nil
+    ) {
+        current?.recordVideoLifecycle(
+            stage: stage,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            adId: adId,
+            serveId: serveId,
+            errorCode: errorCode,
+            clipIndex: clipIndex,
+            muted: muted,
+            impressionId: impressionId,
+            style: style,
+            skoverlayEnabled: skoverlayEnabled,
+            skoverlayDelaySeconds: skoverlayDelaySeconds,
+            videoPositionS: videoPositionS,
+            pool: pool,
+            durationS: durationS,
+            quartile: quartile,
+            reason: reason,
+            pausedMs: pausedMs,
+            watchedS: watchedS,
+            secondsUnmuted: secondsUnmuted,
+            secondsMuted: secondsMuted,
+            msToNextStepReady: msToNextStepReady,
+            secondsSinceVideoStart: secondsSinceVideoStart,
+            on: on,
+            visibleS: visibleS,
+            error: error
+        )
+    }
+
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
 

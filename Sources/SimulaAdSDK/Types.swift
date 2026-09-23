@@ -554,6 +554,35 @@ enum CreativeMediaType: String, Sendable, Equatable {
     }
 }
 
+/// Native video CTA chrome selected by `ad_behavior.video.style`. Unknown and missing values
+/// deliberately use the least intrusive treatment so a newly-authored server value stays usable.
+public enum VideoChromeStyle: String, Sendable, Equatable, CaseIterable {
+    case bottomBar = "bottom_bar"
+    case floatingPill = "floating_pill"
+    case bottomCard = "bottom_card"
+    case cornerCTA = "corner_cta"
+    case feedCard = "feed_card"
+
+    static func from(_ raw: String?) -> VideoChromeStyle {
+        VideoChromeStyle(rawValue: normalizeBehaviorToken(raw)) ?? .cornerCTA
+    }
+}
+
+public struct VideoBehavior: Sendable, Equatable, Decodable {
+    public let style: VideoChromeStyle
+
+    public init(style: VideoChromeStyle = .cornerCTA) {
+        self.style = style
+    }
+
+    enum CodingKeys: String, CodingKey { case style }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.style = .from(try? c.decode(String.self, forKey: .style))
+    }
+}
+
 /// The creative descriptor (`creative` node). `adUnitType` drives format-aware close copy;
 /// `url`/`posterUrl` describe a native video when `type == "video"`. Decoding is tolerant.
 public struct Creative: Sendable, Equatable, Decodable {
@@ -561,6 +590,12 @@ public struct Creative: Sendable, Equatable, Decodable {
     public let bundleUrl: String?
     public let url: String?
     public let posterUrl: String?
+    public let cta: String?
+    public let appIconUrl: String?
+    public let appName: String?
+    public let subtitle: String?
+    public let videoPool: String?
+    public let clipIndex: Int?
     public let adUnitType: AdUnitType
 
     public init(type: String = "", bundleUrl: String? = nil, adUnitType: AdUnitType = .interstitial) {
@@ -574,20 +609,82 @@ public struct Creative: Sendable, Equatable, Decodable {
         posterUrl: String?,
         adUnitType: AdUnitType = .interstitial
     ) {
+        self.init(
+            type: type,
+            bundleUrl: bundleUrl,
+            url: url,
+            posterUrl: posterUrl,
+            adUnitType: adUnitType,
+            cta: nil,
+            appIconUrl: nil,
+            appName: nil,
+            subtitle: nil,
+            videoPool: nil,
+            clipIndex: nil
+        )
+    }
+
+    public init(
+        type: String = "",
+        bundleUrl: String? = nil,
+        url: String?,
+        posterUrl: String?,
+        adUnitType: AdUnitType = .interstitial,
+        cta: String? = nil,
+        appIconUrl: String? = nil,
+        appName: String? = nil,
+        subtitle: String? = nil,
+        videoPool: String? = nil,
+        clipIndex: Int? = nil
+    ) {
         self.type = type
         self.bundleUrl = bundleUrl
         self.url = url
         self.posterUrl = posterUrl
+        self.cta = cta
+        self.appIconUrl = appIconUrl
+        self.appName = appName
+        self.subtitle = subtitle
+        self.videoPool = videoPool
+        self.clipIndex = clipIndex.flatMap { (0...2).contains($0) ? $0 : nil }
         self.adUnitType = adUnitType
     }
 
     var mediaType: CreativeMediaType { .from(type) }
+    /// Slot-level V2 metadata. This never activates V2 by itself; callers must also require the
+    /// canonical response-level `video_plan_version` marker.
+    var isVideoPlanV2Clip: Bool { mediaType == .video && clipIndex != nil }
+
+    var videoChromeTitle: String? {
+        appName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(128))
+        }
+    }
+
+    var videoChromeSubtitle: String? {
+        subtitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(256))
+        }
+    }
+
+    var videoCTATitle: String {
+        cta?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(128))
+        } ?? "Install"
+    }
 
     enum CodingKeys: String, CodingKey {
         case type
         case bundleUrl = "bundle_url"
         case url
         case posterUrl = "poster_url"
+        case cta
+        case appIconUrl = "app_icon_url"
+        case appName = "app_name"
+        case subtitle
+        case videoPool = "video_pool"
+        case pool
+        case clipIndex = "clip_index"
         case adUnitType = "ad_unit_type"
     }
 
@@ -597,7 +694,21 @@ public struct Creative: Sendable, Equatable, Decodable {
         self.bundleUrl = try? c.decode(String.self, forKey: .bundleUrl)
         self.url = try? c.decode(String.self, forKey: .url)
         self.posterUrl = try? c.decode(String.self, forKey: .posterUrl)
+        self.cta = try? c.decode(String.self, forKey: .cta)
+        self.appIconUrl = try? c.decode(String.self, forKey: .appIconUrl)
+        self.appName = try? c.decode(String.self, forKey: .appName)
+        self.subtitle = try? c.decode(String.self, forKey: .subtitle)
+        self.videoPool = Self.nonBlank(
+            (try? c.decode(String.self, forKey: .videoPool))
+                ?? (try? c.decode(String.self, forKey: .pool))
+        )
+        let decodedIndex = try? c.decode(Int.self, forKey: .clipIndex)
+        self.clipIndex = decodedIndex.flatMap { (0...2).contains($0) ? $0 : nil }
         self.adUnitType = .from(try? c.decode(String.self, forKey: .adUnitType))
+    }
+
+    private static func nonBlank(_ value: String?) -> String? {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 }
 
@@ -768,9 +879,9 @@ public enum OverlayPosition: Sendable, Equatable {
     }
 }
 
-/// SKOverlay (iOS) / Play Install Prompt (Android) config (`skoverlay` node): a native,
-/// SDK-presented install banner, independent of the creative click handler. Gated by the OS
-/// capability handshake — the backend won't assign it below iOS 14 / Android API 21.
+/// Native install-overlay config (`skoverlay` node), independent of the creative click handler.
+/// SKOverlay itself is iOS-only; Android uses its separate Play Install Prompt implementation.
+/// The backend gates assignment through the platform capability handshake.
 public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let timing: OverlayTiming
@@ -961,6 +1072,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
     public let autoStoreRedirect: AutoStoreRedirect?
+    public let video: VideoBehavior
 
     public init(
         close: CloseBehavior = CloseBehavior(),
@@ -969,11 +1081,30 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         skoverlay: SKOverlayConfig? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil
     ) {
+        self.init(
+            close: close,
+            storeOpen: storeOpen,
+            storePrompt: storePrompt,
+            skoverlay: skoverlay,
+            autoStoreRedirect: autoStoreRedirect,
+            video: VideoBehavior()
+        )
+    }
+
+    public init(
+        close: CloseBehavior = CloseBehavior(),
+        storeOpen: StoreOpen = .skstoreproduct,
+        storePrompt: StorePrompt? = nil,
+        skoverlay: SKOverlayConfig? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        video: VideoBehavior
+    ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
         self.autoStoreRedirect = autoStoreRedirect
+        self.video = video
     }
 
     enum CodingKeys: String, CodingKey {
@@ -982,6 +1113,7 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storePrompt = "store_prompt"
         case skoverlay
         case autoStoreRedirect = "auto_store_redirect"
+        case video
     }
 
     public init(from decoder: Decoder) throws {
@@ -991,7 +1123,12 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
         self.autoStoreRedirect = try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect)
+        self.video = (try? c.decode(VideoBehavior.self, forKey: .video)) ?? VideoBehavior()
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 /// User-selectable reasons for the in-ad report flow (the "i" → report sheet). `rawValue` is the wire

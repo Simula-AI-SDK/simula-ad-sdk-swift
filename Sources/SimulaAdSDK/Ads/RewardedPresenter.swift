@@ -40,9 +40,14 @@ final class RewardedPresenter {
     func present(
         impressionId: String,
         apiKey: String,
+        adUnitId: String? = nil,
+        serveId: String? = nil,
         renderedHtml: String = "",
+        creative: Creative? = nil,
+        videoBehavior: VideoBehavior = VideoBehavior(),
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -55,6 +60,7 @@ final class RewardedPresenter {
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
+        onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
         onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
@@ -68,6 +74,7 @@ final class RewardedPresenter {
         self.onClose = onClose
         self.videoPlayer = videoPlayer
         self.videoPreparationOwnership = videoPreparationOwnership
+        videoPlayer?.attachVideoPlanScope(videoPlanScope)
 
         // WebView ↔ SDK bridge (PRD §3): the creative can request early completion, haptics,
         // orientation lock, and device/audio/orientation queries. Owned here so the orientation
@@ -78,9 +85,14 @@ final class RewardedPresenter {
         let root = RewardedGameView(
             impressionId: impressionId,
             apiKey: apiKey,
+            adUnitId: adUnitId,
+            serveId: serveId,
             originatingScene: scene,
             renderedHtml: renderedHtml,
+            creative: creative,
+            videoBehavior: videoBehavior,
             videoPlayer: videoPlayer,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -93,6 +105,7 @@ final class RewardedPresenter {
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             bridge: bridge,
+            onVideoStarted: onVideoStarted,
             onClick: onClick,
             onFinish: { [weak self] earned, elapsed, completionReason in
                 self?.dismiss(
@@ -132,9 +145,14 @@ final class RewardedPresenter {
     func present(
         impressionId: String,
         apiKey: String,
+        adUnitId: String? = nil,
+        serveId: String? = nil,
         renderedHtml: String = "",
+        creative: Creative? = nil,
+        videoBehavior: VideoBehavior = VideoBehavior(),
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
@@ -147,15 +165,21 @@ final class RewardedPresenter {
         autoStoreRedirect: AutoStoreRedirect? = nil,
         previewHTML: String? = nil,
         onWillPresent: () -> Void = {},
+        onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping () -> Void,
         onClose: @escaping (Bool, Double, RewardCompletionReason?, FullscreenPresentationLease, UIWindow?) -> Void
     ) -> Bool {
         present(
             impressionId: impressionId,
             apiKey: apiKey,
+            adUnitId: adUnitId,
+            serveId: serveId,
             renderedHtml: renderedHtml,
+            creative: creative,
+            videoBehavior: videoBehavior,
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             close: close,
             storePrompt: storePrompt,
@@ -168,6 +192,7 @@ final class RewardedPresenter {
             autoStoreRedirect: autoStoreRedirect,
             previewHTML: previewHTML,
             onWillPresent: onWillPresent,
+            onVideoStarted: onVideoStarted,
             onClick: { _ in onClick() },
             onClose: onClose
         )
@@ -243,10 +268,15 @@ private struct RewardedGameView: View {
     /// The impression id from /load/rewarded — drives the ad-info report overlay.
     let impressionId: String
     let apiKey: String
+    let adUnitId: String?
+    let serveId: String?
     let originatingScene: UIWindowScene
     /// Server-rendered playable HTML.
     let renderedHtml: String
+    let creative: Creative?
+    let videoBehavior: VideoBehavior
     let videoPlayer: FullscreenVideoPlayer?
+    let videoPlanScope: VideoPlanPresentationScope?
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
     /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
@@ -272,6 +302,7 @@ private struct RewardedGameView: View {
     let previewHTML: String?
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
+    let onVideoStarted: () -> Void
     /// Fired on a user-gesture CTA / store-prompt tap (the CLICKED signal); parity with the interstitial.
     let onClick: (ClickInteraction) -> Void
     let onFinish: (Bool, Double, RewardCompletionReason?) -> Void
@@ -290,6 +321,9 @@ private struct RewardedGameView: View {
     @State private var videoGate: VideoPlaybackGate
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
+    @State private var videoCompletionHandled = false
+    @State private var videoPlanBlockerOwner = VideoPlanBlockerOwner()
+    @State private var videoPlanBlockerGeneration: UInt64 = 0
     @State private var primaryCreativeReady = false
     @State private var admittedVideoPlayerIdentity: ObjectIdentifier?
     @State private var htmlReadinessDeadline: RewardedHTMLReadinessDeadlineState
@@ -322,9 +356,14 @@ private struct RewardedGameView: View {
     init(
         impressionId: String,
         apiKey: String,
+        adUnitId: String?,
+        serveId: String?,
         originatingScene: UIWindowScene,
         renderedHtml: String,
+        creative: Creative?,
+        videoBehavior: VideoBehavior,
         videoPlayer: FullscreenVideoPlayer?,
+        videoPlanScope: VideoPlanPresentationScope?,
         admission: FullscreenPresentationAdmission,
         close: CloseBehavior?,
         storePrompt: StorePrompt?,
@@ -337,14 +376,20 @@ private struct RewardedGameView: View {
         autoStoreRedirect: AutoStoreRedirect?,
         previewHTML: String?,
         bridge: CreativeBridge,
+        onVideoStarted: @escaping () -> Void,
         onClick: @escaping (ClickInteraction) -> Void,
         onFinish: @escaping (Bool, Double, RewardCompletionReason?) -> Void
     ) {
         self.impressionId = impressionId
         self.apiKey = apiKey
+        self.adUnitId = adUnitId
+        self.serveId = serveId
         self.originatingScene = originatingScene
         self.renderedHtml = renderedHtml
+        self.creative = creative
+        self.videoBehavior = videoBehavior
         self.videoPlayer = videoPlayer
+        self.videoPlanScope = videoPlanScope
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.close = close
@@ -358,6 +403,7 @@ private struct RewardedGameView: View {
         self.autoStoreRedirect = autoStoreRedirect
         self.previewHTML = previewHTML
         self.bridge = bridge
+        self.onVideoStarted = onVideoStarted
         self.onClick = onClick
         self.onFinish = onFinish
         _videoGate = State(initialValue: VideoPlaybackGate(
@@ -391,6 +437,15 @@ private struct RewardedGameView: View {
     private var rewardEarned: Bool { rewardCompletion.earned }
     private var presentationActive: Bool {
         viewAppeared && visible && appForegrounded && !storeSheetPresented
+    }
+    private var usesVideoPlanV2: Bool {
+        videoPlanScope != nil && creative?.isVideoPlanV2Clip == true
+    }
+    private var suppressesLegacySKOverlay: Bool {
+        !isLegacySKOverlayEligible(usesVideoPlanV2: usesVideoPlanV2)
+    }
+    private var videoTelemetryBehavior: AdBehavior {
+        AdBehavior(skoverlay: skOverlay, video: videoBehavior)
     }
     private var videoChromeVisibility: VideoPreFirstFrameChromeVisibility {
         guard let videoPlayer else {
@@ -490,7 +545,13 @@ private struct RewardedGameView: View {
             attributionRouteLifecycle.activate()
             if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             reconcileTimer()
-            startSKOverlay()
+            if !suppressesLegacySKOverlay { startSKOverlay() }
+            videoPlanBlockerGeneration &+= 1
+            videoPlanScope?.activateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration,
+                blocked: !appForegrounded || storeSheetPresented
+            )
             // PLAYABLE_END: if the reward was already earned (duration 0), fire immediately.
             fireAutoStoreRedirectIfCloseShown()
         }
@@ -512,17 +573,23 @@ private struct RewardedGameView: View {
             storePromptGestureGuard.release()
             clickHandoffs.reset()
             videoPlayer?.setPresentationBlocked(true)
+            videoPlanScope?.deactivateBlocker(
+                owner: videoPlanBlockerOwner,
+                generation: videoPlanBlockerGeneration
+            )
         }
         // Pause the play-to-earn timer while the app is backgrounded OR an in-app store/Safari sheet
         // covers the playable; resume only when both clear, so the reward can't be earned off-screen.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             appForegrounded = false
+            updateVideoPlanBlocker(true)
             admission.setBlocked(true)
             storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
+            updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
             storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
@@ -536,12 +603,14 @@ private struct RewardedGameView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
             storeSheetPresented = true
+            updateVideoPlanBlocker(true)
             admission.setBlocked(true)
             storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
             storeSheetPresented = false
+            updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
             storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
@@ -741,6 +810,14 @@ private struct RewardedGameView: View {
         }
     }
 
+    private func updateVideoPlanBlocker(_ blocked: Bool) {
+        videoPlanScope?.updateBlocker(
+            owner: videoPlanBlockerOwner,
+            generation: videoPlanBlockerGeneration,
+            blocked: blocked
+        )
+    }
+
     /// A user-gesture CTA tap inside the playable surfaces CLICKED to the publisher. The WebView
     /// coordinator reports the terminal route outcome separately, and only a successful route marks
     /// the store-exit funnel.
@@ -856,7 +933,44 @@ private struct RewardedGameView: View {
             controlsEnabled: canUseVideoControls(
                 firstFrameAdmitted: primaryCreativeReady,
                 displayAdmitted: admission.hasAdmittedDisplay
-            )
+            ),
+            chromeConfiguration: videoChromeConfiguration(
+                creative: creative,
+                behavior: videoTelemetryBehavior,
+                isVideoPlanV2: usesVideoPlanV2
+            ),
+            effectiveClosePosition: effectiveVideoClosePosition(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position
+            ),
+            bottomProgressBarObstructsChrome: videoBottomProgressBarObstructsChrome(
+                treatment: (close ?? CloseBehavior()).treatment,
+                position: (close ?? CloseBehavior()).position
+            ),
+            storePromptVisible: storePromptVisible && !rewardEarned,
+            storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
+                configuredClosePosition: (close ?? CloseBehavior()).position
+            ),
+            onMuteChanged: { muted in
+                guard usesVideoPlanV2 else { return }
+                videoPlanScope?.updateMuted(muted)
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.muteToggle,
+                    adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
+                    isVideoPlanV2: usesVideoPlanV2,
+                    creative: creative, behavior: videoTelemetryBehavior,
+                    muted: muted,
+                    mutedWatchMs: player.mutedWatchMilliseconds,
+                    unmutedWatchMs: player.unmutedWatchMilliseconds,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            telemetryPauseReason: { videoPauseReason },
+            onTelemetryEvent: usesVideoPlanV2
+                ? { event in recordVideoSurfaceTelemetry(event, player: player) }
+                : nil
         )
             .allowsHitTesting(!clickHandoffPending)
             .onReceive(player.$status) { handleVideoStatus($0, player: player) }
@@ -864,33 +978,68 @@ private struct RewardedGameView: View {
             .onReceive(player.$duration) { _ in updateVideoGate(player: player, played: player.playedSeconds) }
     }
 
-    private func handleVideoStatus(_ status: FullscreenVideoStatus, player: FullscreenVideoPlayer) {
+    private func handleVideoStatus(
+        _ status: FullscreenVideoStatus,
+        player: FullscreenVideoPlayer,
+        terminalAlreadyClaimed: Bool = false
+    ) {
         switch status {
         case .ready, .paused:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .playing:
             updateVideoGate(player: player, played: player.playedSeconds)
         case .ended:
-            guard primaryCreativeReady else { return }
+            guard primaryCreativeReady, !videoCompletionHandled,
+                  terminalAlreadyClaimed || claimVideoPlanTerminalIfNeeded(
+                      player: player,
+                      event: .completion
+                  ) else { return }
+            videoCompletionHandled = true
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.complete, adFormat: "rewarded", adUnitId: nil,
-                adId: impressionId, serveId: nil
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.complete,
+                adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
+                isVideoPlanV2: usesVideoPlanV2,
+                creative: creative, behavior: videoTelemetryBehavior,
+                muted: player.isMuted,
+                mutedWatchMs: player.mutedWatchMilliseconds,
+                unmutedWatchMs: player.unmutedWatchMilliseconds,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
+            if shouldAutomaticallyAdvanceCompletedVideo(
+                usesVideoPlanV2: usesVideoPlanV2,
+                status: status
+            ) {
+                requestTerminal(earned: true)
+            }
         case .failed(let reason):
-            guard !videoFailureHandled else { return }
+            guard !videoFailureHandled,
+                  claimVideoPlanTerminalIfNeeded(player: player, event: .failure) else { return }
             videoFailureHandled = true
             admission.visualBecameUnavailable(owner: admissionOwner)
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.fail, adFormat: "rewarded", adUnitId: nil,
-                adId: impressionId, serveId: nil, errorCode: reason.rawValue
+            recordFullscreenVideoLifecycle(
+                stage: FullscreenVideoTelemetryStage.fail,
+                adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
+                isVideoPlanV2: usesVideoPlanV2,
+                creative: creative, behavior: videoTelemetryBehavior,
+                muted: player.isMuted,
+                mutedWatchMs: player.mutedWatchMilliseconds,
+                unmutedWatchMs: player.unmutedWatchMilliseconds,
+                errorCode: reason.rawValue,
+                videoPositionS: player.playedSeconds,
+                durationS: player.duration,
+                secondsSinceVideoStart: player.secondsSinceVideoStart
             )
             Telemetry.shared.recordError(
                 signature: "video:playback_failed",
                 errorCode: reason.rawValue,
                 breadcrumb: "surface=rewarded"
             )
-            requestCreativeFailure()
+            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.failed)
+            requestTerminalAdvance()
         case .preparing:
             break
         }
@@ -913,29 +1062,67 @@ private struct RewardedGameView: View {
             }
             return true
         }
+        let admittedAt = ProcessInfo.processInfo.systemUptime
+        let ended = player.status == .ended
+        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         admission.visualBecameReady(owner: admissionOwner)
-        if !videoStartRecorded {
-            videoStartRecorded = true
-            Telemetry.shared.recordLifecycle(
-                stage: FullscreenVideoTelemetryStage.start, adFormat: "rewarded", adUnitId: nil,
-                adId: impressionId, serveId: nil
-            )
+        runVideoFirstFrameStartSequence(
+            shouldRecordStart: !videoStartRecorded,
+            recordStart: {
+                videoStartRecorded = true
+                recordFullscreenVideoLifecycle(
+                    stage: FullscreenVideoTelemetryStage.start,
+                    adFormat: "rewarded", adUnitId: adUnitId, adId: impressionId, serveId: serveId,
+                    isVideoPlanV2: usesVideoPlanV2,
+                    creative: creative, behavior: videoTelemetryBehavior,
+                    muted: player.isMuted,
+                    videoPositionS: player.playedSeconds,
+                    durationS: player.duration,
+                    secondsSinceVideoStart: player.secondsSinceVideoStart
+                )
+            },
+            startOverlay: {
+                videoPlanScope?.firstVideoFrame(
+                    playerID: player.videoPlanPresentationID,
+                    creative: creative,
+                    behavior: videoTelemetryBehavior,
+                    adFormat: "rewarded",
+                    adUnitId: adUnitId,
+                    adId: impressionId,
+                    serveId: serveId,
+                    config: skOverlay,
+                    trackingUrl: trackingUrl,
+                    destination: destination,
+                    storeUrl: storeUrl,
+                    attribution: attribution,
+                    originatingScene: originatingScene,
+                    admittedAt: admittedAt,
+                    blocked: !appForegrounded || storeSheetPresented
+                )
+            },
+            notifyStarted: onVideoStarted
+        )
+        if ended {
+            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
+        } else {
+            updateVideoGate(player: player, played: player.playedSeconds)
         }
-        updateVideoGate(player: player, played: player.playedSeconds)
         return true
     }
 
     private func handleVideoPreFirstFrameEscape(player: FullscreenVideoPlayer) {
-        guard videoPreFirstFrameEscapeAction(
+        guard let decision = videoPreFirstFrameEscapeDecision(
             surface: .rewarded,
             presentationMounted: viewAppeared && visible,
             firstFrameAdmitted: primaryCreativeReady || player.hasAdmittedFirstVisualFrame,
             terminal: videoFailureHandled || player.status.isTerminal
-        ) == .finishRewardedUnearned else { return }
+        ), decision.action == .finishRewardedUnearned,
+              claimVideoPlanTerminalIfNeeded(player: player, event: decision.terminalEvent) else { return }
+        recordVideoClose(player: player, reason: decision.telemetryReason)
         videoFailureHandled = true
-        requestCreativeFailure()
+        requestTerminalAdvance()
     }
 
     private func updateVideoGate(
@@ -957,6 +1144,55 @@ private struct RewardedGameView: View {
             earnReward(reason: reason)
             storePromptVisible = false
         }
+    }
+
+    private var videoPauseReason: String {
+        if !appForegrounded { return FullscreenVideoTerminationReason.backgrounded }
+        if storeSheetPresented { return FullscreenVideoTerminationReason.storePresented }
+        if videoPlayer?.hasActiveAudioInterruption == true {
+            return FullscreenVideoTerminationReason.audioInterruption
+        }
+        return FullscreenVideoTerminationReason.playback
+    }
+
+    private func recordVideoSurfaceTelemetry(
+        _ event: VideoSurfaceTelemetryEvent,
+        player: FullscreenVideoPlayer
+    ) {
+        let stage: String
+        var quartile: Int?
+        var reason: String?
+        var pausedMs: Double?
+        switch event {
+        case .quartile(let value):
+            stage = FullscreenVideoTelemetryStage.duration
+            quartile = value
+        case .pause(let value):
+            stage = FullscreenVideoTelemetryStage.pause
+            reason = value
+        case .resume(let value, let duration):
+            stage = FullscreenVideoTelemetryStage.resume
+            reason = value
+            pausedMs = duration
+        }
+        recordFullscreenVideoLifecycle(
+            stage: stage,
+            adFormat: "rewarded", adUnitId: adUnitId,
+            adId: impressionId, serveId: serveId,
+            isVideoPlanV2: usesVideoPlanV2,
+            creative: creative, behavior: videoTelemetryBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            quartile: quartile,
+            reason: reason,
+            pausedMs: pausedMs,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            on: stage == FullscreenVideoTelemetryStage.pause
+                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil
+        )
     }
 
     private func earnReward(reason: RewardCompletionReason) {
@@ -1083,6 +1319,7 @@ private struct RewardedGameView: View {
     // MARK: SKOverlay
 
     private func startSKOverlay() {
+        guard !suppressesLegacySKOverlay else { return }
         let config = skOverlay
         guard config?.enabled == true || skOverlayState.creativePresentationRequested,
               resolvedAppID == nil, !skOverlayResolutionStarted,
@@ -1121,24 +1358,46 @@ private struct RewardedGameView: View {
     }
 
     private func presentSKOverlay(config: SKOverlayConfig) {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.canPresent(hasResolvedAppID: resolvedAppID?.isEmpty == false),
               let appID = resolvedAppID else { return }
         guard visible, attributionRouteLifecycle.isActive,
               UIApplication.shared.applicationState == .active,
               originatingScene.activationState == .foregroundActive else { return }
         guard #available(iOS 14.0, *) else { return }
+        var claimReservation: SKOverlayPresentationClaim.Reservation?
+        if let videoPlanScope {
+            guard let reservation = videoPlanScope.reserveLegacySKOverlay() else { return }
+            claimReservation = reservation
+        }
         guard let ownership = SKOverlayPresenter.present(
             appID: appID,
             config: config,
             attribution: attribution,
             originatingScene: originatingScene
-        ) else { return }
-        if !skOverlayState.install(ownership) {
+        ) else {
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        guard skOverlayState.install(ownership) else {
             SKOverlayPresenter.dismiss(ownershipToken: ownership)
+            if let claimReservation {
+                videoPlanScope?.legacySKOverlayDidFail(claimReservation)
+            }
+            return
+        }
+        if let claimReservation,
+           videoPlanScope?.legacySKOverlayDidPresent(claimReservation) != true {
+            if let installed = skOverlayState.dismiss() {
+                SKOverlayPresenter.dismiss(ownershipToken: installed)
+            }
         }
     }
 
     private func presentSKOverlayOnClickIfNeeded() {
+        guard !suppressesLegacySKOverlay else { return }
         guard let config = skOverlay, config.enabled, config.timing == .onClick else { return }
         // A configured product sheet remains foreground when both StoreKit surfaces are selected;
         // the overlay stays exactly owned by this scene/presentation behind it.
@@ -1146,6 +1405,7 @@ private struct RewardedGameView: View {
     }
 
     private func showSKOverlayFromCreative() {
+        guard !suppressesLegacySKOverlay else { return }
         guard skOverlayState.requestCreativePresentation() else { return }
         skOverlayTask?.cancel()
         skOverlayTask = nil
@@ -1154,7 +1414,8 @@ private struct RewardedGameView: View {
     }
 
     private func presentRequestedSKOverlayIfNeeded() {
-        guard skOverlayState.creativePresentationRequested,
+        guard !suppressesLegacySKOverlay,
+              skOverlayState.creativePresentationRequested,
               resolvedAppID?.isEmpty == false else { return }
         presentSKOverlay(config: creativeRequestedSKOverlayConfig(from: skOverlay))
     }
@@ -1174,10 +1435,64 @@ private struct RewardedGameView: View {
             dismissUnlocked: earned,
             clickHandoffPending: clickHandoffPending
         ) else { return }
+        if let player = videoPlayer, usesVideoPlanV2 {
+            guard claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) else { return }
+            recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
+            videoPlanScope?.handoffBegan()
+        }
         requestTerminal(earned: earned)
     }
 
-    private func requestCreativeFailure() {
+    private func recordVideoClose(player: FullscreenVideoPlayer, reason: String) {
+        let watchTotals = player.flushPresentationWatchAccounting()
+        recordFullscreenVideoLifecycle(
+            stage: FullscreenVideoTelemetryStage.close,
+            adFormat: "rewarded", adUnitId: adUnitId,
+            adId: impressionId, serveId: serveId,
+            isVideoPlanV2: usesVideoPlanV2,
+            creative: creative, behavior: videoTelemetryBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            reason: reason,
+            secondsSinceVideoStart: player.secondsSinceVideoStart
+        )
+    }
+
+    private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
+        guard usesVideoPlanV2 else { return }
+        _ = player.flushPresentationWatchAccounting()
+        videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
+            adFormat: "rewarded",
+            adUnitId: adUnitId,
+            adId: impressionId,
+            serveId: serveId,
+            creative: creative,
+            behavior: videoTelemetryBehavior,
+            muted: player.isMuted,
+            mutedWatchMs: player.mutedWatchMilliseconds,
+            unmutedWatchMs: player.unmutedWatchMilliseconds,
+            videoPositionS: player.playedSeconds,
+            durationS: player.duration,
+            secondsSinceVideoStart: player.secondsSinceVideoStart,
+            reason: reason
+        ))
+    }
+
+    private func claimVideoPlanTerminalIfNeeded(
+        player: FullscreenVideoPlayer,
+        event: VideoPlanTerminalEvent
+    ) -> Bool {
+        guard usesVideoPlanV2 else { return true }
+        return videoPlanScope?.claimVideoTerminal(
+            playerID: player.videoPlanPresentationID,
+            event: event
+        ) == true
+    }
+
+    private func requestTerminalAdvance() {
         requestTerminal(earned: rewardEarned)
     }
 
