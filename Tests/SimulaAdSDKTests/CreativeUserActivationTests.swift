@@ -24,6 +24,17 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("activation_nonce: activationNonce"))
     }
 
+    func testEveryActivationFrameCarriesValidatedClickSourceForSrcdoc() {
+        let source = creativeUserActivationScriptSource(
+            nonce: "nonce",
+            clickSource: .fallbackCTA
+        )
+
+        XCTAssertTrue(source.contains("var slotClickSource = 'fallback_cta'"))
+        XCTAssertTrue(source.contains("window.simulaClickInteraction(slotClickSource, true)"))
+        XCTAssertFalse(source.contains("window.__simulaNativeSlotSource"))
+    }
+
     func testGeneratedScriptExposesStablePayloadFreeStoreAPI() {
         let source = creativeUserActivationScriptSource(nonce: "nonce")
 
@@ -32,14 +43,20 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'dismissStore'"))
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'showInstallBanner'"))
         XCTAssertTrue(source.contains("function openStore()"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'openCTA'"))
         XCTAssertTrue(source.contains("function dismissStore()"))
         XCTAssertTrue(source.contains("function showInstallBanner()"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW'"))
-        XCTAssertTrue(source.contains("postNative(nativeStringify(message))"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify(withIdentity(message, identity)))"))
         XCTAssertTrue(source.contains("postNative(nativeStringify({"))
-        XCTAssertFalse(source.contains("function openStore(value"))
+        XCTAssertTrue(source.contains("function withIdentity(message, identity)"))
+        XCTAssertTrue(source.contains("window.simulaClickInteraction(slotClickSource, true)"))
+        XCTAssertTrue(source.contains("typeof identity === 'string'"))
+        XCTAssertFalse(source.contains("__simulaMintClickIdentity"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_CTA_OPEN'"))
+        XCTAssertFalse(source.contains("CTA_CLICK"))
         XCTAssertFalse(source.contains("activation_nonce: 'nonce'"))
     }
 

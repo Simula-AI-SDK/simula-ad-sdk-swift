@@ -95,9 +95,9 @@ public struct DeviceCapabilities: Encodable, Sendable {
     public let adAttributionKitAvailable: Bool
     /// Client support declaration only. Per-fallback server ownership is decoded separately.
     public let nativeClickBeaconV1: Bool
-    /// Native AVPlayer rendering, lifecycle, gating, and fallback sequencing are fully supported.
+    /// Retained for source and binary compatibility. Video negotiation is request-scoped.
     public let videoV1: Bool
-    /// Fully planned three-slot video sequencing, native chrome, audio, and presentation timing.
+    /// Retained for source and binary compatibility. Video negotiation is request-scoped.
     public let videoPlanV2: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -106,8 +106,6 @@ public struct DeviceCapabilities: Encodable, Sendable {
         case skanVersion = "skan_version"
         case adAttributionKitAvailable = "adattributionkit_available"
         case nativeClickBeaconV1 = "native_click_beacon_v1"
-        case videoV1 = "video_v1"
-        case videoPlanV2 = "video_plan_v2"
     }
 
     public init(
@@ -245,8 +243,6 @@ public struct DeviceCapabilities: Encodable, Sendable {
             "skan_version": skanVersion,
             "adattributionkit_available": adAttributionKitAvailable,
             "native_click_beacon_v1": nativeClickBeaconV1,
-            "video_v1": videoV1,
-            "video_plan_v2": videoPlanV2,
         ]
     }
 }
@@ -590,8 +586,8 @@ enum FullscreenCreativeContent: Equatable, Sendable {
     case video(url: URL, posterURL: URL?)
 }
 
-func isVideoPlanV2Contract(_ version: String?) -> Bool {
-    version?.trimmingCharacters(in: .whitespacesAndNewlines) == "video_plan_v2"
+func isVideoContract2(_ version: Int?) -> Bool {
+    version == 2
 }
 
 func validatedCreativeURL(_ raw: String?) -> URL? {
@@ -602,6 +598,14 @@ func validatedCreativeURL(_ raw: String?) -> URL? {
           scheme == "https" || scheme == "http",
           url.host?.isEmpty == false else { return nil }
     return url
+}
+
+struct FullscreenContracts: Encodable, Sendable, Equatable {
+    let video: Int
+
+    init(video: Int = 2) {
+        self.video = video
+    }
 }
 
 /// Request body for POST /ads/load/interstitial — the imperative `.load()` prefetch call.
@@ -622,6 +626,7 @@ public struct AdLoadRequest: Encodable, Sendable {
     public let capabilities: DeviceCapabilities
     /// Publisher metadata attached to this impression. Encoded only when non-nil.
     public let metadata: [String: String]?
+    let contracts = FullscreenContracts()
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -633,6 +638,7 @@ public struct AdLoadRequest: Encodable, Sendable {
         case context
         case capabilities
         case metadata
+        case contracts
     }
 
     public init(
@@ -760,15 +766,18 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Explicit presentation contract marker. Unlike per-creative `clip_index`, this remains present
     /// when the primary slot is playable and a later V2 fallback slot is video.
     public let videoPlanVersion: String?
+    /// Exact numeric response contract. Legacy string markers never activate contract behavior.
+    let videoContract: Int?
+    let impressionUrl: String?
     /// Experiment-assignment metadata (`experiment` node), carried for telemetry only.
     public let experiment: Experiment?
     /// Cleared bid (the estimated CPM) for this serve, backend-provided. Drives ``adValue``; defaults
     /// to 0 → a $0 estimate when absent (e.g. a no-fill).
     public let bidAmt: Double
 
-    var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var usesVideoPlanV2Contract: Bool { isVideoContract2(videoContract) }
     var primaryUsesVideoPlanV2: Bool {
-        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+        usesVideoPlanV2Contract && creative?.mediaType == .video
     }
 
     /// `destination` mapped to a typed value; unknown strings fall back to `.appstore`.
@@ -779,6 +788,7 @@ public struct AdLoadResponse: Decodable, Sendable {
     /// Estimated revenue derived on-device from ``bidAmt``. Held on the loaded ad and
     /// surfaced on the paid event when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
+    var validatedImpressionURL: URL? { validatedCreativeURL(impressionUrl) }
 
     /// The HTML creative to render — trimmed and non-blank — or `nil`. A `nil`
     /// value means the payload carries no renderable creative (no-fill).
@@ -819,6 +829,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         case skanAttribution = "skan_attribution"
         case creative
         case videoPlanVersion = "video_plan_version"
+        case videoContract = "video_contract"
+        case impressionUrl = "impression_url"
         case experiment
         case bidAmt = "bid_amt"
     }
@@ -840,6 +852,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.skanAttribution = try? c.decode(AdAttribution.self, forKey: .skanAttribution)
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.videoPlanVersion = try? c.decode(String.self, forKey: .videoPlanVersion)
+        self.videoContract = exactJSONInteger(for: decoder, key: CodingKeys.videoContract)
+        self.impressionUrl = try? c.decode(String.self, forKey: .impressionUrl)
         self.experiment = try? c.decode(Experiment.self, forKey: .experiment)
         self.bidAmt = (try? c.decode(Double.self, forKey: .bidAmt)) ?? 0
     }
@@ -873,6 +887,8 @@ public struct AdLoadResponse: Decodable, Sendable {
         self.skanAttribution = skanAttribution
         self.creative = creative
         self.videoPlanVersion = nil
+        self.videoContract = nil
+        self.impressionUrl = nil
         self.experiment = experiment
         self.bidAmt = bidAmt
         self.prewarmSKProduct = prewarmSKProduct
@@ -900,6 +916,7 @@ public struct RewardedInitRequest: Encodable, Sendable {
     public let capabilities: DeviceCapabilities
     /// Publisher metadata attached to this impression. Encoded only when non-nil.
     public let metadata: [String: String]?
+    let contracts = FullscreenContracts()
 
     enum CodingKeys: String, CodingKey {
         case adUnitId = "ad_unit_id"
@@ -911,6 +928,7 @@ public struct RewardedInitRequest: Encodable, Sendable {
         case context
         case capabilities
         case metadata
+        case contracts
     }
 
     public init(
@@ -1016,6 +1034,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// Typed primary creative metadata. Missing/unknown type means playable.
     public let creative: Creative?
     public let videoPlanVersion: String?
+    let videoContract: Int?
+    let impressionUrl: String?
     // Mirrors the interstitial response: the play-to-earn gate (`close.delaySeconds`) plus the
     // mid-ad store prompt + its tap routing. `adBehavior` is nil when the payload omits
     // `ad_behavior` → no gate (instantly earned) and no store prompt.
@@ -1037,9 +1057,9 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// Cleared bid (estimated CPM) for this serve — see ``AdLoadResponse/bidAmt``. Drives ``adValue``.
     public let bidAmt: Double
 
-    var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var usesVideoPlanV2Contract: Bool { isVideoContract2(videoContract) }
     var primaryUsesVideoPlanV2: Bool {
-        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+        usesVideoPlanV2Contract && creative?.mediaType == .video
     }
 
     /// The advertiser destination kind (App Store vs web); defaults to `.appstore`.
@@ -1050,6 +1070,7 @@ public struct RewardedInitResponse: Decodable, Sendable {
     /// Estimated revenue derived on-device from ``bidAmt``; surfaced on the paid event
     /// when the impression fires (no network round-trip).
     public var adValue: AdValue { AdValue.fromBidCpm(bidAmt) }
+    var validatedImpressionURL: URL? { validatedCreativeURL(impressionUrl) }
 
     public var htmlCreative: String? {
         let value = renderedHtml.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1070,6 +1091,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
         case renderedHtml = "rendered_html"
         case creative
         case videoPlanVersion = "video_plan_version"
+        case videoContract = "video_contract"
+        case impressionUrl = "impression_url"
         case destination
         case trackingUrl = "tracking_url"
         case iosStoreUrl = "ios_store_url"
@@ -1087,6 +1110,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.renderedHtml = (try? c.decode(String.self, forKey: .renderedHtml)) ?? ""
         self.creative = try? c.decode(Creative.self, forKey: .creative)
         self.videoPlanVersion = try? c.decode(String.self, forKey: .videoPlanVersion)
+        self.videoContract = exactJSONInteger(for: decoder, key: CodingKeys.videoContract)
+        self.impressionUrl = try? c.decode(String.self, forKey: .impressionUrl)
         self.destination = (try? c.decode(String.self, forKey: .destination)) ?? AdDestination.appstore.rawValue
         self.trackingUrl = try? c.decode(String.self, forKey: .trackingUrl)
         self.iosStoreUrl = try? c.decode(String.self, forKey: .iosStoreUrl)
@@ -1174,6 +1199,8 @@ public struct RewardedInitResponse: Decodable, Sendable {
         self.renderedHtml = renderedHtml
         self.creative = creative
         self.videoPlanVersion = nil
+        self.videoContract = nil
+        self.impressionUrl = nil
         self.destination = destination
         self.trackingUrl = trackingUrl
         self.iosStoreUrl = iosStoreUrl
@@ -1202,6 +1229,7 @@ public struct FallbackAd: Sendable {
     public let posterUrl: String?
     public let creative: Creative?
     let videoPlanVersion: String?
+    let videoContract: Int?
     public let adBehavior: AdBehavior
     public let destination: String?
     public let trackingUrl: String?
@@ -1259,6 +1287,7 @@ public struct FallbackAd: Sendable {
         self.posterUrl = nil
         self.creative = nil
         self.videoPlanVersion = nil
+        self.videoContract = nil
         self.adBehavior = AdBehavior(close: closeBehavior)
         self.destination = nil
         self.trackingUrl = nil
@@ -1277,6 +1306,7 @@ public struct FallbackAd: Sendable {
         posterUrl: String?,
         creative: Creative? = nil,
         videoPlanVersion: String? = nil,
+        videoContract: Int? = nil,
         adBehavior: AdBehavior?,
         nativeClickBeaconV1Enabled: Bool,
         destination: String? = nil,
@@ -1291,6 +1321,7 @@ public struct FallbackAd: Sendable {
         self.renderedHtml = renderedHtml
         self.creative = creative
         self.videoPlanVersion = videoPlanVersion
+        self.videoContract = videoContract
         self.type = creative?.type ?? type
         self.url = creative?.url ?? url
         self.posterUrl = creative?.posterUrl ?? posterUrl
@@ -1308,7 +1339,7 @@ public struct FallbackAd: Sendable {
         AdDestination(rawValue: destination ?? "") ?? .appstore
     }
     var mediaType: CreativeMediaType { .from(type) }
-    var usesVideoPlanV2Contract: Bool { isVideoPlanV2Contract(videoPlanVersion) }
+    var usesVideoPlanV2Contract: Bool { isVideoContract2(videoContract) }
     var usesVideoPlanV2: Bool {
         usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
     }
@@ -1318,6 +1349,8 @@ public struct FallbackAd: Sendable {
         }
     }
     var creativeContent: FullscreenCreativeContent? {
+        // Contract 2 has one stitched primary video. Fallbacks remain ordinary HTML end screens.
+        if usesVideoPlanV2Contract, mediaType == .video { return nil }
         if mediaType == .video {
             guard let url = validatedCreativeURL(url) else { return nil }
             return .video(url: url, posterURL: validatedCreativeURL(posterUrl))
@@ -1343,7 +1376,9 @@ func fallbackAdBehavior(_ behavior: AdBehavior?) -> AdBehavior {
         storePrompt: behavior?.storePrompt,
         skoverlay: behavior?.skoverlay,
         autoStoreRedirect: behavior?.autoStoreRedirect,
-        video: behavior?.video ?? VideoBehavior()
+        video: behavior?.video ?? VideoBehavior(),
+        reward: behavior?.reward ?? RewardBehavior(),
+        progressBar: behavior?.progressBar ?? ProgressBarBehavior()
     )
 }
 
@@ -1365,12 +1400,14 @@ struct FallbackAdsAPIResponse: Decodable {
     let ads: [FallbackAdItem]
     let nativeClickBeaconV1Enabled: Bool?
     let videoPlanVersion: String?
+    let videoContract: Int?
 
     enum CodingKeys: String, CodingKey {
         case impressionId = "impression_id"
         case ads
         case nativeClickBeaconV1Enabled = "native_click_beacon_v1_enabled"
         case videoPlanVersion = "video_plan_version"
+        case videoContract = "video_contract"
     }
 
     init(from decoder: Decoder) throws {
@@ -1379,10 +1416,11 @@ struct FallbackAdsAPIResponse: Decodable {
         self.ads = (try? c.decode(LossyFallbackAdItems.self, forKey: .ads).items) ?? []
         self.nativeClickBeaconV1Enabled = try? c.decode(Bool.self, forKey: .nativeClickBeaconV1Enabled)
         self.videoPlanVersion = try? c.decode(String.self, forKey: .videoPlanVersion)
+        self.videoContract = exactJSONInteger(for: decoder, key: CodingKeys.videoContract)
     }
 
     var resolvedAds: [FallbackAd] {
-        let usableAds = ads.compactMap { item -> FallbackAd? in
+        let usableAds = Array(ads.compactMap { item -> FallbackAd? in
             let html = [item.renderedHtml, item.html]
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? $0 : nil }
                 .first
@@ -1395,6 +1433,7 @@ struct FallbackAdsAPIResponse: Decodable {
                 posterUrl: item.posterUrl,
                 creative: item.resolvedCreative,
                 videoPlanVersion: videoPlanVersion,
+                videoContract: videoContract,
                 adBehavior: item.adBehavior,
                 nativeClickBeaconV1Enabled: item.nativeClickBeaconV1Enabled
                     ?? nativeClickBeaconV1Enabled
@@ -1405,7 +1444,7 @@ struct FallbackAdsAPIResponse: Decodable {
                 androidStoreUrl: item.androidStoreUrl
             )
             return ad.creativeContent == nil ? nil : ad
-        }
+        }.prefix(2))
         return usableAds.enumerated().map { index, ad in
             let close = ad.closeBehavior.replacingAction(
                 resolvedFallbackCloseAction(
@@ -1423,13 +1462,16 @@ struct FallbackAdsAPIResponse: Decodable {
                 posterUrl: ad.posterUrl,
                 creative: ad.creative,
                 videoPlanVersion: ad.videoPlanVersion,
+                videoContract: ad.videoContract,
                 adBehavior: AdBehavior(
                     close: close,
                     storeOpen: ad.adBehavior.storeOpen,
                     storePrompt: ad.adBehavior.storePrompt,
                     skoverlay: ad.adBehavior.skoverlay,
                     autoStoreRedirect: ad.adBehavior.autoStoreRedirect,
-                    video: ad.adBehavior.video
+                    video: ad.adBehavior.video,
+                    reward: ad.adBehavior.reward,
+                    progressBar: ad.adBehavior.progressBar
                 ),
                 nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
                 destination: ad.destination,
@@ -1595,6 +1637,8 @@ private struct FallbackAdBehaviorPayload: Decodable {
         case skoverlay
         case autoStoreRedirect = "auto_store_redirect"
         case video
+        case reward
+        case progressBar = "progress_bar"
     }
 
     init(from decoder: Decoder) throws {
@@ -1622,7 +1666,10 @@ private struct FallbackAdBehaviorPayload: Decodable {
             storePrompt: try? c.decode(StorePrompt.self, forKey: .storePrompt),
             skoverlay: try? c.decode(SKOverlayConfig.self, forKey: .skoverlay),
             autoStoreRedirect: try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect),
-            video: (try? c.decode(VideoBehavior.self, forKey: .video)) ?? VideoBehavior()
+            video: (try? c.decode(VideoBehavior.self, forKey: .video)) ?? VideoBehavior(),
+            reward: (try? c.decode(RewardBehavior.self, forKey: .reward)) ?? RewardBehavior(),
+            progressBar: (try? c.decode(ProgressBarBehavior.self, forKey: .progressBar))
+                ?? ProgressBarBehavior()
         )
     }
 }
@@ -1632,6 +1679,7 @@ public enum RewardCompletionReason: String, Codable, Sendable {
     case durationElapsed = "duration_elapsed"
     case videoCompleted = "video_completed"
     case creativeCompleted = "creative_completed"
+    case unitEnd = "unit_end"
 }
 
 public struct VerifyRewardRequest: Encodable, Sendable {
@@ -1646,7 +1694,6 @@ public struct VerifyRewardRequest: Encodable, Sendable {
         case serveId = "serve_id"
         case sessionId = "session_id"
         case elapsedPlayTime = "elapsed_play_time"
-        case adUnitId = "ad_unit_id"
         case completionReason = "completion_reason"
     }
 
@@ -2056,7 +2103,7 @@ public final class SimulaAPI: @unchecked Sendable {
             throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
-        return try JSONDecoder().decode(AdLoadResponse.self, from: data)
+        return try decodeFullscreenPayload(AdLoadResponse.self, from: data)
     }
 
     // MARK: - Load Native Ad
@@ -2198,7 +2245,7 @@ public final class SimulaAPI: @unchecked Sendable {
             throw mapHTTPError(data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
-        return try JSONDecoder().decode(RewardedInitResponse.self, from: data)
+        return try decodeFullscreenPayload(RewardedInitResponse.self, from: data)
     }
 
     /// Verifies a rewarded play via POST /minigames/verify-reward. On a verified call
@@ -2346,7 +2393,7 @@ public final class SimulaAPI: @unchecked Sendable {
             )
         }
 
-        let apiResponse = try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: data)
+        let apiResponse = try decodeFullscreenPayload(FallbackAdsAPIResponse.self, from: data)
         return apiResponse.resolvedAds
     }
 
@@ -2440,7 +2487,7 @@ public final class SimulaAPI: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(apiKey: apiKey), to: &request)
-        let normalizedSource = ClickSource(rawValue: clickSource)?.rawValue ?? ClickSource.primaryCTA.rawValue
+        let normalizedSource = validatedClickToken(clickSource) ?? ClickSource.primaryCTA.rawValue
         request.setValue(interactionId, forHTTPHeaderField: "X-Simula-Click-Event-Id")
         request.setValue(normalizedSource, forHTTPHeaderField: "X-Simula-Click-Source")
 

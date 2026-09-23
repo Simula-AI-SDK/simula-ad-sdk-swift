@@ -13,11 +13,11 @@ import StoreKit
 final class SKOverlayAttributionTests: XCTestCase {
 
     private func decodeInterstitial(_ json: String) throws -> AdLoadResponse {
-        try JSONDecoder().decode(AdLoadResponse.self, from: Data(json.utf8))
+        try decodeFullscreenPayload(AdLoadResponse.self, from: Data(json.utf8))
     }
 
     private func decodeFallbacks(_ json: String) throws -> [FallbackAd] {
-        try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
+        try decodeFullscreenPayload(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
     }
 
     func testOverlayOwnershipDismissesOnlyMatchingOwnerAndScene() {
@@ -121,7 +121,7 @@ final class SKOverlayAttributionTests: XCTestCase {
     }
 
     func testV2AllPlayablePrimaryRemainsLegacyEligible() throws {
-        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable","clip_index":0}}"#)
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_contract":2,"creative":{"type":"playable","clip_index":0}}"#)
 
         XCTAssertTrue(primary.usesVideoPlanV2Contract)
         XCTAssertFalse(primary.primaryUsesVideoPlanV2)
@@ -129,10 +129,10 @@ final class SKOverlayAttributionTests: XCTestCase {
     }
 
     func testV2PlayablePrimaryLegacySuccessClaimsLaterVideoOverlay() throws {
-        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
-        let fallbacks = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/video.mp4","clip_index":1}]}"#)
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_contract":2,"creative":{"type":"playable"}}"#)
+        let fallbacks = try decodeFallbacks(#"{"video_contract":2,"ads":[{"type":"video","url":"https://cdn.example/video.mp4","clip_index":1}]}"#)
         XCTAssertTrue(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))
-        XCTAssertTrue(try XCTUnwrap(fallbacks.first).usesVideoPlanV2)
+        XCTAssertTrue(fallbacks.isEmpty)
         var claim = SKOverlayPresentationClaim()
         let legacy = try XCTUnwrap(claim.reserve())
 
@@ -141,7 +141,7 @@ final class SKOverlayAttributionTests: XCTestCase {
     }
 
     func testV2VideoPrimaryIsScopedOnly() throws {
-        let primary = try decodeInterstitial(#"{"ad_inserted":true,"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/video.mp4","clip_index":0}}"#)
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/video.mp4","clip_index":0}}"#)
 
         XCTAssertTrue(primary.primaryUsesVideoPlanV2)
         XCTAssertFalse(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))

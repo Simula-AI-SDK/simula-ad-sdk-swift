@@ -637,7 +637,7 @@ final class VideoPlanPresentationScope {
         admittedAt: TimeInterval,
         blocked: Bool
     ) {
-        guard !cancelled, creative?.isVideoPlanV2Clip == true,
+        guard !cancelled, creative?.mediaType == .video,
               let firstFrame = admitVideoPlanFirstFrame(
                   playerID: playerID,
                   admittedAt: admittedAt,

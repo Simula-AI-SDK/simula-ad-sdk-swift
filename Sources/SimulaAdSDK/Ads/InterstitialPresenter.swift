@@ -76,6 +76,7 @@ final class InterstitialPresenter {
     private var creativeBridge: CreativeBridge?
     private var videoPlayer: FullscreenVideoPlayer?
     private var videoPreparationOwnership: FullscreenVideoPreparationOwnership?
+    private var videoAssetLease: VideoAssetLease?
     private var onClose: ((FullscreenPresentationLease, UIWindow?) -> Void)?
     private var presentationLease: FullscreenPresentationLease?
     /// The host's key window, captured before we take key. Restored on dismiss so
@@ -101,6 +102,7 @@ final class InterstitialPresenter {
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
@@ -119,6 +121,7 @@ final class InterstitialPresenter {
         self.onClose = onClose
         self.videoPlayer = videoPlayer
         self.videoPreparationOwnership = videoPreparationOwnership
+        self.videoAssetLease = videoAssetLease
         videoPlayer?.attachVideoPlanScope(videoPlanScope)
 
         // WebView ↔ SDK bridge (PRD §3). Owned here so the orientation handler can reach the
@@ -172,6 +175,7 @@ final class InterstitialPresenter {
         response: AdLoadResponse,
         videoPlayer: FullscreenVideoPlayer? = nil,
         videoPreparationOwnership: FullscreenVideoPreparationOwnership? = nil,
+        videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
         onWillPresent: () -> Void = {},
@@ -184,6 +188,7 @@ final class InterstitialPresenter {
             response: response,
             videoPlayer: videoPlayer,
             videoPreparationOwnership: videoPreparationOwnership,
+            videoAssetLease: videoAssetLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
             onWillPresent: onWillPresent,
@@ -216,6 +221,9 @@ final class InterstitialPresenter {
         } else {
             _ = videoPreparationOwnership?.releaseFromPresentation()
         }
+        let videoAssetLease = videoAssetLease
+        self.videoAssetLease = nil
+        videoAssetLease?.release()
         window = nil
         originalKeyWindow = nil
         let callback = onClose
@@ -418,6 +426,7 @@ private struct CreativeInterstitialView: View {
                     treatment: closeConfig.treatment,
                     position: closeConfig.position,
                     progressBarColor: closeConfig.progressBarColor,
+                    progressBarStyle: response.adBehavior?.progressBar.style ?? .single,
                     action: closeConfig.action,
                     isRewardCopy: isRewardCopy,
                     enabled: canDismissFullscreen(
@@ -426,6 +435,8 @@ private struct CreativeInterstitialView: View {
                     ),
                     remaining: closeRemaining,
                     progress: closeProgress,
+                    mediaProgress: videoMediaProgress,
+                    gateFraction: videoGateFraction,
                     onClose: { handleClose() }
                 )
                 // Identity keyed to the pause generation — see `closeGateGeneration`.
@@ -652,6 +663,7 @@ private struct CreativeInterstitialView: View {
             onStoreDismissRequest: { dismissSKOverlay() },
             storeProductOwnershipToken: attributionRouteLifecycle.storeProductOwnership,
             attributionRouteLifecycle: attributionRouteLifecycle,
+            clickSource: .primaryUnknown,
             clickBeaconImpressionId: response.impressionId,
             bridge: bridge,
             attribution: response.skanAttribution,
@@ -740,7 +752,7 @@ private struct CreativeInterstitialView: View {
                     muted: muted,
                     mutedWatchMs: player.mutedWatchMilliseconds,
                     unmutedWatchMs: player.unmutedWatchMilliseconds,
-                    videoPositionS: player.playedSeconds,
+                    videoPositionS: player.currentMediaPositionSeconds,
                     durationS: player.duration,
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
@@ -753,7 +765,9 @@ private struct CreativeInterstitialView: View {
             .allowsHitTesting(!clickHandoffPending)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onReceive(player.$status) { handleVideoStatus($0, player: player) }
-            .onReceive(player.$playedSeconds) { updateVideoGate(player: player, played: $0) }
+            .onReceive(player.$mediaPositionSeconds) { _ in
+                updateVideoGate(player: player, played: player.playedSeconds)
+            }
             .onReceive(player.$duration) { _ in updateVideoGate(player: player, played: player.playedSeconds) }
     }
 
@@ -784,7 +798,7 @@ private struct CreativeInterstitialView: View {
                 muted: player.isMuted,
                 mutedWatchMs: player.mutedWatchMilliseconds,
                 unmutedWatchMs: player.unmutedWatchMilliseconds,
-                videoPositionS: player.playedSeconds,
+                videoPositionS: player.currentMediaPositionSeconds,
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
@@ -811,7 +825,7 @@ private struct CreativeInterstitialView: View {
                 mutedWatchMs: player.mutedWatchMilliseconds,
                 unmutedWatchMs: player.unmutedWatchMilliseconds,
                 errorCode: reason.rawValue,
-                videoPositionS: player.playedSeconds,
+                videoPositionS: player.currentMediaPositionSeconds,
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
@@ -865,7 +879,7 @@ private struct CreativeInterstitialView: View {
                     isVideoPlanV2: usesVideoPlanV2,
                     creative: response.creative, behavior: response.adBehavior,
                     muted: player.isMuted,
-                    videoPositionS: player.playedSeconds,
+                    videoPositionS: player.currentMediaPositionSeconds,
                     durationS: player.duration,
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
@@ -917,9 +931,16 @@ private struct CreativeInterstitialView: View {
         ended: Bool = false
     ) {
         guard primaryCreativeReady else { return }
-        videoGate.update(duration: player.duration, played: played, ended: ended)
-        closeProgress = videoGate.progress
-        closeRemaining = videoGate.secondsRemaining
+        videoGate.update(
+            duration: player.duration,
+            played: played,
+            mediaPosition: player.currentMediaPositionSeconds,
+            ended: ended
+        )
+        let progress = videoGate.progress
+        let remaining = videoGate.secondsRemaining
+        if closeProgress != progress { closeProgress = progress }
+        if closeRemaining != remaining { closeRemaining = remaining }
         if shouldShowVideoStorePrompt(
             enabled: response.adBehavior?.storePrompt?.enabled == true,
             reachedMidpoint: videoGate.reachedAssetMidpoint,
@@ -931,6 +952,20 @@ private struct CreativeInterstitialView: View {
             closeEnabled = true
             storePromptVisible = false
         }
+    }
+
+    private var videoMediaProgress: Double {
+        guard let player = videoPlayer, let duration = player.duration,
+              duration.isFinite, duration > 0 else { return closeProgress }
+        return min(1, max(0, player.mediaPositionSeconds / duration))
+    }
+
+    private var videoGateFraction: Double {
+        guard let duration = videoPlayer?.duration else { return 1 }
+        return progressBarGateFraction(
+            gateSeconds: TimeInterval(closeConfig.delaySeconds),
+            mediaDuration: duration
+        )
     }
 
     private var videoPauseReason: String {
@@ -971,7 +1006,7 @@ private struct CreativeInterstitialView: View {
             muted: player.isMuted,
             mutedWatchMs: player.mutedWatchMilliseconds,
             unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             quartile: quartile,
             reason: reason,
@@ -1159,7 +1194,7 @@ private struct CreativeInterstitialView: View {
             muted: player.isMuted,
             mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
             unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             reason: reason,
             secondsSinceVideoStart: player.secondsSinceVideoStart
@@ -1168,7 +1203,7 @@ private struct CreativeInterstitialView: View {
 
     private func markVideoHandoff(player: FullscreenVideoPlayer, reason: String) {
         guard usesVideoPlanV2 else { return }
-        _ = player.flushPresentationWatchAccounting()
+        let watchTotals = player.flushPresentationWatchAccounting()
         videoPlanScope?.videoTerminated(VideoPlanHandoffTelemetry(
             adFormat: "interstitial",
             adUnitId: response.adUnitId,
@@ -1177,9 +1212,9 @@ private struct CreativeInterstitialView: View {
             creative: response.creative,
             behavior: response.adBehavior,
             muted: player.isMuted,
-            mutedWatchMs: player.mutedWatchMilliseconds,
-            unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
+            unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason
@@ -1563,12 +1598,15 @@ struct CloseButtonView: View {
     let treatment: CloseTreatment
     let position: ClosePosition
     let progressBarColor: String
+    let progressBarStyle: ProgressBarStyle
     let action: CloseAction
     /// `true` → "Reward in X"; `false` → "Close in X" (only used by `rewardOrCloseLabel`).
     let isRewardCopy: Bool
     let enabled: Bool
     let remaining: Int
     let progress: Double
+    let mediaProgress: Double
+    let gateFraction: Double
     let onClose: () -> Void
 
     // Visible close affordance sized to a compact ~22pt circle; the tappable frame
@@ -1602,7 +1640,11 @@ struct CloseButtonView: View {
         ZStack {
             // `progress_bar` treatment: a full-width bar, shown during the delay and tinted by color.
             // Pinned to the top edge by default; at bottom_left it sits on the bottom edge instead.
-            if !enabled && treatment == .progressBar {
+            if shouldMountProgressBar(
+                treatment: treatment,
+                style: progressBarStyle,
+                dismissUnlocked: enabled
+            ) {
                 progressBar
             }
 
@@ -1629,9 +1671,26 @@ struct CloseButtonView: View {
     private var progressBar: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Rectangle().fill(Color.white.opacity(0.25))
-                Rectangle().fill(tint)
-                    .frame(width: max(0, geo.size.width * progress))
+                Rectangle().fill(
+                    progressBarStyle == .twoTone
+                        ? Color(hex: twoToneProgressTrackHex)
+                        : Color.white.opacity(0.25)
+                )
+                if progressBarStyle == .twoTone {
+                    let segments = twoToneProgressSegments(
+                        progress: mediaProgress,
+                        gateFraction: gateFraction
+                    )
+                    HStack(spacing: 0) {
+                        Rectangle().fill(Color(hex: twoToneProgressGateHex))
+                            .frame(width: max(0, geo.size.width * segments.bright))
+                        Rectangle().fill(Color(hex: twoToneProgressPostGateHex))
+                            .frame(width: max(0, geo.size.width * segments.dark))
+                    }
+                } else {
+                    Rectangle().fill(tint)
+                        .frame(width: max(0, geo.size.width * progress))
+                }
             }
         }
         .frame(height: closeProgressBarHeight)

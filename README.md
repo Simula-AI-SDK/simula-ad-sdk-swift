@@ -62,6 +62,33 @@ entries are ignored without failing the ad load. `SimulaRewardedAd` exposes the 
 `setMetadata(_:_:)` and `setMetadata(_:)` overloads as `SimulaInterstitialAd`. Native preloads do not
 accept metadata; supply it to the `NativeAdSlot` that consumes the preload.
 
+## Fullscreen Video Contract
+
+Interstitial and rewarded load requests advertise `contracts.video = 2`. A response opts in only
+with the exact numeric root field `video_contract: 2`; legacy `video_v1` and `video_plan_v2` markers
+are not serialized or activated. Contract 2 uses one stitched primary video URL. Optional
+`creative.segments` identify telemetry ranges only and never cause player restarts or fallback-video
+handoffs. Ordinary HTML end screens continue in their server order.
+
+Video assets are fully downloaded before the loaded callback. The SDK uses an opaque, backup-excluded
+cache under `Library/Caches`, with 50 MiB per-asset and 100 MiB total limits, a 30-second transfer
+deadline, at most two concurrent transfers, single-flight URL downloads, and active-lease-safe
+eviction. AVPlayer never receives a remote URL and the SDK does not fall back to streaming.
+
+Audio-session activation is deliberately asymmetric for host stability. The SDK may best-effort
+activate the process-global `AVAudioSession` when unmuted playback needs it, but it never calls
+`setActive(false)` because exclusive ownership cannot be proven. Final SDK release pauses or stops
+its player and clears only SDK logical accounting. Overlapping SDK playback remains reference-counted,
+and idle-timer ownership is independently released and restored to the host's prior value.
+
+For rewarded contract-2 units, `ad_behavior.reward.earn_at = "unit_end"` earns once at the final
+renderable screen gate and verifies once when the entire unit closes using
+`completion_reason = "unit_end"`. A response with `verified: false` is a verification failure.
+
+An optional validated top-level `impression_url` is requested once at the existing two-second
+impression commit. This measurement request is a plain bounded unauthenticated GET with no SDK,
+privacy, or cookie headers and does not affect impression, paid, or reward callbacks.
+
 ## Development Environment
 
 Development artifacts select the staging API when the app's Info.plist contains

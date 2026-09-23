@@ -2,6 +2,12 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class FallbackOutcomeTests: XCTestCase {
+    func testFallbackVideoNeverMountsWithoutPreparedPlayer() {
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: true, hasPreparedPlayer: false), .prepare)
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: true, hasPreparedPlayer: true), .mount)
+        XCTAssertEqual(fallbackVideoReadiness(isVideo: false, hasPreparedPlayer: false), .mount)
+    }
+
     func testFallbackAdvanceRequiresCurrentScreenWithoutPendingClickRoute() {
         XCTAssertTrue(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: nil))
         XCTAssertFalse(canAdvanceFallback(renderedIndex: 0, currentIndex: 0, clickHandoffIndex: 0))
@@ -47,7 +53,7 @@ final class FallbackOutcomeTests: XCTestCase {
 
     func testPresentedFallbackCompletionIsDistinctAndExactlyOnce() {
         var coordinator = FallbackPresentationCoordinator()
-        coordinator.beginPresenting()
+        _ = coordinator.beginPresenting()
 
         XCTAssertEqual(coordinator.completedPresentedContent(), .completed)
         XCTAssertNil(coordinator.completedPresentedContent())
@@ -74,7 +80,7 @@ final class FallbackOutcomeTests: XCTestCase {
 
     func testNoScenePresentationFailureIsUnavailableOnce() {
         var coordinator = FallbackPresentationCoordinator()
-        coordinator.beginPresenting()
+        _ = coordinator.beginPresenting()
 
         XCTAssertEqual(coordinator.presentationUnavailable(), .presentationUnavailable)
         XCTAssertNil(coordinator.presentationUnavailable())
@@ -82,6 +88,118 @@ final class FallbackOutcomeTests: XCTestCase {
             FallbackOutcome.presentationUnavailable.unavailableReason,
             "presentation_unavailable"
         )
+    }
+
+    func testCreativeFailureAdvancesUntilFinalScreenThenResolvesUnavailable() {
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 0, currentIndex: 0, screenCount: 2),
+            .advance
+        )
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 1, currentIndex: 1, screenCount: 2),
+            .finishUnavailable
+        )
+        XCTAssertEqual(
+            fallbackCreativeFailureResolution(renderedIndex: 0, currentIndex: 1, screenCount: 2),
+            .ignore
+        )
+    }
+
+    func testEndScreenOneVideoPreparationSkipAdvancesToEndScreenTwoOnce() {
+        let generation = UUID()
+        let surface = FallbackLoadingSurface.videoPreparation(index: 0, generation: generation)
+
+        XCTAssertEqual(
+            fallbackLoadingSkipResolution(
+                surface: surface,
+                activeInitialFetchGeneration: nil,
+                currentIndex: 0,
+                currentVideoPreparationGeneration: generation,
+                screenCount: 2
+            ),
+            .resolveVideoPreparationFailure(.advance)
+        )
+        XCTAssertEqual(
+            fallbackLoadingSkipResolution(
+                surface: surface,
+                activeInitialFetchGeneration: nil,
+                currentIndex: 1,
+                currentVideoPreparationGeneration: UUID(),
+                screenCount: 2
+            ),
+            .stale,
+            "a repeated ES1 Skip must not skip the newly preparing ES2"
+        )
+    }
+
+    func testFinalVideoPreparationSkipUsesFinalCreativeFailurePolicy() {
+        let generation = UUID()
+
+        XCTAssertEqual(
+            fallbackLoadingSkipResolution(
+                surface: .videoPreparation(index: 1, generation: generation),
+                activeInitialFetchGeneration: nil,
+                currentIndex: 1,
+                currentVideoPreparationGeneration: generation,
+                screenCount: 2
+            ),
+            .resolveVideoPreparationFailure(.finishUnavailable)
+        )
+    }
+
+    func testInitialFallbackFetchSkipEndsUnavailableExactlyOnce() {
+        var coordinator = FallbackPresentationCoordinator()
+        let generation = coordinator.beginLoading()
+        let surface = FallbackLoadingSurface.initialFetch(generation: generation)
+
+        XCTAssertEqual(
+            fallbackLoadingSkipResolution(
+                surface: surface,
+                activeInitialFetchGeneration: generation,
+                currentIndex: 0,
+                currentVideoPreparationGeneration: nil,
+                screenCount: 0
+            ),
+            .cancelInitialFetch
+        )
+        XCTAssertEqual(coordinator.presentationUnavailable(), .presentationUnavailable)
+        XCTAssertNil(coordinator.presentationUnavailable())
+        XCTAssertEqual(
+            fallbackLoadingSkipResolution(
+                surface: surface,
+                activeInitialFetchGeneration: nil,
+                currentIndex: 0,
+                currentVideoPreparationGeneration: nil,
+                screenCount: 0
+            ),
+            .stale
+        )
+    }
+
+    @MainActor
+    func testFailedFinalPlayableEarnsInternallyButSubmitsOnlyAtUnitClose() {
+        var submissions = 0
+        let claim = UnitEndRewardClaim()
+        claim.primaryGateDidOpen()
+        claim.fallbackDidResolve(renderableScreenCount: 2)
+        claim.fallbackGateDidOpen(isFinal: false)
+
+        claim.fallbackBecameUnavailable()
+        claim.fallbackBecameUnavailable()
+        claim.fallbackDeliveryDidFinish()
+
+        XCTAssertTrue(claim.earned)
+        XCTAssertEqual(submissions, 0)
+        XCTAssertTrue(claim.consumeAtUnitClose(
+            onEarn: { submissions += 1 },
+            enqueueVerification: { submissions += 1 }
+        ))
+        XCTAssertEqual(submissions, 2)
+        XCTAssertFalse(claim.consumeAtUnitClose(
+            onEarn: { submissions += 1 },
+            enqueueVerification: { submissions += 1 }
+        ))
+        XCTAssertEqual(submissions, 2)
     }
 
     func testRewardedUnavailableOutcomesFailOpenOnlyForEarnedReward() {

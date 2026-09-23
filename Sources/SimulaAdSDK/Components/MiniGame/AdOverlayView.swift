@@ -291,6 +291,7 @@ public struct AdOverlayView: View {
     var onCreativeFailure: (() -> Void)? = nil
     var onVideoCompleted: (() -> Void)? = nil
     var onVideoStarted: (() -> Void)? = nil
+    var onGateOpened: (() -> Void)? = nil
     var videoPlayer: FullscreenVideoPlayer? = nil
     var videoPlanScope: VideoPlanPresentationScope? = nil
     #if os(iOS)
@@ -339,12 +340,13 @@ public struct AdOverlayView: View {
     @State private var adPageReady = false
     /// Terminal load failure keeps the native black shield but removes the indefinite spinner.
     @State private var adPageFailed = false
-    /// A committed document can still fail while loading subresources. HTML close timing starts at
-    /// mount for legacy compatibility; native video timing starts only after its first visual frame.
+    /// Playable timing starts only after WKWebView finishes the current document; native video timing
+    /// starts only after its first visual frame.
     @State private var pageFinished = false
-    /// A watchdog timeout fails open: close remains available even if the same load finishes later.
-    @State private var loadTimedOut = false
+    @State private var pendingPlayablePageFinish = false
+    @State private var pendingPlayableFailure = false
     @State private var hasAppeared = false
+    @State private var hasEverAppeared = false
     @State private var loadedCreativeIdentity: String?
     @State private var loadCoordinator = AdOverlayLoadCoordinator()
     @State private var loadWatchdogTask: Task<Void, Never>?
@@ -487,7 +489,9 @@ public struct AdOverlayView: View {
                                 onAdClick: { handleAdClick($0) },
                                 onClickHandoffPendingChanged: { updateClickHandoffPending($0) },
                                 attributionRouteLifecycle: activeRouteLifecycle,
-                                clickSource: .fallbackCTA,
+                                clickSource: ad.sourceIndex == 0
+                                    ? .endScreen1Unknown
+                                    : .endScreen2Unknown,
                                 clickBeaconImpressionId: nativeClickBeaconImpressionId,
                                 attribution: attribution,
                                 ctaTrackingUrl: ctaTrackingUrl,
@@ -532,7 +536,7 @@ public struct AdOverlayView: View {
                                         muted: muted,
                                         mutedWatchMs: videoPlayer.mutedWatchMilliseconds,
                                         unmutedWatchMs: videoPlayer.unmutedWatchMilliseconds,
-                                        videoPositionS: videoPlayer.playedSeconds,
+                                        videoPositionS: videoPlayer.currentMediaPositionSeconds,
                                         durationS: videoPlayer.duration,
                                         secondsSinceVideoStart: videoPlayer.secondsSinceVideoStart
                                     )
@@ -544,7 +548,9 @@ public struct AdOverlayView: View {
                             )
                                 .allowsHitTesting(!clickHandoffPending)
                                 .onReceive(videoPlayer.$status) { handleVideoStatus($0, player: videoPlayer) }
-                                .onReceive(videoPlayer.$playedSeconds) { updateVideoGate(player: videoPlayer, played: $0) }
+                                .onReceive(videoPlayer.$mediaPositionSeconds) { _ in
+                                    updateVideoGate(player: videoPlayer, played: videoPlayer.playedSeconds)
+                                }
                                 .onReceive(videoPlayer.$duration) { _ in
                                     updateVideoGate(player: videoPlayer, played: videoPlayer.playedSeconds)
                                 }
@@ -649,6 +655,7 @@ public struct AdOverlayView: View {
             )
             #endif
             hasAppeared = true
+            hasEverAppeared = true
             if screenMountCoordinator.scheduleIfNeeded() {
                 // Let the outer lifecycle modifier finish installing its notification subscriptions
                 // before an automatic store sheet can synchronously publish will-present.
@@ -678,13 +685,16 @@ public struct AdOverlayView: View {
                 }
             } else {
                 startCurrentCreativeLoadIfNeeded()
-                #if os(iOS)
-                if !replayPendingVideoFirstFrameIfNeeded() {
+                if !resolvePendingPlayableFailureIfReady() {
+                    admitPendingPlayablePageFinishIfReady()
+                    #if os(iOS)
+                    if !replayPendingVideoFirstFrameIfNeeded() {
+                        beginPresentationIfReady()
+                    }
+                    #else
                     beginPresentationIfReady()
+                    #endif
                 }
-                #else
-                beginPresentationIfReady()
-                #endif
             }
         }
         .onDisappear {
@@ -701,6 +711,8 @@ public struct AdOverlayView: View {
             loadWatchdogTask?.cancel()
             loadWatchdogTask = nil
             loadCoordinator.cancel()
+            pendingPlayablePageFinish = false
+            pendingPlayableFailure = false
             firstFrameHandoff.invalidate()
             countdownTask?.cancel()
             countdownTask = nil
@@ -839,6 +851,7 @@ public struct AdOverlayView: View {
     private func updateClickHandoffPending(_ pending: Bool) {
         clickHandoffPending = pending
         onClickHandoffPendingChanged?(pending)
+        reconcileCountdown()
     }
 
     private func requestClose() {
@@ -911,11 +924,14 @@ public struct AdOverlayView: View {
         firstFrameHandoff.invalidate()
         #endif
         if identityChanged {
+            pendingPlayablePageFinish = false
+            pendingPlayableFailure = false
             videoFailureHandled = false
             videoStartRecorded = false
             videoCompleteRecorded = false
             videoTerminalAdvanceRequested = false
         }
+        if !identityChanged && pendingPlayablePageFinish { return }
         guard identityChanged || loadCoordinator.isIdle
                 || (!pageFinished && !adPageFailed && !loadCoordinator.isLoading
                     && !loadCoordinator.isTimedOut) else {
@@ -929,7 +945,6 @@ public struct AdOverlayView: View {
         adPageReady = false
         adPageFailed = false
         pageFinished = false
-        loadTimedOut = false
         let closeDelay = countdownPolicy.delaySeconds
         adCountdown = countdownPolicy.delaySeconds
         closeStateInitialized = true
@@ -950,27 +965,29 @@ public struct AdOverlayView: View {
         do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
         if Task.isCancelled || !loadCoordinator.timeout(generation: generation) { return }
         loadWatchdogTask = nil
-        loadTimedOut = true
-        adPageReady = true
-        adPageFailed = false
-        countdownTask?.cancel()
-        countdownTask = nil
-        unlockDismissal()
+        markLegacyHTMLPageFailed()
     }
 
     private func markPageFinished() {
-        guard hasAppeared, !closing else { return }
+        guard !closing, hasAppeared || !hasEverAppeared else { return }
         startCurrentCreativeLoadIfNeeded()
         guard !adPageFailed, loadCoordinator.finishCurrentLoad() else { return }
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
+        pendingPlayablePageFinish = true
+        admitPendingPlayablePageFinishIfReady()
+    }
+
+    private func admitPendingPlayablePageFinishIfReady() {
+        guard pendingPlayablePageFinish, hasAppeared, !closing, !adPageFailed else { return }
+        pendingPlayablePageFinish = false
         adPageReady = true
         pageFinished = true
         beginPresentationIfReady()
     }
 
-    /// `didFinish` can race SwiftUI's `onAppear` for a newly-installed hosting controller. HTML
-    /// reconciles from mount; video still waits for first-frame readiness.
+    /// `didFinish` can race SwiftUI's `onAppear`; playable admission is retained until mount, while
+    /// video still waits for first-frame readiness.
     private func beginPresentationIfReady() {
         guard hasAppeared, !closing else { return }
         if ad.mediaType == .video {
@@ -1005,26 +1022,35 @@ public struct AdOverlayView: View {
     }
 
     private func markLegacyHTMLPageFailed() {
-        guard ad.mediaType == .playable else { return }
+        guard !closing, hasAppeared || !hasEverAppeared,
+              ad.mediaType == .playable, !pageFinished else { return }
         startCurrentCreativeLoadIfNeeded()
         guard loadCoordinator.failCurrentLoad() else { return }
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
-        adPageReady = false
-        adPageFailed = true
-        reconcileCountdown()
+        applyTerminalPageFailure()
+        pendingPlayableFailure = true
+        _ = resolvePendingPlayableFailureIfReady()
+    }
+
+    private func resolvePendingPlayableFailureIfReady() -> Bool {
+        guard pendingPlayableFailure, hasAppeared, !closing else { return false }
+        pendingPlayableFailure = false
+        if let onCreativeFailure { onCreativeFailure() }
+        else { onClose() }
+        return true
     }
 
     private func applyTerminalPageFailure() {
         firstFrameHandoff.clearPending()
+        pendingPlayablePageFinish = false
         adPageReady = false
         adPageFailed = true
         countdownTask?.cancel()
         countdownTask = nil
-        unlockDismissal()
     }
 
-    /// Runs the countdown only while the app is foregrounded and no in-app store sheet covers the ad.
+    /// Runs only after render admission and while no lifecycle, store, or click blocker covers the ad.
     private func reconcileCountdown() {
         #if os(iOS)
         if let videoPlayer, ad.mediaType == .video {
@@ -1037,7 +1063,8 @@ public struct AdOverlayView: View {
             pageFinished: pageFinished,
             hasAppeared: hasAppeared,
             appForegrounded: appForegrounded,
-            storeSheetPresented: storeSheetPresented
+            storeSheetPresented: storeSheetPresented,
+            clickHandoffPending: clickHandoffPending
         ) {
             startCountdown()
         } else {
@@ -1094,9 +1121,11 @@ public struct AdOverlayView: View {
     }
 
     private func unlockDismissal() {
+        guard !dismissUnlocked else { return }
         adCountdown = 0
         ringProgress = 1
         dismissUnlocked = true
+        onGateOpened?()
     }
 
     #if os(iOS)
@@ -1161,7 +1190,7 @@ public struct AdOverlayView: View {
                 mutedWatchMs: player.mutedWatchMilliseconds,
                 unmutedWatchMs: player.unmutedWatchMilliseconds,
                 errorCode: reason.rawValue,
-                videoPositionS: player.playedSeconds,
+                videoPositionS: player.currentMediaPositionSeconds,
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
@@ -1247,7 +1276,7 @@ public struct AdOverlayView: View {
                     isVideoPlanV2: ad.usesVideoPlanV2,
                     creative: ad.creative, behavior: ad.adBehavior,
                     muted: player.isMuted,
-                    videoPositionS: player.playedSeconds,
+                    videoPositionS: player.currentMediaPositionSeconds,
                     durationS: player.duration,
                     secondsSinceVideoStart: player.secondsSinceVideoStart
                 )
@@ -1300,10 +1329,21 @@ public struct AdOverlayView: View {
     ) {
         guard pageFinished, let identity = videoSurfaceIdentity(for: player),
               firstFrameHandoff.admitted == identity else { return }
-        videoGate.update(duration: player.duration, played: played, ended: ended)
-        ringProgress = CGFloat(videoGate.progress)
-        adCountdown = videoGate.secondsRemaining
-        dismissUnlocked = videoGate.isUnlocked
+        videoGate.update(
+            duration: player.duration,
+            played: played,
+            mediaPosition: player.currentMediaPositionSeconds,
+            ended: ended
+        )
+        let progress = CGFloat(videoGate.progress)
+        let countdown = videoGate.secondsRemaining
+        if ringProgress != progress { ringProgress = progress }
+        if adCountdown != countdown { adCountdown = countdown }
+        if videoGate.isUnlocked {
+            unlockDismissal()
+        } else if dismissUnlocked {
+            dismissUnlocked = false
+        }
     }
 
     private var videoPauseReason: String {
@@ -1346,7 +1386,7 @@ public struct AdOverlayView: View {
             muted: player.isMuted,
             mutedWatchMs: player.mutedWatchMilliseconds,
             unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             quartile: quartile,
             reason: reason,
@@ -1370,7 +1410,7 @@ public struct AdOverlayView: View {
             muted: videoPlayer?.isMuted,
             mutedWatchMs: videoPlayer?.mutedWatchMilliseconds,
             unmutedWatchMs: videoPlayer?.unmutedWatchMilliseconds,
-            videoPositionS: videoPlayer?.playedSeconds,
+            videoPositionS: videoPlayer?.currentMediaPositionSeconds,
             durationS: videoPlayer?.duration,
             secondsSinceVideoStart: videoPlayer?.secondsSinceVideoStart
         )
@@ -1389,7 +1429,7 @@ public struct AdOverlayView: View {
             muted: player.isMuted,
             mutedWatchMs: watchTotals?.mutedMilliseconds ?? player.mutedWatchMilliseconds,
             unmutedWatchMs: watchTotals?.unmutedMilliseconds ?? player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             reason: reason,
             secondsSinceVideoStart: player.secondsSinceVideoStart
@@ -1409,7 +1449,7 @@ public struct AdOverlayView: View {
             muted: player.isMuted,
             mutedWatchMs: player.mutedWatchMilliseconds,
             unmutedWatchMs: player.unmutedWatchMilliseconds,
-            videoPositionS: player.playedSeconds,
+            videoPositionS: player.currentMediaPositionSeconds,
             durationS: player.duration,
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             reason: reason
@@ -1575,13 +1615,15 @@ func fallbackCloseRequestAction(
 }
 
 func shouldRunFallbackCountdown(
-    isVideo: Bool,
+    isVideo _: Bool,
     pageFinished: Bool,
     hasAppeared: Bool,
     appForegrounded: Bool,
-    storeSheetPresented: Bool
+    storeSheetPresented: Bool,
+    clickHandoffPending: Bool = false
 ) -> Bool {
-    hasAppeared && (!isVideo || pageFinished) && appForegrounded && !storeSheetPresented
+    return pageFinished && hasAppeared && appForegrounded
+        && !storeSheetPresented && !clickHandoffPending
 }
 
 func canBeginFallbackVideoClick(

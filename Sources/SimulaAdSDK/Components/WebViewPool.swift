@@ -193,13 +193,23 @@ struct CreativeUserActivationState: Equatable {
     }
 }
 
-func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = true) -> String {
+func creativeUserActivationScriptSource(
+    nonce: String,
+    exposesStoreAPI: Bool = true,
+    clickSource: ClickSource = .primaryUnknown
+) -> String {
+    let validatedSource = validatedClickToken(clickSource.rawValue)
+        ?? ClickSource.primaryUnknown.rawValue
     let storeAPI = exposesStoreAPI ? """
       function openStore() {
         return claimGesture({
           type: 'SIMULA_INTERNAL_STORE_OPEN',
           activation_nonce: activationNonce
-        });
+        }, clickIdentity);
+      }
+
+      function openCTA(url) {
+        return forwardCTA(url);
       }
 
       function dismissStore() {
@@ -229,6 +239,9 @@ func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = t
         Object.defineProperty(simulaAdAPI, 'openStore', {
           value: openStore, writable: false, configurable: false, enumerable: true
         });
+        Object.defineProperty(simulaAdAPI, 'openCTA', {
+          value: openCTA, writable: false, configurable: false, enumerable: true
+        });
         Object.defineProperty(simulaAdAPI, 'dismissStore', {
           value: dismissStore, writable: false, configurable: false, enumerable: true
         });
@@ -243,6 +256,7 @@ func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = t
     return """
     (function() {
       var activationNonce = '\(nonce)';
+      var slotClickSource = '\(validatedSource)';
       var originalOpen = window.open;
       var nativeHandler = window.webkit && window.webkit.messageHandlers
         ? window.webkit.messageHandlers.simulaSDK
@@ -366,18 +380,42 @@ func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = t
         catch (_) { return null; }
       }
 
-      function claimGesture(message) {
+      function claimGesture(message, identityFactory) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
         if (!hasActiveUserGesture()) { return false; }
         claimedGesture = gestureSequence;
         try {
-          postNative(nativeStringify(message));
+          var identity = typeof identityFactory === 'function' ? identityFactory() : null;
+          postNative(nativeStringify(withIdentity(message, identity)));
           return true;
         } catch (_) {
           if (claimedGesture === gestureSequence) { claimedGesture = -1; }
           return false;
         }
+      }
+
+      function withIdentity(message, identity) {
+        if (!identity || typeof identity !== 'object') { return message; }
+        if (typeof identity.interaction_id === 'string') {
+          message.interaction_id = identity.interaction_id;
+        }
+        if (typeof identity.click_source === 'string') {
+          message.click_source = identity.click_source;
+        }
+        return message;
+      }
+
+      function clickIdentity() {
+        var helper = window.simulaClickInteraction;
+        if (typeof helper !== 'function') { return null; }
+        try {
+          var identity = window.simulaClickInteraction(slotClickSource, true);
+          if (typeof identity === 'string') {
+            return { interaction_id: identity, click_source: slotClickSource };
+          }
+          return identity && typeof identity === 'object' ? identity : null;
+        } catch (_) { return null; }
       }
 
       function forwardCTA(value) {
@@ -387,7 +425,7 @@ func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = t
           type: 'SIMULA_CTA_OPEN',
           url: url,
           activation_nonce: activationNonce
-        });
+        }, clickIdentity);
       }
 
     \(storeAPI)
@@ -405,6 +443,11 @@ func creativeUserActivationScriptSource(nonce: String, exposesStoreAPI: Bool = t
       }, true);
     })();
     """
+}
+
+func creativeSlotSourceScriptSource(_ source: ClickSource) -> String {
+    let value = validatedClickToken(source.rawValue) ?? ClickSource.primaryUnknown.rawValue
+    return "window.__simulaNativeSlotSource='\(value)';"
 }
 
 struct SimulaWebViewPrewarmSkipGate {
@@ -556,8 +599,8 @@ private func waitForNativeAdDisplayFrame() async {
 /// weakly, so it introduces no retain cycle through the content controller.
 enum WebViewForwardedMessage {
     case page(String)
-    case userActivatedCTA(URL)
-    case userActivatedStoreOpen
+    case userActivatedCTA(URL, HTMLClickIdentity?)
+    case userActivatedStoreOpen(HTMLClickIdentity?)
     case storeOverlayShow
     case storeDismiss
 }
@@ -680,7 +723,10 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
               body.utf16.count <= creativeBridgeMaxMessageUTF16Characters else { return }
         switch CreativeStoreMessage.authenticate(body, expectedNonce: userActivationNonce) {
         case .open:
-            onMessage?(.userActivatedStoreOpen)
+            onMessage?(.userActivatedStoreOpen(nil))
+            return
+        case .openWithIdentity(let identity):
+            onMessage?(.userActivatedStoreOpen(identity))
             return
         case .showOverlay:
             Self.storeBridgeLogger.info("SKOverlay bridge message authenticated")
@@ -695,8 +741,8 @@ final class WebViewMessageForwarder: NSObject, WKScriptMessageHandler {
             break
         }
         switch CreativeCTAOpenMessage.authenticate(body, expectedNonce: userActivationNonce) {
-        case .accepted(let url):
-            onMessage?(.userActivatedCTA(url))
+        case .accepted(let url, let identity):
+            onMessage?(.userActivatedCTA(url, identity))
         case .rejected:
             return
         case .notMessage:
@@ -817,9 +863,17 @@ final class WebViewPool {
     /// suppressed synchronously and forwarded as a structured message over the existing bridge.
     /// The per-WebView nonce and bound native handler are captured before creative code runs. Direct
     /// page calls to the public handler therefore cannot forge a billable activation message.
-    private static func userActivationScript(nonce: String, exposesStoreAPI: Bool) -> WKUserScript {
+    private static func userActivationScript(
+        nonce: String,
+        exposesStoreAPI: Bool,
+        clickSource: ClickSource
+    ) -> WKUserScript {
         WKUserScript(
-            source: creativeUserActivationScriptSource(nonce: nonce, exposesStoreAPI: exposesStoreAPI),
+            source: creativeUserActivationScriptSource(
+                nonce: nonce,
+                exposesStoreAPI: exposesStoreAPI,
+                clickSource: clickSource
+            ),
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         )
@@ -829,12 +883,22 @@ final class WebViewPool {
         on controller: WKUserContentController,
         nonce: String,
         bridgeCapability: String,
-        exposesStoreAPI: Bool = false
+        exposesStoreAPI: Bool = false,
+        clickSource: ClickSource = .primaryUnknown
     ) {
         controller.removeAllUserScripts()
+        controller.addUserScript(WKUserScript(
+            source: creativeSlotSourceScriptSource(clickSource),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
         controller.addUserScript(postMessageScript(capability: bridgeCapability))
         controller.addUserScript(errorCaptureScript)
-        controller.addUserScript(userActivationScript(nonce: nonce, exposesStoreAPI: exposesStoreAPI))
+        controller.addUserScript(userActivationScript(
+            nonce: nonce,
+            exposesStoreAPI: exposesStoreAPI,
+            clickSource: clickSource
+        ))
     }
 
     private func makePooled() -> Pooled {
@@ -933,7 +997,8 @@ final class WebViewPool {
         delegate: WKNavigationDelegate & WKUIDelegate,
         onMessage: @escaping (WebViewForwardedMessage) -> Void,
         surface: String? = nil,
-        exposesStoreAPI: Bool = false
+        exposesStoreAPI: Bool = false,
+        clickSource: ClickSource = .primaryUnknown
     ) -> WKWebView {
         let startNanos = DispatchTime.now().uptimeNanoseconds
         // Drop any prewarmed views whose storage policy no longer matches the
@@ -951,7 +1016,8 @@ final class WebViewPool {
             on: pooled.webView.configuration.userContentController,
             nonce: pooled.forwarder.userActivationNonce,
             bridgeCapability: pooled.forwarder.bridgeCapability,
-            exposesStoreAPI: exposesStoreAPI
+            exposesStoreAPI: exposesStoreAPI,
+            clickSource: clickSource
         )
         pooled.forwarder.onMessage = onMessage
         pooled.webView.navigationDelegate = delegate

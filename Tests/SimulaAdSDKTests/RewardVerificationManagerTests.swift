@@ -111,6 +111,60 @@ final class RewardVerificationManagerTests: XCTestCase {
         await mgr.cancelPendingWorkForTests()
     }
 
+    func testInitialPersistenceAcknowledgementWaitsForDurableCommit() async {
+        let verifier = FakeVerifier()
+        verifier.gate("A")
+        let store = ScriptedRewardStore(saveResults: [false, true, true])
+        let persistenceSleep = ControllablePersistenceSleep()
+        let persisted = LockedRewardPersistenceCounter()
+        let mgr = RewardVerificationManager(
+            verifier: verifier,
+            store: store,
+            now: { 0 },
+            persistenceSleep: { await persistenceSleep.sleep($0) }
+        )
+
+        mgr.queueVerification(
+            serveId: "A",
+            sessionId: "s",
+            elapsedPlayTime: 5,
+            completionReason: .unitEnd,
+            onPersisted: { persisted.record() }
+        )
+        _ = await persistenceSleep.waitForRequest()
+
+        XCTAssertEqual(persisted.count, 0)
+        XCTAssertEqual(verifier.callCount("A"), 0, "verification cannot start before persistence")
+
+        persistenceSleep.release()
+        await waitUntil { persisted.count == 1 }
+        await verifier.waitUntilEntered("A")
+        XCTAssertEqual(store.persisted.map(\.serveId), ["A"])
+
+        verifier.release("A")
+        await waitUntil { store.persisted.isEmpty }
+        XCTAssertEqual(persisted.count, 1)
+        await mgr.cancelPendingWorkForTests()
+    }
+
+    func testHTTPResponseWithVerifiedFalseDoesNotDeliverSuccessOrDeleteTask() async {
+        let verifier = FakeVerifier()
+        verifier.setVerified(false, for: "A")
+        let store = ScriptedRewardStore()
+        let mgr = RewardVerificationManager(verifier: verifier, store: store, now: { 1000 })
+        let exp = expectation(description: "false verification fails")
+
+        mgr.queueVerification(serveId: "A", sessionId: "s", elapsedPlayTime: 5) { result in
+            if case .failure = result { exp.fulfill() }
+        }
+        await fulfillment(of: [exp], timeout: TestWait.timeout)
+
+        XCTAssertEqual(store.persisted.count, 1)
+        XCTAssertEqual(store.persisted.first?.retryCount, 1)
+        XCTAssertEqual(verifier.callCount("A"), 1)
+        await mgr.cancelPendingWorkForTests()
+    }
+
     func testCompletionReasonPersistsAndIsReusedOnRetry() async {
         let verifier = FakeVerifier()
         verifier.setError(SimulaAPIError.httpError(statusCode: 500), for: "A")
@@ -739,6 +793,7 @@ private final class ControllableSleep: @unchecked Sendable {
 private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
     private let lock = NSLock()
     private var tokens: [String: String?] = [:]
+    private var verified: [String: Bool] = [:]
     private var errors: [String: Error] = [:]
     private var counts: [String: Int] = [:]
     private var gated: Set<String> = []
@@ -749,6 +804,7 @@ private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
     private var reasons: [String: [RewardCompletionReason?]] = [:]
 
     func setToken(_ token: String?, for serveId: String) { lock.lock(); tokens[serveId] = token; lock.unlock() }
+    func setVerified(_ value: Bool, for serveId: String) { lock.lock(); verified[serveId] = value; lock.unlock() }
     func setError(_ error: Error, for serveId: String) { lock.lock(); errors[serveId] = error; lock.unlock() }
     func clearError(for serveId: String) { lock.lock(); errors[serveId] = nil; lock.unlock() }
     func gate(_ serveId: String) { lock.lock(); gated.insert(serveId); lock.unlock() }
@@ -798,10 +854,11 @@ private final class FakeVerifier: RewardVerifying, @unchecked Sendable {
         lock.lock()
         let error = errors[serveId]
         let token = tokens[serveId] ?? nil
+        let isVerified = verified[serveId] ?? true
         lock.unlock()
 
         if let error { throw error }
-        return VerifyRewardResponse(verified: true, token: token)
+        return VerifyRewardResponse(verified: isVerified, token: token)
     }
 
     /// Suspends until verify(serveId) has been entered (used to sequence the in-flight tests).
@@ -890,6 +947,17 @@ private final class RewardCallbackRecorder: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let first = results.first else { return nil }
         return try? first.get()
+    }
+}
+
+private final class LockedRewardPersistenceCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+
+    func record() {
+        lock.lock(); value += 1; lock.unlock()
     }
 }
 

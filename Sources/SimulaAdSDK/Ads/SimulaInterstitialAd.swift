@@ -234,6 +234,7 @@ public final class SimulaInterstitialAd {
     /// At most one primary video player is retained, created as soon as the load response exposes
     /// its URL so AVFoundation can prepare before `show()`.
     private var preparedVideoOwnership: FullscreenVideoPreparationOwnership?
+    private var preparedVideoLease: VideoAssetLease?
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
     /// post-game ad flow).
     private var fallbackPresenter: FallbackAdPresenter?
@@ -394,12 +395,27 @@ public final class SimulaInterstitialAd {
             #if os(iOS)
             releasePreparedVideo()
             let usesVideoPlanV2 = response.primaryUsesVideoPlanV2
+            let localCreative: FullscreenCreativeContent
+            var localLease: VideoAssetLease?
+            if case .video(let remoteURL, let posterURL) = creative {
+                let lease = try await VideoAssetCache.shared.acquire(remoteURL)
+                guard !Task.isCancelled else {
+                    lease.release()
+                    return
+                }
+                preparedVideoLease = lease
+                localLease = lease
+                localCreative = .video(url: lease.localURL, posterURL: posterURL)
+            } else {
+                localCreative = creative
+            }
             switch reserveFullscreenVideoPreparation(
-                for: creative,
+                for: localCreative,
                 startsMuted: !usesVideoPlanV2,
                 stallTimeout: usesVideoPlanV2
                     ? FullscreenVideoPlayer.videoPlanV2StallTimeout
-                    : FullscreenVideoPlayer.preparationTimeout
+                    : FullscreenVideoPlayer.preparationTimeout,
+                assetLease: localLease
             ) {
             case .notRequired:
                 break
@@ -426,6 +442,7 @@ public final class SimulaInterstitialAd {
             }
             #endif
         } catch let apiError as SimulaAPIError {
+            if Task.isCancelled { return }
             // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
             // lifecycle event comes from failLoad()).
             Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
@@ -436,7 +453,19 @@ public final class SimulaInterstitialAd {
             } else {
                 failLoad(.network(apiError))
             }
+        } catch let cacheError as VideoAssetCacheError {
+            if Task.isCancelled { return }
+            let failure = videoAssetLoadFailure(for: cacheError)
+            Telemetry.shared.recordError(
+                signature: failure.telemetrySignature,
+                errorCode: failure.telemetryCode,
+                breadcrumb: "surface=interstitial"
+            )
+            failLoad(failure.callbackError, telemetryCode: failure.telemetryCode)
+        } catch is CancellationError {
+            return
         } catch {
+            if Task.isCancelled { return }
             Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
             failLoad(.network(.invalidResponse))
         }
@@ -521,6 +550,9 @@ public final class SimulaInterstitialAd {
                 metadata: metadata,
                 showStartNanos: showStartNanos
             ),
+            onCommittedImpression: {
+                PlainImpressionSender.shared.send(response.validatedImpressionURL)
+            },
             notifyDisplayed: { owner in
                 owner.delegate?.interstitialDidDisplay(owner)
             },
@@ -541,7 +573,11 @@ public final class SimulaInterstitialAd {
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
         let primaryUsesVideoPlanV2 = response.primaryUsesVideoPlanV2
         if response.creative?.mediaType == .video {
-            guard case .video(let url, let posterURL)? = response.creativeContent else {
+            guard case .video(_, let posterURL)? = response.creativeContent,
+                  let url = preparedVideoOwnership.flatMap({
+                      FullscreenVideoPreparationPool.shared.localURL(for: $0.token)
+                  }) ?? preparedVideoLease?.localURL,
+                  url.isFileURL else {
                 admission.stop()
                 failDisplay(.notReady)
                 return
@@ -562,7 +598,8 @@ public final class SimulaInterstitialAd {
                 presentationVideoPlayer = player
                 presentationVideoOwnership = ownership
             } else {
-                releasePreparedVideo()
+                _ = preparedVideoOwnership?.releaseFromAd()
+                preparedVideoOwnership = nil
                 presentationVideoPlayer = FullscreenVideoPlayer(
                     url: url,
                     posterURL: posterURL,
@@ -581,6 +618,7 @@ public final class SimulaInterstitialAd {
             response: response,
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
+            videoAssetLease: preparedVideoLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
             onWillPresent: {
@@ -703,6 +741,8 @@ public final class SimulaInterstitialAd {
             if let presentationVideoOwnership,
                presentationVideoOwnership.returnToAdAfterPresentationFailure() {
                 preparedVideoOwnership = presentationVideoOwnership
+            } else {
+                presentationVideoPlayer?.stop()
             }
             // Couldn't present (no window scene). Keep the loaded ad so the host
             // can retry; report DISPLAY_FAILED without a bogus DISPLAYED/CLOSED.
@@ -713,6 +753,7 @@ public final class SimulaInterstitialAd {
 
         // Only now is the ad actually on screen.
         state = .showing(response, metadata: metadata)
+        preparedVideoLease = nil
         self.presenter = presenter
         if presentationVideoPlayer == nil { admission.presentationDidSucceed() }
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
@@ -861,14 +902,15 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Failure helpers
 
-    private func failLoad(_ error: SimulaAdError) {
+    private func failLoad(_ error: SimulaAdError, telemetryCode: String? = nil) {
         #if os(iOS)
         releasePreparedVideo()
         #endif
         state = .idle
         Telemetry.shared.recordLifecycle(
             stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: error.telemetryCode
+            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos),
+            errorCode: telemetryCode ?? error.telemetryCode
         )
         delegate?.interstitialDidFailToLoad(self, error: error)
     }
@@ -877,6 +919,8 @@ public final class SimulaInterstitialAd {
     private func releasePreparedVideo() {
         _ = preparedVideoOwnership?.releaseFromAd()
         preparedVideoOwnership = nil
+        preparedVideoLease?.release()
+        preparedVideoLease = nil
     }
     #endif
 
@@ -998,7 +1042,7 @@ public final class SimulaInterstitialAd {
             let ads = try await api.fetchFallbacks(impressionId: impressionId)
             result = ads.isEmpty
                 ? .noContent
-                : .content(ads, preparedVideos: prepareUpcomingFallbackVideos(
+                : .content(ads, preparedVideos: await prepareUpcomingFallbackVideos(
                     ads,
                     allowV2Preparation: allowV2Preparation()
                 ))

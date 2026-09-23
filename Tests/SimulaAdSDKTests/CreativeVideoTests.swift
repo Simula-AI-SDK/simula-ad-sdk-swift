@@ -3,15 +3,15 @@ import XCTest
 
 final class CreativeVideoTests: XCTestCase {
     private func decodeInterstitial(_ json: String) throws -> AdLoadResponse {
-        try JSONDecoder().decode(AdLoadResponse.self, from: Data(json.utf8))
+        try decodeFullscreenPayload(AdLoadResponse.self, from: Data(json.utf8))
     }
 
     private func decodeRewarded(_ json: String) throws -> RewardedInitResponse {
-        try JSONDecoder().decode(RewardedInitResponse.self, from: Data(json.utf8))
+        try decodeFullscreenPayload(RewardedInitResponse.self, from: Data(json.utf8))
     }
 
     private func decodeFallbacks(_ json: String) throws -> [FallbackAd] {
-        try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
+        try decodeFullscreenPayload(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
     }
 
     func testUnknownCreativeTypeDefaultsToPlayableHTML() throws {
@@ -51,7 +51,7 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(posterURL?.lastPathComponent, "reward.jpg")
     }
 
-    func testCapabilitiesEncodeVideoV1ForFullscreenRequests() throws {
+    func testFullscreenRequestUsesTopLevelVideoContractOnly() throws {
         let capabilities = DeviceCapabilities(
             osVersion: "18.0.0",
             storekitAvailable: true,
@@ -64,11 +64,12 @@ final class CreativeVideoTests: XCTestCase {
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(rewarded)) as? [String: Any]
         )
-        XCTAssertEqual((object["capabilities"] as? [String: Any])?["video_v1"] as? Bool, true)
-        XCTAssertEqual(capabilities.dictionary["video_v1"] as? Bool, true)
+        XCTAssertNil((object["capabilities"] as? [String: Any])?["video_v1"])
+        XCTAssertNil(capabilities.dictionary["video_v1"])
+        XCTAssertEqual((object["contracts"] as? [String: Any])?["video"] as? Int, 2)
     }
 
-    func testCapabilitiesAdvertiseVideoPlanV2Independently() throws {
+    func testLegacyCapabilityInitializersDoNotSerializeVideoMarkers() throws {
         let capabilities = DeviceCapabilities(
             osVersion: "18.0.0",
             storekitAvailable: true,
@@ -81,15 +82,15 @@ final class CreativeVideoTests: XCTestCase {
         let data = try JSONEncoder().encode(capabilities)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        XCTAssertEqual(object["video_v1"] as? Bool, true)
-        XCTAssertEqual(object["video_plan_v2"] as? Bool, true)
-        XCTAssertEqual(capabilities.dictionary["video_plan_v2"] as? Bool, true)
+        XCTAssertNil(object["video_v1"])
+        XCTAssertNil(object["video_plan_v2"])
+        XCTAssertNil(capabilities.dictionary["video_plan_v2"])
     }
 
     func testVideoPlanV2CreativeAndStyleDecode() throws {
         let response = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,"video_plan_version":"video_plan_v2",
+          "ad_inserted":true,"video_contract":2,
           "creative":{
             "type":"video","url":"https://cdn.example/ad.mp4","cta":"Play Now",
             "app_icon_url":"https://cdn.example/icon.png","app_name":"Example Game",
@@ -193,47 +194,40 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [0], "Markerless clips retain V1 preparation")
     }
 
-    func testCanonicalMarkerStillRequiresVideoAndValidClipIndexPerSlot() throws {
-        let missing = try decodeInterstitial(#"{"ad_inserted":true,"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/a.mp4"}}"#)
-        let malformed = try decodeRewarded(#"{"video_plan_version":"video_plan_v2","creative":{"type":"video","url":"https://cdn.example/b.mp4","clip_index":"1"}}"#)
-        let playable = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"HTML","clip_index":0}]}"#)
+    func testNumericContractActivatesWithoutLegacyClipMetadata() throws {
+        let missing = try decodeInterstitial(#"{"ad_inserted":true,"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/a.mp4"}}"#)
+        let malformed = try decodeRewarded(#"{"video_contract":2,"creative":{"type":"video","url":"https://cdn.example/b.mp4","clip_index":"1"}}"#)
+        let playable = try decodeFallbacks(#"{"video_contract":2,"ads":[{"type":"playable","rendered_html":"HTML","clip_index":0}]}"#)
 
         XCTAssertTrue(missing.usesVideoPlanV2Contract)
-        XCTAssertFalse(missing.primaryUsesVideoPlanV2)
+        XCTAssertTrue(missing.primaryUsesVideoPlanV2)
         XCTAssertTrue(malformed.usesVideoPlanV2Contract)
-        XCTAssertFalse(malformed.primaryUsesVideoPlanV2)
+        XCTAssertTrue(malformed.primaryUsesVideoPlanV2)
         XCTAssertEqual(playable.map(\.usesVideoPlanV2Contract), [true])
         XCTAssertEqual(playable.map(\.usesVideoPlanV2), [false])
         XCTAssertEqual(upcomingFallbackVideoIndices(playable), [])
     }
 
-    func testNestedFallbackCreativePreservesV2SemanticIndexAndChrome() throws {
+    func testContractTwoDropsFallbackVideoSlots() throws {
         let ads = try decodeFallbacks(#"""
-        {"video_plan_version":"video_plan_v2","ads":[{
+        {"video_contract":2,"ads":[{
           "ad_id":"es2",
           "creative":{"type":"video","url":"https://cdn.example/es2.mp4","cta":"Get","app_icon_url":"https://cdn.example/icon.png","app_name":"Game","video_pool":"trailer","clip_index":2},
           "ad_behavior":{"video":{"style":"floating_pill"}}
         }]}
         """#)
-        let ad = try XCTUnwrap(ads.first)
-
-        XCTAssertEqual(ad.sourceIndex, 0)
-        XCTAssertEqual(ad.creative?.clipIndex, 2)
-        XCTAssertEqual(ad.creative?.videoPool, "trailer")
-        XCTAssertTrue(ad.usesVideoPlanV2)
-        XCTAssertEqual(ad.adBehavior.video.style, .floatingPill)
-        XCTAssertTrue(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: ad.usesVideoPlanV2, status: .ended))
+        XCTAssertTrue(ads.isEmpty)
     }
 
     func testAllPlayableGoldenFlowRemainsPrimaryThenES1ThenES2() throws {
         let primary = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2",
+          "ad_inserted":true,"rendered_html":"PRIMARY","video_contract":2,
           "creative":{"type":"playable","clip_index":0}
         }
         """#)
         let fallbacks = try decodeFallbacks(#"""
-        {"video_plan_version":"video_plan_v2","ads":[
+        {"video_contract":2,"ads":[
           {"rendered_html":"ES1","creative":{"type":"playable","clip_index":1}},
           {"rendered_html":"ES2","creative":{"type":"playable","clip_index":2}}
         ]}
@@ -249,18 +243,18 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(fallbacks.map(\.mediaType), [.playable, .playable])
     }
 
-    func testPlayablePrimaryPreservesLaterV2FallbackFromFallbackRootMarker() throws {
-        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
-        let rewarded = try decodeRewarded(#"{"rendered_html":"PRIMARY","video_plan_version":"video_plan_v2","creative":{"type":"playable"}}"#)
-        let fallbacks = try decodeFallbacks(#"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"ES1"},{"type":"video","url":"https://cdn.example/es2.mp4","clip_index":2}]}"#)
+    func testAllPlayableContractRetainsHTMLAndDropsFallbackVideo() throws {
+        let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_contract":2,"creative":{"type":"playable"}}"#)
+        let rewarded = try decodeRewarded(#"{"rendered_html":"PRIMARY","video_contract":2,"creative":{"type":"playable"}}"#)
+        let fallbacks = try decodeFallbacks(#"{"video_contract":2,"ads":[{"type":"playable","rendered_html":"ES1"},{"type":"video","url":"https://cdn.example/es2.mp4","clip_index":2}]}"#)
 
         XCTAssertTrue(primary.usesVideoPlanV2Contract)
         XCTAssertFalse(primary.primaryUsesVideoPlanV2)
         XCTAssertTrue(rewarded.usesVideoPlanV2Contract)
         XCTAssertFalse(rewarded.primaryUsesVideoPlanV2)
-        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2Contract), [true, true])
-        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2), [false, true])
-        XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [1])
+        XCTAssertEqual(fallbacks.map(\.usesVideoPlanV2Contract), [true])
+        XCTAssertEqual(fallbacks.map(\.mediaType), [.playable])
+        XCTAssertEqual(upcomingFallbackVideoIndices(fallbacks), [])
     }
 
     func testVideoPlanSKOverlayDefaultsClampAndStayV2Only() {
@@ -995,7 +989,7 @@ final class CreativeVideoTests: XCTestCase {
     func testQuartileAndPauseTelemetryStateMachinesAreOneShot() {
         var quartiles = VideoQuartileState()
         XCTAssertEqual(quartiles.crossed(position: 2.4, duration: 10), [])
-        XCTAssertEqual(quartiles.crossed(position: 7.6, duration: 10), [25, 50, 75])
+        XCTAssertEqual(quartiles.crossed(position: 7.6, duration: 10), [50])
         XCTAssertEqual(quartiles.crossed(position: 10, duration: 10), [])
 
         var pause = VideoPauseTelemetryState()
@@ -1030,25 +1024,25 @@ final class CreativeVideoTests: XCTestCase {
     func testCanonicalPoolAliasAndValidVideoClipRules() throws {
         let canonical = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,"video_plan_version":"video_plan_v2",
+          "ad_inserted":true,"video_contract":2,
           "creative":{"type":"video","url":"https://cdn.example/a.mp4","video_pool":"ugc","pool":"trailer","clip_index":1}
         }
         """#)
         let alias = try decodeRewarded(#"""
         {
-          "video_plan_version":"video_plan_v2",
+          "video_contract":2,
           "creative":{"type":"video","url":"https://cdn.example/b.mp4","pool":"gameplay","clip_index":2}
         }
         """#)
         let invalid = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,"video_plan_version":"video_plan_v2",
+          "ad_inserted":true,"video_contract":2,
           "creative":{"type":"video","url":"https://cdn.example/c.mp4","video_pool":"ugc","clip_index":3}
         }
         """#)
         let playable = try decodeInterstitial(#"""
         {
-          "ad_inserted":true,"rendered_html":"HTML","video_plan_version":"video_plan_v2",
+          "ad_inserted":true,"rendered_html":"HTML","video_contract":2,
           "creative":{"type":"playable","clip_index":0}
         }
         """#)
@@ -1059,7 +1053,7 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertTrue(canonical.primaryUsesVideoPlanV2)
         XCTAssertTrue(alias.primaryUsesVideoPlanV2)
         XCTAssertFalse(invalid.creative?.isVideoPlanV2Clip == true)
-        XCTAssertFalse(invalid.primaryUsesVideoPlanV2)
+        XCTAssertTrue(invalid.primaryUsesVideoPlanV2)
         XCTAssertTrue(playable.usesVideoPlanV2Contract)
         XCTAssertFalse(playable.creative?.isVideoPlanV2Clip == true)
         XCTAssertFalse(playable.primaryUsesVideoPlanV2)
@@ -1083,8 +1077,8 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(ad.creative?.subtitle, "Flat Subtitle")
         XCTAssertEqual(ad.creative?.videoPool, "trailer")
         XCTAssertEqual(ad.creative?.clipIndex, 1)
-        XCTAssertTrue(ad.usesVideoPlanV2Contract)
-        XCTAssertTrue(ad.usesVideoPlanV2)
+        XCTAssertFalse(ad.usesVideoPlanV2Contract)
+        XCTAssertFalse(ad.usesVideoPlanV2)
     }
 
     func testStyleRequirementsDegradeToCornerCTA() {
@@ -1241,6 +1235,18 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(accounting.mutedMilliseconds, 1_250)
     }
 
+    func testProgressPublicationCoalescesUnchangedSamplesWithoutAffectingWatchAccounting() {
+        XCTAssertFalse(shouldPublishVideoProgress(previous: 1.25, next: 1.25))
+        XCTAssertFalse(shouldPublishVideoProgress(previous: 1.25, next: .nan))
+        XCTAssertTrue(shouldPublishVideoProgress(previous: 1.25, next: 1.5))
+
+        var accounting = VideoAudioWatchAccounting()
+        accounting.update(playedSeconds: 1.25, isMuted: true)
+        accounting.update(playedSeconds: 1.5, isMuted: false)
+        XCTAssertEqual(accounting.mutedMilliseconds, 1_250)
+        XCTAssertEqual(accounting.unmutedMilliseconds, 250)
+    }
+
     func testPresentationWatchAccountingAggregatesTwoClipsThroughFailurePlayableAndClose() {
         var accounting = VideoPlanPresentationWatchAccounting<String>()
 
@@ -1303,6 +1309,86 @@ final class CreativeVideoTests: XCTestCase {
                 mutedMilliseconds: 300,
                 unmutedMilliseconds: 1_200
             )
+        )
+    }
+
+    func testInterstitialPrimaryToNextHandoffEmitsOnceWithAggregatedWatchTotals() throws {
+        try assertPrimaryToNextHandoff(
+            adFormat: "interstitial",
+            mutedMilliseconds: 750,
+            unmutedMilliseconds: 1_250
+        )
+    }
+
+    func testRewardedPrimaryToNextHandoffEmitsOnceWithAggregatedWatchTotals() throws {
+        try assertPrimaryToNextHandoff(
+            adFormat: "rewarded",
+            mutedMilliseconds: 500,
+            unmutedMilliseconds: 2_000
+        )
+    }
+
+    private func assertPrimaryToNextHandoff(
+        adFormat: String,
+        mutedMilliseconds: Int,
+        unmutedMilliseconds: Int
+    ) throws {
+        var accounting = VideoPlanPresentationWatchAccounting<String>()
+        var handoff = VideoPlanHandoffState<VideoPlanHandoffTelemetry>()
+        _ = accounting.update(
+            playerID: "primary",
+            mutedMilliseconds: mutedMilliseconds,
+            unmutedMilliseconds: unmutedMilliseconds
+        )
+        // A terminal flush can repeat the latest sampled snapshot without double counting it.
+        let terminalTotals = accounting.update(
+            playerID: "primary",
+            mutedMilliseconds: mutedMilliseconds,
+            unmutedMilliseconds: unmutedMilliseconds
+        )
+        handoff.videoTerminated(
+            origin: VideoPlanHandoffTelemetry(
+                adFormat: adFormat,
+                adUnitId: "unit",
+                adId: "ad",
+                serveId: "serve",
+                creative: nil,
+                behavior: nil,
+                muted: mutedMilliseconds > 0,
+                mutedWatchMs: terminalTotals.mutedMilliseconds,
+                unmutedWatchMs: terminalTotals.unmutedMilliseconds,
+                videoPositionS: 2,
+                durationS: 4,
+                secondsSinceVideoStart: 2,
+                reason: FullscreenVideoTerminationReason.completed
+            ),
+            secondsSinceVideoStart: 2,
+            now: 10
+        )
+
+        var emitted: [(VideoPlanHandoffTelemetry, VideoPlanPresentationWatchTotals)] = []
+        if let completion = handoff.nextStepReady(now: 10.25) {
+            emitted.append((completion.origin, accounting.totals))
+        }
+        if let completion = handoff.nextStepReady(now: 10.5) {
+            emitted.append((completion.origin, accounting.totals))
+        }
+
+        let event = try XCTUnwrap(emitted.first)
+        XCTAssertEqual(emitted.count, 1)
+        XCTAssertEqual(event.0.adFormat, adFormat)
+        XCTAssertEqual(event.0.reason, FullscreenVideoTerminationReason.completed)
+        XCTAssertEqual(event.0.mutedWatchMs, mutedMilliseconds)
+        XCTAssertEqual(event.0.unmutedWatchMs, unmutedMilliseconds)
+        XCTAssertEqual(
+            event.0.mutedWatchMs + event.0.unmutedWatchMs,
+            mutedMilliseconds + unmutedMilliseconds
+        )
+        XCTAssertEqual(event.1.mutedMilliseconds, mutedMilliseconds)
+        XCTAssertEqual(event.1.unmutedMilliseconds, unmutedMilliseconds)
+        XCTAssertEqual(
+            event.1.mutedMilliseconds + event.1.unmutedMilliseconds,
+            mutedMilliseconds + unmutedMilliseconds
         )
     }
 
@@ -2005,7 +2091,7 @@ final class CreativeVideoTests: XCTestCase {
         )
 
         XCTAssertEqual(upcomingFallbackVideoIndices(ads), [1])
-        XCTAssertEqual(upcomingFallbackVideoIndices(ads, allowV2Preparation: false), [])
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads, allowV2Preparation: false), [1])
     }
 
     func testV2FallbackPreparationSelectsOnlyNextVideoAcrossPlayable() throws {
@@ -2014,7 +2100,7 @@ final class CreativeVideoTests: XCTestCase {
         )
 
         XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0])
-        XCTAssertEqual(nextV2FallbackVideoIndex(in: ads, after: 0), 2)
+        XCTAssertNil(nextV2FallbackVideoIndex(in: ads, after: 0))
         XCTAssertNil(nextV2FallbackVideoIndex(in: ads, after: 2))
     }
 
@@ -2031,12 +2117,12 @@ final class CreativeVideoTests: XCTestCase {
             #"{"video_plan_version":"video_plan_v2","ads":[{"type":"playable","rendered_html":"A"},{"type":"playable","rendered_html":"B"},{"type":"video","url":"https://cdn.example/one.mp4","clip_index":2}]}"#
         )
 
-        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [2])
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [])
         XCTAssertEqual(discardedFallbackVideoPreparationIndices(
             in: ads,
             around: 0,
             preparedIndices: [2]
-        ), [])
+        ), [2])
     }
 
     func testNextV2PreparationSurvivesTraversalAcrossMultiplePlayables() throws {
@@ -2048,7 +2134,7 @@ final class CreativeVideoTests: XCTestCase {
             in: ads,
             around: 1,
             preparedIndices: [3]
-        ), [])
+        ), [3])
         XCTAssertEqual(discardedFallbackVideoPreparationIndices(
             in: ads,
             around: 2,
@@ -2125,7 +2211,7 @@ final class CreativeVideoTests: XCTestCase {
             ads: ads,
             around: 0,
             preparedIndices: []
-        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [2], discardIndices: []))
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: []))
     }
 
     func testMiniGameV2PreparationTraversesGapsAndRecoversMissingToken() throws {
@@ -2137,12 +2223,12 @@ final class CreativeVideoTests: XCTestCase {
             ads: ads,
             around: 1,
             preparedIndices: []
-        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [3], discardIndices: []))
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: []))
         XCTAssertEqual(miniGameFallbackVideoPreparationPlan(
             ads: ads,
             around: 2,
             preparedIndices: [3]
-        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: []))
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: [3]))
     }
 
     func testMiniGameV2PreparationDoesNotDuplicateAndStaysBounded() throws {
@@ -2176,14 +2262,157 @@ final class CreativeVideoTests: XCTestCase {
             ads: ads,
             around: 1,
             preparedIndices: [0, 1, 2]
-        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: [0]))
+        ), MiniGameFallbackVideoPreparationPlan(prepareIndices: [], discardIndices: [0, 2]))
+    }
+
+    func testFallbackPreparedTokenRetentionKeepsOnlyCurrentAndImmediateNext() throws {
+        let ads = try decodeFallbacks(
+            #"{"ads":[{"type":"video","url":"https://cdn.example/one.mp4"},{"type":"video","url":"https://cdn.example/two.mp4"},{"type":"video","url":"https://cdn.example/three.mp4"}]}"#
+        )
+
+        XCTAssertEqual(ads.count, 2)
+        XCTAssertEqual(
+            boundedFallbackVideoPreparationIndices(
+                in: ads,
+                around: 0,
+                preparedIndices: [0, 1, 2, 9]
+            ),
+            [0, 1]
+        )
+        XCTAssertEqual(
+            boundedFallbackVideoPreparationIndices(
+                in: ads,
+                around: 1,
+                preparedIndices: [0, 1]
+            ),
+            [1]
+        )
     }
 
     #if os(iOS)
     @MainActor
-    func testFallbackVideoPreparationOnlyWarmsImmediateNextClip() throws {
+    func testInterstitialReadyLeaseOutlivesPoolExpiryAndDeletesAfterPresentationDetach() throws {
+        let localURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertTrue(FileManager.default.createFile(atPath: localURL.path, contents: Data([1])))
+        let leaseReleased = LockedVideoLeaseObservation()
+        let lease = VideoAssetLease(localURL: localURL) {
+            leaseReleased.record()
+            try? FileManager.default.removeItem(at: localURL)
+        }
+        var now: TimeInterval = 0
+        let pool = FullscreenVideoPreparationPool(capacity: 2, retention: 300, now: { now })
+        let token = try XCTUnwrap(pool.prepare(url: localURL, posterURL: nil, assetLease: lease))
+        now = 301
+        let replacement = try XCTUnwrap(pool.prepare(
+            url: URL(fileURLWithPath: "/dev/null/replacement"),
+            posterURL: nil
+        ))
+
+        XCTAssertNil(pool.localURL(for: token), "the five-minute preparation entry expires")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+        XCTAssertFalse(leaseReleased.wasReleased, "the ready ad independently retains the asset")
+
+        let coldPlayer = FullscreenVideoPlayer(url: lease.localURL, posterURL: nil)
+        XCTAssertNotNil(coldPlayer.player.currentItem, "show can cold-start from the ready lease")
+        coldPlayer.stop()
+        XCTAssertNil(coldPlayer.player.currentItem)
+        lease.release()
+
+        XCTAssertTrue(leaseReleased.wasReleased)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+        pool.release(replacement)
+    }
+
+    @MainActor
+    func testRewardedReadyLeaseOutlivesPoolCapEvictionAndSupersedeReleasesOnce() throws {
+        let localURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertTrue(FileManager.default.createFile(atPath: localURL.path, contents: Data([1])))
+        let releaseObservation = LockedVideoLeaseObservation()
+        let lease = VideoAssetLease(localURL: localURL) {
+            releaseObservation.record()
+            try? FileManager.default.removeItem(at: localURL)
+        }
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        let token = try XCTUnwrap(pool.prepare(
+            url: localURL,
+            posterURL: nil,
+            assetLease: lease
+        ))
+        let replacement = try XCTUnwrap(pool.prepare(
+            url: URL(fileURLWithPath: "/dev/null/rewarded-replacement"),
+            posterURL: nil
+        ))
+
+        XCTAssertNil(pool.localURL(for: token), "the preparation cap evicts the old idle player")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+        XCTAssertFalse(releaseObservation.wasReleased)
+
+        lease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+        XCTAssertTrue(releaseObservation.wasReleased)
+        lease.release()
+        XCTAssertEqual(releaseObservation.releaseCount, 1, "supersede/stale cleanup is idempotent")
+        pool.release(replacement)
+    }
+
+    @MainActor
+    func testInterstitialFailedPresentationRetryKeepsBothReadyAndPoolOwners() throws {
+        let localURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertTrue(FileManager.default.createFile(atPath: localURL.path, contents: Data([1])))
+        let releaseObservation = LockedVideoLeaseObservation()
+        let readyLease = VideoAssetLease(localURL: localURL) {
+            releaseObservation.record()
+            try? FileManager.default.removeItem(at: localURL)
+        }
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        let token = try XCTUnwrap(pool.prepare(url: localURL, posterURL: nil, assetLease: readyLease))
+        let firstAttempt = try XCTUnwrap(pool.claim(token, url: localURL, posterURL: nil))
+
+        pool.returnToPrepared(token)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+        let retry = try XCTUnwrap(pool.claim(token, url: localURL, posterURL: nil))
+        XCTAssertTrue(firstAttempt === retry)
+
+        pool.release(token)
+        XCTAssertNil(retry.player.currentItem, "pool release detaches the claimed player first")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+        readyLease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+        XCTAssertEqual(releaseObservation.releaseCount, 1)
+    }
+
+    @MainActor
+    func testRewardedCloseWaitsForPoolAndPresentationLeaseWithoutDoubleDelete() throws {
+        let localURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertTrue(FileManager.default.createFile(atPath: localURL.path, contents: Data([1])))
+        let releaseObservation = LockedVideoLeaseObservation()
+        let presentationLease = VideoAssetLease(localURL: localURL) {
+            releaseObservation.record()
+            try? FileManager.default.removeItem(at: localURL)
+        }
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        let token = try XCTUnwrap(pool.prepare(
+            url: localURL,
+            posterURL: nil,
+            assetLease: presentationLease
+        ))
+        let player = try XCTUnwrap(pool.claim(token, url: localURL, posterURL: nil))
+
+        presentationLease.release()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+        pool.release(token)
+
+        XCTAssertNil(player.player.currentItem)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+        presentationLease.release()
+        pool.release(token)
+        XCTAssertEqual(releaseObservation.releaseCount, 1)
+    }
+
+    @MainActor
+    func testContractTwoDoesNotPrepareFallbackVideoPlayers() throws {
         let ads = try decodeFallbacks(
-            #"{"video_plan_version":"video_plan_v2","ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
+            #"{"video_contract":2,"ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
         )
         var attempts = 0
 
@@ -2202,8 +2431,8 @@ final class CreativeVideoTests: XCTestCase {
             return FullscreenVideoPreparationToken()
         }
 
-        XCTAssertEqual(attempts, 1)
-        XCTAssertEqual(prepared.keys.sorted(), [0])
+        XCTAssertEqual(attempts, 0)
+        XCTAssertTrue(prepared.isEmpty)
     }
 
     @MainActor
@@ -2258,4 +2487,23 @@ final class CreativeVideoTests: XCTestCase {
         player.stop()
     }
     #endif
+}
+
+private final class LockedVideoLeaseObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var releases = 0
+
+    var wasReleased: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return releases > 0
+    }
+
+    var releaseCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return releases
+    }
+
+    func record() {
+        lock.lock(); releases += 1; lock.unlock()
+    }
 }
