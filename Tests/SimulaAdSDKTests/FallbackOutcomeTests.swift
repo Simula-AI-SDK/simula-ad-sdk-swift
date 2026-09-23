@@ -177,6 +177,43 @@ final class FallbackOutcomeTests: XCTestCase {
     }
 
     @MainActor
+    func testTransferredPrefetchResolvesRewardAfterHostAdIsReleased() {
+        let claim = UnitEndRewardClaim()
+        claim.primaryGateDidOpen()
+        let ownership = FallbackPrefetchOwnership()
+        ownership.transferToLoadingPresenter(windowInstalled: true)
+        let ads = [FallbackAd(adId: "es2", iframeUrl: "", html: "HTML")]
+        XCTAssertTrue(resolveRewardedFallbackPrefetch(
+            .content(ads, preparedVideos: [:]), ownership: ownership,
+            isCurrentPrefetch: false, unitEndReward: claim
+        ))
+        XCTAssertFalse(claim.earned)
+        claim.fallbackGateDidOpen(isFinal: true)
+        XCTAssertTrue(claim.earned)
+        var events: [String] = []
+        XCTAssertTrue(claim.consumeAtUnitClose(
+            onEarn: { events.append("earned") }, enqueueVerification: { events.append("verify") }
+        ))
+        XCTAssertFalse(claim.consumeAtUnitClose(
+            onEarn: { events.append("duplicate") }, enqueueVerification: { events.append("duplicate") }
+        ))
+        XCTAssertEqual(events, ["earned", "verify"])
+    }
+
+    @MainActor
+    func testStaleUnownedPrefetchCannotResolveRewardAuthority() {
+        for result: FallbackFetchResult in [.noContent, .failure] {
+            let claim = UnitEndRewardClaim()
+            claim.primaryGateDidOpen()
+            XCTAssertFalse(resolveRewardedFallbackPrefetch(
+                result, ownership: FallbackPrefetchOwnership(),
+                isCurrentPrefetch: false, unitEndReward: claim
+            ))
+            XCTAssertFalse(claim.earned)
+        }
+    }
+
+    @MainActor
     func testFailedFinalPlayableEarnsInternallyButSubmitsOnlyAtUnitClose() {
         var submissions = 0
         let claim = UnitEndRewardClaim()

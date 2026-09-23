@@ -6,6 +6,17 @@ final class FallbackAdParsingTests: XCTestCase {
         try decodeFullscreenPayload(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
     }
 
+    func testInlineFallbackRetainsItsLegacyOrigin() throws {
+        let ads = try decode(#"{"ads":[{"html":"<a href='next'>Next</a>","iframe_url":"https://api.example/iframe/serve"}]}"#)
+        let ad = try XCTUnwrap(ads.first)
+        let base = try XCTUnwrap(validatedCreativeURL(ad.iframeUrl))
+        XCTAssertEqual(URL(string: "next", relativeTo: base)?.absoluteURL.absoluteString, "https://api.example/iframe/next")
+        for value in [#""javascript:alert(1)""#, #""file:///etc/passwd""#, "42"] {
+            let invalid = try decode("{\"ads\":[{\"html\":\"HTML\",\"iframe_url\":\(value)}]}")
+            XCTAssertEqual(invalid.first?.iframeUrl, "")
+        }
+    }
+
     func testMissingOwnershipDefaultsToHTML() throws {
         let ads = try decode(#"{"ads":[{"ad_id":"a","html":"<html/>"}]}"#)
         XCTAssertEqual(ads.map(\.nativeClickBeaconV1Enabled), [false])

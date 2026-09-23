@@ -1192,18 +1192,13 @@ public final class SimulaRewardedAd {
                     )
                 }
             ) { [weak self] result in
-                if self != nil {
-                    switch result {
-                    case .content(let ads, _):
-                        unitEndReward?.fallbackDidResolve(renderableScreenCount: ads.count)
-                    case .noContent:
-                        unitEndReward?.fallbackDidResolve(renderableScreenCount: 0)
-                    case .failure:
-                        unitEndReward?.fallbackBecameUnavailable()
-                    }
-                }
+                guard resolveRewardedFallbackPrefetch(
+                    result,
+                    ownership: ownership,
+                    isCurrentPrefetch: self?.fallbackPrefetchToken == token,
+                    unitEndReward: unitEndReward
+                ) else { return false }
                 if ownership.consumedByLoadingPresenter { return true }
-                guard self?.fallbackPrefetchToken == token else { return false }
                 self?.prefetchedFallbacks = result
                 return true
             }
@@ -1451,4 +1446,25 @@ public final class SimulaRewardedAd {
         }
     }
     #endif
+}
+
+/// A loading presenter can outlive its host ad. Resolve its captured reward authority
+/// before displaying the fetched screens; stale, unowned prefetches must not earn.
+@MainActor
+func resolveRewardedFallbackPrefetch(
+    _ result: FallbackFetchResult,
+    ownership: FallbackPrefetchOwnership,
+    isCurrentPrefetch: Bool,
+    unitEndReward: UnitEndRewardClaim?
+) -> Bool {
+    guard isCurrentPrefetch || ownership.consumedByLoadingPresenter else { return false }
+    switch result {
+    case .content(let ads, _):
+        unitEndReward?.fallbackDidResolve(renderableScreenCount: ads.count)
+    case .noContent:
+        unitEndReward?.fallbackDidResolve(renderableScreenCount: 0)
+    case .failure:
+        unitEndReward?.fallbackBecameUnavailable()
+    }
+    return true
 }

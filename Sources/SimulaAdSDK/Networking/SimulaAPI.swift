@@ -1304,6 +1304,7 @@ public struct FallbackAd: Sendable {
     init(
         adId: String,
         sourceIndex: Int,
+        iframeUrl: String? = nil,
         renderedHtml: String?,
         type: String,
         url: String?,
@@ -1321,7 +1322,7 @@ public struct FallbackAd: Sendable {
         let resolvedBehavior = fallbackAdBehavior(adBehavior)
         self.adId = adId
         self.sourceIndex = max(0, sourceIndex)
-        self.iframeUrl = ""
+        self.iframeUrl = validatedCreativeURL(iframeUrl)?.absoluteString ?? ""
         self.renderedHtml = renderedHtml
         self.creative = creative
         self.videoPlanVersion = videoPlanVersion
@@ -1431,6 +1432,7 @@ struct FallbackAdsAPIResponse: Decodable {
             let ad = FallbackAd(
                 adId: item.adId ?? "",
                 sourceIndex: item.sourceIndex,
+                iframeUrl: item.iframeUrl,
                 renderedHtml: html,
                 type: item.type ?? "playable",
                 url: item.url,
@@ -1460,6 +1462,7 @@ struct FallbackAdsAPIResponse: Decodable {
             return FallbackAd(
                 adId: ad.adId,
                 sourceIndex: ad.sourceIndex,
+                iframeUrl: ad.iframeUrl,
                 renderedHtml: ad.renderedHtml,
                 type: ad.type,
                 url: ad.url,
@@ -1490,6 +1493,7 @@ struct FallbackAdsAPIResponse: Decodable {
 struct FallbackAdItem: Decodable {
     var sourceIndex = 0
     let adId: String?
+    let iframeUrl: String?
     let renderedHtml: String?
     let html: String?
     let type: String?
@@ -1512,6 +1516,7 @@ struct FallbackAdItem: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case adId = "ad_id"
+        case iframeUrl = "iframe_url"
         case renderedHtml = "rendered_html"
         case html
         case type, url
@@ -1533,6 +1538,7 @@ struct FallbackAdItem: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.adId = try? c.decode(String.self, forKey: .adId)
+        self.iframeUrl = try? c.decode(String.self, forKey: .iframeUrl)
         self.renderedHtml = try? c.decode(String.self, forKey: .renderedHtml)
         self.html = try? c.decode(String.self, forKey: .html)
         self.type = try? c.decode(String.self, forKey: .type)

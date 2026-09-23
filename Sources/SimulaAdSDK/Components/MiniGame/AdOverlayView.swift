@@ -482,6 +482,7 @@ public struct AdOverlayView: View {
                         if ad.mediaType == .playable, let html = ad.renderedHtml {
                             WebViewRepresentable(
                                 htmlString: html,
+                                baseURL: validatedCreativeURL(ad.iframeUrl),
                                 onNavigationFinished: { markPageFinished() },
                                 onNavigationFailed: { _ in markLegacyHTMLPageFailed() },
                                 onWebContentProcessTerminated: { markLegacyHTMLPageFailed() },
