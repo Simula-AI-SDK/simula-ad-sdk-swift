@@ -374,6 +374,17 @@ public final class SimulaRewardedAd {
             } else {
                 failLoad(.network(apiError))
             }
+        } catch let cacheError as VideoAssetCacheError {
+            if Task.isCancelled { return }
+            let failure = videoAssetLoadFailure(for: cacheError)
+            Telemetry.shared.recordError(
+                signature: failure.telemetrySignature,
+                errorCode: failure.telemetryCode,
+                breadcrumb: "surface=rewarded"
+            )
+            failLoad(failure.callbackError, telemetryCode: failure.telemetryCode)
+        } catch is CancellationError {
+            return
         } catch {
             if Task.isCancelled { return }
             Telemetry.shared.recordError(signature: "rewarded:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaRewardedAd.load")
@@ -1083,14 +1094,15 @@ public final class SimulaRewardedAd {
 
     // MARK: - Failure helpers
 
-    private func failLoad(_ error: SimulaAdError) {
+    private func failLoad(_ error: SimulaAdError, telemetryCode: String? = nil) {
         #if os(iOS)
         releasePreparedVideo()
         #endif
         state = .idle
         Telemetry.shared.recordLifecycle(
             stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: error.telemetryCode
+            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos),
+            errorCode: telemetryCode ?? error.telemetryCode
         )
         delegate?.rewardedDidFailToLoad(self, error: error)
     }

@@ -11,12 +11,55 @@ let videoAssetMaximumRedirects = 5
 private let videoAssetCleanupBatchSize = 128
 private let videoAssetMaximumCacheFiles = 256
 
-enum VideoAssetCacheError: Error, Equatable {
+enum VideoAssetCacheError: Error, Equatable, CaseIterable {
     case invalidURL
+    case unsafeTarget
     case unavailable
     case tooLarge
     case cacheFull
+    case admissionOverflow
     case timedOut
+}
+
+struct VideoAssetLoadFailure {
+    let callbackError: SimulaAdError
+    let telemetryCode: String
+
+    var telemetrySignature: String { "video_asset:\(telemetryCode)" }
+}
+
+func videoAssetLoadFailure(for error: VideoAssetCacheError) -> VideoAssetLoadFailure {
+    // The public error enums have no cache-specific cases. Keep their ABI stable while using
+    // conventional timeout/unavailable statuses to preserve the network distinction.
+    switch error {
+    case .timedOut:
+        return VideoAssetLoadFailure(
+            callbackError: .network(.httpError(statusCode: 408)),
+            telemetryCode: "cache_timeout"
+        )
+    case .unavailable:
+        return VideoAssetLoadFailure(
+            callbackError: .network(.httpError(statusCode: 503)),
+            telemetryCode: "transfer_failed"
+        )
+    case .invalidURL:
+        return VideoAssetLoadFailure(callbackError: .noFill, telemetryCode: "invalid_url")
+    case .unsafeTarget:
+        return VideoAssetLoadFailure(callbackError: .noFill, telemetryCode: "unsafe_target")
+    case .tooLarge:
+        return VideoAssetLoadFailure(callbackError: .noFill, telemetryCode: "asset_too_large")
+    case .cacheFull:
+        return VideoAssetLoadFailure(callbackError: .noFill, telemetryCode: "cache_full")
+    case .admissionOverflow:
+        return VideoAssetLoadFailure(callbackError: .noFill, telemetryCode: "cache_admission")
+    }
+}
+
+private func normalizedVideoAssetTransferError(_ error: Error) -> Error {
+    if error is CancellationError { return CancellationError() }
+    if let cacheError = error as? VideoAssetCacheError { return cacheError }
+    if (error as? URLError)?.code == .timedOut { return VideoAssetCacheError.timedOut }
+    return VideoAssetCacheError.unavailable
 }
 
 protocol VideoAssetDownloading: Sendable {
@@ -221,7 +264,8 @@ actor VideoAssetCache {
         guard let scheme = remoteURL.scheme?.lowercased(),
               (scheme == "https" || scheme == "http"),
               remoteURL.host?.isEmpty == false else { throw VideoAssetCacheError.invalidURL }
-        try prepareDirectory()
+        do { try prepareDirectory() }
+        catch { throw VideoAssetCacheError.cacheFull }
         let key = Self.key(for: remoteURL)
         let finalURL = rootURL.appendingPathComponent(key, isDirectory: false)
         if validAsset(at: finalURL) {
@@ -260,7 +304,7 @@ actor VideoAssetCache {
         let waiterCount = inFlight.values.reduce(0) { $0 + $1.waiters.count }
         if var existing = inFlight[key] {
             guard waiterCount < waiterLimit else {
-                continuation.resume(throwing: VideoAssetCacheError.unavailable)
+                continuation.resume(throwing: VideoAssetCacheError.admissionOverflow)
                 return
             }
             existing.waiters[id] = continuation
@@ -269,7 +313,7 @@ actor VideoAssetCache {
         }
         let deadline = monotonicNow() + videoAssetDownloadTimeout
         guard waiterCount < waiterLimit, inFlight.count < waiterLimit else {
-            continuation.resume(throwing: VideoAssetCacheError.unavailable)
+            continuation.resume(throwing: VideoAssetCacheError.admissionOverflow)
             return
         }
         let generation = UUID()
@@ -340,7 +384,9 @@ actor VideoAssetCache {
         finalURL: URL,
         deadline: TimeInterval
     ) async throws -> URL {
-        let target = try await downloader.prepareTarget(from: remoteURL, deadline: deadline)
+        let target: VideoAssetDownloadTarget
+        do { target = try await downloader.prepareTarget(from: remoteURL, deadline: deadline) }
+        catch { throw normalizedVideoAssetTransferError(error) }
         try Task.checkCancellation()
         guard monotonicNow() < deadline else { throw VideoAssetCacheError.timedOut }
         let slotID = UUID()
@@ -355,12 +401,16 @@ actor VideoAssetCache {
         let remaining = deadline - monotonicNow()
         guard remaining > 0 else { throw VideoAssetCacheError.timedOut }
         try Task.checkCancellation()
-        try await downloader.download(
-            target: target,
-            to: temporaryURL,
-            maximumBytes: videoAssetMaximumBytes,
-            timeout: remaining
-        )
+        do {
+            try await downloader.download(
+                target: target,
+                to: temporaryURL,
+                maximumBytes: videoAssetMaximumBytes,
+                timeout: remaining
+            )
+        } catch {
+            throw normalizedVideoAssetTransferError(error)
+        }
         try Task.checkCancellation()
         guard monotonicNow() <= deadline else { throw VideoAssetCacheError.timedOut }
         guard let bytes = fileSize(temporaryURL), bytes > 0 else {
@@ -368,7 +418,8 @@ actor VideoAssetCache {
         }
         guard bytes <= videoAssetMaximumBytes else { throw VideoAssetCacheError.tooLarge }
         if fileManager.fileExists(atPath: finalURL.path) { removeIndexedFile(finalURL) }
-        try fileManager.moveItem(at: temporaryURL, to: finalURL)
+        do { try fileManager.moveItem(at: temporaryURL, to: finalURL) }
+        catch { throw VideoAssetCacheError.cacheFull }
         try? (finalURL as NSURL).setResourceValue(true, forKey: .isExcludedFromBackupKey)
         cacheIndex[key] = CacheFile(url: finalURL, bytes: bytes, modified: wallNow())
         enforceFileCountLimit()
@@ -406,7 +457,7 @@ actor VideoAssetCache {
             return
         }
         guard transferQueue.count < videoAssetMaximumPendingTransfers else {
-            throw VideoAssetCacheError.unavailable
+            throw VideoAssetCacheError.admissionOverflow
         }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -737,12 +788,16 @@ final class URLSessionVideoAssetDownloader: NSObject, VideoAssetDownloading, @un
             )
         } catch PublicNetworkResolverError.timedOut {
             throw VideoAssetCacheError.timedOut
+        } catch PublicNetworkResolverError.overloaded {
+            throw VideoAssetCacheError.admissionOverflow
+        } catch PublicNetworkResolverError.unavailable {
+            throw VideoAssetCacheError.unavailable
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw VideoAssetCacheError.invalidURL
+            throw VideoAssetCacheError.unavailable
         }
-        guard let request else { throw VideoAssetCacheError.invalidURL }
+        guard let request else { throw VideoAssetCacheError.unsafeTarget }
         return VideoAssetDownloadTarget(remoteURL: remoteURL, admittedRequest: request)
     }
 
@@ -769,7 +824,7 @@ final class URLSessionVideoAssetDownloader: NSObject, VideoAssetDownloading, @un
         timeout: TimeInterval
     ) async throws {
         guard let initialRequest = target.admittedRequest else {
-            throw VideoAssetCacheError.invalidURL
+            throw VideoAssetCacheError.unsafeTarget
         }
         let delegate = StreamingDownloadDelegate(
             destination: temporaryURL,
@@ -831,7 +886,8 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         var request = initialRequest
         request.timeoutInterval = remaining
 
-        try Data().write(to: destination, options: .atomic)
+        do { try Data().write(to: destination, options: .atomic) }
+        catch { throw VideoAssetCacheError.unavailable }
         guard let handle = try? FileHandle(forWritingTo: destination) else {
             throw VideoAssetCacheError.unavailable
         }
@@ -890,7 +946,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
             return
         }
         guard let url = request.url else {
-            setTerminalError(VideoAssetCacheError.invalidURL)
+            setTerminalError(VideoAssetCacheError.unsafeTarget)
             completionHandler(nil)
             return
         }
@@ -907,7 +963,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
                 return
             }
             guard expectedRedirects < videoAssetMaximumRedirects else {
-                self.setTerminalError(VideoAssetCacheError.invalidURL)
+                self.setTerminalError(VideoAssetCacheError.unsafeTarget)
                 completionHandler(nil)
                 return
             }
@@ -923,8 +979,16 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
                 self.setTerminalError(VideoAssetCacheError.timedOut)
                 completionHandler(nil)
                 return
+            } catch PublicNetworkResolverError.overloaded {
+                self.setTerminalError(VideoAssetCacheError.admissionOverflow)
+                completionHandler(nil)
+                return
+            } catch PublicNetworkResolverError.unavailable {
+                self.setTerminalError(VideoAssetCacheError.unavailable)
+                completionHandler(nil)
+                return
             } catch {
-                self.setTerminalError(VideoAssetCacheError.invalidURL)
+                self.setTerminalError(VideoAssetCacheError.unavailable)
                 completionHandler(nil)
                 return
             }
@@ -960,7 +1024,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
             if terminalError == nil {
                 terminalError = now >= deadline
                     ? VideoAssetCacheError.timedOut
-                    : VideoAssetCacheError.invalidURL
+                    : VideoAssetCacheError.unsafeTarget
             }
             return nil
         }
@@ -1003,7 +1067,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         }
         do { try handle?.write(contentsOf: data) }
         catch {
-            setTerminalError(error)
+            setTerminalError(VideoAssetCacheError.unavailable)
             dataTask.cancel()
         }
     }
@@ -1021,7 +1085,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         let terminalError = terminalError
         dataTask = nil
         if let terminalError { completionResult = .failure(terminalError) }
-        else if let error { completionResult = .failure(error) }
+        else if let error { completionResult = .failure(normalizedVideoAssetTransferError(error)) }
         else { completionResult = .success(()) }
         lock.unlock()
         session.finishTasksAndInvalidate()
@@ -1032,7 +1096,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         let completion = continuation
         let result = completionResult
             ?? terminalError.map { .failure($0) }
-            ?? error.map { .failure($0) }
+            ?? error.map { .failure(normalizedVideoAssetTransferError($0)) }
             ?? .failure(VideoAssetCacheError.unavailable)
         continuation = nil
         completionResult = nil

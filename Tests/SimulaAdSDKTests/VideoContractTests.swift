@@ -659,7 +659,7 @@ final class VideoAssetCacheTests: XCTestCase {
             )
             XCTFail("Expected private initial URL rejection")
         } catch {
-            XCTAssertEqual(error as? VideoAssetCacheError, .invalidURL)
+            XCTAssertEqual(error as? VideoAssetCacheError, .unsafeTarget)
         }
         XCTAssertEqual(VideoAssetURLProtocol.recorder.requestCount, 0)
     }
@@ -683,7 +683,7 @@ final class VideoAssetCacheTests: XCTestCase {
             )
             XCTFail("Expected mixed DNS rejection")
         } catch {
-            XCTAssertEqual(error as? VideoAssetCacheError, .invalidURL)
+            XCTAssertEqual(error as? VideoAssetCacheError, .unsafeTarget)
         }
         XCTAssertEqual(VideoAssetURLProtocol.recorder.requestCount, 0)
     }
@@ -843,6 +843,42 @@ final class VideoAssetCacheTests: XCTestCase {
         XCTAssertEqual(videoAssetMaximumConcurrentTransfers, 2)
     }
 
+    func testEveryVideoAssetCacheErrorMapsToExactCallbackAndTelemetryClassification() {
+        let cases: [(VideoAssetCacheError, String, String)] = [
+            (.invalidURL, "no_fill", "invalid_url"),
+            (.unsafeTarget, "no_fill", "unsafe_target"),
+            (.unavailable, "network:http_503", "transfer_failed"),
+            (.tooLarge, "no_fill", "asset_too_large"),
+            (.cacheFull, "no_fill", "cache_full"),
+            (.admissionOverflow, "no_fill", "cache_admission"),
+            (.timedOut, "network:http_408", "cache_timeout"),
+        ]
+
+        XCTAssertEqual(cases.map(\.0), VideoAssetCacheError.allCases)
+        for (cacheError, expectedCallback, expectedTelemetryCode) in cases {
+            let failure = videoAssetLoadFailure(for: cacheError)
+            XCTAssertEqual(callbackClassification(failure.callbackError), expectedCallback, "\(cacheError)")
+            XCTAssertEqual(failure.telemetryCode, expectedTelemetryCode, "\(cacheError)")
+            XCTAssertEqual(
+                failure.telemetrySignature,
+                "video_asset:\(expectedTelemetryCode)",
+                "\(cacheError)"
+            )
+        }
+    }
+
+    func testMalformedFullscreenJSONRemainsInvalidResponse() {
+        XCTAssertThrowsError(
+            try decodeFullscreenPayload(AdLoadResponse.self, from: Data("not json".utf8))
+        ) { error in
+            XCTAssertFalse(error is VideoAssetCacheError)
+            XCTAssertEqual(
+                self.callbackClassification(.network(.invalidResponse)),
+                "network:invalid_response"
+            )
+        }
+    }
+
     func testTransferConcurrencyIsCappedAtTwo() async throws {
         let root = temporaryDirectory()
         let downloader = ConcurrencyGatedVideoDownloader(bytes: 8)
@@ -945,7 +981,7 @@ final class VideoAssetCacheTests: XCTestCase {
             _ = try await cache.acquire(try XCTUnwrap(URL(string: "https://cdn.example/overflow.mp4")))
             XCTFail("Expected bounded queue rejection")
         } catch {
-            XCTAssertEqual(error as? VideoAssetCacheError, .unavailable)
+            XCTAssertEqual(error as? VideoAssetCacheError, .admissionOverflow)
         }
         let started = await downloader.started
         XCTAssertEqual(started, ["active.mp4"])
@@ -1148,6 +1184,25 @@ final class VideoAssetCacheTests: XCTestCase {
 
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    }
+
+    private func callbackClassification(_ error: SimulaAdError) -> String {
+        switch error {
+        case .noFill:
+            return "no_fill"
+        case .network(let apiError):
+            switch apiError {
+            case .httpError(let statusCode): return "network:http_\(statusCode)"
+            case .invalidResponse: return "network:invalid_response"
+            case .invalidURL: return "network:invalid_url"
+            case .invalidApiKey: return "network:invalid_api_key"
+            case .noFill: return "network:no_fill"
+            case .decodingError: return "network:decoding_error"
+            case .adUnitNotFound: return "network:ad_unit_not_found"
+            }
+        default:
+            return error.telemetryCode
+        }
     }
 }
 
