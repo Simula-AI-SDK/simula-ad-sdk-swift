@@ -829,7 +829,6 @@ private struct CreativeInterstitialView: View {
                 durationS: player.duration,
                 secondsSinceVideoStart: player.secondsSinceVideoStart
             )
-            markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
                 status: status
@@ -1196,13 +1195,19 @@ private struct CreativeInterstitialView: View {
     }
 
     private func handleClose() {
-        guard canDismissFullscreen(
+        guard visible, canDismissFullscreen(
             dismissUnlocked: closeEnabled,
             clickHandoffPending: clickHandoffPending
         ) else { return }
         if let player = videoPlayer, usesVideoPlanV2 {
-            guard claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) else { return }
-            recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
+            guard videoCompletionHandled || claimVideoPlanTerminalIfNeeded(
+                player: player, event: .userClose
+            ) else { return }
+            markVideoHandoff(
+                player: player,
+                reason: videoCompletionHandled
+                    ? FullscreenVideoTerminationReason.completed : FullscreenVideoTerminationReason.user
+            )
             videoPlanScope?.handoffBegan()
         }
         endSKANViewThroughImpression()

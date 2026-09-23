@@ -224,9 +224,7 @@ func prepareUpcomingFallbackVideos(
     allowV2Preparation: Bool = true
 ) async -> [Int: FullscreenVideoPreparationToken] {
     var prepared: [Int: FullscreenVideoPreparationToken] = [:]
-    let indices = ads.indices.prefix(1).filter { index in
-        allowV2Preparation && !ads[index].usesVideoPlanV2Contract && ads[index].mediaType == .video
-    }
+    let indices = upcomingFallbackVideoIndices(ads, allowV2Preparation: allowV2Preparation)
     for index in indices {
         if let token = await prepareFallbackVideo(ads[index]) { prepared[index] = token }
     }
@@ -258,8 +256,7 @@ func prepareFallbackVideo(_ ad: FallbackAd) async -> FullscreenVideoPreparationT
 
 @MainActor
 func preparingImmediateV2FallbackIfNeeded(_ result: FallbackFetchResult) -> FallbackFetchResult {
-    // Contract 2 fallback payloads are playable-only, so no fallback video can become eligible
-    // after the primary first frame.
+    // ES1 video follows a playable primary and is prepared during the initial fallback fetch.
     result
 }
 
@@ -904,7 +901,7 @@ final class FallbackAdPresenter {
             initialOriginatingScene: initialOriginatingScene ?? window?.windowScene,
             expectsVideoPlanNextStep: index + 1 < ads.count,
             adId: ad.adId,
-            nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            nativeClickBeaconV1Enabled: ad.usesVideoPlanV2Contract || ad.nativeClickBeaconV1Enabled,
             closeBehavior: ad.closeBehavior,
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,

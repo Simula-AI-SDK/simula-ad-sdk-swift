@@ -371,7 +371,6 @@ public struct AdOverlayView: View {
     @State private var videoFailureHandled = false
     @State private var videoStartRecorded = false
     @State private var videoCompleteRecorded = false
-    @State private var videoTerminalAdvanceRequested = false
     @State private var videoPlanBlockerOwner = VideoPlanBlockerOwner()
     @State private var videoPlanBlockerGeneration: UInt64 = 0
     #if os(iOS)
@@ -516,8 +515,16 @@ public struct AdOverlayView: View {
                                     behavior: ad.adBehavior,
                                     isVideoPlanV2: ad.usesVideoPlanV2
                                 ),
-                                effectiveClosePosition: closeBehavior.position,
-                                bottomProgressBarObstructsChrome: false,
+                                effectiveClosePosition: effectiveVideoClosePosition(
+                                    treatment: closeBehavior.treatment,
+                                    position: closeBehavior.position,
+                                    progressBarStyle: ad.usesVideoPlanV2 ? ad.adBehavior.progressBar.style : .single
+                                ),
+                                bottomProgressBarObstructsChrome: ad.usesVideoPlanV2 && videoBottomProgressBarObstructsChrome(
+                                    treatment: closeBehavior.treatment,
+                                    position: closeBehavior.position,
+                                    progressBarStyle: ad.adBehavior.progressBar.style
+                                ),
                                 storePromptSharesMuteCorner: videoStorePromptSharesMuteCorner(
                                     configuredClosePosition: closeBehavior.position
                                 ),
@@ -574,7 +581,25 @@ public struct AdOverlayView: View {
                         }
 
                         #if os(iOS)
-                        if videoChromeVisibility.showsServerControl {
+                        if videoChromeVisibility.showsServerControl, ad.usesVideoPlanV2 {
+                            CloseButtonView(
+                                treatment: closeBehavior.treatment,
+                                position: closeBehavior.position,
+                                progressBarColor: closeBehavior.progressBarColor,
+                                progressBarStyle: ad.adBehavior.progressBar.style,
+                                action: closeBehavior.action,
+                                isRewardCopy: telemetryAdFormat == "rewarded",
+                                enabled: canDismissFullscreen(
+                                    dismissUnlocked: dismissUnlocked,
+                                    clickHandoffPending: clickHandoffPending
+                                ),
+                                remaining: adCountdown,
+                                progress: Double(ringProgress),
+                                mediaProgress: videoMediaProgress,
+                                gateFraction: videoGateFraction,
+                                onClose: requestClose
+                            )
+                        } else if videoChromeVisibility.showsServerControl {
                             closeControl
                                 .padding(8)
                                 // The fallback info glyph uses an 18pt corner inset. Move a bottom-left
@@ -855,6 +880,7 @@ public struct AdOverlayView: View {
     }
 
     private func requestClose() {
+        guard !closing else { return }
         switch fallbackCloseRequestAction(
             isVideo: ad.mediaType == .video,
             pageFinished: pageFinished,
@@ -876,13 +902,21 @@ public struct AdOverlayView: View {
             else { onClose() }
         case .close:
             #if os(iOS)
-            if ad.usesVideoPlanV2, let player = videoPlayer,
+            if ad.usesVideoPlanV2, let player = videoPlayer, !videoCompleteRecorded,
                !claimVideoPlanTerminalIfNeeded(player: player, event: .userClose) { return }
             #endif
             firstFrameHandoff.invalidate()
             #if os(iOS)
             if ad.usesVideoPlanV2, let player = videoPlayer {
-                recordVideoClose(player: player, reason: FullscreenVideoTerminationReason.user)
+                applyVideoPlanTerminal(
+                    videoPlanTerminalAction(
+                        reason: videoCompleteRecorded
+                            ? FullscreenVideoTerminationReason.completed : FullscreenVideoTerminationReason.user,
+                        expectsNextStep: expectsVideoPlanNextStep,
+                        playbackStarted: true
+                    ),
+                    player: player
+                )
                 videoPlanScope?.handoffBegan()
             }
             #endif
@@ -929,7 +963,6 @@ public struct AdOverlayView: View {
             videoFailureHandled = false
             videoStartRecorded = false
             videoCompleteRecorded = false
-            videoTerminalAdvanceRequested = false
         }
         if !identityChanged && pendingPlayablePageFinish { return }
         guard identityChanged || loadCoordinator.isIdle
@@ -1152,24 +1185,7 @@ public struct AdOverlayView: View {
             ) else { return }
             updateVideoGate(player: player, played: player.playedSeconds, ended: true)
             recordVideoCompleteIfNeeded()
-            if ad.usesVideoPlanV2 {
-                guard !videoTerminalAdvanceRequested else { return }
-                videoTerminalAdvanceRequested = true
-                applyVideoPlanTerminal(
-                    videoPlanTerminalAction(
-                        reason: FullscreenVideoTerminationReason.completed,
-                        expectsNextStep: expectsVideoPlanNextStep,
-                        playbackStarted: true
-                    ),
-                    player: player
-                )
-            }
-            if shouldAutomaticallyAdvanceCompletedVideo(
-                usesVideoPlanV2: ad.usesVideoPlanV2,
-                status: status
-            ) {
-                onVideoCompleted?()
-            }
+            // Stay on the completed frame until the user taps the unlocked close control.
         case .failed(let reason):
             guard !videoFailureHandled else { return }
             guard let identity = videoSurfaceIdentity(for: player),
@@ -1319,6 +1335,19 @@ public struct AdOverlayView: View {
         return AdOverlayVideoSurfaceIdentity(
             creative: creativeIdentity,
             player: ObjectIdentifier(player)
+        )
+    }
+
+    private var videoMediaProgress: Double {
+        guard let player = videoPlayer, let duration = player.duration,
+              duration.isFinite, duration > 0 else { return Double(ringProgress) }
+        return min(1, max(0, player.mediaPositionSeconds / duration))
+    }
+
+    private var videoGateFraction: Double {
+        guard let duration = videoPlayer?.duration else { return 1 }
+        return progressBarGateFraction(
+            gateSeconds: TimeInterval(closeBehavior.delaySeconds), mediaDuration: duration
         )
     }
 

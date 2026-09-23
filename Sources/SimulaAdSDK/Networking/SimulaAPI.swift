@@ -1345,7 +1345,7 @@ public struct FallbackAd: Sendable {
     var mediaType: CreativeMediaType { .from(type) }
     var usesVideoPlanV2Contract: Bool { isVideoContract2(videoContract) }
     var usesVideoPlanV2: Bool {
-        usesVideoPlanV2Contract && creative?.isVideoPlanV2Clip == true
+        usesVideoPlanV2Contract && mediaType == .video && sourceIndex == 0
     }
     var hasIOSItemRoutingFields: Bool {
         [trackingUrl, iosStoreUrl].contains {
@@ -1353,8 +1353,8 @@ public struct FallbackAd: Sendable {
         }
     }
     var creativeContent: FullscreenCreativeContent? {
-        // Contract 2 has one stitched primary video. Fallbacks remain ordinary HTML end screens.
-        if usesVideoPlanV2Contract, mediaType == .video { return nil }
+        // ES1 may be a video after a playable primary; ES2 is always an HTML card.
+        if usesVideoPlanV2Contract, mediaType == .video, sourceIndex != 0 { return nil }
         if mediaType == .video {
             guard let url = validatedCreativeURL(url) else { return nil }
             return .video(url: url, posterURL: validatedCreativeURL(posterUrl))
@@ -1579,7 +1579,8 @@ struct FallbackAdItem: Decodable {
             appName: resolvedName,
             subtitle: resolvedSubtitle,
             videoPool: resolvedPool,
-            clipIndex: nestedIndex ?? flatIndex
+            clipIndex: nestedIndex ?? flatIndex,
+            segments: creative?.segments ?? []
         )
     }
 

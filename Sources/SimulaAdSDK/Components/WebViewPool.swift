@@ -473,7 +473,7 @@ func creativeUserActivationScriptSource(
         var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
         if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
         if (forwardCTA(anchor.href)) { event.preventDefault(); }
-      }, true);
+      }, false);
     })();
     """
 }

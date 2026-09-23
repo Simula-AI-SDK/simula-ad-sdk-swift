@@ -132,7 +132,7 @@ final class SKOverlayAttributionTests: XCTestCase {
         let primary = try decodeInterstitial(#"{"ad_inserted":true,"rendered_html":"PRIMARY","video_contract":2,"creative":{"type":"playable"}}"#)
         let fallbacks = try decodeFallbacks(#"{"video_contract":2,"ads":[{"type":"video","url":"https://cdn.example/video.mp4","clip_index":1}]}"#)
         XCTAssertTrue(isLegacySKOverlayEligible(usesVideoPlanV2: primary.primaryUsesVideoPlanV2))
-        XCTAssertTrue(fallbacks.isEmpty)
+        XCTAssertEqual(fallbacks.first?.usesVideoPlanV2, true)
         var claim = SKOverlayPresentationClaim()
         let legacy = try XCTUnwrap(claim.reserve())
 

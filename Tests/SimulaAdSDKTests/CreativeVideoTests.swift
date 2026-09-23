@@ -252,15 +252,20 @@ final class CreativeVideoTests: XCTestCase {
         ))
     }
 
-    func testContractTwoDropsFallbackVideoSlots() throws {
+    func testContractTwoAcceptsES1VideoWithoutLegacyClipMetadata() throws {
         let ads = try decodeFallbacks(#"""
         {"video_contract":2,"ads":[{
-          "ad_id":"es2",
-          "creative":{"type":"video","url":"https://cdn.example/es2.mp4","cta":"Get","app_icon_url":"https://cdn.example/icon.png","app_name":"Game","video_pool":"trailer","clip_index":2},
+          "ad_id":"es1",
+          "creative":{"type":"video","url":"https://cdn.example/es1.mp4","cta":"Get","app_icon_url":"https://cdn.example/icon.png","app_name":"Game","segments":[{"clip_index":0,"video_pool":"trailer","start_seconds":0,"end_seconds":10}]},
           "ad_behavior":{"video":{"style":"floating_pill"}}
         }]}
         """#)
-        XCTAssertTrue(ads.isEmpty)
+        XCTAssertEqual(ads.count, 1)
+        XCTAssertEqual(ads.first?.sourceIndex, 0)
+        XCTAssertEqual(ads.first?.usesVideoPlanV2, true)
+        XCTAssertEqual(ads.first?.creative?.segments.count, 1)
+        XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0])
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: true, status: .ended))
     }
 
     func testAllPlayableGoldenFlowRemainsPrimaryThenES1ThenES2() throws {
@@ -2498,7 +2503,7 @@ final class CreativeVideoTests: XCTestCase {
     }
 
     @MainActor
-    func testContractTwoDoesNotPrepareFallbackVideoPlayers() throws {
+    func testContractTwoPreparesES1VideoAndRejectsES2Video() throws {
         let ads = try decodeFallbacks(
             #"{"video_contract":2,"ads":[{"type":"video","url":"https://cdn.example/one.mp4","clip_index":1},{"type":"video","url":"https://cdn.example/two.mp4","clip_index":2}]}"#
         )
@@ -2519,8 +2524,8 @@ final class CreativeVideoTests: XCTestCase {
             return FullscreenVideoPreparationToken()
         }
 
-        XCTAssertEqual(attempts, 0)
-        XCTAssertTrue(prepared.isEmpty)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(prepared.keys.sorted(), [0])
     }
 
     @MainActor
