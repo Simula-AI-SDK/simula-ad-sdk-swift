@@ -1007,7 +1007,8 @@ private struct RewardedGameView: View {
             telemetryPauseReason: { videoPauseReason },
             onTelemetryEvent: usesVideoPlanV2
                 ? { event in recordVideoSurfaceTelemetry(event, player: player) }
-                : nil
+                : nil,
+            segments: creative?.segments ?? []
         )
             .allowsHitTesting(!clickHandoffPending)
             .onReceive(player.$status) { handleVideoStatus($0, player: player) }
@@ -1215,10 +1216,15 @@ private struct RewardedGameView: View {
         player: FullscreenVideoPlayer
     ) {
         let stage: String
+        var segmentEvent: VideoSegmentTelemetryEvent?
         var quartile: Int?
         var reason: String?
         var pausedMs: Double?
         switch event {
+        case .segment(let value):
+            stage = value.stage
+            segmentEvent = value
+            quartile = value.stage == FullscreenVideoTelemetryStage.duration ? 50 : nil
         case .quartile(let value):
             stage = FullscreenVideoTelemetryStage.duration
             quartile = value
@@ -1246,7 +1252,8 @@ private struct RewardedGameView: View {
             pausedMs: pausedMs,
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             on: stage == FullscreenVideoTelemetryStage.pause
-                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil
+                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil,
+            segmentEvent: segmentEvent
         )
     }
 

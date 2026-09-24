@@ -134,6 +134,25 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertEqual(results, [false])
         XCTAssertFalse(probe.snapshot.ranOnMain)
         coordinator.release(claim)
+        XCTAssertNil(coordinator.claim { _ in XCTFail("a stalled activation must not admit another wait") })
+        XCTAssertEqual(probe.snapshot.count, 1)
+        probe.gate.signal()
+        await waitUntil {
+            guard let next = coordinator.claim(completion: { _ in }) else { return false }
+            coordinator.release(next)
+            return true
+        }
+    }
+
+    @MainActor
+    func testAudioActivationFailureMutesWithoutFailingTheVideo() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        XCTAssertFalse(player.isMuted)
+        player.continueWithoutAudioSession()
+        XCTAssertTrue(player.isMuted)
+        if case .failed = player.status { XCTFail("Audio failure must not fail video playback") }
+        XCTAssertFalse(player.isStopped)
+        player.stop()
     }
 
     @MainActor

@@ -414,14 +414,22 @@ func creativeUserActivationScriptSource(
         } catch (_) { return false; }
       }
 
-      function claimGesture(message, identityFactory) {
+      function claimGesture(message, identityFactory, clickEvent) {
         if (!postNative || gestureSequence === 0) { return false; }
         if (claimedGesture === gestureSequence) { return true; }
         if (!hasActiveUserGesture()) { return false; }
         claimedGesture = gestureSequence;
         try {
-          var identity = typeof identityFactory === 'function' ? identityFactory() : null;
-          postNative(nativeStringify(withIdentity(message, identity)));
+          var identity = clickEvent && typeof window.simulaClickForEvent === 'function'
+            ? window.simulaClickForEvent(clickEvent, slotClickSource) : null;
+          function deliver() {
+            var resolvedIdentity = identity || (typeof identityFactory === 'function' ? identityFactory() : null);
+            try { postNative(nativeStringify(withIdentity(message, resolvedIdentity))); } catch (_) {}
+          }
+          // Reserve navigation in capture, but let the creative's handler supply its exact
+          // click source before native reports. A macrotask survives stopPropagation and
+          // browser microtask checkpoints between listeners. window.open stays synchronous.
+          if (clickEvent) nativeSetTimeout(deliver, 0); else deliver();
           return true;
         } catch (_) {
           if (claimedGesture === gestureSequence) { claimedGesture = -1; }
@@ -452,14 +460,14 @@ func creativeUserActivationScriptSource(
         } catch (_) { return null; }
       }
 
-      function forwardCTA(value) {
+      function forwardCTA(value, clickEvent) {
         var url = resolvedURL(value);
         if (!url || !isExternalCTA(url)) { return false; }
         return claimGesture({
           type: 'SIMULA_CTA_OPEN',
           url: url,
           activation_nonce: activationNonce
-        }, clickIdentity);
+        }, clickIdentity, clickEvent);
       }
 
     \(storeAPI)
@@ -473,7 +481,7 @@ func creativeUserActivationScriptSource(
         if (!event.isTrusted || !hasActiveUserGesture()) { return; }
         var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
         if (!anchor || String(anchor.target).toLowerCase() !== '_blank') { return; }
-        if (forwardCTA(anchor.href)) { event.preventDefault(); }
+        if (forwardCTA(anchor.href, event)) { event.preventDefault(); }
       }, true);
     })();
     """

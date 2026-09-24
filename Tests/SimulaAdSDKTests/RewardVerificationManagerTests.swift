@@ -6,6 +6,17 @@ import XCTest
 /// retain / in-flight routing / recovery), exercised with a fake verifier, an isolated
 /// `UserDefaults`, and a controllable clock — no network, no wall-clock timing.
 final class RewardVerificationManagerTests: XCTestCase {
+    func testOnlyExplicitVerificationRejectionIsPermanent() throws {
+        XCTAssertTrue(isPermanentVerificationError(RewardVerificationRejection.notVerified))
+        XCTAssertFalse(isPermanentVerificationError(SimulaAPIError.invalidResponse))
+        for body in ["{}", "{\"verified\":null}", "{\"verified\":\"false\"}"] {
+            let response = try JSONDecoder().decode(VerifyRewardResponse.self, from: Data(body.utf8))
+            XCTAssertFalse(response.verified)
+            XCTAssertFalse(response.explicitlyRejected)
+        }
+        let response = try JSONDecoder().decode(VerifyRewardResponse.self, from: Data("{\"verified\":false}".utf8))
+        XCTAssertTrue(response.explicitlyRejected)
+    }
 
     // Must mirror RewardVerificationManager.userDefaultsKey (private there).
     private let queueKey = "simula_pending_reward_verifications"
@@ -147,7 +158,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         await mgr.cancelPendingWorkForTests()
     }
 
-    func testHTTPResponseWithVerifiedFalseDoesNotDeliverSuccessOrDeleteTask() async {
+    func testHTTPResponseWithVerifiedFalsePermanentlyReconcilesTask() async {
         let verifier = FakeVerifier()
         verifier.setVerified(false, for: "A")
         let store = ScriptedRewardStore()
@@ -159,8 +170,7 @@ final class RewardVerificationManagerTests: XCTestCase {
         }
         await fulfillment(of: [exp], timeout: TestWait.timeout)
 
-        XCTAssertEqual(store.persisted.count, 1)
-        XCTAssertEqual(store.persisted.first?.retryCount, 1)
+        XCTAssertTrue(store.persisted.isEmpty)
         XCTAssertEqual(verifier.callCount("A"), 1)
         await mgr.cancelPendingWorkForTests()
     }

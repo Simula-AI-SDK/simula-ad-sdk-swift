@@ -120,7 +120,10 @@ func rewardVerificationBackoff(retryCount: Int) -> TimeInterval {
 
 /// True if [error] is a permanent client error — a 4xx other than 408 (Request Timeout)
 /// or 429 (Too Many Requests) — for which retrying won't help.
+enum RewardVerificationRejection: Error { case notVerified }
+
 func isPermanentVerificationError(_ error: Error) -> Bool {
+    if error is RewardVerificationRejection { return true }
     if case let SimulaAPIError.httpError(statusCode) = error,
        (400...499).contains(statusCode), statusCode != 408, statusCode != 429 {
         return true
@@ -445,6 +448,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 adUnitId: task.adUnitId ?? "",
                 completionReason: task.completionReason
             )
+            if response.explicitlyRejected { throw RewardVerificationRejection.notVerified }
             guard response.verified else { throw SimulaAPIError.invalidResponse }
             result = .success(response.token)
         } catch {

@@ -787,7 +787,8 @@ private struct CreativeInterstitialView: View {
             telemetryPauseReason: { videoPauseReason },
             onTelemetryEvent: usesVideoPlanV2
                 ? { event in recordVideoSurfaceTelemetry(event, player: player) }
-                : nil
+                : nil,
+            segments: response.creative?.segments ?? []
         )
             .allowsHitTesting(!clickHandoffPending)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1008,10 +1009,15 @@ private struct CreativeInterstitialView: View {
         player: FullscreenVideoPlayer
     ) {
         let stage: String
+        var segmentEvent: VideoSegmentTelemetryEvent?
         var quartile: Int?
         var reason: String?
         var pausedMs: Double?
         switch event {
+        case .segment(let value):
+            stage = value.stage
+            segmentEvent = value
+            quartile = value.stage == FullscreenVideoTelemetryStage.duration ? 50 : nil
         case .quartile(let value):
             stage = FullscreenVideoTelemetryStage.duration
             quartile = value
@@ -1039,7 +1045,8 @@ private struct CreativeInterstitialView: View {
             pausedMs: pausedMs,
             secondsSinceVideoStart: player.secondsSinceVideoStart,
             on: stage == FullscreenVideoTelemetryStage.pause
-                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil
+                || stage == FullscreenVideoTelemetryStage.resume ? "video" : nil,
+            segmentEvent: segmentEvent
         )
     }
 

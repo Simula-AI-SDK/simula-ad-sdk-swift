@@ -1738,10 +1738,12 @@ public struct VerifyRewardRequest: Encodable, Sendable {
 public struct VerifyRewardResponse: Decodable, Sendable {
     public let verified: Bool
     public let token: String?
+    let explicitlyRejected: Bool
 
     public init(verified: Bool, token: String?) {
         self.verified = verified
         self.token = token
+        self.explicitlyRejected = !verified
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1750,7 +1752,9 @@ public struct VerifyRewardResponse: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.verified = (try? c.decode(Bool.self, forKey: .verified)) ?? false
+        let verified = try? c.decode(Bool.self, forKey: .verified)
+        self.verified = verified ?? false
+        self.explicitlyRejected = verified == false
         self.token = try? c.decode(String.self, forKey: .token)
     }
 }

@@ -715,6 +715,7 @@ struct VideoPauseTelemetryState: Equatable, Sendable {
 }
 
 enum VideoSurfaceTelemetryEvent: Equatable, Sendable {
+    case segment(VideoSegmentTelemetryEvent)
     case quartile(Int)
     case pause(reason: String)
     case resume(reason: String, pausedMs: Double)
@@ -741,8 +742,11 @@ func recordFullscreenVideoLifecycle(
     msToNextStepReady: Double? = nil,
     secondsSinceVideoStart: Double? = nil,
     visibleS: Double? = nil,
-    on: String? = nil
+    on: String? = nil,
+    segmentEvent: VideoSegmentTelemetryEvent? = nil
 ) {
+    if isVideoPlanV2, creative?.segments.isEmpty == false, segmentEvent == nil,
+       stage == FullscreenVideoTelemetryStage.start || stage == FullscreenVideoTelemetryStage.complete { return }
     guard isVideoPlanV2 else {
         Telemetry.shared.recordLifecycle(
             stage: stage,
@@ -760,12 +764,12 @@ func recordFullscreenVideoLifecycle(
         hasAppName: creative?.videoChromeTitle != nil
     ).rawValue
     let overlay = effectiveVideoPlanSKOverlayConfig(isVideoPlanV2: true, config: behavior?.skoverlay)
-    let mutedSeconds = mutedWatchMs.map { Double($0) / 1_000 }
-    let unmutedSeconds = unmutedWatchMs.map { Double($0) / 1_000 }
-    let watchedSeconds = (mutedWatchMs != nil || unmutedWatchMs != nil)
-        ? Double((mutedWatchMs ?? 0) + (unmutedWatchMs ?? 0)) / 1_000
+    let mutedSeconds = segmentEvent?.mutedSeconds ?? mutedWatchMs.map { Double($0) / 1_000 }
+    let unmutedSeconds = segmentEvent?.unmutedSeconds ?? unmutedWatchMs.map { Double($0) / 1_000 }
+    let watchedSeconds = (mutedSeconds != nil || unmutedSeconds != nil)
+        ? (mutedSeconds ?? 0) + (unmutedSeconds ?? 0)
         : nil
-    let activeSegment = activeVideoSegment(in: creative?.segments ?? [], at: videoPositionS ?? 0)
+    let activeSegment = segmentEvent?.segment ?? activeVideoSegment(in: creative?.segments ?? [], at: videoPositionS ?? 0)
     Telemetry.shared.recordVideoLifecycle(
         stage: stage,
         adFormat: adFormat,
@@ -779,9 +783,9 @@ func recordFullscreenVideoLifecycle(
         style: style,
         skoverlayEnabled: overlay != nil,
         skoverlayDelaySeconds: overlay?.delaySeconds,
-        videoPositionS: videoPositionS,
+        videoPositionS: segmentEvent?.position ?? videoPositionS,
         pool: activeSegment?.videoPool ?? creative?.videoPool,
-        durationS: durationS,
+        durationS: segmentEvent?.duration ?? durationS,
         quartile: quartile,
         reason: reason,
         pausedMs: pausedMs,
@@ -1084,6 +1088,7 @@ final class VideoAudioSessionCoordinator {
     private var deadlines: [UUID: DispatchWorkItem] = [:]
     private var activated = false
     private var activating = false
+    private var activationTimedOut = false
     private let activate: @Sendable () -> Bool
     private let claimTimeout: TimeInterval
 
@@ -1097,11 +1102,11 @@ final class VideoAudioSessionCoordinator {
     }
 
     func claim(completion: @escaping (Bool) -> Void) -> UUID? {
-        guard claims.count < Self.maximumClaims else { return nil }
+        guard !activationTimedOut, claims.count < Self.maximumClaims else { return nil }
         let id = UUID()
         claims.insert(id)
         pending[id] = completion
-        let deadline = DispatchWorkItem { [weak self] in self?.finishClaim(id, success: false) }
+        let deadline = DispatchWorkItem { [weak self] in self?.activationDeadlineExpired(id) }
         deadlines[id] = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + claimTimeout, execute: deadline)
         if activated {
@@ -1126,8 +1131,17 @@ final class VideoAudioSessionCoordinator {
 
     private func activationFinished(_ success: Bool) {
         activating = false
+        activationTimedOut = false
         activated = success && !claims.isEmpty
         for id in Array(pending.keys) { finishClaim(id, success: success) }
+    }
+
+    private func activationDeadlineExpired(_ id: UUID) {
+        guard pending[id] != nil else { return }
+        // A timed-out system call is still running. Do not queue retries behind it or make
+        // every later video wait another deadline; callers can immediately play muted.
+        if activating { activationTimedOut = true }
+        for pendingID in Array(pending.keys) { finishClaim(pendingID, success: false) }
     }
 
     private func finishClaim(_ id: UUID, success: Bool) {
@@ -1404,6 +1418,7 @@ final class FullscreenVideoPlayer: ObservableObject {
                 isMuted: isMuted
             )
             playedSeconds = finalSnapshot.playedSeconds
+            emitSegmentTelemetry(position: finalMediaTime)
         }
         return reportPresentationWatchAccounting()
     }
@@ -1556,6 +1571,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             )
             mediaPositionSeconds = mediaPosition
             playedSeconds = snapshot.playedSeconds
+            emitSegmentTelemetry(position: mediaPosition)
         } else {
             audioWatchAccounting.update(playedSeconds: playedSeconds, isMuted: isMuted)
         }
@@ -1583,6 +1599,7 @@ final class FullscreenVideoPlayer: ObservableObject {
         visiblePlaybackClock.admitFirstFrame(mediaTime: mediaPosition)
         firstFrameUptime = ProcessInfo.processInfo.systemUptime
         playedSeconds = 0
+        emitSegmentTelemetry(position: mediaPosition)
         if usesProgressWatchdog {
             progressWatchdog.reset()
             scheduleProgressWatchdogTick()
@@ -1811,6 +1828,24 @@ final class FullscreenVideoPlayer: ObservableObject {
         }
     }
 
+    private var segmentTelemetry = VideoSegmentTelemetryState()
+    private var telemetrySegments: [VideoSegment] = []
+    let segmentTelemetryEvents = PassthroughSubject<VideoSegmentTelemetryEvent, Never>()
+
+    func configureSegmentTelemetry(_ segments: [VideoSegment]) {
+        telemetrySegments = Array(segments.prefix(3))
+        emitSegmentTelemetry(position: mediaPositionSeconds)
+    }
+
+    private func emitSegmentTelemetry(position: Double) {
+        guard hasAdmittedFirstVisualFrame, !telemetrySegments.isEmpty else { return }
+        for event in segmentTelemetry.update(
+            segments: telemetrySegments, position: position, played: playedSeconds, muted: isMuted
+        ) {
+            segmentTelemetryEvents.send(event)
+        }
+    }
+
     private var isFailed: Bool {
         if case .failed = status { return true }
         return false
@@ -1823,6 +1858,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             let updatedPlayedSeconds = visiblePlaybackClock.update(mediaTime: seconds)
             audioWatchAccounting.update(playedSeconds: updatedPlayedSeconds, isMuted: isMuted)
             playedSeconds = updatedPlayedSeconds
+            emitSegmentTelemetry(position: seconds)
             if shouldPublishVideoProgress(previous: mediaPositionSeconds, next: seconds) {
                 mediaPositionSeconds = seconds
             }
@@ -1904,6 +1940,7 @@ final class FullscreenVideoPlayer: ObservableObject {
             isMuted: isMuted
         )
         playedSeconds = finalSnapshot.playedSeconds
+        emitSegmentTelemetry(position: finalMediaTime)
         _ = reportPresentationWatchAccounting()
         wantsPlayback = false
         playbackTimeoutWorkItem?.cancel()
@@ -2071,7 +2108,7 @@ final class FullscreenVideoPlayer: ObservableObject {
                     audioSessionClaim = VideoAudioSessionCoordinator.shared.claim { [weak self] success in
                         self?.audioSessionActivationFinished(success)
                     }
-                    if audioSessionClaim == nil { fail(.playbackFailed) }
+                    if audioSessionClaim == nil { continueWithoutAudioSession() }
                 }
                 return
             }
@@ -2093,12 +2130,18 @@ final class FullscreenVideoPlayer: ObservableObject {
     private func audioSessionActivationFinished(_ success: Bool) {
         guard audioSessionClaim != nil, !stopped, !isFailed, status != .ended else { return }
         guard success else {
-            releaseAudioSessionClaim()
-            fail(.playbackFailed)
+            continueWithoutAudioSession()
             return
         }
         audioSessionReady = true
         reconcilePlayback()
+    }
+
+    func continueWithoutAudioSession() {
+        guard !stopped, !isFailed, status != .ended else { return }
+        releaseAudioSessionClaim()
+        Telemetry.shared.recordError(signature: "video:audio_activation_unavailable")
+        setMuted(true)
     }
 
     private func releaseAudioSessionClaim() {
@@ -2668,6 +2711,7 @@ struct FullscreenVideoSurface: View {
     var onMuteChanged: ((Bool) -> Void)? = nil
     var telemetryPauseReason: () -> String = { FullscreenVideoTerminationReason.playback }
     var onTelemetryEvent: ((VideoSurfaceTelemetryEvent) -> Void)? = nil
+    var segments: [VideoSegment] = []
     @State private var firstFrameHandoff = VideoSurfaceFirstFrameHandoffState()
     @State private var quartileState = VideoQuartileState()
     @State private var pauseTelemetryState = VideoPauseTelemetryState()
@@ -2783,6 +2827,7 @@ struct FullscreenVideoSurface: View {
         }
         .background(Color.black)
         .onAppear {
+            videoPlayer.configureSegmentTelemetry(segments)
             firstFrameHandoff.setPresentationActive(presentationActive)
             firstFrameHandoff.surfaceDidAppear()
             attemptParentHandoff()
@@ -2797,9 +2842,13 @@ struct FullscreenVideoSurface: View {
         }
         .onReceive(videoPlayer.$mediaPositionSeconds) { position in
             guard onTelemetryEvent != nil else { return }
+            guard segments.isEmpty else { return }
             for quartile in quartileState.crossed(position: position, duration: videoPlayer.duration) {
                 onTelemetryEvent?(.quartile(quartile))
             }
+        }
+        .onReceive(videoPlayer.segmentTelemetryEvents) { event in
+            onTelemetryEvent?(.segment(event))
         }
         .onReceive(videoPlayer.$status) { status in
             guard onTelemetryEvent != nil, videoPlayer.hasAdmittedFirstVisualFrame else { return }

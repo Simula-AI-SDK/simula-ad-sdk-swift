@@ -52,7 +52,7 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW'"))
-        XCTAssertTrue(source.contains("postNative(nativeStringify(withIdentity(message, identity)))"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify(withIdentity(message, resolvedIdentity)))"))
         XCTAssertTrue(source.contains("postNative(nativeStringify({"))
         XCTAssertTrue(source.contains("function withIdentity(message, identity)"))
         XCTAssertTrue(source.contains("window.simulaClickInteraction(slotClickSource, true)"))
@@ -86,7 +86,7 @@ final class CreativeUserActivationTests: XCTestCase {
         }
         XCTAssertTrue(source.contains("if (!url || !isExternalCTA(url)) { return false; }"))
         XCTAssertTrue(source.contains("return originalOpen.apply(window, arguments);"))
-        XCTAssertTrue(source.contains("if (forwardCTA(anchor.href)) { event.preventDefault(); }"))
+        XCTAssertTrue(source.contains("if (forwardCTA(anchor.href, event)) { event.preventDefault(); }"))
         XCTAssertFalse(source.contains("window.__simulaNativeSlotSource"), "srcdoc frames use the installed semantic source")
     }
 
@@ -104,12 +104,12 @@ final class CreativeUserActivationTests: XCTestCase {
         }
         context.setObject(resolve, forKeyedSubscript: "resolveURL" as NSString)
         context.evaluateScript("""
-        var messages = [], listeners = [], nativeOpens = 0;
+        var messages = [], listeners = [], timers = [], nativeOpens = 0;
         var document = {baseURI: 'https://creative.example/game'};
         var navigator = {userActivation: {isActive: false}};
         var window = {
           location: {origin: 'https://creative.example'},
-          open: function() { nativeOpens++; }, setTimeout: function() {},
+          open: function() { nativeOpens++; }, setTimeout: function(callback) { timers.push(callback); },
           webkit: {messageHandlers: {simulaSDK: {postMessage: function(value) { messages.push(JSON.parse(value)); }}}},
           addEventListener: function(type, callback, capture) { listeners.push({type:type, callback:callback, capture:capture}); }
         };
@@ -118,6 +118,7 @@ final class CreativeUserActivationTests: XCTestCase {
           if (!parsed) { throw Error('invalid URL'); }
           this.href = parsed.href; this.protocol = parsed.protocol; this.origin = parsed.origin;
         }
+        function flushTimers() { while (timers.length) timers.shift()(); }
         function click(url, stoppedAtTarget, trusted) {
           var anchor = {href:url, target:'_blank'};
           var event = {type:'click', isTrusted:trusted, timeStamp:1,
@@ -137,12 +138,26 @@ final class CreativeUserActivationTests: XCTestCase {
         for scheme in ["itms-apps", "itms-appss", "https"] {
             let context = try activationContext()
             context.evaluateScript("click('\(scheme)://apps.apple.com/app/id375380948', true, true)")
-            context.evaluateScript("window.open('\(scheme)://apps.apple.com/app/id375380948')")
+            context.evaluateScript("window.open('\(scheme)://apps.apple.com/app/id375380948'); flushTimers()")
             XCTAssertNil(context.exception)
             XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 1)
             XCTAssertEqual(context.evaluateScript("messages[0].type")?.toString(), "SIMULA_CTA_OPEN")
             XCTAssertEqual(context.evaluateScript("nativeOpens")?.toInt32(), 0)
         }
+    }
+
+    func testCapturedAnchorReadsSharedIdentityAfterCreativeHandlerRuns() throws {
+        let context = try activationContext()
+        context.evaluateScript("""
+        var identity = {interaction_id:'b9585d88-0868-4a79-b29d-0a52639903a7', click_source:'primary_unknown'};
+        window.simulaClickForEvent = function() { return identity; };
+        click('https://store.example/app', true, true);
+        identity.click_source = 'end_screen_ad_1_cta';
+        flushTimers();
+        """)
+        XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("messages[0].click_source")?.toString(), "end_screen_ad_1_cta")
+        XCTAssertEqual(context.evaluateScript("messages[0].interaction_id")?.toString(), "b9585d88-0868-4a79-b29d-0a52639903a7")
     }
 
     func testUntrustedAndInternalClicksDoNotClaimNativeCTA() throws {

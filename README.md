@@ -68,12 +68,17 @@ Interstitial and rewarded load requests advertise `contracts.video = 2`. A respo
 with the exact numeric root field `video_contract: 2`; legacy `video_v1` and `video_plan_v2` markers
 are not serialized or activated. Contract 2 uses one stitched primary video URL. Optional
 `creative.segments` identify telemetry ranges only and never cause player restarts or fallback-video
-handoffs. Ordinary HTML end screens continue in their server order.
+handoffs. Each segment emits start, 50%, and completion events with clip-local position, duration,
+and muted/unmuted watch time. Ordinary HTML end screens continue in their server order.
 
 Video assets are fully downloaded before the loaded callback. The SDK uses an opaque, backup-excluded
 cache under `Library/Caches`, with 50 MiB per-asset and 100 MiB total limits, a 30-second transfer
 deadline, at most two concurrent transfers, single-flight URL downloads, and active-lease-safe
 eviction. AVPlayer never receives a remote URL and the SDK does not fall back to streaming.
+
+All videos start unmuted, including legacy plans. Activation failure or a bounded activation timeout
+falls back to muted playback. A timed-out activation blocks further activation attempts until that
+system call returns, so later videos can play muted immediately without queuing blocked work.
 
 Audio-session activation is deliberately asymmetric for host stability. The SDK may best-effort
 activate the process-global `AVAudioSession` when unmuted playback needs it, but it never calls
@@ -85,7 +90,9 @@ For rewarded contract-2 units, `ad_behavior.reward.earn_at = "unit_end"` establi
 authority only at the final gate: the primary gate when no fallback is authoritative, or the final
 renderable fallback gate/end when fallback screens exist. Host-object teardown does not promote an
 earlier gate. The publisher callback and one verification are deferred until the whole unit closes,
-using `completion_reason = "unit_end"`. A response with `verified: false` is a verification failure.
+using `completion_reason = "unit_end"`. If an admitted primary video fails before its gate, a rendered
+end screen can still earn at its final gate; unavailable screens do not manufacture gate evidence.
+An explicit `verified: false` permanently reconciles verification; malformed responses remain retryable.
 
 An optional validated top-level `impression_url` is requested once at the existing two-second
 impression commit. This measurement request is a plain bounded unauthenticated GET with no SDK,
