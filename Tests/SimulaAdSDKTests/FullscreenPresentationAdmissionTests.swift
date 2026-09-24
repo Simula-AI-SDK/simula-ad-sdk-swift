@@ -2583,6 +2583,23 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
+    func testDiscardingPreparedOwnershipReleasesPoolTokenAndAssetLease() async throws {
+        let released = expectation(description: "last cache lease released")
+        let url = URL(fileURLWithPath: "/dev/null")
+        let pool = FullscreenVideoPreparationPool.shared
+        var lease: VideoAssetLease? = VideoAssetLease(localURL: url) { released.fulfill() }
+        let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil, assetLease: lease))
+        var ownership: FullscreenVideoPreparationOwnership? = FullscreenVideoPreparationOwnership(token: token)
+        weak var weakOwnership = ownership
+        XCTAssertNotNil(pool.localURL(for: token))
+        ownership = nil
+        lease = nil
+        XCTAssertNil(weakOwnership)
+        await fulfillment(of: [released], timeout: TestWait.timeout)
+        XCTAssertNil(pool.localURL(for: token))
+    }
+
+    @MainActor
     func testAdOwnerDeinitCannotReleaseTransferredActivePresentation() throws {
         final class AdOwner {
             var preparation: FullscreenVideoPreparationOwnership?

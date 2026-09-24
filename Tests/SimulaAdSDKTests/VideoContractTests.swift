@@ -313,6 +313,29 @@ final class VideoContractTests: XCTestCase {
     }
 
     @MainActor
+    func testAuthoritativeRewardIsDeliveredOnceEvenWithoutVerificationInputs() throws {
+        final class Delegate: SimulaRewardedAdDelegate {
+            var events: [String] = []
+            func rewardedDidEarnReward(_ ad: SimulaRewardedAd) { events.append("earned") }
+            func rewardedRewardVerificationDidFail(_ ad: SimulaRewardedAd, error: Error) {
+                events.append("verification_failed")
+            }
+        }
+        for elapsed in [5.0, Double.nan] {
+            let ad = SimulaRewardedAd(adUnitId: "unit")
+            let delegate = Delegate()
+            ad.delegate = delegate
+            let response = try decodeRewarded(#"{"impression_id":"serve","video_contract":2}"#)
+            let claim = UnitEndRewardClaim()
+            claim.primaryGateDidOpen()
+            claim.fallbackDidResolve(renderableScreenCount: 0)
+            ad.handleUnitEndClose(response: response, claim: claim, elapsedPlayTime: elapsed)
+            ad.handleUnitEndClose(response: response, claim: claim, elapsedPlayTime: elapsed)
+            XCTAssertEqual(delegate.events, ["earned", "verification_failed"])
+        }
+    }
+
+    @MainActor
     func testUnitEndDuplicateCloseDoesNotDuplicateDelegateOrQueue() {
         var earned = 0
         var queued = 0

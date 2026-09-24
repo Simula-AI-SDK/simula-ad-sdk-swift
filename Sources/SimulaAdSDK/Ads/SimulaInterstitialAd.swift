@@ -259,6 +259,8 @@ public final class SimulaInterstitialAd {
 
     deinit {
         #if os(iOS)
+        // Primary preparation ownership and cache leases release in their own deinitializers.
+        // Fallbacks retain raw pool tokens, which still require explicit cleanup.
         let fallbackResult = prefetchedFallbacks
         DispatchQueue.main.async {
             releasePreparedFallbackVideos(in: fallbackResult)

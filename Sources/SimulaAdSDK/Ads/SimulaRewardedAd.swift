@@ -182,6 +182,8 @@ public final class SimulaRewardedAd {
 
     deinit {
         #if os(iOS)
+        // Primary preparation ownership and cache leases release in their own deinitializers.
+        // Fallbacks retain raw pool tokens, which still require explicit cleanup.
         let fallbackResult = prefetchedFallbacks
         DispatchQueue.main.async {
             releasePreparedFallbackVideos(in: fallbackResult)
@@ -949,15 +951,18 @@ public final class SimulaRewardedAd {
         )
     }
 
-    private func handleUnitEndClose(
+    func handleUnitEndClose(
         response: RewardedInitResponse,
         claim: UnitEndRewardClaim,
         elapsedPlayTime: Double
     ) {
-        guard let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
+        // Snapshot before the delegate can synchronously start another load. Verification data
+        // must not suppress delivery of an already-authoritative reward.
+        let verificationElapsedPlayTime = rewardVerificationElapsedPlayTime(
             earned: true,
             actualElapsedPlayTime: elapsedPlayTime
-        ), let sessionId, !sessionId.isEmpty else { return }
+        )
+        let verificationSessionId = sessionId
 
         claim.consumeAtUnitClose(
             onEarn: {
@@ -968,6 +973,21 @@ public final class SimulaRewardedAd {
                 delegate?.rewardedDidEarnReward(self)
             },
             enqueueVerification: { [weak self] in
+                guard let verificationElapsedPlayTime,
+                      let sessionId = verificationSessionId, !sessionId.isEmpty else {
+                    let error: Error = verificationElapsedPlayTime == nil
+                        ? SimulaAPIError.invalidResponse : SimulaAdError.noSession
+                    Telemetry.shared.recordLifecycle(
+                        stage: "reward_verification_failed", adFormat: Self.adFormat,
+                        adUnitId: self?.adUnitId, adId: response.impressionId,
+                        errorCode: verificationElapsedPlayTime == nil ? "invalid_elapsed_time" : "no_session"
+                    )
+                    self?.dispatchVerificationResult(.failure(error))
+                    #if os(iOS)
+                    if self?.unitEndRewardClaim === claim { self?.unitEndRewardClaim = nil }
+                    #endif
+                    return
+                }
                 Self.enqueueVerification(
                     impressionId: response.impressionId,
                     sessionId: sessionId,
