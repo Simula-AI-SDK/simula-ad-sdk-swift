@@ -772,28 +772,24 @@ public struct AdOverlayView: View {
         .modifier(AdCountdownLifecycle(
             onBackground: {
                 appForegrounded = false
-                storeExitTracker?.onAppAway()
                 onPresentationBlockedChanged?(true)
                 updateVideoPlanBlocker(true)
                 reconcileCountdown()
             },
             onForeground: {
                 appForegrounded = true
-                storeExitTracker?.onAppForeground()
                 onPresentationBlockedChanged?(storeSheetPresented)
                 updateVideoPlanBlocker(storeSheetPresented)
                 reconcileCountdown()
             },
             onSheetPresent: {
                 storeSheetPresented = true
-                storeExitTracker?.onSheetPresented()
                 onPresentationBlockedChanged?(true)
                 updateVideoPlanBlocker(true)
                 reconcileCountdown()
             },
             onSheetDismiss: {
                 storeSheetPresented = false
-                storeExitTracker?.onSheetDismissed()
                 onPresentationBlockedChanged?(!appForegrounded)
                 updateVideoPlanBlocker(!appForegrounded)
                 reconcileCountdown()
@@ -1793,11 +1789,11 @@ private struct AdCountdownLifecycle: ViewModifier {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in onBackground() }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in onForeground() }
             .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
-                guard (notification.object as? StoreProductOwnershipToken) === sheetScope else { return }
+                guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: sheetScope) == true else { return }
                 onSheetPresent()
             }
             .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
-                guard (notification.object as? StoreProductOwnershipToken) === sheetScope else { return }
+                guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: sheetScope) == true else { return }
                 onSheetDismiss()
             }
         #else

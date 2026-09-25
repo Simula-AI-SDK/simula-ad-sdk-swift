@@ -320,8 +320,6 @@ final class StoreProductPresentationTests: XCTestCase {
             SKStoreProductViewController()
         }
         CreativeCTARouter.setViewControllerPresenterForTesting { _ in true }
-        let lifecycle = AttributionRouteLifecycle()
-        lifecycle.activate()
         var events: [StoreDwellLifecycleEvent] = []
         var now = 1_000.0
         let tracker = StoreExitTracker(
@@ -330,28 +328,10 @@ final class StoreProductPresentationTests: XCTestCase {
             now: { now },
             recorder: { events.append($0) }
         )
-        let willPresent = NotificationCenter.default.addObserver(
-            forName: .simulaAdExternalSheetWillPresent,
-            object: nil,
-            queue: .main
-        ) { notification in
-            guard (notification.object as? StoreProductOwnershipToken)
-                    === lifecycle.storeProductOwnership else { return }
-            tracker.onSheetPresented()
-        }
-        let didDismiss = NotificationCenter.default.addObserver(
-            forName: .simulaAdExternalSheetDidDismiss,
-            object: nil,
-            queue: .main
-        ) { notification in
-            guard (notification.object as? StoreProductOwnershipToken)
-                    === lifecycle.storeProductOwnership else { return }
-            now = 1_500
-            tracker.onSheetDismissed()
-        }
+        let lifecycle = AttributionRouteLifecycle(storeDwellPresentationID: tracker.presentationID)
+        lifecycle.activate()
         defer {
-            NotificationCenter.default.removeObserver(willPresent)
-            NotificationCenter.default.removeObserver(didDismiss)
+            tracker.onAdClosed()
             lifecycle.deactivate()
             CreativeCTARouter.resetExternalPresentationStateForTesting()
         }
@@ -378,12 +358,131 @@ final class StoreProductPresentationTests: XCTestCase {
         XCTAssertEqual(events.map(\.stage), ["store_opened"])
         XCTAssertEqual(events.first?.trigger, "auto_redirect")
 
+        now = 1_500
         CreativeCTARouter.dismissStoreProduct(
             ownershipToken: lifecycle.storeProductOwnership
         )
         await Task.yield()
         XCTAssertEqual(events.map(\.stage), ["store_opened", "store_returned"])
         XCTAssertEqual(events.last?.endEvent, .sheetDismissed)
+    }
+
+    @MainActor
+    func testCommittedSheetAfterPrimaryTeardownRemainsOwnedUntilFallbackReturn() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        CreativeCTARouter.setStoreProductControllerProviderForTesting { SKStoreProductViewController() }
+        CreativeCTARouter.setViewControllerPresenterForTesting { _ in true }
+        var now = 1_000.0
+        var events: [StoreDwellLifecycleEvent] = []
+        let tracker = StoreExitTracker(adId: "ad", adFormat: "interstitial",
+            now: { now }, recorder: { events.append($0) })
+        let primary = AttributionRouteLifecycle(storeDwellPresentationID: tracker.presentationID)
+        let fallback = AttributionRouteLifecycle(storeDwellPresentationID: tracker.presentationID)
+        primary.activate()
+        let execution = makeCreativeAttributionRouteExecution(
+            id: UUID(), source: .primaryCTA, isActive: { primary.isActive },
+            canCompleteAfterPresentationTeardown: { true }, onUIHandoffReleased: {},
+            onTerminalOutcome: { outcome in
+                if let route = outcome.storeDwellRoute { tracker.recordStoreOpen("cta", route: route) }
+            }, onFinished: { _ in })
+        startAsynchronousAttributionRoute(execution: execution, start: {})
+        primary.deactivate()
+        fallback.activate()
+        defer {
+            tracker.onAdClosed()
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+        now = 1_100
+        execution.complete(storeDwellRoute: .storeProductSheet) {
+            CreativeCTARouter.presentStoreProduct(appID: "375380948", ownershipToken: primary.storeProductOwnership)
+        }
+        XCTAssertEqual(events.map(\.stage), ["store_opened"])
+        // Fallback timing must remain blocked even though sheet routing ownership is distinct.
+        XCTAssertTrue(CreativeCTARouter.isExternalPresentationActive(ownershipToken: fallback.storeProductOwnership))
+        XCTAssertFalse(CreativeCTARouter.isExternalPresentationActive(ownershipToken: StoreProductOwnershipToken()))
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: fallback.storeProductOwnership)
+        await Task.yield()
+        XCTAssertEqual(events.count, 1, "A sibling surface cannot dismiss a sheet it did not open")
+        now = 2_100
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: primary.storeProductOwnership)
+        await Task.yield()
+        XCTAssertEqual(events.last?.endEvent, .sheetDismissed)
+        XCTAssertEqual(events.last?.durationMs, 1_000)
+        XCTAssertFalse(CreativeCTARouter.isExternalPresentationActive(ownershipToken: fallback.storeProductOwnership))
+
+        now = 2_200
+        let second = AttributionRouteExecution(isActive: { fallback.isActive }) { outcome in
+            if let route = outcome.storeDwellRoute { tracker.recordStoreOpen("fallback_cta", route: route) }
+        }
+        openFallbackAutomaticRoute(trackingUrl: "itms-apps://apps.apple.com/app/id375380948",
+            destination: .appstore, storeOpen: .skstoreproduct, storeUrl: nil, attribution: nil,
+            lifecycle: fallback, execution: second)
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: fallback.storeProductOwnership)
+        await Task.yield()
+        XCTAssertEqual(events.map(\.stage), ["store_opened", "store_returned", "store_opened", "store_returned"])
+        XCTAssertEqual(events.map(\.opens), [1, 1, 2, 2])
+    }
+
+    @MainActor
+    func testPresentationObservationSurvivesSurfaceGapsAndIgnoresForeignSheets() {
+        let center = NotificationCenter()
+        var events: [StoreDwellLifecycleEvent] = []
+        var now = 1_000.0
+        let tracker = StoreExitTracker(adId: "ad", adFormat: "rewarded", now: { now },
+            recorder: { events.append($0) }, notificationCenter: center)
+        let owner = StoreProductOwnershipToken(storeDwellPresentationID: tracker.presentationID)
+        let foreign = StoreProductOwnershipToken()
+        center.post(name: .simulaAdExternalSheetWillPresent, object: owner)
+        tracker.recordStoreOpen("cta", route: .storeProductSheet)
+        center.post(name: .simulaAdExternalSheetDidDismiss, object: foreign)
+        center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        now = 2_000
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(events.count, 1)
+        center.post(name: .simulaAdExternalSheetDidDismiss, object: owner)
+        XCTAssertEqual(events.last?.durationMs, 1_000)
+        tracker.recordStoreOpen("fallback_cta", route: .externalAppStore)
+        center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        now = 3_000
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(events.last?.endEvent, .appForeground)
+        tracker.onAdClosed()
+        center.post(name: .simulaAdExternalSheetWillPresent, object: owner)
+        tracker.recordStoreOpen("cta", route: .storeProductSheet)
+        center.post(name: .simulaAdExternalSheetDidDismiss, object: owner)
+        XCTAssertEqual(events.count, 4)
+    }
+
+    @MainActor
+    func testBackgroundLifecyclePostingDoesNotWaitForMainThread() async {
+        let center = NotificationCenter()
+        let posted = expectation(description: "Background poster completes")
+        let opened = expectation(description: "Main actor confirms the visit")
+        var events: [StoreDwellLifecycleEvent] = []
+        let tracker = StoreExitTracker(adId: "ad", adFormat: "interstitial", recorder: {
+            events.append($0)
+            if $0.stage == "store_opened" { opened.fulfill() }
+        }, notificationCenter: center)
+        defer { tracker.onAdClosed() }
+        tracker.recordStoreOpen("cta", route: .externalAppStore)
+        DispatchQueue.global(qos: .utility).async {
+            center.post(name: UIApplication.willResignActiveNotification, object: nil)
+            posted.fulfill()
+        }
+        await fulfillment(of: [posted, opened], timeout: 2)
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(events.map(\.stage), ["store_opened", "store_returned"])
+    }
+
+    @MainActor
+    func testLifecycleObserversDoNotRetainTrackerWithoutExplicitClose() {
+        let center = NotificationCenter()
+        var tracker: StoreExitTracker? = StoreExitTracker(adId: "ad", adFormat: "interstitial", notificationCenter: center)
+        weak var weakTracker = tracker
+        tracker = nil
+        XCTAssertNil(weakTracker)
+        center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
     @MainActor

@@ -159,6 +159,33 @@ final class StoreExitTrackerTests: XCTestCase {
         XCTAssertEqual(harness.launchTimeouts, 0)
     }
 
+    func testClosingProvisionalLaunchCancelsWithoutReportingLaunchFailure() {
+        let harness = Harness()
+        let tracker = harness.makeTracker()
+        tracker.recordStoreOpen("cta", route: .externalAppStore)
+        tracker.onAdClosed()
+        harness.scheduled.forEach { $0() }
+        XCTAssertTrue(harness.events.isEmpty)
+        XCTAssertEqual(harness.launchTimeouts, 0)
+    }
+
+    func testStaleSheetDismissalCannotEndAnotherSheetsVisit() {
+        let harness = Harness()
+        let tracker = harness.makeTracker()
+        let first = StoreProductOwnershipToken()
+        let second = StoreProductOwnershipToken()
+        tracker.onSheetPresented(owner: first)
+        tracker.recordStoreOpen("cta", route: .storeProductSheet)
+        tracker.onSheetDismissed(owner: first)
+        tracker.onSheetPresented(owner: second)
+        tracker.recordStoreOpen("fallback_cta", route: .storeProductSheet)
+        tracker.onSheetDismissed(owner: first)
+        XCTAssertEqual(harness.events.map(\.stage), ["store_opened", "store_returned", "store_opened"])
+        tracker.onSheetDismissed(owner: second)
+        XCTAssertEqual(harness.events.last?.endEvent, .sheetDismissed)
+        XCTAssertEqual(harness.events.last?.opens, 2)
+    }
+
     func testOpenOrdinalSaturatesAtBackendLimit() {
         let harness = Harness()
         let tracker = harness.makeTracker()

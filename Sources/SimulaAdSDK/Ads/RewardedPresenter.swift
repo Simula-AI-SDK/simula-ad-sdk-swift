@@ -364,7 +364,7 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
-    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
+    @State private var attributionRouteLifecycle: AttributionRouteLifecycle
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     @State private var htmlReadinessTask: Task<Void, Never>?
@@ -417,6 +417,9 @@ private struct RewardedGameView: View {
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.storeExit = storeExit
+        _attributionRouteLifecycle = State(initialValue: AttributionRouteLifecycle(
+            storeDwellPresentationID: storeExit?.presentationID
+        ))
         self.close = close
         self.storePrompt = storePrompt
         self.trackingUrl = trackingUrl
@@ -622,14 +625,12 @@ private struct RewardedGameView: View {
             appForegrounded = false
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAppAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
-            storeExit?.onAppForeground()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
             presentRequestedSKOverlayIfNeeded()
@@ -640,19 +641,17 @@ private struct RewardedGameView: View {
             presentRequestedSKOverlayIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
-            guard (notification.object as? StoreProductOwnershipToken) === attributionRouteLifecycle.storeProductOwnership else { return }
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = true
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onSheetPresented()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
-            guard (notification.object as? StoreProductOwnershipToken) === attributionRouteLifecycle.storeProductOwnership else { return }
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = false
             updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
-            storeExit?.onSheetDismissed()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
             completeDeferredTerminalIfPossible()

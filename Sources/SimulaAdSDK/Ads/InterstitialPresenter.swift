@@ -340,7 +340,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptTask: Task<Void, Never>?
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
-    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
+    @State private var attributionRouteLifecycle: AttributionRouteLifecycle
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -375,6 +375,9 @@ private struct CreativeInterstitialView: View {
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
         self.storeExit = storeExit
+        _attributionRouteLifecycle = State(initialValue: AttributionRouteLifecycle(
+            storeDwellPresentationID: storeExit?.presentationID
+        ))
         self.originatingScene = originatingScene
         self.bridge = bridge
         self.onVideoStarted = onVideoStarted
@@ -556,14 +559,12 @@ private struct CreativeInterstitialView: View {
             appForegrounded = false
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAppAway()
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
-            storeExit?.onAppForeground()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
             presentRequestedSKOverlayIfNeeded()
@@ -580,20 +581,18 @@ private struct CreativeInterstitialView: View {
             startSKANViewThroughImpression()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
-            guard (notification.object as? StoreProductOwnershipToken) === attributionRouteLifecycle.storeProductOwnership else { return }
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             endSKANViewThroughImpressionIfStarted()
             storeSheetPresented = true
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onSheetPresented()
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
-            guard (notification.object as? StoreProductOwnershipToken) === attributionRouteLifecycle.storeProductOwnership else { return }
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = false
             updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
-            storeExit?.onSheetDismissed()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
             startSKANViewThroughImpression()

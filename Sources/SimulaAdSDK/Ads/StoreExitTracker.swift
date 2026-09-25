@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 enum StoreDwellRoute: Equatable, Sendable {
     case storeProductSheet
@@ -69,6 +72,7 @@ private enum StoreDwellContinuousClock {
 /// provisional until an app-away signal arrives within the bounded settle window.
 @MainActor
 final class StoreExitTracker {
+    let presentationID = UUID()
     static let externalLaunchSettleSeconds: TimeInterval = 2
     private static let maxOpens = 1_000
 
@@ -92,6 +96,9 @@ final class StoreExitTracker {
     private var launchGeneration = 0
     private var openCount = 0
     private var closed = false
+    private var sheetOwner: StoreProductOwnershipToken?
+    private let notificationCenter: NotificationCenter
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     init(
         adId: String?,
@@ -100,8 +107,10 @@ final class StoreExitTracker {
         now: @escaping Clock = StoreDwellContinuousClock.nowMilliseconds,
         recorder: Recorder? = nil,
         recordLaunchWithoutAway: ErrorRecorder? = nil,
-        schedule: Scheduler? = nil
+        schedule: Scheduler? = nil,
+        notificationCenter: NotificationCenter = .default
     ) {
+        self.notificationCenter = notificationCenter
         self.now = now
         self.activeSinceMs = now()
         self.recorder = recorder ?? { event in
@@ -110,7 +119,7 @@ final class StoreExitTracker {
                 adFormat: adFormat,
                 adUnitId: adUnitId,
                 adId: adId,
-                serveId: adFormat == "interstitial" ? adId : nil,
+                serveId: (adFormat == "interstitial" || adFormat == "rewarded") ? adId : nil,
                 durationMs: event.durationMs,
                 errorCode: nil,
                 trigger: event.trigger,
@@ -129,7 +138,52 @@ final class StoreExitTracker {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             return StoreDwellScheduledAction { item.cancel() }
         }
+        #if os(iOS)
+        observeLifecycle()
+        #endif
     }
+
+    deinit {
+        for observer in lifecycleObservers { notificationCenter.removeObserver(observer) }
+        launchTimer?.cancel()
+    }
+
+    #if os(iOS)
+    private func observeLifecycle() {
+        observe(UIApplication.willResignActiveNotification) { tracker, _ in tracker.onAppAway() }
+        observe(UIApplication.didBecomeActiveNotification) { tracker, _ in tracker.onAppForeground() }
+        observe(.simulaAdExternalSheetWillPresent) { tracker, owner in
+            guard let owner, owner.storeDwellPresentationID == tracker.presentationID else { return }
+            tracker.onSheetPresented(owner: owner)
+        }
+        observe(.simulaAdExternalSheetDidDismiss) { tracker, owner in
+            guard let owner, owner.storeDwellPresentationID == tracker.presentationID else { return }
+            tracker.onSheetDismissed(owner: owner)
+        }
+    }
+
+    /// Four observers per presentation, never per screen/visit. No synchronous hop from a posting
+    /// background thread, no polling, and no strong capture of the presentation or host controller.
+    private func observe(
+        _ name: Notification.Name,
+        action: @escaping @MainActor (StoreExitTracker, StoreProductOwnershipToken?) -> Void
+    ) {
+        lifecycleObservers.append(notificationCenter.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
+            let owner = notification.object as? StoreProductOwnershipToken
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    guard let self, !self.closed else { return }
+                    action(self, owner)
+                }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.closed else { return }
+                    action(self, owner)
+                }
+            }
+        })
+    }
+    #endif
 
     func recordStoreOpen(_ trigger: String, route: StoreDwellRoute) {
         guard !closed, pending == nil else { return }
@@ -172,15 +226,17 @@ final class StoreExitTracker {
         resolve(visit, endEvent: .appForeground, at: timestamp)
     }
 
-    func onSheetPresented() {
-        guard !closed else { return }
+    func onSheetPresented(owner: StoreProductOwnershipToken? = nil) {
+        guard !closed, sheetPresentedAtMs == nil else { return }
+        sheetOwner = owner
         let timestamp = now()
         sheetPresentedAtMs = timestamp
         addBlocker(.sheet, at: timestamp)
     }
 
-    func onSheetDismissed() {
-        guard !closed else { return }
+    func onSheetDismissed(owner: StoreProductOwnershipToken? = nil) {
+        guard !closed, sheetOwner === owner else { return }
+        sheetOwner = nil
         let timestamp = now()
         sheetPresentedAtMs = nil
         removeBlocker(.sheet, at: timestamp)
@@ -191,12 +247,15 @@ final class StoreExitTracker {
     func onAdClosed() {
         guard !closed else { return }
         closed = true
+        for observer in lifecycleObservers { notificationCenter.removeObserver(observer) }
+        lifecycleObservers.removeAll()
+        sheetOwner = nil
         launchTimer?.cancel()
         launchTimer = nil
         switch pending {
         case .externalLaunch:
+            // Intentional teardown cancels a provisional launch; only the settle timeout is an error.
             pending = nil
-            recordLaunchWithoutAway()
         case .externalAway(let visit), .sheet(let visit):
             pending = nil
             recorder(StoreDwellLifecycleEvent(

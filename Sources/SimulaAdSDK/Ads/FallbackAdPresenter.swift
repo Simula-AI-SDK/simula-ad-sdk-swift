@@ -916,7 +916,7 @@ final class FallbackAdPresenter {
         ) : nil
         let usesVideoRoute = ad.mediaType == .video
         currentRouteLifecycle?.deactivate()
-        let routeLifecycle = AttributionRouteLifecycle()
+        let routeLifecycle = AttributionRouteLifecycle(storeDwellPresentationID: storeExitTracker?.presentationID)
         currentRouteLifecycle = routeLifecycle
         return AnyView(AdOverlayView(
             ad: ad,

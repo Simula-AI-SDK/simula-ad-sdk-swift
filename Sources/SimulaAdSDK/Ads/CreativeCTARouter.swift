@@ -283,9 +283,17 @@ struct CreativeClickClaim {
 
 final class StoreProductOwnershipToken: Hashable, @unchecked Sendable {
     fileprivate let id: UUID
+    let storeDwellPresentationID: UUID?
 
-    init(id: UUID = UUID()) {
+    init(id: UUID = UUID(), storeDwellPresentationID: UUID? = nil) {
         self.id = id
+        self.storeDwellPresentationID = storeDwellPresentationID
+    }
+
+    /// Surface ownership stays distinct; only presentation visibility is shared across fallbacks.
+    func belongsToSamePresentation(as other: StoreProductOwnershipToken) -> Bool {
+        self === other || (storeDwellPresentationID != nil
+            && storeDwellPresentationID == other.storeDwellPresentationID)
     }
 
     static func == (lhs: StoreProductOwnershipToken, rhs: StoreProductOwnershipToken) -> Bool {
@@ -337,7 +345,11 @@ final class AttributionRouteLifecycle: @unchecked Sendable {
     private var active = false
     let automaticRoutes = AutomaticRouteCoordinator()
     let automaticRouteScope = AnyHashable(UUID())
-    let storeProductOwnership = StoreProductOwnershipToken()
+    let storeProductOwnership: StoreProductOwnershipToken
+
+    init(storeDwellPresentationID: UUID? = nil) {
+        storeProductOwnership = StoreProductOwnershipToken(storeDwellPresentationID: storeDwellPresentationID)
+    }
 
     func activate() {
         lock.lock(); active = true; lock.unlock()
@@ -1643,7 +1655,7 @@ enum CreativeCTARouter {
     static func isExternalPresentationActive(
         ownershipToken: StoreProductOwnershipToken
     ) -> Bool {
-        isPresentingExternal && activeExternalOwnership === ownershipToken
+        isPresentingExternal && activeExternalOwnership?.belongsToSamePresentation(as: ownershipToken) == true
     }
     private static var presentationRootOverrideForTesting: (() -> UIViewController?)?
     private static var viewControllerPresenterForTesting: ((UIViewController) -> Bool)?
