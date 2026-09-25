@@ -454,6 +454,47 @@ final class StoreProductPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testPlayableWebViewInheritsLifecycleSheetOwnership() async {
+        CreativeCTARouter.resetExternalPresentationStateForTesting()
+        CreativeCTARouter.setStoreProductControllerProviderForTesting { SKStoreProductViewController() }
+        CreativeCTARouter.setViewControllerPresenterForTesting { _ in true }
+        var events: [StoreDwellLifecycleEvent] = []
+        let tracker = StoreExitTracker(adId: "ad", adFormat: "interstitial", recorder: { events.append($0) })
+        let lifecycle = AttributionRouteLifecycle(storeDwellPresentationID: tracker.presentationID)
+        lifecycle.activate()
+        let playable = WebViewRepresentable(
+            htmlString: "<html></html>",
+            onAttributionRouteOutcome: { outcome in
+                if let route = outcome.storeDwellRoute { tracker.recordStoreOpen("fallback_cta", route: route) }
+            },
+            attributionRouteLifecycle: lifecycle
+        )
+        defer {
+            tracker.onAdClosed()
+            CreativeCTARouter.resetExternalPresentationStateForTesting()
+        }
+        XCTAssertTrue(playable.storeProductOwnershipToken === lifecycle.storeProductOwnership)
+        let execution = AttributionRouteExecution(isActive: { lifecycle.isActive }) {
+            playable.onAttributionRouteOutcome?($0)
+        }
+        CreativeCTARouter.open(
+            trackingUrl: "itms-apps://apps.apple.com/app/id375380948",
+            destination: .appstore, storeOpen: .skstoreproduct, storeUrl: nil, attribution: nil,
+            storeProductOwnership: playable.storeProductOwnershipToken, execution: execution
+        )
+        XCTAssertTrue(CreativeCTARouter.isExternalPresentationActive(ownershipToken: lifecycle.storeProductOwnership))
+        CreativeCTARouter.dismissStoreProduct(ownershipToken: lifecycle.storeProductOwnership)
+        await Task.yield()
+        XCTAssertEqual(events.map(\.stage), ["store_opened", "store_returned"])
+        XCTAssertEqual(events.last?.endEvent, .sheetDismissed)
+
+        let explicit = StoreProductOwnershipToken()
+        let override = WebViewRepresentable(htmlString: "", storeProductOwnershipToken: explicit,
+            attributionRouteLifecycle: lifecycle)
+        XCTAssertTrue(override.storeProductOwnershipToken === explicit)
+    }
+
+    @MainActor
     func testBackgroundLifecyclePostingDoesNotWaitForMainThread() async {
         let center = NotificationCenter()
         let posted = expectation(description: "Background poster completes")
