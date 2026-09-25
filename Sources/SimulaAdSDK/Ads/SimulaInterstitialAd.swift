@@ -234,6 +234,7 @@ public final class SimulaInterstitialAd {
     /// At most one primary video player is retained, created as soon as the load response exposes
     /// its URL so AVFoundation can prepare before `show()`.
     private var preparedVideoOwnership: FullscreenVideoPreparationOwnership?
+    private var preparedVideoLease: VideoAssetLease?
     /// Holds the post-close fallback ad window while it's on screen (parity with the minigame's
     /// post-game ad flow).
     private var fallbackPresenter: FallbackAdPresenter?
@@ -246,6 +247,8 @@ public final class SimulaInterstitialAd {
     /// The prefetch result once it lands, so the close path can present the fallback window
     /// synchronously (before the primary window is torn down) rather than awaiting.
     private var prefetchedFallbacks: FallbackFetchResult?
+    private var videoPlanScope: VideoPlanPresentationScope?
+    private var primaryV2VideoStarted = false
     #endif
 
     // MARK: - Init
@@ -256,6 +259,8 @@ public final class SimulaInterstitialAd {
 
     deinit {
         #if os(iOS)
+        // Primary preparation ownership and cache leases release in their own deinitializers.
+        // Fallbacks retain raw pool tokens, which still require explicit cleanup.
         let fallbackResult = prefetchedFallbacks
         DispatchQueue.main.async {
             releasePreparedFallbackVideos(in: fallbackResult)
@@ -391,7 +396,29 @@ public final class SimulaInterstitialAd {
             }
             #if os(iOS)
             releasePreparedVideo()
-            switch reserveFullscreenVideoPreparation(for: creative) {
+            let usesVideoPlanV2 = response.primaryUsesVideoPlanV2
+            let localCreative: FullscreenCreativeContent
+            var localLease: VideoAssetLease?
+            if case .video(let remoteURL, let posterURL) = creative {
+                let lease = try await VideoAssetCache.shared.acquire(remoteURL)
+                guard !Task.isCancelled else {
+                    lease.release()
+                    return
+                }
+                preparedVideoLease = lease
+                localLease = lease
+                localCreative = .video(url: lease.localURL, posterURL: posterURL)
+            } else {
+                localCreative = creative
+            }
+            switch reserveFullscreenVideoPreparation(
+                for: localCreative,
+                startsMuted: false,
+                stallTimeout: usesVideoPlanV2
+                    ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                    : FullscreenVideoPlayer.preparationTimeout,
+                assetLease: localLease
+            ) {
             case .notRequired:
                 break
             case .reserved(let ownership):
@@ -417,6 +444,7 @@ public final class SimulaInterstitialAd {
             }
             #endif
         } catch let apiError as SimulaAPIError {
+            if Task.isCancelled { return }
             // Genuine exception — always-sent, deduped handled error (the sampled `load_fail`
             // lifecycle event comes from failLoad()).
             Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(apiError)", message: apiError.errorDescription, breadcrumb: "SimulaInterstitialAd.load")
@@ -427,7 +455,19 @@ public final class SimulaInterstitialAd {
             } else {
                 failLoad(.network(apiError))
             }
+        } catch let cacheError as VideoAssetCacheError {
+            if Task.isCancelled { return }
+            let failure = videoAssetLoadFailure(for: cacheError)
+            Telemetry.shared.recordError(
+                signature: failure.telemetrySignature,
+                errorCode: failure.telemetryCode,
+                breadcrumb: "surface=interstitial"
+            )
+            failLoad(failure.callbackError, telemetryCode: failure.telemetryCode)
+        } catch is CancellationError {
+            return
         } catch {
+            if Task.isCancelled { return }
             Telemetry.shared.recordError(signature: "interstitial:load", errorCode: "\(type(of: error))", message: error.localizedDescription, breadcrumb: "SimulaInterstitialAd.load")
             failLoad(.network(.invalidResponse))
         }
@@ -492,6 +532,12 @@ public final class SimulaInterstitialAd {
         }
 
         let presenter = InterstitialPresenter()
+        videoPlanScope?.cancel()
+        let videoPlanScope = response.usesVideoPlanV2Contract
+            ? VideoPlanPresentationScope()
+            : nil
+        self.videoPlanScope = videoPlanScope
+        primaryV2VideoStarted = false
         let clickAdUnitId = adUnitId
         let storeExit = StoreExitTracker(
             adId: response.impressionId,
@@ -511,6 +557,9 @@ public final class SimulaInterstitialAd {
                 metadata: metadata,
                 showStartNanos: showStartNanos
             ),
+            onCommittedImpression: {
+                PlainImpressionSender.shared.send(response.validatedImpressionURL)
+            },
             notifyDisplayed: { owner in
                 owner.delegate?.interstitialDidDisplay(owner)
             },
@@ -529,21 +578,41 @@ public final class SimulaInterstitialAd {
         )
         let presentationVideoPlayer: FullscreenVideoPlayer?
         let presentationVideoOwnership: FullscreenVideoPreparationOwnership?
+        let primaryUsesVideoPlanV2 = response.primaryUsesVideoPlanV2
         if response.creative?.mediaType == .video {
-            guard case .video(let url, let posterURL)? = response.creativeContent else {
+            guard case .video(_, let posterURL)? = response.creativeContent,
+                  let url = preparedVideoOwnership.flatMap({
+                      FullscreenVideoPreparationPool.shared.localURL(for: $0.token)
+                  }) ?? preparedVideoLease?.localURL,
+                  url.isFileURL else {
                 admission.stop()
                 failDisplay(.notReady)
                 return
             }
+            let startsMuted = false
+            let stallTimeout = primaryUsesVideoPlanV2
+                ? FullscreenVideoPlayer.videoPlanV2StallTimeout
+                : FullscreenVideoPlayer.preparationTimeout
             if let ownership = preparedVideoOwnership,
-               let player = ownership.claim(url: url, posterURL: posterURL),
+               let player = ownership.claim(
+                   url: url,
+                   posterURL: posterURL,
+                   startsMuted: startsMuted,
+                   stallTimeout: stallTimeout
+               ),
                ownership.transferToPresentation() {
                 preparedVideoOwnership = nil
                 presentationVideoPlayer = player
                 presentationVideoOwnership = ownership
             } else {
-                releasePreparedVideo()
-                presentationVideoPlayer = FullscreenVideoPlayer(url: url, posterURL: posterURL)
+                _ = preparedVideoOwnership?.releaseFromAd()
+                preparedVideoOwnership = nil
+                presentationVideoPlayer = FullscreenVideoPlayer(
+                    url: url,
+                    posterURL: posterURL,
+                    startsMuted: startsMuted,
+                    stallTimeout: stallTimeout
+                )
                 presentationVideoOwnership = nil
             }
         } else {
@@ -556,6 +625,8 @@ public final class SimulaInterstitialAd {
             response: response,
             videoPlayer: presentationVideoPlayer,
             videoPreparationOwnership: presentationVideoOwnership,
+            videoAssetLease: preparedVideoLease,
+            videoPlanScope: videoPlanScope,
             admission: admission,
             storeExitTracker: storeExit,
             onWillPresent: {
@@ -569,6 +640,13 @@ public final class SimulaInterstitialAd {
                     )
                 } else {
                     StoreProductPrewarmer.shared.disable()
+                }
+            },
+            onVideoStarted: { [weak self] in
+                guard primaryUsesVideoPlanV2, let self else { return }
+                self.primaryV2VideoStarted = true
+                if let result = self.prefetchedFallbacks {
+                    self.prefetchedFallbacks = preparingImmediateV2FallbackIfNeeded(result)
                 }
             },
             onClick: { [weak self] interaction in
@@ -590,6 +668,10 @@ public final class SimulaInterstitialAd {
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
                     storeExit.onAdClosed()
+                    videoPlanScope?.closePendingHandoff(
+                        reason: FallbackOutcome.hostUnavailable.videoPlanCloseReason
+                    )
+                    videoPlanScope?.cancel()
                     let terminalOutcome = admission.finish()
                     if terminalOutcome == .closed {
                         SimulaInterstitialAd.recordFallbackOutcome(
@@ -606,12 +688,16 @@ public final class SimulaInterstitialAd {
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
                     storeExit.onAdClosed()
+                    videoPlanScope?.cancel()
+                    self.videoPlanScope = nil
                     presentationLease.finishPostCloseTeardown()
                     return
                 }
                 let postPrimaryPolicy = FullscreenPostPrimaryPolicy(terminalOutcome: terminalOutcome)
                 guard postPrimaryPolicy.presentsFallbacks else {
                     storeExit.onAdClosed()
+                    videoPlanScope?.cancel()
+                    self.videoPlanScope = nil
                     self.discardFallbackPrefetch()
                     presentationLease.finishPostCloseTeardown()
                     return
@@ -632,11 +718,14 @@ public final class SimulaInterstitialAd {
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
                         storeExit.onAdClosed()
+                        videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
+                        videoPlanScope?.cancel()
                         SimulaInterstitialAd.recordFallbackOutcome(
                             outcome,
                             adUnitId: clickAdUnitId,
                             impressionId: response.impressionId
                         )
+                        self?.videoPlanScope = nil
                         guard let self, postPrimaryPolicy.notifiesPublisherClose else { return }
                         self.delegate?.interstitialDidClose(self)
                         // Auto-preload the next ad only now that the WHOLE unit is closed (Android
@@ -659,10 +748,14 @@ public final class SimulaInterstitialAd {
         )
 
         guard didPresent else {
+            videoPlanScope?.cancel()
+            self.videoPlanScope = nil
             admission.stop()
             if let presentationVideoOwnership,
                presentationVideoOwnership.returnToAdAfterPresentationFailure() {
                 preparedVideoOwnership = presentationVideoOwnership
+            } else {
+                presentationVideoPlayer?.stop()
             }
             // Couldn't present (no window scene). Keep the loaded ad so the host
             // can retry; report DISPLAY_FAILED without a bogus DISPLAYED/CLOSED.
@@ -673,12 +766,16 @@ public final class SimulaInterstitialAd {
 
         // Only now is the ad actually on screen.
         state = .showing(response, metadata: metadata)
+        preparedVideoLease = nil
         self.presenter = presenter
         if presentationVideoPlayer == nil { admission.presentationDidSucceed() }
         // Prefetch the post-close fallback screens now, in the background, so they're ready the
         // instant the user closes — fetching after close left a gap that flashed the screen behind.
         // GET /load/fallbacks is side-effect-free (no impression tracking), so this reports nothing early.
-        startFallbackPrefetch(impressionId: response.impressionId)
+        startFallbackPrefetch(
+            impressionId: response.impressionId,
+            primaryUsesVideoPlanV2: primaryUsesVideoPlanV2
+        )
         #else
         failDisplay(.unsupportedPlatform)
         #endif
@@ -818,14 +915,15 @@ public final class SimulaInterstitialAd {
 
     // MARK: - Failure helpers
 
-    private func failLoad(_ error: SimulaAdError) {
+    private func failLoad(_ error: SimulaAdError, telemetryCode: String? = nil) {
         #if os(iOS)
         releasePreparedVideo()
         #endif
         state = .idle
         Telemetry.shared.recordLifecycle(
             stage: "load_fail", adFormat: Self.adFormat, adUnitId: adUnitId,
-            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos), errorCode: error.telemetryCode
+            adId: nil, serveId: nil, durationMs: msSince(loadStartNanos),
+            errorCode: telemetryCode ?? error.telemetryCode
         )
         delegate?.interstitialDidFailToLoad(self, error: error)
     }
@@ -834,6 +932,8 @@ public final class SimulaInterstitialAd {
     private func releasePreparedVideo() {
         _ = preparedVideoOwnership?.releaseFromAd()
         preparedVideoOwnership = nil
+        preparedVideoLease?.release()
+        preparedVideoLease = nil
     }
     #endif
 
@@ -892,7 +992,10 @@ public final class SimulaInterstitialAd {
     /// (`GET /load/fallbacks/{impressionId}`) while the primary ad is on screen, so they're ready
     /// the instant the user closes. Missing content and fetch failure remain distinct unavailable
     /// outcomes for telemetry. The fetch is side-effect-free server-side.
-    private func startFallbackPrefetch(impressionId: String) {
+    private func startFallbackPrefetch(
+        impressionId: String,
+        primaryUsesVideoPlanV2: Bool
+    ) {
         #if os(iOS)
         discardFallbackPrefetch()
         guard !impressionId.isEmpty else { return }
@@ -905,7 +1008,16 @@ public final class SimulaInterstitialAd {
         // screens — even if this ad object is released before the task starts (parity with the
         // pre-refactor closure); `self` stays weak and only gates the state write.
         fallbackPrefetch = Task { [weak self, api] in
-            await Self.runFallbackPrefetch(api: api, impressionId: impressionId) { [weak self] result in
+            await Self.runFallbackPrefetch(
+                api: api,
+                impressionId: impressionId,
+                allowV2Preparation: { [weak self] in
+                    allowsV2FallbackPreparation(
+                        primaryUsesVideoPlanV2: primaryUsesVideoPlanV2,
+                        primaryV2VideoStarted: self?.primaryV2VideoStarted == true
+                    )
+                }
+            ) { [weak self] result in
                 if ownership.consumedByLoadingPresenter { return true }
                 guard self?.fallbackPrefetchToken == token else { return false }
                 self?.prefetchedFallbacks = result
@@ -935,14 +1047,20 @@ public final class SimulaInterstitialAd {
     private static func runFallbackPrefetch(
         api: SimulaAPI,
         impressionId: String,
+        allowV2Preparation: @escaping @MainActor () -> Bool,
         publish: @escaping @MainActor (FallbackFetchResult) -> Bool
     ) async -> FallbackFetchResult {
         let result: FallbackFetchResult
         do {
-            let ads = try await api.fetchFallbacks(impressionId: impressionId)
+            let ads = try await fetchFallbackAdsWithRetry {
+                try await api.fetchFallbacks(impressionId: impressionId)
+            }
             result = ads.isEmpty
                 ? .noContent
-                : .content(ads, preparedVideos: prepareUpcomingFallbackVideos(ads))
+                : .content(ads, preparedVideos: await prepareUpcomingFallbackVideos(
+                    ads,
+                    allowV2Preparation: allowV2Preparation()
+                ))
         } catch {
             result = .failure
         }
@@ -1067,6 +1185,7 @@ public final class SimulaInterstitialAd {
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
             storeExitTracker: storeExitTracker,
+            videoPlanScope: videoPlanScope,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
         ) { [weak self] outcome in
@@ -1135,6 +1254,7 @@ public final class SimulaInterstitialAd {
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
             storeExitTracker: storeExitTracker,
+            videoPlanScope: videoPlanScope,
             presentationLease: presentationLease
         ) { [weak self] outcome in
             self?.fallbackPresenter = nil

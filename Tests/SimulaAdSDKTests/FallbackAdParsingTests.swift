@@ -3,7 +3,18 @@ import XCTest
 
 final class FallbackAdParsingTests: XCTestCase {
     private func decode(_ json: String) throws -> [FallbackAd] {
-        try JSONDecoder().decode(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
+        try decodeFullscreenPayload(FallbackAdsAPIResponse.self, from: Data(json.utf8)).resolvedAds
+    }
+
+    func testInlineFallbackRetainsItsLegacyOrigin() throws {
+        let ads = try decode(#"{"ads":[{"html":"<a href='next'>Next</a>","iframe_url":"https://api.example/iframe/serve"}]}"#)
+        let ad = try XCTUnwrap(ads.first)
+        let base = try XCTUnwrap(validatedCreativeURL(ad.iframeUrl))
+        XCTAssertEqual(URL(string: "next", relativeTo: base)?.absoluteURL.absoluteString, "https://api.example/iframe/next")
+        for value in [#""javascript:alert(1)""#, #""file:///etc/passwd""#, "42"] {
+            let invalid = try decode("{\"ads\":[{\"html\":\"HTML\",\"iframe_url\":\(value)}]}")
+            XCTAssertEqual(invalid.first?.iframeUrl, "")
+        }
     }
 
     func testMissingOwnershipDefaultsToHTML() throws {
@@ -49,10 +60,10 @@ final class FallbackAdParsingTests: XCTestCase {
     func testFallbackCloseMissingNullAndMalformedObjectsUseFallbackDefaults() throws {
         let ads = try decode(#"{"ads":[{"html":"a"},{"html":"b","ad_behavior":null},{"html":"c","ad_behavior":"bad"},{"html":"d","ad_behavior":{"close":17}}]}"#)
 
-        XCTAssertEqual(ads.map(\.closeBehavior.delaySeconds), [5, 5, 5, 5])
-        XCTAssertEqual(ads.map(\.closeBehavior.treatment), Array(repeating: .countdownCircle, count: 4))
-        XCTAssertEqual(ads.map(\.closeBehavior.position), Array(repeating: .topRight, count: 4))
-        XCTAssertEqual(ads.map(\.closeBehavior.action), Array(repeating: .closeX, count: 4))
+        XCTAssertEqual(ads.map(\.closeBehavior.delaySeconds), [5, 5])
+        XCTAssertEqual(ads.map(\.closeBehavior.treatment), Array(repeating: .countdownCircle, count: 2))
+        XCTAssertEqual(ads.map(\.closeBehavior.position), Array(repeating: .topRight, count: 2))
+        XCTAssertEqual(ads.map(\.closeBehavior.action), Array(repeating: .closeX, count: 2))
     }
 
     func testFallbackClosePartialAndMalformedFieldsResolveIndependently() throws {
@@ -88,8 +99,8 @@ final class FallbackAdParsingTests: XCTestCase {
     func testFallbackPositionAndActionParsingAreTolerant() throws {
         let ads = try decode(#"{"ads":[{"html":"a","ad_behavior":{"close":{"position":"TOP-LEFT","action":"FoRwArD"}}},{"html":"b","ad_behavior":{"close":{"position":"bottom-left","action":"CLOSE-X"}}},{"html":"c","ad_behavior":{"close":{"position":"elsewhere","action":"skip"}}}]}"#)
 
-        XCTAssertEqual(ads.map(\.closeBehavior.position), [.topLeft, .bottomLeft, .topRight])
-        XCTAssertEqual(ads.map(\.closeBehavior.action), [.forward, .closeX, .closeX])
+        XCTAssertEqual(ads.map(\.closeBehavior.position), [.topLeft, .bottomLeft])
+        XCTAssertEqual(ads.map(\.closeBehavior.action), [.forward, .closeX])
     }
 
     func testFallbackItemsKeepIndependentCloseTimingTreatmentAndPosition() throws {
@@ -108,8 +119,8 @@ final class FallbackAdParsingTests: XCTestCase {
     func testOnlyResolvedUsableES1CanRetainForward() throws {
         let ads = try decode(#"{"ads":[{"ad_id":"unusable","ad_behavior":{"close":{"action":"forward"}}},{"ad_id":"es1","html":"a","ad_behavior":{"close":{"action":"forward"}}},{"ad_id":"es2","html":"b","ad_behavior":{"close":{"action":"forward"}}},{"ad_id":"later","html":"c","ad_behavior":{"close":{"action":"forward"}}}]}"#)
 
-        XCTAssertEqual(ads.map(\.adId), ["es1", "es2", "later"])
-        XCTAssertEqual(ads.map(\.closeBehavior.action), [.forward, .closeX, .closeX])
+        XCTAssertEqual(ads.map(\.adId), ["es1", "es2"])
+        XCTAssertEqual(ads.map(\.closeBehavior.action), [.forward, .closeX])
     }
 
     func testES1WithoutNextUsableFallbackForcesClose() throws {

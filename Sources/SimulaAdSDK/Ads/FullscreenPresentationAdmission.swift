@@ -204,11 +204,124 @@ struct RewardCompletionState: Equatable, Sendable {
     private(set) var earned = false
     private(set) var reason: RewardCompletionReason?
 
-    mutating func earn(reason: RewardCompletionReason) {
-        guard !earned else { return }
+    @discardableResult
+    mutating func earn(reason: RewardCompletionReason) -> Bool {
+        guard !earned else { return false }
         earned = true
         self.reason = reason
+        return true
     }
+}
+
+struct UnitEndRewardState: Equatable, Sendable {
+    enum FallbackAuthority: Equatable, Sendable {
+        case unknown
+        case none
+        case renderableScreens
+        case unavailable
+    }
+
+    private(set) var earned = false
+    private(set) var primaryGateOpened = false
+    private(set) var fallbackAuthority = FallbackAuthority.unknown
+    private(set) var lastFallbackGateOpened = false
+
+    mutating func primaryGateDidOpen() -> Bool {
+        primaryGateOpened = true
+        return claimIfAuthorized()
+    }
+
+    mutating func fallbackDidResolve(renderableScreenCount: Int) -> Bool {
+        fallbackAuthority = renderableScreenCount > 0 ? .renderableScreens : .none
+        return claimIfAuthorized()
+    }
+
+    mutating func fallbackBecameUnavailable() -> Bool {
+        fallbackAuthority = .unavailable
+        return claimLastRenderableAuthority()
+    }
+
+    mutating func fallbackGateDidOpen(isFinal: Bool) -> Bool {
+        guard fallbackAuthority == .renderableScreens else { return false }
+        lastFallbackGateOpened = true
+        return isFinal ? claim() : false
+    }
+
+    mutating func fallbackDeliveryDidFinish() -> Bool {
+        claimLastRenderableAuthority()
+    }
+
+    private mutating func claimIfAuthorized() -> Bool {
+        guard primaryGateOpened,
+              fallbackAuthority == .none || fallbackAuthority == .unavailable else { return false }
+        return claim()
+    }
+
+    private mutating func claimLastRenderableAuthority() -> Bool {
+        guard lastFallbackGateOpened || primaryGateOpened else { return false }
+        return claim()
+    }
+
+    private mutating func claim() -> Bool {
+        guard !earned else { return false }
+        earned = true
+        return true
+    }
+}
+
+@MainActor
+final class UnitEndRewardClaim {
+    private var state = UnitEndRewardState()
+    private var consumed = false
+
+    var earned: Bool { state.earned }
+
+    func primaryGateDidOpen() {
+        _ = state.primaryGateDidOpen()
+    }
+
+    func fallbackDidResolve(renderableScreenCount: Int) {
+        _ = state.fallbackDidResolve(renderableScreenCount: renderableScreenCount)
+    }
+
+    func fallbackBecameUnavailable() {
+        _ = state.fallbackBecameUnavailable()
+    }
+
+    func fallbackGateDidOpen(isFinal: Bool) {
+        _ = state.fallbackGateDidOpen(isFinal: isFinal)
+    }
+
+    func fallbackDeliveryDidFinish() {
+        _ = state.fallbackDeliveryDidFinish()
+    }
+
+    @discardableResult
+    func consumeAtUnitClose(
+        onEarn: () -> Void,
+        enqueueVerification: () -> Void
+    ) -> Bool {
+        guard state.earned, !consumed else { return false }
+        consumed = true
+        onEarn()
+        enqueueVerification()
+        return true
+    }
+}
+
+@MainActor
+@discardableResult
+/// Host teardown may consume a unit-end reward that already crossed its authoritative end. It must
+/// never resolve missing fallback authority or promote an open primary gate into an earned reward.
+func consumeAlreadyAuthoritativeUnitEndRewardOnHostTeardown(
+    _ claim: UnitEndRewardClaim?,
+    onEarn: () -> Void,
+    enqueueVerification: () -> Void
+) -> Bool {
+    claim?.consumeAtUnitClose(
+        onEarn: onEarn,
+        enqueueVerification: enqueueVerification
+    ) ?? false
 }
 
 struct RewardedEarlyCompletionState: Equatable, Sendable {
@@ -482,6 +595,7 @@ func fullscreenPresentationAccountingCallbacks<Owner: AnyObject>(
     owner: WeakFullscreenPresentationOwner<Owner>,
     snapshot: FullscreenPresentationAccountingSnapshot,
     sink: FullscreenPresentationAccountingSink = .live,
+    onCommittedImpression: @escaping () -> Void = {},
     notifyDisplayed: @escaping (Owner) -> Void,
     notifyDisplayFailed: @escaping (Owner) -> Void,
     notifyImpression: @escaping (Owner, AdValue) -> Void
@@ -496,6 +610,7 @@ func fullscreenPresentationAccountingCallbacks<Owner: AnyObject>(
             if let owner = owner.value { notifyDisplayFailed(owner) }
         },
         onImpression: {
+            onCommittedImpression()
             sink.recordImpression(snapshot)
             if let owner = owner.value { notifyImpression(owner, snapshot.adValue) }
             sink.enqueueSeen(snapshot)

@@ -2,6 +2,7 @@ import XCTest
 @testable import SimulaAdSDK
 #if os(iOS)
 import AVFoundation
+import Combine
 #endif
 
 final class FullscreenPresentationAdmissionTests: XCTestCase {
@@ -44,6 +45,150 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             lock.unlock()
         }
     }
+
+    #if os(iOS)
+    private final class AudioActivationProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var ranOnMain = false
+        let gate = DispatchSemaphore(value: 0)
+
+        func activate() -> Bool {
+            lock.lock()
+            count += 1
+            ranOnMain = ranOnMain || Thread.isMainThread
+            lock.unlock()
+            gate.wait()
+            return true
+        }
+
+        var snapshot: (count: Int, ranOnMain: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (count, ranOnMain)
+        }
+    }
+
+    @MainActor
+    func testAudioCoordinatorCoalescesOffMainAndCancelsStaleClaims() async throws {
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var cancelledDelivered = false
+        var delivered = false
+        let cancelled = try XCTUnwrap(coordinator.claim { _ in cancelledDelivered = true })
+        let live = try XCTUnwrap(coordinator.claim { success in delivered = success })
+        await waitUntil { probe.snapshot.count == 1 }
+        XCTAssertFalse(probe.snapshot.ranOnMain)
+        XCTAssertFalse(delivered, "a stalled activation must return to the main actor immediately")
+        coordinator.release(cancelled)
+        probe.gate.signal()
+        await waitUntil { delivered }
+        XCTAssertFalse(cancelledDelivered)
+        XCTAssertEqual(probe.snapshot.count, 1)
+
+        var overlappingDelivered = false
+        let overlapping = try XCTUnwrap(coordinator.claim { success in overlappingDelivered = success })
+        await waitUntil { overlappingDelivered }
+        XCTAssertEqual(probe.snapshot.count, 1, "active claims reuse the existing activation")
+        coordinator.release(live)
+        coordinator.release(overlapping)
+        var laterDelivered = false
+        let later = try XCTUnwrap(coordinator.claim { success in laterDelivered = success })
+        await waitUntil { probe.snapshot.count == 2 }
+        probe.gate.signal()
+        await waitUntil { laterDelivered }
+        coordinator.release(later)
+    }
+
+    @MainActor
+    func testAudioCoordinatorFailedActivationAndBoundedPendingClaims() async throws {
+        let failing = VideoAudioSessionCoordinator(activate: { false })
+        var failed = false
+        let claim = try XCTUnwrap(failing.claim { success in failed = !success })
+        await waitUntil { failed }
+        failing.release(claim)
+
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var ids: [UUID] = []
+        for _ in 0..<16 {
+            ids.append(try XCTUnwrap(coordinator.claim { _ in XCTFail("cancelled claim delivered") }))
+        }
+        XCTAssertNil(coordinator.claim { _ in XCTFail("rejected claim delivered") })
+        await waitUntil { probe.snapshot.count == 1 }
+        for id in ids { coordinator.release(id) }
+        probe.gate.signal()
+    }
+
+    @MainActor
+    func testAudioActivationDeadlineFiresWhileWorkerIsBlocked() async throws {
+        let probe = AudioActivationProbe()
+        let coordinator = VideoAudioSessionCoordinator(claimTimeout: 0.01, activate: { probe.activate() })
+        defer { probe.gate.signal() }
+        var results: [Bool] = []
+        let claim = try XCTUnwrap(coordinator.claim { results.append($0) })
+        await waitUntil { probe.snapshot.count == 1 }
+        await waitUntil { !results.isEmpty }
+        XCTAssertEqual(results, [false])
+        XCTAssertFalse(probe.snapshot.ranOnMain)
+        coordinator.release(claim)
+        XCTAssertNil(coordinator.claim { _ in XCTFail("a stalled activation must not admit another wait") })
+        XCTAssertEqual(probe.snapshot.count, 1)
+        probe.gate.signal()
+        await waitUntil {
+            guard let next = coordinator.claim(completion: { _ in }) else { return false }
+            coordinator.release(next)
+            return true
+        }
+    }
+
+    @MainActor
+    func testAudioActivationFailureMutesWithoutFailingTheVideo() {
+        let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
+        XCTAssertFalse(player.isMuted)
+        player.continueWithoutAudioSession()
+        XCTAssertTrue(player.isMuted)
+        if case .failed = player.status { XCTFail("Audio failure must not fail video playback") }
+        XCTAssertFalse(player.isStopped)
+        player.stop()
+    }
+
+    @MainActor
+    func testIdleTimerCoordinatorRestoresHostValueAfterOverlappingTerminalReleases() {
+        var hostValue = false
+        var writes: [Bool] = []
+        let coordinator = VideoIdleTimerCoordinator(
+            read: { hostValue },
+            write: { hostValue = $0; writes.append($0) }
+        )
+        coordinator.claim()
+        coordinator.claim()
+        coordinator.release()
+        XCTAssertTrue(hostValue)
+        coordinator.release()
+        XCTAssertFalse(hostValue)
+        XCTAssertEqual(writes, [true, false])
+    }
+
+    @MainActor
+    func testIdleTimerCoordinatorDoesNotOverwriteHostChange() {
+        var hostValue = false
+        var writes: [Bool] = []
+        let coordinator = VideoIdleTimerCoordinator(
+            read: { hostValue },
+            write: { hostValue = $0; writes.append($0) }
+        )
+        coordinator.claim()
+        hostValue = false
+
+        coordinator.release()
+
+        XCTAssertFalse(hostValue)
+        XCTAssertEqual(writes, [true])
+    }
+    #endif
 
     func testVideoFailureNeverEarnsBeforeGateEvenAfterFirstFrame() {
         let beforeFrame = rewardedTerminalOutcome(earned: false, actualElapsedPlayTime: 0)
@@ -719,8 +864,8 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ))
     }
 
-    func testFallbackFailureAdvanceWaitsForHandoff() {
-        var state = FallbackFailureAdvanceState()
+    func testFallbackTerminalAdvanceWaitsForHandoff() {
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 2, blocked: true))
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 2), 2)
@@ -728,15 +873,15 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(state.request(index: 3, blocked: false))
     }
 
-    func testFallbackFailureAdvanceAlsoWaitsForStoreSheet() {
-        var state = FallbackFailureAdvanceState()
+    func testFallbackTerminalAdvanceAlsoWaitsForStoreSheet() {
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 0, blocked: true))
         XCTAssertNil(state.blockersDidClear(currentIndex: 1))
         XCTAssertEqual(state.blockersDidClear(currentIndex: 0), 0)
     }
 
-    func testFallbackHTMLCountdownStartsAtMountWhileVideoWaitsForFirstFrame() {
-        XCTAssertTrue(shouldRunFallbackCountdown(
+    func testFallbackCountdownWaitsForRenderAdmissionAndEveryBlocker() {
+        XCTAssertFalse(shouldRunFallbackCountdown(
             isVideo: false,
             pageFinished: false,
             hasAppeared: true,
@@ -751,16 +896,38 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             storeSheetPresented: false
         ))
         XCTAssertTrue(shouldRunFallbackCountdown(
-            isVideo: true,
+            isVideo: false,
             pageFinished: true,
             hasAppeared: true,
             appForegrounded: true,
             storeSheetPresented: false
         ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: false,
+            storeSheetPresented: false
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: true
+        ))
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false,
+            clickHandoffPending: true
+        ))
     }
 
-    func testDeclarativeFallbackFailureWaitsUntilEveryRouteBlockerClears() {
-        var state = FallbackFailureAdvanceState()
+    func testDeclarativeFallbackTerminalWaitsUntilEveryRouteBlockerClears() {
+        var state = FallbackTerminalAdvanceState()
         let clickPending = true
         let sheetPresented = true
         XCTAssertFalse(state.request(index: 1, blocked: clickPending || sheetPresented))
@@ -839,6 +1006,95 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ), .rejectCurrent)
         XCTAssertNil(ownership.activeRequest)
     }
+
+    func testMiniGameRetainedV2PresentationRecreatesScopeBeforeReconciliation() {
+        let recovery = miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: false
+        )
+
+        XCTAssertTrue(recovery.createScope)
+        XCTAssertFalse(recovery.reattachCurrentPlayer)
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: false
+        ), .reconcile)
+    }
+
+    func testMiniGameRetainedV2PlayerIsReattachedWithoutReconciliation() {
+        let recovery = miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: true
+        )
+
+        XCTAssertTrue(recovery.createScope)
+        XCTAssertTrue(recovery.reattachCurrentPlayer)
+        XCTAssertEqual(miniGameFallbackVideoLifecycleAction(
+            event: .appear,
+            showAdOverlay: true,
+            hasSelectedAd: true,
+            selectedAdIsVideo: true,
+            ownsCurrentPlayer: true
+        ), .none)
+    }
+
+    func testMiniGameScopeRecoveryIgnoresNonV2AndInactivePresentations() {
+        XCTAssertEqual(miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: false,
+            containsVideoPlanV2: true,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: true,
+            ownsCurrentPlayer: true
+        ), MiniGameFallbackV2ScopeRecovery(createScope: false, reattachCurrentPlayer: false))
+        XCTAssertEqual(miniGameFallbackV2ScopeRecovery(
+            showAdOverlay: true,
+            containsVideoPlanV2: false,
+            hasScope: false,
+            currentAdUsesVideoPlanV2: false,
+            ownsCurrentPlayer: true
+        ), MiniGameFallbackV2ScopeRecovery(createScope: false, reattachCurrentPlayer: false))
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testMiniGameReattachedV2PlayerPreservesMuteAndRestoresTerminalClaims() {
+        let events: [VideoPlanTerminalEvent] = [.completion, .failure, .userClose]
+        for (index, event) in events.enumerated() {
+            let player = FullscreenVideoPlayer(
+                url: URL(fileURLWithPath: "/dev/null"),
+                posterURL: nil,
+                startsMuted: index.isMultiple(of: 2),
+                stallTimeout: FullscreenVideoPlayer.videoPlanV2StallTimeout
+            )
+            let expectedMuted = player.isMuted
+            let scope = VideoPlanPresentationScope()
+
+            reattachMiniGameFallbackV2Player(player, to: scope)
+
+            XCTAssertEqual(scope.isMuted, expectedMuted)
+            XCTAssertEqual(player.isMuted, expectedMuted)
+            XCTAssertTrue(scope.claimVideoTerminal(
+                playerID: player.videoPlanPresentationID,
+                event: event
+            ))
+            XCTAssertFalse(scope.claimVideoTerminal(
+                playerID: player.videoPlanPresentationID,
+                event: event
+            ))
+            scope.cancel()
+            player.stop()
+        }
+    }
+    #endif
 
     @MainActor
     func testMiniGameFallbackVideoReacquiresOnceAfterDisappearReappear() {
@@ -1226,25 +1482,40 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(canUseVideoControls(firstFrameAdmitted: true, displayAdmitted: true))
     }
 
-    func testPreFirstFrameEscapeRoutesEachSurfaceThroughItsExistingTerminalPath() {
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+    func testPreFirstFrameEscapeDistinguishesCancellationOnEachSurface() {
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .interstitial,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .failInterstitialDisplay)
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .failInterstitialDisplay,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
+        ))
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .rewarded,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .finishRewardedUnearned)
-        XCTAssertEqual(videoPreFirstFrameEscapeAction(
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .finishRewardedUnearned,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
+        ))
+        XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .fallback,
             presentationMounted: true,
             firstFrameAdmitted: false,
             terminal: false
-        ), .requestFallbackFailureAdvance)
+        ), VideoPreFirstFrameEscapeDecision(
+            action: .requestFallbackFailureAdvance,
+            terminalEvent: .userClose,
+            telemetryStage: FullscreenVideoTelemetryStage.close,
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
+        ))
     }
 
     func testPreFirstFrameEscapeRejectsUnmountedTerminalAndStalePostFrameTaps() {
@@ -1350,7 +1621,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         ), .requestFallbackFailureAdvance)
         var handoff = PendingFirstFrameHandoff<String>()
         handoff.activate("current-player")
-        var advance = FallbackFailureAdvanceState()
+        var advance = FallbackTerminalAdvanceState()
 
         XCTAssertTrue(handoff.claimPreFirstFrameFailure("current-player"))
         XCTAssertFalse(advance.request(index: 1, blocked: true))
@@ -2030,17 +2301,53 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     @MainActor
     func testPlayerMuteDefenseRemainsSynchronizedAcrossExplicitToggle() {
         let player = FullscreenVideoPlayer(url: URL(fileURLWithPath: "/dev/null"), posterURL: nil)
-        XCTAssertTrue(player.isMuted)
-        XCTAssertTrue(player.player.isMuted)
+        XCTAssertFalse(player.isMuted)
+        XCTAssertFalse(player.player.isMuted)
         XCTAssertTrue(player.admitFirstVisualFrame())
 
         player.toggleMuted()
-        XCTAssertFalse(player.isMuted)
-        XCTAssertFalse(player.player.isMuted)
-        player.toggleMuted()
         XCTAssertTrue(player.isMuted)
         XCTAssertTrue(player.player.isMuted)
+        player.toggleMuted()
+        XCTAssertFalse(player.isMuted)
+        XCTAssertFalse(player.player.isMuted)
         player.stop()
+    }
+
+    @MainActor
+    func testLegacyAndV2ColdFallbackVideosStartUnmuted() throws {
+        for timeout in [FullscreenVideoPlayer.preparationTimeout, FullscreenVideoPlayer.videoPlanV2StallTimeout] {
+            let ownership = makeFallbackVideoOwnership(
+                url: URL(fileURLWithPath: "/dev/null"),
+                posterURL: nil,
+                token: nil,
+                stallTimeout: timeout
+            )
+            defer { ownership.release() }
+            let player = try XCTUnwrap(ownership.resource)
+            XCTAssertFalse(player.isMuted)
+            XCTAssertFalse(player.player.isMuted)
+        }
+    }
+
+    @MainActor
+    func testLegacyAndV2PreparedVideosStartUnmutedAndPreserveUserMuteOnReuse() throws {
+        let url = URL(fileURLWithPath: "/dev/null")
+        let pool = FullscreenVideoPreparationPool(capacity: 1)
+        for timeout in [FullscreenVideoPlayer.preparationTimeout, FullscreenVideoPlayer.videoPlanV2StallTimeout] {
+            let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil, stallTimeout: timeout))
+            defer { pool.release(token) }
+            let player = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil, stallTimeout: timeout))
+            XCTAssertFalse(player.isMuted)
+            XCTAssertFalse(player.player.isMuted)
+
+            player.setMuted(true)
+            pool.returnToPrepared(token)
+            let reclaimed = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil, stallTimeout: timeout))
+            XCTAssertTrue(reclaimed === player)
+            XCTAssertTrue(reclaimed.isMuted)
+            XCTAssertTrue(reclaimed.player.isMuted)
+        }
     }
 
     @MainActor
@@ -2058,10 +2365,44 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             object: nil,
             userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
         )
+        XCTAssertFalse(
+            player.hasActiveAudioInterruption,
+            "notification delivery must return before publishing interruption state"
+        )
         await waitUntil { player.hasActiveAudioInterruption }
         XCTAssertEqual(player.status, .preparing)
         XCTAssertFalse(player.status.isTerminal)
         XCTAssertTrue(player.hasActiveAudioInterruption)
+    }
+
+    @MainActor
+    func testTerminalObserverSchedulesTeardownAfterCallbackReturnsExactlyOnce() async {
+        let player = FullscreenVideoPlayer.makeStateTestingPlayer(
+            url: URL(fileURLWithPath: "/dev/null"),
+            posterURL: nil
+        )
+        XCTAssertTrue(player.admitFirstVisualFrame())
+        var callbackReturned = false
+        var terminalPublications = 0
+        var teardownRanAfterCallback = false
+        let observation = player.$status.dropFirst().sink { status in
+            guard status.isTerminal else { return }
+            terminalPublications += 1
+            teardownRanAfterCallback = callbackReturned
+            player.stop()
+        }
+
+        player.enqueueEndedObserverCallbackForTests()
+        XCTAssertFalse(player.isStopped)
+        XCTAssertEqual(terminalPublications, 0)
+        callbackReturned = true
+        await waitUntil { player.isStopped }
+
+        player.enqueueEndedObserverCallbackForTests()
+        await Task.yield()
+        XCTAssertTrue(teardownRanAfterCallback)
+        XCTAssertEqual(terminalPublications, 1)
+        withExtendedLifetime(observation) {}
     }
 
     @MainActor
@@ -2242,6 +2583,23 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
+    func testDiscardingPreparedOwnershipReleasesPoolTokenAndAssetLease() async throws {
+        let released = expectation(description: "last cache lease released")
+        let url = URL(fileURLWithPath: "/dev/null")
+        let pool = FullscreenVideoPreparationPool.shared
+        var lease: VideoAssetLease? = VideoAssetLease(localURL: url) { released.fulfill() }
+        let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil, assetLease: lease))
+        var ownership: FullscreenVideoPreparationOwnership? = FullscreenVideoPreparationOwnership(token: token)
+        weak var weakOwnership = ownership
+        XCTAssertNotNil(pool.localURL(for: token))
+        ownership = nil
+        lease = nil
+        XCTAssertNil(weakOwnership)
+        await fulfillment(of: [released], timeout: TestWait.timeout)
+        XCTAssertNil(pool.localURL(for: token))
+    }
+
+    @MainActor
     func testAdOwnerDeinitCannotReleaseTransferredActivePresentation() throws {
         final class AdOwner {
             var preparation: FullscreenVideoPreparationOwnership?
@@ -2289,15 +2647,15 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
     }
 
     @MainActor
-    func testFallbackPreparedTokenReleasePreventsPlayerReuse() throws {
+    func testFallbackPreparedTokenReleaseInvalidatesPlayerAndToken() throws {
         let url = URL(fileURLWithPath: "/dev/null")
         let pool = FullscreenVideoPreparationPool.shared
         let token = try XCTUnwrap(pool.prepare(url: url, posterURL: nil))
         let first = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
         pool.returnToPrepared(token)
         releasePreparedFallbackVideos(in: .content([], preparedVideos: [0: token]))
-        let replacement = try XCTUnwrap(pool.claim(token, url: url, posterURL: nil))
-        XCTAssertFalse(first === replacement)
+        XCTAssertNil(pool.claim(token, url: url, posterURL: nil))
+        XCTAssertTrue(first.isStopped)
         pool.release(token)
     }
 

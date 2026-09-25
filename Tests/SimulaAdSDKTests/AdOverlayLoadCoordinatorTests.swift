@@ -14,6 +14,53 @@ final class AdOverlayLoadCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .timedOut(generation))
     }
 
+    func testZeroGateNeverStartsBeforePlayableRenderAdmission() {
+        let policy = FallbackCountdownPolicy(delaySeconds: 0)
+
+        XCTAssertFalse(policy.needsTicker)
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: false,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+        XCTAssertTrue(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+    }
+
+    func testFinishedPlayableStillWaitsForVisibleParentAdmission() {
+        XCTAssertFalse(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: false,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+        XCTAssertTrue(shouldRunFallbackCountdown(
+            isVideo: false,
+            pageFinished: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            storeSheetPresented: false
+        ))
+    }
+
+    func testLatePlayableFinishAfterTimeoutCannotOpenZeroGate() {
+        var coordinator = AdOverlayLoadCoordinator()
+        let generation = coordinator.beginLoad()
+
+        XCTAssertTrue(coordinator.timeout(generation: generation))
+        XCTAssertTrue(coordinator.failCurrentLoad())
+        XCTAssertFalse(coordinator.finishCurrentLoad())
+        XCTAssertEqual(coordinator.phase, .failed(generation))
+    }
+
     func testMountFiresOnceBeforeTimeoutAndLateFinishCannotDuplicateIt() {
         var mount = AdOverlayScreenMountCoordinator()
         var load = AdOverlayLoadCoordinator()
@@ -49,6 +96,8 @@ final class AdOverlayLoadCoordinatorTests: XCTestCase {
         var coordinator = AdOverlayLoadCoordinator()
         let failedGeneration = coordinator.beginLoad()
         XCTAssertTrue(coordinator.failCurrentLoad())
+        XCTAssertFalse(coordinator.failCurrentLoad())
+        XCTAssertFalse(coordinator.finishCurrentLoad())
         XCTAssertFalse(coordinator.timeout(generation: failedGeneration))
 
         let disappearedGeneration = coordinator.beginLoad()

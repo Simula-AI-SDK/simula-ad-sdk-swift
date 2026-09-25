@@ -436,9 +436,10 @@ private func normalizeBehaviorToken(_ raw: String?) -> String {
 /// trap the user with no exit. Keep this independent from SKOverlay timing and bounded at 60s.
 let maxCloseDelaySeconds = 60
 
-/// Independent cap for delayed SKOverlay presentation. It intentionally does not reuse the close
-/// gate's safety constant: changing close-button experiment arms must not change install timing.
-let maxSKOverlayDelaySeconds = 300
+/// Contract 2 narrows install-overlay timing to one minute. The public/legacy model keeps its
+/// historical five-minute range; exact Contract 2 payload decoding applies this stricter limit.
+let maxSKOverlayDelaySeconds = 60
+let maxLegacySKOverlayDelaySeconds = 300
 
 /// Validates a server-supplied progress-bar color. Accepts an optional leading `#` followed by
 /// exactly 6 hex digits; anything else (missing, wrong length, non-hex) falls back to white per
@@ -554,6 +555,114 @@ enum CreativeMediaType: String, Sendable, Equatable {
     }
 }
 
+/// Native video CTA chrome selected by `ad_behavior.video.style`. Unknown and missing values
+/// deliberately use the least intrusive treatment so a newly-authored server value stays usable.
+public enum VideoChromeStyle: String, Sendable, Equatable, CaseIterable {
+    case bottomBar = "bottom_bar"
+    case floatingPill = "floating_pill"
+    case bottomCard = "bottom_card"
+    case cornerCTA = "corner_cta"
+    case feedCard = "feed_card"
+
+    static func from(_ raw: String?) -> VideoChromeStyle {
+        VideoChromeStyle(rawValue: normalizeBehaviorToken(raw)) ?? .cornerCTA
+    }
+}
+
+public struct VideoBehavior: Sendable, Equatable, Decodable {
+    public let style: VideoChromeStyle
+
+    public init(style: VideoChromeStyle = .cornerCTA) {
+        self.style = style
+    }
+
+    enum CodingKeys: String, CodingKey { case style }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.style = .from(try? c.decode(String.self, forKey: .style))
+    }
+}
+
+public struct VideoSegment: Sendable, Equatable {
+    public let clipIndex: Int
+    public let videoPool: String
+    public let startSeconds: Double
+    public let endSeconds: Double
+}
+
+private struct RawVideoSegment: Decodable {
+    let clipIndex: Int?
+    let videoPool: String?
+    let startSeconds: Double?
+    let endSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case clipIndex = "clip_index"
+        case videoPool = "video_pool"
+        case startSeconds = "start_seconds"
+        case endSeconds = "end_seconds"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let exactIndex = exactJSONInteger(for: decoder, key: CodingKeys.clipIndex) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .clipIndex,
+                in: c,
+                debugDescription: "clip_index must be a lexical JSON integer"
+            )
+        }
+        clipIndex = exactIndex
+        videoPool = try c.decode(String.self, forKey: .videoPool)
+        startSeconds = try c.decode(Double.self, forKey: .startSeconds)
+        endSeconds = try c.decode(Double.self, forKey: .endSeconds)
+    }
+}
+
+private struct StrictVideoSegments: Decodable {
+    let items: [RawVideoSegment]
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var decoded: [RawVideoSegment] = []
+        while !container.isAtEnd {
+            guard decoded.count < 3 else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "segments must contain at most three entries"
+                )
+            }
+            decoded.append(try container.decode(RawVideoSegment.self))
+        }
+        items = decoded
+    }
+}
+
+private func validatedVideoSegments(_ raw: [RawVideoSegment]) -> [VideoSegment] {
+    guard !raw.isEmpty, raw.count <= 3 else { return [] }
+    var result: [VideoSegment] = []
+    result.reserveCapacity(raw.count)
+    for (expectedIndex, item) in raw.enumerated() {
+        guard item.clipIndex == expectedIndex,
+              let pool = item.videoPool?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !pool.isEmpty, pool.utf8.count <= 64,
+              let start = item.startSeconds, start.isFinite,
+              let end = item.endSeconds, end.isFinite else {
+            return []
+        }
+        let expectedStart = result.last?.endSeconds ?? 0
+        guard end > start, abs(start - expectedStart) <= 0.001 else { return [] }
+        result.append(VideoSegment(
+            clipIndex: expectedIndex,
+            videoPool: pool,
+            startSeconds: expectedStart,
+            endSeconds: end
+        ))
+    }
+    return result
+}
+
 /// The creative descriptor (`creative` node). `adUnitType` drives format-aware close copy;
 /// `url`/`posterUrl` describe a native video when `type == "video"`. Decoding is tolerant.
 public struct Creative: Sendable, Equatable, Decodable {
@@ -561,6 +670,13 @@ public struct Creative: Sendable, Equatable, Decodable {
     public let bundleUrl: String?
     public let url: String?
     public let posterUrl: String?
+    public let cta: String?
+    public let appIconUrl: String?
+    public let appName: String?
+    public let subtitle: String?
+    public let videoPool: String?
+    public let clipIndex: Int?
+    public let segments: [VideoSegment]
     public let adUnitType: AdUnitType
 
     public init(type: String = "", bundleUrl: String? = nil, adUnitType: AdUnitType = .interstitial) {
@@ -574,21 +690,116 @@ public struct Creative: Sendable, Equatable, Decodable {
         posterUrl: String?,
         adUnitType: AdUnitType = .interstitial
     ) {
+        self.init(
+            type: type,
+            bundleUrl: bundleUrl,
+            url: url,
+            posterUrl: posterUrl,
+            adUnitType: adUnitType,
+            cta: nil,
+            appIconUrl: nil,
+            appName: nil,
+            subtitle: nil,
+            videoPool: nil,
+            clipIndex: nil,
+            segments: []
+        )
+    }
+
+    public init(
+        type: String = "",
+        bundleUrl: String? = nil,
+        url: String?,
+        posterUrl: String?,
+        adUnitType: AdUnitType = .interstitial,
+        cta: String? = nil,
+        appIconUrl: String? = nil,
+        appName: String? = nil,
+        subtitle: String? = nil,
+        videoPool: String? = nil,
+        clipIndex: Int? = nil
+    ) {
+        self.init(
+            type: type,
+            bundleUrl: bundleUrl,
+            url: url,
+            posterUrl: posterUrl,
+            adUnitType: adUnitType,
+            cta: cta,
+            appIconUrl: appIconUrl,
+            appName: appName,
+            subtitle: subtitle,
+            videoPool: videoPool,
+            clipIndex: clipIndex,
+            segments: []
+        )
+    }
+
+    init(
+        type: String = "",
+        bundleUrl: String? = nil,
+        url: String?,
+        posterUrl: String?,
+        adUnitType: AdUnitType = .interstitial,
+        cta: String? = nil,
+        appIconUrl: String? = nil,
+        appName: String? = nil,
+        subtitle: String? = nil,
+        videoPool: String? = nil,
+        clipIndex: Int? = nil,
+        segments: [VideoSegment]
+    ) {
         self.type = type
         self.bundleUrl = bundleUrl
         self.url = url
         self.posterUrl = posterUrl
+        self.cta = cta
+        self.appIconUrl = appIconUrl
+        self.appName = appName
+        self.subtitle = subtitle
+        self.videoPool = videoPool
+        self.clipIndex = clipIndex.flatMap { (0...2).contains($0) ? $0 : nil }
+        self.segments = segments
         self.adUnitType = adUnitType
     }
 
     var mediaType: CreativeMediaType { .from(type) }
+    /// Slot-level V2 metadata. This never activates V2 by itself; callers must also require the
+    /// canonical response-level `video_plan_version` marker.
+    var isVideoPlanV2Clip: Bool { mediaType == .video && clipIndex != nil }
+
+    var videoChromeTitle: String? {
+        appName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(128))
+        }
+    }
+
+    var videoChromeSubtitle: String? {
+        subtitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(256))
+        }
+    }
+
+    var videoCTATitle: String {
+        cta?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map {
+            String($0.prefix(128))
+        } ?? "Install"
+    }
 
     enum CodingKeys: String, CodingKey {
         case type
         case bundleUrl = "bundle_url"
         case url
         case posterUrl = "poster_url"
+        case cta
+        case appIconUrl = "app_icon_url"
+        case appName = "app_name"
+        case subtitle
+        case videoPool = "video_pool"
+        case pool
+        case clipIndex = "clip_index"
         case adUnitType = "ad_unit_type"
+        case segments
     }
 
     public init(from decoder: Decoder) throws {
@@ -597,7 +808,28 @@ public struct Creative: Sendable, Equatable, Decodable {
         self.bundleUrl = try? c.decode(String.self, forKey: .bundleUrl)
         self.url = try? c.decode(String.self, forKey: .url)
         self.posterUrl = try? c.decode(String.self, forKey: .posterUrl)
+        self.cta = try? c.decode(String.self, forKey: .cta)
+        self.appIconUrl = try? c.decode(String.self, forKey: .appIconUrl)
+        self.appName = try? c.decode(String.self, forKey: .appName)
+        self.subtitle = try? c.decode(String.self, forKey: .subtitle)
+        self.videoPool = Self.nonBlank(
+            (try? c.decode(String.self, forKey: .videoPool))
+                ?? (try? c.decode(String.self, forKey: .pool))
+        )
+        let decodedIndex = try? c.decode(Int.self, forKey: .clipIndex)
+        self.clipIndex = decodedIndex.flatMap { (0...2).contains($0) ? $0 : nil }
+        let contract2 = CodingUserInfoKey.simulaVideoContract2
+            .flatMap { decoder.userInfo[$0] as? Bool } == true
+        self.segments = contract2
+            ? validatedVideoSegments(
+                (try? c.decode(StrictVideoSegments.self, forKey: .segments).items) ?? []
+            )
+            : []
         self.adUnitType = .from(try? c.decode(String.self, forKey: .adUnitType))
+    }
+
+    private static func nonBlank(_ value: String?) -> String? {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 }
 
@@ -768,9 +1000,9 @@ public enum OverlayPosition: Sendable, Equatable {
     }
 }
 
-/// SKOverlay (iOS) / Play Install Prompt (Android) config (`skoverlay` node): a native,
-/// SDK-presented install banner, independent of the creative click handler. Gated by the OS
-/// capability handshake — the backend won't assign it below iOS 14 / Android API 21.
+/// Native install-overlay config (`skoverlay` node), independent of the creative click handler.
+/// SKOverlay itself is iOS-only; Android uses its separate Play Install Prompt implementation.
+/// The backend gates assignment through the platform capability handshake.
 public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     public let enabled: Bool
     public let timing: OverlayTiming
@@ -787,7 +1019,7 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
     ) {
         self.enabled = enabled
         self.timing = timing
-        self.delaySeconds = min(maxSKOverlayDelaySeconds, max(0, delaySeconds))
+        self.delaySeconds = min(maxLegacySKOverlayDelaySeconds, max(0, delaySeconds))
         self.position = position
         self.dismissible = dismissible
     }
@@ -802,10 +1034,17 @@ public struct SKOverlayConfig: Sendable, Equatable, Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
         self.timing = .from(try? c.decode(String.self, forKey: .timing))
-        self.delaySeconds = min(
-            maxSKOverlayDelaySeconds,
-            max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
-        )
+        let contract2 = CodingUserInfoKey.simulaVideoContract2
+            .flatMap { decoder.userInfo[$0] as? Bool } == true
+        if contract2 {
+            let exact = exactJSONInteger(for: decoder, key: CodingKeys.delaySeconds)
+            self.delaySeconds = exact.flatMap { (0...maxSKOverlayDelaySeconds).contains($0) ? $0 : nil } ?? 3
+        } else {
+            self.delaySeconds = min(
+                maxLegacySKOverlayDelaySeconds,
+                max(0, (try? c.decode(Int.self, forKey: .delaySeconds)) ?? 0)
+            )
+        }
         self.position = .from(try? c.decode(String.self, forKey: .position))
         self.dismissible = (try? c.decode(Bool.self, forKey: .dismissible)) ?? true
     }
@@ -947,6 +1186,53 @@ public struct AutoStoreRedirect: Sendable, Equatable, Decodable {
     }
 }
 
+enum RewardEarnAt: String, Sendable, Equatable {
+    case unitEnd = "unit_end"
+
+    static func from(_ raw: String?) -> RewardEarnAt? {
+        RewardEarnAt(rawValue: normalizeBehaviorToken(raw))
+    }
+}
+
+struct RewardBehavior: Sendable, Equatable, Decodable {
+    let earnAt: RewardEarnAt?
+
+    init(earnAt: RewardEarnAt? = nil) {
+        self.earnAt = earnAt
+    }
+
+    enum CodingKeys: String, CodingKey { case earnAt = "earn_at" }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        earnAt = .from(try? c.decode(String.self, forKey: .earnAt))
+    }
+}
+
+enum ProgressBarStyle: String, Sendable, Equatable {
+    case single
+    case twoTone = "two_tone"
+
+    static func from(_ raw: String?) -> ProgressBarStyle {
+        ProgressBarStyle(rawValue: normalizeBehaviorToken(raw)) ?? .single
+    }
+}
+
+struct ProgressBarBehavior: Sendable, Equatable, Decodable {
+    let style: ProgressBarStyle
+
+    init(style: ProgressBarStyle = .single) {
+        self.style = style
+    }
+
+    enum CodingKeys: String, CodingKey { case style }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        style = .from(try? c.decode(String.self, forKey: .style))
+    }
+}
+
 /// Server-driven render config returned per-impression in `ad_behavior`. Optional on the load
 /// response: an absent object means "render today's defaults". A present-but-partial object
 /// fills each missing field with its default; `store_prompt` / `skoverlay` / `auto_store_redirect`
@@ -961,6 +1247,9 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
     public let storePrompt: StorePrompt?
     public let skoverlay: SKOverlayConfig?
     public let autoStoreRedirect: AutoStoreRedirect?
+    public let video: VideoBehavior
+    let reward: RewardBehavior
+    let progressBar: ProgressBarBehavior
 
     public init(
         close: CloseBehavior = CloseBehavior(),
@@ -969,11 +1258,56 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         skoverlay: SKOverlayConfig? = nil,
         autoStoreRedirect: AutoStoreRedirect? = nil
     ) {
+        self.init(
+            close: close,
+            storeOpen: storeOpen,
+            storePrompt: storePrompt,
+            skoverlay: skoverlay,
+            autoStoreRedirect: autoStoreRedirect,
+            video: VideoBehavior(),
+            reward: RewardBehavior(),
+            progressBar: ProgressBarBehavior()
+        )
+    }
+
+    public init(
+        close: CloseBehavior = CloseBehavior(),
+        storeOpen: StoreOpen = .skstoreproduct,
+        storePrompt: StorePrompt? = nil,
+        skoverlay: SKOverlayConfig? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        video: VideoBehavior
+    ) {
+        self.init(
+            close: close,
+            storeOpen: storeOpen,
+            storePrompt: storePrompt,
+            skoverlay: skoverlay,
+            autoStoreRedirect: autoStoreRedirect,
+            video: video,
+            reward: RewardBehavior(),
+            progressBar: ProgressBarBehavior()
+        )
+    }
+
+    init(
+        close: CloseBehavior = CloseBehavior(),
+        storeOpen: StoreOpen = .skstoreproduct,
+        storePrompt: StorePrompt? = nil,
+        skoverlay: SKOverlayConfig? = nil,
+        autoStoreRedirect: AutoStoreRedirect? = nil,
+        video: VideoBehavior,
+        reward: RewardBehavior,
+        progressBar: ProgressBarBehavior
+    ) {
         self.close = close
         self.storeOpen = storeOpen
         self.storePrompt = storePrompt
         self.skoverlay = skoverlay
         self.autoStoreRedirect = autoStoreRedirect
+        self.video = video
+        self.reward = reward
+        self.progressBar = progressBar
     }
 
     enum CodingKeys: String, CodingKey {
@@ -982,6 +1316,9 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         case storePrompt = "store_prompt"
         case skoverlay
         case autoStoreRedirect = "auto_store_redirect"
+        case video
+        case reward
+        case progressBar = "progress_bar"
     }
 
     public init(from decoder: Decoder) throws {
@@ -991,7 +1328,15 @@ public struct AdBehavior: Sendable, Equatable, Decodable {
         self.storePrompt = try? c.decode(StorePrompt.self, forKey: .storePrompt)
         self.skoverlay = try? c.decode(SKOverlayConfig.self, forKey: .skoverlay)
         self.autoStoreRedirect = try? c.decode(AutoStoreRedirect.self, forKey: .autoStoreRedirect)
+        self.video = (try? c.decode(VideoBehavior.self, forKey: .video)) ?? VideoBehavior()
+        self.reward = (try? c.decode(RewardBehavior.self, forKey: .reward)) ?? RewardBehavior()
+        self.progressBar = (try? c.decode(ProgressBarBehavior.self, forKey: .progressBar))
+            ?? ProgressBarBehavior()
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 /// User-selectable reasons for the in-ad report flow (the "i" → report sheet). `rawValue` is the wire

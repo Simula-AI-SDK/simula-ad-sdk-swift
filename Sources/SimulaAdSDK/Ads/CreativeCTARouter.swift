@@ -140,16 +140,92 @@ func isDirectAppStoreScheme(_ scheme: String?) -> Bool {
     return directAppStoreSchemes.contains(scheme.lowercased())
 }
 
-enum ClickSource: String, Codable, Sendable {
-    case primaryCTA = "primary_cta"
-    case storePrompt = "store_prompt"
-    case installBanner = "install_banner"
-    case fallbackCTA = "fallback_cta"
-    case autoRedirect = "auto_redirect"
+struct ClickSource: RawRepresentable, Codable, Sendable, Hashable {
+    let rawValue: String
 
-    var storeDwellTrigger: String {
-        self == .primaryCTA ? "cta" : rawValue
+    init(rawValue: String) { self.rawValue = rawValue }
+
+    var storeDwellTrigger: String { self == .primaryCTA ? "cta" : rawValue }
+
+    static let autoRedirect = ClickSource(rawValue: "auto_redirect")
+    static let companion = ClickSource(rawValue: "companion")
+    static let cta = ClickSource(rawValue: "cta")
+    static let endScreen = ClickSource(rawValue: "end_screen")
+    static let endScreenAd1Backdrop = ClickSource(rawValue: "end_screen_ad_1_backdrop")
+    static let endScreenAd1CTA = ClickSource(rawValue: "end_screen_ad_1_cta")
+    static let endScreenAd2Backdrop = ClickSource(rawValue: "end_screen_ad_2_backdrop")
+    static let endScreenAd2CTA = ClickSource(rawValue: "end_screen_ad_2_cta")
+    static let endScreenAd2InterestedButton = ClickSource(rawValue: "end_screen_ad_2_interested_button")
+    static let fallbackCTA = ClickSource(rawValue: "fallback_cta")
+    static let installBanner = ClickSource(rawValue: "install_banner")
+    static let interstitial = ClickSource(rawValue: "interstitial")
+    static let native = ClickSource(rawValue: "native")
+    static let nativeBackdrop = ClickSource(rawValue: "native_backdrop")
+    static let nativeCTA = ClickSource(rawValue: "native_cta")
+    static let playable = ClickSource(rawValue: "playable")
+    static let primaryCTA = ClickSource(rawValue: "primary_cta")
+    static let primaryUnknown = ClickSource(rawValue: "primary_unknown")
+    static let rewarded = ClickSource(rawValue: "rewarded")
+    static let sdk = ClickSource(rawValue: "sdk")
+    static let storePrompt = ClickSource(rawValue: "store_prompt")
+    static let videoPreviewCTA = ClickSource(rawValue: "video_preview_cta")
+    static let endScreen1Unknown = ClickSource(rawValue: "end_screen_1_unknown")
+    static let endScreen2Unknown = ClickSource(rawValue: "end_screen_2_unknown")
+
+    /// Exact backend `click_contract.py` / `routes/tracking.py` vocabulary. Do not normalize aliases:
+    /// HTML-owned Contract 2 interactions must preserve the backend-authored source byte-for-byte.
+    static let contract2AllowedSources: Set<ClickSource> = [
+        .autoRedirect, .companion, .cta, .endScreen,
+        .endScreenAd1Backdrop, .endScreenAd1CTA,
+        .endScreenAd2Backdrop, .endScreenAd2CTA, .endScreenAd2InterestedButton,
+        .fallbackCTA, .installBanner, .interstitial, .native, .nativeBackdrop, .nativeCTA,
+        .playable, .primaryCTA, .primaryUnknown, .rewarded, .sdk, .storePrompt,
+        .videoPreviewCTA, .endScreen1Unknown, .endScreen2Unknown,
+    ]
+
+    static func contract2(_ rawValue: String?) -> ClickSource? {
+        guard let rawValue else { return nil }
+        let source = ClickSource(rawValue: rawValue)
+        return contract2AllowedSources.contains(source) ? source : nil
     }
+}
+
+struct HTMLClickIdentity: Equatable, Sendable {
+    let interactionId: String?
+    let clickSource: String?
+}
+
+func validatedClickToken(_ value: String?) -> String? {
+    guard let value, !value.isEmpty, value.utf8.count <= 64,
+          value.unicodeScalars.allSatisfy({
+              CharacterSet.alphanumerics.contains($0) || "_-.:".unicodeScalars.contains($0)
+          }) else { return nil }
+    return value
+}
+
+func validatedRFC4122ClickID(_ value: String?) -> String? {
+    guard let value, value.utf8.count == 36 else { return nil }
+    let characters = Array(value.utf8)
+    guard characters[8] == 45, characters[13] == 45,
+          characters[18] == 45, characters[23] == 45 else { return nil }
+    let hyphens: Set<Int> = [8, 13, 18, 23]
+    guard characters.enumerated().allSatisfy({ index, byte in
+        hyphens.contains(index) || (48...57).contains(byte)
+            || (65...70).contains(byte) || (97...102).contains(byte)
+    }), (49...53).contains(characters[14]),
+          [56, 57, 65, 66, 97, 98].contains(characters[19]) else { return nil }
+    return value
+}
+
+func resolvedClickInteraction(
+    identity: HTMLClickIdentity?,
+    fallbackSource: ClickSource,
+    makeID: () -> String = { UUID().uuidString }
+) -> ClickInteraction {
+    return ClickInteraction(
+        id: validatedRFC4122ClickID(identity?.interactionId) ?? makeID(),
+        source: ClickSource.contract2(identity?.clickSource) ?? fallbackSource
+    )
 }
 
 struct ClickInteraction: Equatable, Sendable {
@@ -823,13 +899,14 @@ enum CreativeCTAOpenAdmission: Equatable {
 enum CreativeCTAOpenAuthentication: Equatable {
     case notMessage
     case rejected
-    case accepted(URL)
+    case accepted(URL, HTMLClickIdentity?)
 }
 
 enum CreativeStoreMessageAuthentication: Equatable {
     case notMessage
     case rejected
     case open
+    case openWithIdentity(HTMLClickIdentity)
     case showOverlay
     case dismiss
 }
@@ -853,11 +930,20 @@ enum CreativeStoreMessage {
         }
         guard !expectedNonce.isEmpty,
               object["activation_nonce"] as? String == expectedNonce,
-              Set(object.keys).isSubset(of: ["type", "activation_nonce"]) else {
+              Set(object.keys).isSubset(of: [
+                  "type", "activation_nonce", "interaction_id", "click_source"
+              ]) else {
             return .rejected
         }
+        let identity = HTMLClickIdentity(
+            interactionId: object["interaction_id"] as? String,
+            clickSource: object["click_source"] as? String
+        )
         switch messageType {
-        case openType: return .open
+        case openType:
+            return identity.interactionId == nil && identity.clickSource == nil
+                ? .open
+                : .openWithIdentity(identity)
         case showOverlayType: return .showOverlay
         default: return .dismiss
         }
@@ -880,7 +966,7 @@ enum CreativeCTAOpenMessage {
         externalClickOnly: Bool
     ) -> CreativeCTAOpenAdmission {
         switch authenticate(body, expectedNonce: expectedNonce) {
-        case .accepted(let url):
+        case .accepted(let url, _):
             return isAllowed(url, destination: destination, externalClickOnly: externalClickOnly)
                 ? .accepted(url)
                 : .rejected
@@ -903,13 +989,19 @@ enum CreativeCTAOpenMessage {
         guard messageType == type else { return .notMessage }
         guard !expectedNonce.isEmpty,
               object["activation_nonce"] as? String == expectedNonce,
+              Set(object.keys).isSubset(of: [
+                  "type", "activation_nonce", "url", "interaction_id", "click_source"
+              ]),
               let value = object["url"] as? String,
               !value.isEmpty,
               let url = URL(string: value),
               url.scheme?.isEmpty == false else {
             return .rejected
         }
-        return .accepted(url)
+        return .accepted(url, HTMLClickIdentity(
+            interactionId: object["interaction_id"] as? String,
+            clickSource: object["click_source"] as? String
+        ))
     }
 
     static func isAllowed(_ url: URL, destination: AdDestination, externalClickOnly: Bool) -> Bool {

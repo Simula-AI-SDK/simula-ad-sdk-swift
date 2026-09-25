@@ -275,7 +275,7 @@ final class CreativeClickURLTests: XCTestCase {
     func testFallbackVideoSceneReaderDeliversDetachAfterViewDeallocates() async {
         let detached = expectation(description: "overlay scene detached")
         var reader: AdOverlayWindowSceneView? = AdOverlayWindowSceneView()
-        reader?.onSceneChanged = { captured in
+        reader?.onSceneChanged = { _, captured in
             XCTAssertNil(captured)
             detached.fulfill()
         }
@@ -337,7 +337,7 @@ final class CreativeClickURLTests: XCTestCase {
     }
 
     func testRepeatedFailedVideoCloseWhileBlockedAdvancesExactlyOnceAfterBlockersClear() {
-        var state = FallbackFailureAdvanceState()
+        var state = FallbackTerminalAdvanceState()
         XCTAssertFalse(state.request(index: 1, blocked: true))
         XCTAssertEqual(
             fallbackCloseRequestAction(
