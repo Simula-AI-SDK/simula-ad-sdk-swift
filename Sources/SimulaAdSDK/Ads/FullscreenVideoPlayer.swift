@@ -607,7 +607,7 @@ func videoPreFirstFrameEscapeDecision(
         action: action,
         terminalEvent: .userClose,
         telemetryStage: FullscreenVideoTelemetryStage.close,
-        telemetryReason: FullscreenVideoTerminationReason.user
+        telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
     )
 }
 
@@ -633,6 +633,7 @@ enum FullscreenVideoTerminationReason {
     static let completed = "completed"
     static let failed = "failed"
     static let user = "user"
+    static let preFirstFrameCancel = "pre_first_frame_cancel"
     static let noNextStep = "no_next_step"
     static let nextStepFailed = "next_step_failed"
     static let nextStepTimeout = "next_step_timeout"
@@ -642,7 +643,7 @@ enum FullscreenVideoTerminationReason {
     static let playback = "playback"
 
     static let canonicalVocabulary: Set<String> = [
-        completed, failed, user, noNextStep, nextStepFailed, nextStepTimeout,
+        completed, failed, user, preFirstFrameCancel, noNextStep, nextStepFailed, nextStepTimeout,
         backgrounded, storePresented, audioInterruption, playback,
     ]
 }

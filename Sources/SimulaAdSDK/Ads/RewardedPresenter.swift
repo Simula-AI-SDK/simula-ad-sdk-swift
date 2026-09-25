@@ -1102,8 +1102,6 @@ private struct RewardedGameView: View {
             return true
         }
         let admittedAt = ProcessInfo.processInfo.systemUptime
-        let ended = player.status == .ended
-        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         admission.visualBecameReady(owner: admissionOwner)
@@ -1143,11 +1141,7 @@ private struct RewardedGameView: View {
             },
             notifyStarted: onVideoStarted
         )
-        if ended {
-            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
-        } else {
-            updateVideoGate(player: player, played: player.playedSeconds)
-        }
+        updateVideoGate(player: player, played: player.playedSeconds)
         return true
     }
 

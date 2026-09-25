@@ -328,7 +328,7 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(
             FullscreenVideoTerminationReason.canonicalVocabulary,
             Set([
-                "completed", "failed", "user", "no_next_step", "next_step_failed",
+                "completed", "failed", "user", "pre_first_frame_cancel", "no_next_step", "next_step_failed",
                 "next_step_timeout", "backgrounded", "store_presented",
                 "audio_interruption", "playback",
             ])
@@ -562,7 +562,7 @@ final class CreativeVideoTests: XCTestCase {
 
         XCTAssertEqual(emitted.count, 1)
         XCTAssertEqual(emitted.first?.stage, FullscreenVideoTelemetryStage.close)
-        XCTAssertEqual(emitted.first?.reason, FullscreenVideoTerminationReason.user)
+        XCTAssertEqual(emitted.first?.reason, FullscreenVideoTerminationReason.preFirstFrameCancel)
         XCTAssertFalse(arbiter.claimTerminal(playerID: "stale-player", event: decision.terminalEvent))
         XCTAssertFalse(arbiter.claimTerminal(playerID: "clip-a", event: .failure))
     }

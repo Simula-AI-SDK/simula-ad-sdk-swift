@@ -1697,7 +1697,7 @@ public struct VerifyRewardRequest: Encodable, Sendable {
     public let serveId: String
     public let sessionId: String
     public let elapsedPlayTime: Double
-    /// Sent alongside serve_id so the SSV reward callback can resolve/validate the ad unit off the body.
+    /// Retained for source compatibility; not encoded. The server resolves the ad unit from serve_id.
     public let adUnitId: String
     public let completionReason: RewardCompletionReason?
 

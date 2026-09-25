@@ -886,15 +886,11 @@ private struct CreativeInterstitialView: View {
             return true
         }
         let admittedAt = ProcessInfo.processInfo.systemUptime
-        let ended = player.status == .ended
-        if ended, !claimVideoPlanTerminalIfNeeded(player: player, event: .completion) { return false }
         primaryCreativeReady = true
         admittedVideoPlayerIdentity = ObjectIdentifier(player)
         handleSKANCreativeReady()
         admission.visualBecameReady(owner: admissionOwner)
-        if !ended {
-            updateVideoGate(player: player, played: player.playedSeconds)
-        }
+        updateVideoGate(player: player, played: player.playedSeconds)
         runVideoFirstFrameStartSequence(
             shouldRecordStart: !videoStartRecorded,
             recordStart: {
@@ -933,9 +929,6 @@ private struct CreativeInterstitialView: View {
             notifyStarted: onVideoStarted
         )
         fireAutoStoreRedirectIfCloseShown()
-        if ended {
-            handleVideoStatus(.ended, player: player, terminalAlreadyClaimed: true)
-        }
         return true
     }
 

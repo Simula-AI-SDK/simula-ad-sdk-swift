@@ -1482,7 +1482,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
         XCTAssertTrue(canUseVideoControls(firstFrameAdmitted: true, displayAdmitted: true))
     }
 
-    func testPreFirstFrameEscapeRoutesEachSurfaceAsCanonicalUserClose() {
+    func testPreFirstFrameEscapeDistinguishesCancellationOnEachSurface() {
         XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .interstitial,
             presentationMounted: true,
@@ -1492,7 +1492,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             action: .failInterstitialDisplay,
             terminalEvent: .userClose,
             telemetryStage: FullscreenVideoTelemetryStage.close,
-            telemetryReason: FullscreenVideoTerminationReason.user
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
         ))
         XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .rewarded,
@@ -1503,7 +1503,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             action: .finishRewardedUnearned,
             terminalEvent: .userClose,
             telemetryStage: FullscreenVideoTelemetryStage.close,
-            telemetryReason: FullscreenVideoTerminationReason.user
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
         ))
         XCTAssertEqual(videoPreFirstFrameEscapeDecision(
             surface: .fallback,
@@ -1514,7 +1514,7 @@ final class FullscreenPresentationAdmissionTests: XCTestCase {
             action: .requestFallbackFailureAdvance,
             terminalEvent: .userClose,
             telemetryStage: FullscreenVideoTelemetryStage.close,
-            telemetryReason: FullscreenVideoTerminationReason.user
+            telemetryReason: FullscreenVideoTerminationReason.preFirstFrameCancel
         ))
     }
 

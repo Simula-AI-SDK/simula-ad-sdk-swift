@@ -97,6 +97,8 @@ An explicit `verified: false` permanently reconciles verification; malformed res
 An optional validated top-level `impression_url` is requested once at the existing two-second
 impression commit. This measurement request is a plain bounded unauthenticated GET with no SDK,
 privacy, or cookie headers and does not affect impression, paid, or reward callbacks.
+Cancelling before the first video frame emits `video_close` with reason `pre_first_frame_cancel`;
+normal user closes retain reason `user`, so reporting can distinguish preparation cancellations.
 
 ## Development Environment
 
