@@ -63,8 +63,8 @@ struct CarrierInfo: Sendable {
 ///   error. Failed batches retry with exponential backoff.
 /// - **Bounded**: the buffer caps at `maxBuffer` (oldest non-critical event dropped) and distinct
 ///   error signatures at `maxErrorSignatures`; both surface a `dropped` meta event.
-/// - **Sampled / killable**: perf is sampled per session at `sampleRate`; the whole pipeline
-///   honors `isEnabled` (host opt-out always wins; the server can additionally disable it).
+/// - **Sampled / killable**: perf, including video telemetry, is sampled per session and each event
+///   carries `sample_rate`; the whole pipeline honors `isEnabled` (host opt-out always wins).
 ///
 /// `@unchecked Sendable` is safe: all mutable state is guarded by `lock`, and the async send
 /// happens off the lock. Collaborators are injected so the engine is exercised with an isolated
@@ -322,7 +322,11 @@ final class TelemetryManager: @unchecked Sendable {
         errorCode: String?,
         trigger: String? = nil,
         cacheSource: String? = nil,
-        breadcrumb: String? = nil
+        breadcrumb: String? = nil,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         recordLifecycle(
             stage: stage,
@@ -336,8 +340,69 @@ final class TelemetryManager: @unchecked Sendable {
             cacheSource: cacheSource,
             breadcrumb: breadcrumb,
             interactionId: nil,
-            clickSource: nil
+            clickSource: nil,
+            endEvent: endEvent,
+            opens: opens,
+            contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
+    }
+
+    func recordVideoLifecycle(
+        stage: String,
+        adFormat: String,
+        adUnitId: String?,
+        adId: String?,
+        serveId: String?,
+        errorCode: String?,
+        clipIndex: Int?,
+        muted: Bool?,
+        impressionId: String?,
+        style: String?,
+        skoverlayEnabled: Bool?,
+        skoverlayDelaySeconds: Int?,
+        videoPositionS: Double?,
+        pool: String?,
+        durationS: Double?,
+        quartile: Int?,
+        reason: String?,
+        pausedMs: Double?,
+        watchedS: Double?,
+        secondsUnmuted: Double?,
+        secondsMuted: Double?,
+        msToNextStepReady: Double?,
+        secondsSinceVideoStart: Double?,
+        on: String?,
+        visibleS: Double?,
+        error: String?
+    ) {
+        var event = newEvent(type: TelemetryType.lifecycle, name: stage)
+        event.adFormat = adFormat
+        event.adUnitId = adUnitId
+        event.adId = adId
+        event.serveId = serveId
+        event.errorCode = errorCode
+        event.clipIndex = clipIndex
+        event.muted = muted
+        event.impressionId = impressionId
+        event.style = style
+        event.skoverlayEnabled = skoverlayEnabled
+        event.skoverlayDelaySeconds = skoverlayDelaySeconds.map { min(60, max(0, $0)) }
+        event.videoPositionS = videoPositionS.map { max(0, $0) }
+        event.pool = pool
+        event.durationS = durationS.map { max(0, $0) }
+        event.quartile = quartile
+        event.reason = reason
+        event.pausedMs = pausedMs.map { max(0, $0) }
+        event.watchedS = watchedS.map { max(0, $0) }
+        event.secondsUnmuted = secondsUnmuted.map { max(0, $0) }
+        event.secondsMuted = secondsMuted.map { max(0, $0) }
+        event.msToNextStepReady = msToNextStepReady.map { max(0, $0) }
+        event.secondsSinceVideoStart = secondsSinceVideoStart.map { max(0, $0) }
+        event.on = on
+        event.visibleS = visibleS.map { max(0, $0) }
+        event.videoError = error
+        enqueuePerf(event)
     }
 
     func recordLifecycle(
@@ -352,7 +417,11 @@ final class TelemetryManager: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil,
         interactionId: String?,
-        clickSource: String?
+        clickSource: String?,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         var e = newEvent(type: TelemetryType.lifecycle, name: stage)
         e.adFormat = adFormat
@@ -364,6 +433,10 @@ final class TelemetryManager: @unchecked Sendable {
         e.durationMs = durationMs
         e.errorCode = errorCode
         e.trigger = trigger
+        e.endEvent = endEvent
+        e.opens = opens
+        e.contaminated = contaminated
+        e.freeSpaceDeltaBytes = freeSpaceDeltaBytes
         e.cacheSource = cacheSource
         e.breadcrumb = breadcrumb
         let accumulatedFunnel = accumulate(stage: stage, adFormat: adFormat, cacheSource: cacheSource, errorCode: errorCode)
@@ -377,9 +450,8 @@ final class TelemetryManager: @unchecked Sendable {
         if accumulatedFunnel { scheduleTimedFlush() }
     }
 
-    /// Set the session experiment assignment for the envelope (last assignment wins).
+    /// Replace the session experiment assignment for the envelope (last assignment wins).
     func setExperiment(experimentId: String?, variantId: String?) {
-        if (experimentId?.isEmpty ?? true) && (variantId?.isEmpty ?? true) { return }
         lock.lock()
         self.experimentId = experimentId
         self.variantId = variantId

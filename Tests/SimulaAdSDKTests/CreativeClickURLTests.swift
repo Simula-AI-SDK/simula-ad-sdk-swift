@@ -1,6 +1,9 @@
 import Foundation
 import XCTest
 @testable import SimulaAdSDK
+#if os(iOS)
+import UIKit
+#endif
 
 final class CreativeClickURLTests: XCTestCase {
     private let activationNonce = "activation-nonce"
@@ -108,6 +111,276 @@ final class CreativeClickURLTests: XCTestCase {
         XCTAssertEqual(beacons.first?.0.clickSource, interaction.source.rawValue)
         XCTAssertEqual(beacons.first?.1, telemetry.first?.0)
         XCTAssertEqual(publisher, [interaction])
+    }
+
+    func testItemRoutedFallbackVideoEnqueuesOneDurableClick() {
+        let ad = FallbackAd(
+            adId: "fallback-video",
+            sourceIndex: 0,
+            renderedHtml: nil,
+            type: "video",
+            url: "https://cdn.example/video.mp4",
+            posterUrl: nil,
+            adBehavior: nil,
+            nativeClickBeaconV1Enabled: true,
+            destination: "web",
+            trackingUrl: "https://item.example/click"
+        )
+        XCTAssertNotNil(fallbackVideoCTARoute(ad: ad, allowsParentFallback: false))
+        let capable = DeviceCapabilities(
+            osVersion: "test", storekitAvailable: true, skanVersion: "4.0",
+            adAttributionKitAvailable: true, nativeClickBeaconV1: true
+        )
+        let interaction = ClickInteraction(id: "item-route", source: .fallbackCTA)
+        var telemetryCount = 0
+        var beaconCount = 0
+        var publisherCount = 0
+
+        accountFallbackClick(
+            adId: ad.adId,
+            interaction: interaction,
+            capabilities: capable,
+            nativeClickBeaconV1Enabled: ad.nativeClickBeaconV1Enabled,
+            adFormat: "rewarded",
+            adUnitId: "unit",
+            serveId: "parent",
+            recordTelemetry: { _, _ in telemetryCount += 1 },
+            enqueueBeacon: { claim, _ in
+                XCTAssertEqual(claim.interactionId, interaction.id)
+                beaconCount += 1
+            },
+            notifyPublisher: { _ in publisherCount += 1 }
+        )
+
+        XCTAssertEqual(telemetryCount, 1)
+        XCTAssertEqual(beaconCount, 1)
+        XCTAssertEqual(publisherCount, 1)
+    }
+
+    func testFallbackVideoWithoutRouteCannotBeginClickAccounting() {
+        XCTAssertFalse(canBeginFallbackVideoClick(
+            pageFinished: true,
+            clickHandoffPending: false,
+            routeActive: true,
+            trackingUrl: nil,
+            destination: .appstore,
+            storeUrl: nil
+        ))
+        XCTAssertTrue(canBeginFallbackVideoClick(
+            pageFinished: true,
+            clickHandoffPending: false,
+            routeActive: true,
+            trackingUrl: "https://item.example/click",
+            destination: .web,
+            storeUrl: nil
+        ))
+    }
+
+    func testFallbackVideoRouteRequiresForegroundActivePresentation() {
+        XCTAssertTrue(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: false,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: false,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: false,
+            applicationActive: true,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: false,
+            sceneForegroundActive: true
+        ))
+        XCTAssertFalse(fallbackVideoRouteExecutionIsActive(
+            routeActive: true,
+            hasAppeared: true,
+            appForegrounded: true,
+            applicationActive: true,
+            sceneForegroundActive: false
+        ))
+    }
+
+    func testFallbackVideoRouteUsesOnlyCapturedForegroundScene() {
+        let captured = NSObject()
+        let inactive = NSObject()
+
+        XCTAssertTrue(fallbackVideoRouteOriginatingScene(
+            captured,
+            isForegroundActive: { $0 === captured }
+        ) === captured)
+        XCTAssertNil(fallbackVideoRouteOriginatingScene(
+            inactive,
+            isForegroundActive: { $0 === captured }
+        ))
+        XCTAssertNil(fallbackVideoRouteOriginatingScene(
+            Optional<NSObject>.none,
+            isForegroundActive: { $0 === captured }
+        ))
+    }
+
+    @MainActor
+    func testFallbackVideoDelayedRouteRejectsBackgroundBeforeBegin() {
+        var appForegrounded = true
+        var applicationActive = true
+        var released = 0
+        var routes = 0
+        var outcomes: [AttributionRouteOutcome] = []
+        let execution = AttributionRouteExecution(
+            isActive: {
+                fallbackVideoRouteExecutionIsActive(
+                    routeActive: true,
+                    hasAppeared: true,
+                    appForegrounded: appForegrounded,
+                    applicationActive: applicationActive,
+                    sceneForegroundActive: true
+                )
+            },
+            onUIHandoffReleased: { released += 1 },
+            onOutcome: { outcomes.append($0) }
+        )
+
+        appForegrounded = false
+        applicationActive = false
+        XCTAssertFalse(execution.begin(path: .directStore))
+        execution.complete { routes += 1; return true }
+
+        XCTAssertEqual(routes, 0)
+        XCTAssertEqual(released, 1)
+        XCTAssertEqual(outcomes.first?.failureClass, "inactive_presentation")
+    }
+
+    #if os(iOS)
+    @MainActor
+    func testFallbackVideoSceneReaderDeliversDetachAfterViewDeallocates() async {
+        let detached = expectation(description: "overlay scene detached")
+        var reader: AdOverlayWindowSceneView? = AdOverlayWindowSceneView()
+        reader?.onSceneChanged = { _, captured in
+            XCTAssertNil(captured)
+            detached.fulfill()
+        }
+        reader?.didMoveToWindow()
+        reader = nil
+
+        await fulfillment(of: [detached], timeout: TestWait.timeout)
+    }
+    #endif
+
+    func testFallbackVideoLoadingShieldDoesNotCoverInterruptionRecovery() {
+        XCTAssertFalse(shouldShowFallbackLoadingShield(
+            isVideo: true,
+            adPageReady: false,
+            terminalFailure: false
+        ))
+        XCTAssertTrue(shouldShowFallbackLoadingShield(
+            isVideo: true,
+            adPageReady: true,
+            terminalFailure: true
+        ))
+        XCTAssertTrue(shouldShowFallbackLoadingShield(
+            isVideo: false,
+            adPageReady: false,
+            terminalFailure: false
+        ))
+        XCTAssertFalse(shouldShowFallbackLoadingShield(
+            isVideo: false,
+            adPageReady: true,
+            terminalFailure: false
+        ))
+    }
+
+    func testFailedFallbackVideoCloseRequestsDeferredAdvanceBeforeFirstFrame() {
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: false,
+                storeSheetPresented: true,
+                dismissUnlocked: true,
+                clickHandoffPending: true
+            ),
+            .requestFailureAdvance
+        )
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: false,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: false
+            ),
+            .ignore
+        )
+    }
+
+    func testRepeatedFailedVideoCloseWhileBlockedAdvancesExactlyOnceAfterBlockersClear() {
+        var state = FallbackTerminalAdvanceState()
+        XCTAssertFalse(state.request(index: 1, blocked: true))
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: true,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: true
+            ),
+            .requestFailureAdvance
+        )
+        XCTAssertFalse(state.request(index: 1, blocked: true))
+        XCTAssertEqual(state.blockersDidClear(currentIndex: 1), 1)
+        XCTAssertNil(state.blockersDidClear(currentIndex: 1))
+    }
+
+    func testFailedFallbackHTMLRetainsManualCloseProgression() {
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: false,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: false,
+                clickHandoffPending: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            fallbackCloseRequestAction(
+                isVideo: false,
+                pageFinished: false,
+                terminalFailure: true,
+                appForegrounded: true,
+                storeSheetPresented: false,
+                dismissUnlocked: true,
+                clickHandoffPending: false
+            ),
+            .close
+        )
     }
 
     func testFallbackClickAccountingKeepsTelemetryAndPublisherWhenServerOwnsNoBeacon() {

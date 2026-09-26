@@ -1,5 +1,8 @@
 import Foundation
 import XCTest
+#if canImport(JavaScriptCore)
+import JavaScriptCore
+#endif
 @testable import SimulaAdSDK
 
 final class CreativeUserActivationTests: XCTestCase {
@@ -24,6 +27,17 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("activation_nonce: activationNonce"))
     }
 
+    func testEveryActivationFrameCarriesValidatedClickSourceForSrcdoc() {
+        let source = creativeUserActivationScriptSource(
+            nonce: "nonce",
+            clickSource: .fallbackCTA
+        )
+
+        XCTAssertTrue(source.contains("var slotClickSource = 'fallback_cta'"))
+        XCTAssertTrue(source.contains("window.simulaClickInteraction(slotClickSource, true)"))
+        XCTAssertFalse(source.contains("window.__simulaNativeSlotSource"))
+    }
+
     func testGeneratedScriptExposesStablePayloadFreeStoreAPI() {
         let source = creativeUserActivationScriptSource(nonce: "nonce")
 
@@ -32,14 +46,20 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'dismissStore'"))
         XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'showInstallBanner'"))
         XCTAssertTrue(source.contains("function openStore()"))
+        XCTAssertTrue(source.contains("Object.defineProperty(simulaAdAPI, 'openCTA'"))
         XCTAssertTrue(source.contains("function dismissStore()"))
         XCTAssertTrue(source.contains("function showInstallBanner()"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OPEN'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_DISMISS'"))
         XCTAssertTrue(source.contains("type: 'SIMULA_INTERNAL_STORE_OVERLAY_SHOW'"))
-        XCTAssertTrue(source.contains("postNative(nativeStringify(message))"))
+        XCTAssertTrue(source.contains("postNative(nativeStringify(withIdentity(message, resolvedIdentity)))"))
         XCTAssertTrue(source.contains("postNative(nativeStringify({"))
-        XCTAssertFalse(source.contains("function openStore(value"))
+        XCTAssertTrue(source.contains("function withIdentity(message, identity)"))
+        XCTAssertTrue(source.contains("window.simulaClickInteraction(slotClickSource, true)"))
+        XCTAssertTrue(source.contains("typeof identity === 'string'"))
+        XCTAssertFalse(source.contains("__simulaMintClickIdentity"))
+        XCTAssertTrue(source.contains("type: 'SIMULA_CTA_OPEN'"))
+        XCTAssertFalse(source.contains("CTA_CLICK"))
         XCTAssertFalse(source.contains("activation_nonce: 'nonce'"))
     }
 
@@ -51,6 +71,147 @@ final class CreativeUserActivationTests: XCTestCase {
         XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_DISMISS"))
         XCTAssertFalse(source.contains("SIMULA_INTERNAL_STORE_OVERLAY_SHOW"))
         XCTAssertTrue(source.contains("window.open = function()"))
+    }
+
+    func testDocumentStartCTAInterceptionLeavesSameOriginAndInternalNavigationToWebKit() {
+        let source = creativeUserActivationScriptSource(nonce: "nonce")
+
+        XCTAssertTrue(source.contains("function documentHTTPOrigin()"))
+        XCTAssertTrue(source.contains("function isSameOriginCTA(url)"))
+        XCTAssertTrue(source.contains("function isInternalCTA(url)"))
+        XCTAssertTrue(source.contains("function isExternalCTA(url)"))
+        XCTAssertTrue(source.contains("protocol === 'http:' || protocol === 'https:'"))
+        for scheme in ["about:", "data:", "blob:", "javascript:"] {
+            XCTAssertTrue(source.contains("protocol === '\(scheme)'"), scheme)
+        }
+        XCTAssertTrue(source.contains("if (!url || !isExternalCTA(url)) { return false; }"))
+        XCTAssertTrue(source.contains("return originalOpen.apply(window, arguments);"))
+        XCTAssertTrue(source.contains("if (forwardCTA(anchor.href, event)) { event.preventDefault(); }"))
+        XCTAssertFalse(source.contains("window.__simulaNativeSlotSource"), "srcdoc frames use the installed semantic source")
+    }
+
+    #if canImport(JavaScriptCore)
+    private func activationContext() throws -> JSContext {
+        let context = try XCTUnwrap(JSContext())
+        let resolve: @convention(block) (String, String) -> String = { value, base in
+            guard let url = URL(string: value, relativeTo: URL(string: base))?.absoluteURL,
+                  let scheme = url.scheme else { return "null" }
+            let origin = ["http", "https"].contains(scheme)
+                ? "\(scheme)://\(url.host ?? "")\(url.port.map { ":\($0)" } ?? "")" : "null"
+            let fields = ["href": url.absoluteString, "protocol": scheme + ":", "origin": origin]
+            guard let data = try? JSONSerialization.data(withJSONObject: fields) else { return "null" }
+            return String(data: data, encoding: .utf8) ?? "null"
+        }
+        context.setObject(resolve, forKeyedSubscript: "resolveURL" as NSString)
+        context.evaluateScript("""
+        var messages = [], listeners = [], timers = [], nativeOpens = 0;
+        var document = {baseURI: 'https://creative.example/game'};
+        var navigator = {userActivation: {isActive: false}};
+        var window = {
+          location: {origin: 'https://creative.example'},
+          open: function() { nativeOpens++; }, setTimeout: function(callback) { timers.push(callback); },
+          webkit: {messageHandlers: {simulaSDK: {postMessage: function(value) { messages.push(JSON.parse(value)); }}}},
+          addEventListener: function(type, callback, capture) { listeners.push({type:type, callback:callback, capture:capture}); }
+        };
+        function URL(value, base) {
+          var parsed = JSON.parse(resolveURL(String(value), base || document.baseURI));
+          if (!parsed) { throw Error('invalid URL'); }
+          this.href = parsed.href; this.protocol = parsed.protocol; this.origin = parsed.origin;
+        }
+        function flushTimers() { while (timers.length) timers.shift()(); }
+        function click(url, stoppedAtTarget, trusted) {
+          var anchor = {href:url, target:'_blank'};
+          var event = {type:'click', isTrusted:trusted, timeStamp:1,
+            target:{closest:function() { return anchor; }}, preventDefault:function() {}};
+          listeners.filter(function(l) { return l.type === 'click' && l.capture; }).forEach(function(l) { l.callback(event); });
+          if (!stoppedAtTarget) {
+            listeners.filter(function(l) { return l.type === 'click' && !l.capture; }).forEach(function(l) { l.callback(event); });
+          }
+        }
+        """)
+        context.evaluateScript(creativeUserActivationScriptSource(nonce: "nonce"))
+        XCTAssertNil(context.exception)
+        return context
+    }
+
+    func testTrustedStoreSchemeClickSurvivesCreativeStopPropagationAndDeduplicates() throws {
+        for scheme in ["itms-apps", "itms-appss", "https"] {
+            let context = try activationContext()
+            context.evaluateScript("click('\(scheme)://apps.apple.com/app/id375380948', true, true)")
+            context.evaluateScript("window.open('\(scheme)://apps.apple.com/app/id375380948'); flushTimers()")
+            XCTAssertNil(context.exception)
+            XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 1)
+            XCTAssertEqual(context.evaluateScript("messages[0].type")?.toString(), "SIMULA_CTA_OPEN")
+            XCTAssertEqual(context.evaluateScript("nativeOpens")?.toInt32(), 0)
+        }
+    }
+
+    func testCapturedAnchorReadsSharedIdentityAfterCreativeHandlerRuns() throws {
+        let context = try activationContext()
+        context.evaluateScript("""
+        var identity = {interaction_id:'b9585d88-0868-4a79-b29d-0a52639903a7', click_source:'primary_unknown'};
+        window.simulaClickForEvent = function() { return identity; };
+        click('https://store.example/app', true, true);
+        identity.click_source = 'end_screen_ad_1_cta';
+        flushTimers();
+        """)
+        XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("messages[0].click_source")?.toString(), "end_screen_ad_1_cta")
+        XCTAssertEqual(context.evaluateScript("messages[0].interaction_id")?.toString(), "b9585d88-0868-4a79-b29d-0a52639903a7")
+    }
+
+    func testUntrustedAndInternalClicksDoNotClaimNativeCTA() throws {
+        for url in ["https://creative.example/next", "about:blank", "javascript:void(0)", "custom://app"] {
+            let context = try activationContext()
+            context.setObject(url, forKeyedSubscript: "targetURL" as NSString)
+            context.evaluateScript("click(targetURL, true, true)")
+            XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 0)
+        }
+        let context = try activationContext()
+        context.evaluateScript("click('itms-apps://apps.apple.com/app/id375380948', false, false)")
+        XCTAssertEqual(context.evaluateScript("messages.length")?.toInt32(), 0)
+    }
+    #endif
+
+    func testWebViewHTTPOriginIncludesSchemeHostAndEffectivePort() throws {
+        let current = try XCTUnwrap(URL(string: "https://Example.COM/path"))
+
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "https://example.com:443/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "http://example.com/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "https://example.com:444/other")),
+            currentURL: current,
+            currentBaseURL: nil
+        ))
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: try XCTUnwrap(URL(string: "http://example.com:80/other")),
+            currentURL: try XCTUnwrap(URL(string: "http://example.com/path")),
+            currentBaseURL: nil
+        ))
+    }
+
+    func testWebViewHTTPOriginFallsBackToCurrentBaseURL() throws {
+        let target = try XCTUnwrap(URL(string: "https://creative.example:443/next"))
+        let base = try XCTUnwrap(URL(string: "https://CREATIVE.example/root/"))
+
+        XCTAssertTrue(webViewURLsHaveSameHTTPOrigin(
+            targetURL: target,
+            currentURL: nil,
+            currentBaseURL: base
+        ))
+        XCTAssertFalse(webViewURLsHaveSameHTTPOrigin(
+            targetURL: target,
+            currentURL: try XCTUnwrap(URL(string: "https://other.example/root/")),
+            currentBaseURL: base
+        ), "currentURL takes precedence when both sources are present")
     }
 
     func testOpenStoreSharesWindowOpenGestureClaimWhileDismissDoesNotClaim() {

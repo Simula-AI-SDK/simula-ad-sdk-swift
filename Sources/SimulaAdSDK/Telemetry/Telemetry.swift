@@ -8,7 +8,7 @@ import CoreTelephony
 
 /// SDK version stamped on every telemetry batch. Keep in sync with `SimulaAdSDK.podspec`
 /// (`s.version`) and the SPM release tag.
-let SIMULA_SDK_VERSION = "1.2.2-dev.1"
+let SIMULA_SDK_VERSION = "1.2.2-dev.2"
 
 struct DuplicateInitializeCountBuffer {
     private(set) var count = 0
@@ -265,12 +265,18 @@ final class Telemetry: @unchecked Sendable {
         errorCode: String? = nil,
         trigger: String? = nil,
         cacheSource: String? = nil,
-        breadcrumb: String? = nil
+        breadcrumb: String? = nil,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
             serveId: serveId, durationMs: durationMs, errorCode: errorCode,
-            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb
+            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb,
+            endEvent: endEvent, opens: opens, contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
     }
 
@@ -286,13 +292,19 @@ final class Telemetry: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil,
         interactionId: String,
-        clickSource: ClickSource
+        clickSource: ClickSource,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
             serveId: serveId, durationMs: durationMs, errorCode: errorCode,
             trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb,
-            interactionId: interactionId, clickSource: clickSource.rawValue
+            interactionId: interactionId, clickSource: clickSource.rawValue,
+            endEvent: endEvent, opens: opens, contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
     }
 
@@ -314,6 +326,64 @@ final class Telemetry: @unchecked Sendable {
         )
     }
 
+    func recordVideoLifecycle(
+        stage: String,
+        adFormat: String,
+        adUnitId: String?,
+        adId: String?,
+        serveId: String?,
+        errorCode: String? = nil,
+        clipIndex: Int?,
+        muted: Bool?,
+        impressionId: String? = nil,
+        style: String? = nil,
+        skoverlayEnabled: Bool? = nil,
+        skoverlayDelaySeconds: Int? = nil,
+        videoPositionS: Double? = nil,
+        pool: String? = nil,
+        durationS: Double? = nil,
+        quartile: Int? = nil,
+        reason: String? = nil,
+        pausedMs: Double? = nil,
+        watchedS: Double? = nil,
+        secondsUnmuted: Double? = nil,
+        secondsMuted: Double? = nil,
+        msToNextStepReady: Double? = nil,
+        secondsSinceVideoStart: Double? = nil,
+        on: String? = nil,
+        visibleS: Double? = nil,
+        error: String? = nil
+    ) {
+        current?.recordVideoLifecycle(
+            stage: stage,
+            adFormat: adFormat,
+            adUnitId: adUnitId,
+            adId: adId,
+            serveId: serveId,
+            errorCode: errorCode,
+            clipIndex: clipIndex,
+            muted: muted,
+            impressionId: impressionId,
+            style: style,
+            skoverlayEnabled: skoverlayEnabled,
+            skoverlayDelaySeconds: skoverlayDelaySeconds,
+            videoPositionS: videoPositionS,
+            pool: pool,
+            durationS: durationS,
+            quartile: quartile,
+            reason: reason,
+            pausedMs: pausedMs,
+            watchedS: watchedS,
+            secondsUnmuted: secondsUnmuted,
+            secondsMuted: secondsMuted,
+            msToNextStepReady: msToNextStepReady,
+            secondsSinceVideoStart: secondsSinceVideoStart,
+            on: on,
+            visibleS: visibleS,
+            error: error
+        )
+    }
+
     /// Persist + attempt delivery now (e.g. app background).
     func flush() { current?.flushNow() }
 
@@ -332,7 +402,7 @@ final class Telemetry: @unchecked Sendable {
         afterPendingPersistence(timeout: 0.35, completion: completion)
     }
 
-    /// Record the session's experiment assignment (server-driven) for the telemetry envelope.
+    /// Replace the session's experiment assignment; two nil values clear a previous serve's value.
     func setExperiment(experimentId: String?, variantId: String?) {
         current?.setExperiment(experimentId: experimentId, variantId: variantId)
     }

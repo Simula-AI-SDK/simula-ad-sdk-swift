@@ -105,7 +105,8 @@ final class NativeAdWebViewStore {
         impressionId: String,
         creativeKey: String,
         delegate: WKNavigationDelegate & WKUIDelegate,
-        onMessage: @escaping (WebViewForwardedMessage) -> Void
+        onMessage: @escaping (WebViewForwardedMessage) -> Void,
+        clickSource: ClickSource = .primaryUnknown
     ) -> (webView: WKWebView, alreadyLoaded: Bool) {
         if let session = sessions[impressionId] {
             if !session.attached, !session.unusable, session.loadCompleted, session.loadedKey == creativeKey {
@@ -122,7 +123,11 @@ final class NativeAdWebViewStore {
                 // The retained view is on screen in another slot (same serve rendered twice) — hand
                 // out an ephemeral pool view instead; `detach` ignores it (identity mismatch) so it
                 // returns to the pool on dismantle.
-                return (WebViewPool.shared.acquire(delegate: delegate, onMessage: onMessage), false)
+                return (WebViewPool.shared.acquire(
+                    delegate: delegate,
+                    onMessage: onMessage,
+                    clickSource: clickSource
+                ), false)
             }
             // Idle but not reattachable (render process died / load failed off-screen, the load
             // never finished before the row was dismantled, or a different creative now lives
@@ -130,7 +135,11 @@ final class NativeAdWebViewStore {
             remove(impressionId)
         }
 
-        let webView = WebViewPool.shared.acquire(delegate: delegate, onMessage: onMessage)
+        let webView = WebViewPool.shared.acquire(
+            delegate: delegate,
+            onMessage: onMessage,
+            clickSource: clickSource
+        )
         guard let forwarder = WebViewPool.shared.adopt(webView) else {
             // The pool kept ownership (shouldn't happen) — leave the view ephemeral.
             return (webView, false)
@@ -202,13 +211,20 @@ final class NativeAdWebViewStore {
     /// possible (blank new id, or the new serve already holds an attached session in another
     /// slot) the view is orphaned instead: dropped from the store untouched — it lives out this
     /// mount and deallocates on dismantle (`detach` won't match, and the pool no longer owns it).
-    func rebind(_ webView: WKWebView, from oldImpressionId: String, to newImpressionId: String?, creativeKey: String) {
+    func rebind(
+        _ webView: WKWebView,
+        from oldImpressionId: String,
+        to newImpressionId: String?,
+        creativeKey: String,
+        clickSource: ClickSource = .primaryUnknown
+    ) {
         guard let session = sessions[oldImpressionId], session.webView === webView else { return }
         session.forwarder.rotatePresentationCapabilities()
         WebViewPool.installUserScripts(
             on: webView.configuration.userContentController,
             nonce: session.forwarder.userActivationNonce,
-            bridgeCapability: session.forwarder.bridgeCapability
+            bridgeCapability: session.forwarder.bridgeCapability,
+            clickSource: clickSource
         )
         sessions.removeValue(forKey: oldImpressionId)
         if let idx = accessOrder.firstIndex(of: oldImpressionId) { accessOrder.remove(at: idx) }

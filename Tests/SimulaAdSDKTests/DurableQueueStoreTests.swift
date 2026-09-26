@@ -44,13 +44,49 @@ final class DurableQueueStoreTests: XCTestCase {
         let fileURL = temporaryFile("rewards.json")
         let store = FileRewardVerificationStore(fileURL: fileURL, legacyDefaults: defaults)
 
-        XCTAssertEqual(verifications(from: store.load()).map(\.serveId), ["A", "B"])
+        let migrated = verifications(from: store.load())
+        XCTAssertEqual(migrated.map(\.serveId), ["A", "B"])
+        XCTAssertTrue(migrated.allSatisfy { $0.completionReason == nil })
         XCTAssertNil(defaults.data(forKey: "simula_pending_reward_verifications"))
 
         XCTAssertTrue(store.save(expected + [
             PendingVerification(serveId: "C", sessionId: "s", elapsedPlayTime: 3, retryCount: 0, lastAttemptTimestamp: 0),
         ]))
         XCTAssertEqual(verifications(from: store.load()).map(\.serveId), ["A", "B", "C"])
+    }
+
+    func testPendingVerificationDecodesLegacyRowWithoutCompletionReason() throws {
+        let data = Data(#"[{"serveId":"A","sessionId":"s","elapsedPlayTime":2.5,"retryCount":1,"lastAttemptTimestamp":10,"adUnitId":"u"}]"#.utf8)
+        let decoded = try JSONDecoder().decode([PendingVerification].self, from: data)
+
+        XCTAssertEqual(decoded.count, 1)
+        XCTAssertNil(decoded.first?.completionReason)
+    }
+
+    func testUnknownRewardCompletionReasonLoadsWithoutQuarantineAndRoundTripsExactly() throws {
+        let fileURL = temporaryFile("future-reward-reason.json")
+        let original = Data(#"[{"serveId":"A","sessionId":"s","elapsedPlayTime":2.5,"retryCount":1,"lastAttemptTimestamp":10,"adUnitId":"u","completionReason":"future_reason"}]"#.utf8)
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try original.write(to: fileURL)
+        let store = FileRewardVerificationStore(fileURL: fileURL, legacyDefaults: isolatedDefaults())
+
+        let loaded = verifications(from: store.load())
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded.first?.completionReasonRawValue, "future_reason")
+        XCTAssertNil(loaded.first?.completionReason)
+        XCTAssertTrue(loaded.first?.hasUnsupportedCompletionReason == true)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        ).contains { $0.lastPathComponent.hasPrefix("future-reward-reason.json.quarantine.") })
+
+        XCTAssertTrue(store.save(loaded))
+        let roundTrip = verifications(from: store.load())
+        XCTAssertEqual(roundTrip.first?.completionReasonRawValue, "future_reason")
     }
 
     func testMalformedBeaconLegacyDataIsClearedAndDoesNotLatchWrites() {

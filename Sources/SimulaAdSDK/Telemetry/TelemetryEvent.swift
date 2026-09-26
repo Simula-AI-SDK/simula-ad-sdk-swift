@@ -49,15 +49,46 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
     var stack: [String]?
     var cacheHit: Bool?
     var retryCount: Int?
-    /// Store-exit click type for store_opened/returned/abandoned: cta | store_prompt | auto_redirect.
+    /// Store-exit click type: cta | store_prompt | install_banner | fallback_cta | auto_redirect.
     var trigger: String?
+    /// Terminal reason for a store dwell: sheet_dismissed | app_foreground | ad_closed.
+    var endEvent: String?
+    /// One-based store-open ordinal within a fullscreen presentation.
+    var opens: Int?
+    /// Cross-platform optional fields. Swift deliberately leaves both unset.
+    var contaminated: Bool?
+    var freeSpaceDeltaBytes: Int64?
     /// Native load source for load_success: preload | cache | network.
     var cacheSource: String?
+    /// Planned-video dimensions. Nil on legacy `video_v1` and non-video events.
+    var clipIndex: Int?
+    /// SDK/player mute state; the hardware silent switch and host audio routing can still make an
+    /// unmuted clip inaudible, so this does not guarantee audibility.
+    var muted: Bool?
+    var impressionId: String?
+    var style: String?
+    var skoverlayEnabled: Bool?
+    var skoverlayDelaySeconds: Int?
+    var videoPositionS: Double?
+    var pool: String?
+    var durationS: Double?
+    var quartile: Int?
+    var reason: String?
+    var pausedMs: Double?
+    var watchedS: Double?
+    var secondsUnmuted: Double?
+    var secondsMuted: Double?
+    var msToNextStepReady: Double?
+    var secondsSinceVideoStart: Double?
+    var on: String?
+    var visibleS: Double?
+    var videoError: String?
     /// Wall-clock staleness, stamped at flush time = clock() - timestamp. Detects offline/queued events.
     var eventAgeMs: Int?
     /// Occurrence count for a deduped error signature (mutable so repeats aggregate in place).
     var count: Int?
-    /// Effective performance sampling rate when this event entered the buffer.
+    /// Video lifecycle telemetry is sampled with other performance events and carries this effective
+    /// rate so backend aggregation can compensate for sampling.
     var sampleRate: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -82,7 +113,29 @@ struct TelemetryEvent: Codable, Equatable, Sendable {
         case cacheHit = "cache_hit"
         case retryCount = "retry_count"
         case trigger
+        case endEvent = "end_event"
+        case opens, contaminated
+        case freeSpaceDeltaBytes = "free_space_delta_bytes"
         case cacheSource = "cache_source"
+        case clipIndex = "clip_index"
+        case muted
+        case impressionId = "impression_id"
+        case style
+        case skoverlayEnabled = "skoverlay_enabled"
+        case skoverlayDelaySeconds = "skoverlay_delay_seconds"
+        case videoPositionS = "video_position_s"
+        case pool
+        case durationS = "duration_s"
+        case quartile, reason
+        case pausedMs = "paused_ms"
+        case watchedS = "watched_s"
+        case secondsUnmuted = "seconds_unmuted"
+        case secondsMuted = "seconds_muted"
+        case msToNextStepReady = "ms_to_next_step_ready"
+        case secondsSinceVideoStart = "seconds_since_video_start"
+        case on
+        case visibleS = "visible_s"
+        case videoError = "error"
         case eventAgeMs = "event_age_ms"
         case count
         case sampleRate = "sample_rate"

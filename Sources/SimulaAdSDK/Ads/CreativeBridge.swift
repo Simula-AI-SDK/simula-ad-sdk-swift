@@ -77,14 +77,14 @@ private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling 
 
         let center = NotificationCenter.default
         backgroundObserver = center.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification,
+            forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             self?.stopTimer()
         }
         foregroundObserver = center.addObserver(
-            forName: UIApplication.willEnterForegroundNotification,
+            forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -93,7 +93,7 @@ private final class SystemCreativeAudioVolumePoller: CreativeAudioVolumePolling 
             self.onPoll?()
         }
 
-        if UIApplication.shared.applicationState != .background {
+        if UIApplication.shared.applicationState == .active {
             startTimer()
         }
     }

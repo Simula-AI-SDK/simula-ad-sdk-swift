@@ -454,6 +454,7 @@ public final class SimulaProvider: ObservableObject {
         _ = SimulaUserAgent.value
         _ = SimulaDeviceId.value
         _ = SimulaAPI.shared
+        _ = PlainImpressionSender.shared
 
         // Install telemetry before the first request so /session/create (and every subsequent
         // SDK request) is captured. First call wins, so a re-created provider doesn't churn it;

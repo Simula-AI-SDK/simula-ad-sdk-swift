@@ -1,5 +1,5 @@
 internal func nativeAdMountTaskIdentity(response: NativeAdResponse, mountAdmitted: Bool) -> String {
-    "\(response.impressionId ?? "")|\(response.iframeURL ?? "")|\(response.renderedHTML?.hashValue ?? 0)|\(mountAdmitted)"
+    "\(response.impressionId ?? "")|\(response.renderedHTML?.hashValue ?? 0)|\(mountAdmitted)"
 }
 
 struct NativeAdSlotStartupPlan: Equatable {
@@ -301,9 +301,6 @@ public struct NativeAdSlot: View {
             ZStack {
                 if mountAdmitted {
                     WebViewRepresentable(
-                        // Prefer the server-rendered html (the inline <iframe srcdoc> creative); fall back to
-                        // the iframe url when no html is present.
-                        url: response.renderedHTML == nil ? response.iframeURL.flatMap { URL(string: $0) } : nil,
                         htmlString: response.renderedHTML,
                         onNavigationFailed: { _ in handleLoadFailure() },
                         onMessageReceived: { handleMessage($0, impressionId: impressionId, adFormat: response.adFormat) },
@@ -442,11 +439,6 @@ public struct NativeAdSlot: View {
     }
 
     private func retainedCreativeKey(_ response: NativeAdResponse) -> String {
-        if response.renderedHTML == nil,
-           let rawURL = response.iframeURL,
-           let url = URL(string: rawURL) {
-            return url.absoluteString
-        }
         return "html:\(response.renderedHTML?.hashValue ?? 0)"
     }
 

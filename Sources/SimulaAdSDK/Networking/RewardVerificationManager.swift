@@ -15,6 +15,67 @@ struct PendingVerification: Codable, Equatable {
     /// queue entries persisted before this field existed still decode (as `nil`) instead of being
     /// dropped — which would lose the pending reward.
     var adUnitId: String?
+    /// Retain the exact persisted value so a reason introduced by a future SDK does not make this
+    /// older SDK quarantine the complete billing queue as corrupt.
+    private(set) var completionReasonRawValue: String?
+
+    var completionReason: RewardCompletionReason? {
+        completionReasonRawValue.flatMap(RewardCompletionReason.init(rawValue:))
+    }
+
+    var hasUnsupportedCompletionReason: Bool {
+        completionReasonRawValue != nil && completionReason == nil
+    }
+
+    init(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        retryCount: Int,
+        lastAttemptTimestamp: Double,
+        adUnitId: String? = nil,
+        completionReason: RewardCompletionReason? = nil
+    ) {
+        self.serveId = serveId
+        self.sessionId = sessionId
+        self.elapsedPlayTime = elapsedPlayTime
+        self.retryCount = retryCount
+        self.lastAttemptTimestamp = lastAttemptTimestamp
+        self.adUnitId = adUnitId
+        self.completionReasonRawValue = completionReason?.rawValue
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case serveId
+        case sessionId
+        case elapsedPlayTime
+        case retryCount
+        case lastAttemptTimestamp
+        case adUnitId
+        case completionReason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serveId = try container.decode(String.self, forKey: .serveId)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        elapsedPlayTime = try container.decode(Double.self, forKey: .elapsedPlayTime)
+        retryCount = try container.decode(Int.self, forKey: .retryCount)
+        lastAttemptTimestamp = try container.decode(Double.self, forKey: .lastAttemptTimestamp)
+        adUnitId = try container.decodeIfPresent(String.self, forKey: .adUnitId)
+        completionReasonRawValue = try container.decodeIfPresent(String.self, forKey: .completionReason)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(serveId, forKey: .serveId)
+        try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(elapsedPlayTime, forKey: .elapsedPlayTime)
+        try container.encode(retryCount, forKey: .retryCount)
+        try container.encode(lastAttemptTimestamp, forKey: .lastAttemptTimestamp)
+        try container.encodeIfPresent(adUnitId, forKey: .adUnitId)
+        try container.encodeIfPresent(completionReasonRawValue, forKey: .completionReason)
+    }
 }
 
 // MARK: - Seams (injected so the queue is unit-testable without the network/clock)
@@ -23,6 +84,30 @@ struct PendingVerification: Codable, Equatable {
 /// tests substitute a fake. Mirrors the Kotlin `RewardVerifier`.
 protocol RewardVerifying: Sendable {
     func verifyReward(serveId: String, sessionId: String, elapsedPlayTime: Double, adUnitId: String) async throws -> VerifyRewardResponse
+    func verifyReward(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String,
+        completionReason: RewardCompletionReason?
+    ) async throws -> VerifyRewardResponse
+}
+
+extension RewardVerifying {
+    func verifyReward(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String,
+        completionReason: RewardCompletionReason?
+    ) async throws -> VerifyRewardResponse {
+        try await verifyReward(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId
+        )
+    }
 }
 
 extension SimulaAPI: RewardVerifying {}
@@ -35,7 +120,10 @@ func rewardVerificationBackoff(retryCount: Int) -> TimeInterval {
 
 /// True if [error] is a permanent client error — a 4xx other than 408 (Request Timeout)
 /// or 429 (Too Many Requests) — for which retrying won't help.
+enum RewardVerificationRejection: Error { case notVerified }
+
 func isPermanentVerificationError(_ error: Error) -> Bool {
+    if error is RewardVerificationRejection { return true }
     if case let SimulaAPIError.httpError(statusCode) = error,
        (400...499).contains(statusCode), statusCode != 408, statusCode != 429 {
         return true
@@ -85,7 +173,9 @@ public final class RewardVerificationManager: @unchecked Sendable {
     private var startupTriggerTask: Task<Void, Never>?
     private var pendingRemovalServeIds: Set<String> = []
     private var pendingCallbacks: [(@Sendable (Result<String?, Error>) -> Void, Result<String?, Error>)] = []
+    private var pendingPersistenceCallbacks: [String: [@Sendable () -> Void]] = [:]
     private var pendingNetworkRetryDelay: TimeInterval?
+    private var unsupportedCompletionReasonReported = false
     private let maxPendingEnqueues = 100
 
     /// A scheduled wake-up for the earliest backed-off task after a retryable failure (e.g. a
@@ -172,12 +262,52 @@ public final class RewardVerificationManager: @unchecked Sendable {
         adUnitId: String = "",
         completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
     ) {
+        queueVerification(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            completionReason: nil,
+            completion: completion
+        )
+    }
+
+    public func queueVerification(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String = "",
+        completionReason: RewardCompletionReason?,
+        completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
+    ) {
+        queueVerification(
+            serveId: serveId,
+            sessionId: sessionId,
+            elapsedPlayTime: elapsedPlayTime,
+            adUnitId: adUnitId,
+            completionReason: completionReason,
+            onPersisted: nil,
+            completion: completion
+        )
+    }
+
+    func queueVerification(
+        serveId: String,
+        sessionId: String,
+        elapsedPlayTime: Double,
+        adUnitId: String = "",
+        completionReason: RewardCompletionReason?,
+        onPersisted: (@Sendable () -> Void)?,
+        completion: (@Sendable (Result<String?, Error>) -> Void)? = nil
+    ) {
         executor.async { [weak self] in
             self?.enqueueOnExecutor(
                 serveId: serveId,
                 sessionId: sessionId,
                 elapsedPlayTime: elapsedPlayTime,
                 adUnitId: adUnitId,
+                completionReason: completionReason,
+                onPersisted: onPersisted,
                 completion: completion
             )
         }
@@ -188,9 +318,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
         sessionId: String,
         elapsedPlayTime: Double,
         adUnitId: String,
+        completionReason: RewardCompletionReason?,
+        onPersisted: (@Sendable () -> Void)?,
         completion: (@Sendable (Result<String?, Error>) -> Void)?
     ) {
-        guard elapsedPlayTime.isFinite else {
+        guard elapsedPlayTime.isFinite, elapsedPlayTime >= 0 else {
             Telemetry.shared.recordError(
                 signature: "reward_verification:invalid_elapsed_time",
                 breadcrumb: "value=non_finite"
@@ -201,6 +333,9 @@ public final class RewardVerificationManager: @unchecked Sendable {
         guard !pendingRemovalServeIds.contains(serveId) else { return }
         let loaded = loadIfNeeded()
         if let completion { activeCallbacks[serveId] = completion }
+        if let onPersisted {
+            pendingPersistenceCallbacks[serveId, default: []].append(onPersisted)
+        }
         guard loaded else {
             if !pendingQueue.contains(where: { $0.serveId == serveId }) {
                 guard pendingQueue.count < maxPendingEnqueues else {
@@ -209,6 +344,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                         breadcrumb: "queue=reward_verification"
                     )
                     let callback = activeCallbacks.removeValue(forKey: serveId)
+                    pendingPersistenceCallbacks.removeValue(forKey: serveId)
                     callbackQueue.async {
                         callback?(.failure(SimulaAPIError.invalidResponse))
                     }
@@ -221,7 +357,8 @@ public final class RewardVerificationManager: @unchecked Sendable {
                         elapsedPlayTime: elapsedPlayTime,
                         retryCount: 0,
                         lastAttemptTimestamp: 0,
-                        adUnitId: adUnitId
+                        adUnitId: adUnitId,
+                        completionReason: completionReason
                     )
                 )
             }
@@ -235,12 +372,14 @@ public final class RewardVerificationManager: @unchecked Sendable {
                     elapsedPlayTime: elapsedPlayTime,
                     retryCount: 0,
                     lastAttemptTimestamp: 0,
-                    adUnitId: adUnitId
+                    adUnitId: adUnitId,
+                    completionReason: completionReason
                 )
             )
             isDirty = true
             persistIfNeeded()
         } else if !isDirty {
+            dispatchPersistenceCallbacks(for: serveId)
             processOrScheduleRetry()
         }
     }
@@ -274,13 +413,29 @@ public final class RewardVerificationManager: @unchecked Sendable {
     @discardableResult
     private func processNextIfPossible() -> Bool {
         guard isLoaded, !isDirty, !isProcessing else { return false }
+        reportUnsupportedCompletionReasonsIfNeeded()
         let nowTs = now()
         guard let task = queue.first(where: {
-            nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
+            !$0.hasUnsupportedCompletionReason
+                && nowTs - $0.lastAttemptTimestamp >= rewardVerificationBackoff(retryCount: $0.retryCount)
         }) else { return false }
         isProcessing = true
         Task { await self.verify(task) }
         return true
+    }
+
+    private func reportUnsupportedCompletionReasonsIfNeeded() {
+        guard queue.contains(where: \.hasUnsupportedCompletionReason) else {
+            unsupportedCompletionReasonReported = false
+            return
+        }
+        if !unsupportedCompletionReasonReported {
+            unsupportedCompletionReasonReported = true
+            Telemetry.shared.recordError(
+                signature: "reward_verification:unsupported_completion_reason",
+                breadcrumb: "queue=reward_verification"
+            )
+        }
     }
 
     private func verify(_ task: PendingVerification) async {
@@ -290,8 +445,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 serveId: task.serveId,
                 sessionId: task.sessionId,
                 elapsedPlayTime: task.elapsedPlayTime,
-                adUnitId: task.adUnitId ?? ""
+                adUnitId: task.adUnitId ?? "",
+                completionReason: task.completionReason
             )
+            if response.explicitlyRejected { throw RewardVerificationRejection.notVerified }
+            guard response.verified else { throw SimulaAPIError.invalidResponse }
             result = .success(response.token)
         } catch {
             result = .failure(error)
@@ -320,7 +478,7 @@ public final class RewardVerificationManager: @unchecked Sendable {
                 if queue[index].retryCount < Int.max { queue[index].retryCount += 1 }
                 queue[index].lastAttemptTimestamp = now()
                 let nowTs = now()
-                let soonest = queue.map {
+                let soonest = queue.filter { !$0.hasUnsupportedCompletionReason }.map {
                     rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
                 }.min() ?? 0
                 retryDelay = max(soonest, 1)
@@ -342,9 +500,10 @@ public final class RewardVerificationManager: @unchecked Sendable {
     }
 
     private func processOrScheduleRetry() {
+        reportUnsupportedCompletionReasonsIfNeeded()
         guard !processNextIfPossible() else { return }
         let nowTs = now()
-        guard let delay = queue.map({
+        guard let delay = queue.filter({ !$0.hasUnsupportedCompletionReason }).map({
             rewardVerificationBackoff(retryCount: $0.retryCount) - (nowTs - $0.lastAttemptTimestamp)
         }).filter({ $0 > 0 }).min() else {
             return
@@ -418,6 +577,11 @@ public final class RewardVerificationManager: @unchecked Sendable {
 
     private func durabilityCommitted() {
         pendingRemovalServeIds.removeAll()
+        let persistenceCallbacks = pendingPersistenceCallbacks.values.flatMap { $0 }
+        pendingPersistenceCallbacks.removeAll()
+        persistenceCallbacks.forEach { callback in
+            callbackQueue.async { callback() }
+        }
         let callbacks = pendingCallbacks
         pendingCallbacks.removeAll()
         for (callback, result) in callbacks {
@@ -428,6 +592,13 @@ public final class RewardVerificationManager: @unchecked Sendable {
             scheduleRetry(after: delay)
         } else {
             processOrScheduleRetry()
+        }
+    }
+
+    private func dispatchPersistenceCallbacks(for serveId: String) {
+        let callbacks = pendingPersistenceCallbacks.removeValue(forKey: serveId) ?? []
+        callbacks.forEach { callback in
+            callbackQueue.async { callback() }
         }
     }
 
