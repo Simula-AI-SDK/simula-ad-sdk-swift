@@ -533,6 +533,27 @@ import UIKit
 
 // MARK: - FallbackAdPresenter
 
+@MainActor
+func openFallbackAutomaticRoute(
+    trackingUrl: String?,
+    destination: AdDestination,
+    storeOpen: StoreOpen,
+    storeUrl: String?,
+    attribution: AdAttribution?,
+    lifecycle: AttributionRouteLifecycle,
+    execution: AttributionRouteExecution
+) {
+    CreativeCTARouter.open(
+        trackingUrl: trackingUrl,
+        destination: destination,
+        storeOpen: storeOpen,
+        storeUrl: storeUrl,
+        attribution: attribution,
+        storeProductOwnership: lifecycle.storeProductOwnership,
+        execution: execution
+    )
+}
+
 /// Presents the post-close fallback ad screens (`AdOverlayView`) full-screen in a dedicated
 /// `UIWindow`, mirroring the declarative minigame's post-game ad flow. Used by
 /// `SimulaInterstitialAd` and `SimulaRewardedAd` after the primary creative is dismissed: the host
@@ -583,6 +604,7 @@ final class FallbackAdPresenter {
     private var telemetryAdFormat = "interstitial"
     private var telemetryAdUnitId: String?
     private var telemetryServeId: String?
+    private var storeExitTracker: StoreExitTracker?
     private var loadingDeadlineTask: Task<Void, Never>?
     private var onLoadingTimeout: (() -> Void)?
     private var isLoading = false
@@ -622,6 +644,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
+        storeExitTracker: StoreExitTracker? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
@@ -644,6 +667,7 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             presentationLease: presentationLease,
             onFinish: onFinish
@@ -671,6 +695,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String = "interstitial",
         telemetryAdUnitId: String? = nil,
         telemetryServeId: String? = nil,
+        storeExitTracker: StoreExitTracker? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         onLoadingTimeout: @escaping () -> Void,
         presentationLease: FullscreenPresentationLease,
@@ -693,6 +718,7 @@ final class FallbackAdPresenter {
             telemetryAdFormat: telemetryAdFormat,
             telemetryAdUnitId: telemetryAdUnitId,
             telemetryServeId: telemetryServeId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             presentationLease: presentationLease,
             onFinish: onFinish
@@ -727,6 +753,7 @@ final class FallbackAdPresenter {
         telemetryAdFormat: String,
         telemetryAdUnitId: String?,
         telemetryServeId: String?,
+        storeExitTracker: StoreExitTracker?,
         videoPlanScope: VideoPlanPresentationScope?,
         presentationLease: FullscreenPresentationLease,
         onFinish: @escaping (FallbackOutcome) -> Void
@@ -750,6 +777,7 @@ final class FallbackAdPresenter {
         self.telemetryAdFormat = telemetryAdFormat
         self.telemetryAdUnitId = telemetryAdUnitId
         self.telemetryServeId = telemetryServeId
+        self.storeExitTracker = storeExitTracker
         self.videoPlanScope = videoPlanScope
             ?? (ads.contains(where: \.usesVideoPlanV2Contract) ? VideoPlanPresentationScope() : nil)
         self.presentationLease = presentationLease
@@ -853,14 +881,21 @@ final class FallbackAdPresenter {
                 },
                 onOutcome: { outcome in
                     recordAttributionRoute(outcome: outcome, source: .autoRedirect)
+                    if let route = outcome.storeDwellRoute {
+                        self.storeExitTracker?.recordStoreOpen(
+                            ClickSource.autoRedirect.storeDwellTrigger,
+                            route: route
+                        )
+                    }
                 }
             )
-            CreativeCTARouter.open(
+            openFallbackAutomaticRoute(
                 trackingUrl: self.ctaTrackingUrl,
                 destination: self.ctaDestination,
                 storeOpen: self.ctaStoreOpen,
                 storeUrl: self.ctaStoreUrl,
                 attribution: self.attribution,
+                lifecycle: lifecycle,
                 execution: execution
             )
         }
@@ -881,7 +916,7 @@ final class FallbackAdPresenter {
         ) : nil
         let usesVideoRoute = ad.mediaType == .video
         currentRouteLifecycle?.deactivate()
-        let routeLifecycle = AttributionRouteLifecycle()
+        let routeLifecycle = AttributionRouteLifecycle(storeDwellPresentationID: storeExitTracker?.presentationID)
         currentRouteLifecycle = routeLifecycle
         return AnyView(AdOverlayView(
             ad: ad,
@@ -931,6 +966,7 @@ final class FallbackAdPresenter {
             ctaStoreUrl: usesVideoRoute ? videoRoute?.storeUrl : ctaStoreUrl,
             attribution: usesVideoRoute && videoRoute?.source != .parent ? nil : attribution,
             routeLifecycle: routeLifecycle,
+            storeExitTracker: storeExitTracker,
             onScreenMounted: { [weak self] in
                 guard let self, canHandleFallbackScreenCallback(
                     renderedIndex: index,
@@ -1281,6 +1317,7 @@ final class FallbackAdPresenter {
         videoPreparations.removeAll()
         currentRouteLifecycle?.deactivate()
         currentRouteLifecycle = nil
+        storeExitTracker = nil
         window = nil
         hostingController = nil
         originalKeyWindow = nil

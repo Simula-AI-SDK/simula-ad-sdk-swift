@@ -52,6 +52,7 @@ final class RewardedPresenter {
         videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
+        storeExitTracker: StoreExitTracker? = nil,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
         trackingUrl: String? = nil,
@@ -100,6 +101,7 @@ final class RewardedPresenter {
             videoPlayer: videoPlayer,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExit: storeExitTracker,
             close: close,
             storePrompt: storePrompt,
             trackingUrl: trackingUrl,
@@ -163,6 +165,7 @@ final class RewardedPresenter {
         videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
+        storeExitTracker: StoreExitTracker? = nil,
         close: CloseBehavior? = nil,
         storePrompt: StorePrompt? = nil,
         trackingUrl: String? = nil,
@@ -193,6 +196,7 @@ final class RewardedPresenter {
             videoAssetLease: videoAssetLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExitTracker: storeExitTracker,
             close: close,
             storePrompt: storePrompt,
             trackingUrl: trackingUrl,
@@ -296,6 +300,7 @@ private struct RewardedGameView: View {
     let videoPlanScope: VideoPlanPresentationScope?
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
+    let storeExit: StoreExitTracker?
     /// Server `ad_behavior.close` treatment (hidden / countdown ring / progress bar / reward-or-close
     /// label) — rendered by the shared `CloseButtonView`, gated on play-to-earn. `nil` → default.
     /// Its `delaySeconds` is also the play-to-earn gate length (see `gateSeconds`).
@@ -332,9 +337,6 @@ private struct RewardedGameView: View {
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
     @State private var viewAppeared = false
-    /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
-    @State private var storeExit: StoreExitTracker?
-
     @State private var gateClock = FullscreenGateClock()
     @State private var videoGate: VideoPlaybackGate
     @State private var videoFailureHandled = false
@@ -362,7 +364,7 @@ private struct RewardedGameView: View {
     @State private var storePromptVisible = false
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
-    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
+    @State private var attributionRouteLifecycle: AttributionRouteLifecycle
     @State private var visible = true
     @State private var timerTask: Task<Void, Never>?
     @State private var htmlReadinessTask: Task<Void, Never>?
@@ -384,6 +386,7 @@ private struct RewardedGameView: View {
         videoPlayer: FullscreenVideoPlayer?,
         videoPlanScope: VideoPlanPresentationScope?,
         admission: FullscreenPresentationAdmission,
+        storeExit: StoreExitTracker?,
         close: CloseBehavior?,
         storePrompt: StorePrompt?,
         trackingUrl: String?,
@@ -413,6 +416,10 @@ private struct RewardedGameView: View {
         self.videoPlanScope = videoPlanScope
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
+        self.storeExit = storeExit
+        _attributionRouteLifecycle = State(initialValue: AttributionRouteLifecycle(
+            storeDwellPresentationID: storeExit?.presentationID
+        ))
         self.close = close
         self.storePrompt = storePrompt
         self.trackingUrl = trackingUrl
@@ -570,14 +577,15 @@ private struct RewardedGameView: View {
         .hideStatusBar(true)
         .onAppear {
             appForegrounded = UIApplication.shared.applicationState == .active
-            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive(
+                ownershipToken: attributionRouteLifecycle.storeProductOwnership
+            )
             admission.setBlocked(fullscreenPresentationBlocked(
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented
             ))
             viewAppeared = true
             attributionRouteLifecycle.activate()
-            if storeExit == nil { storeExit = StoreExitTracker(adId: impressionId, adFormat: "rewarded") }
             reconcileTimer()
             if !suppressesLegacySKOverlay { startSKOverlay() }
             videoPlanBlockerGeneration &+= 1
@@ -603,7 +611,6 @@ private struct RewardedGameView: View {
             gateClock.pause(at: ProcessInfo.processInfo.systemUptime, total: gateDuration)
             if videoPlayer != nil { admission.visualBecameUnavailable(owner: admissionOwner) }
             dismissSKOverlay()
-            storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
             clickHandoffs.reset()
             videoPlayer?.setPresentationBlocked(true)
@@ -618,14 +625,12 @@ private struct RewardedGameView: View {
             appForegrounded = false
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAway()
             reconcileTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
-            storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
             presentRequestedSKOverlayIfNeeded()
@@ -635,18 +640,18 @@ private struct RewardedGameView: View {
             guard let scene = notification.object as? UIWindowScene, scene === originatingScene else { return }
             presentRequestedSKOverlayIfNeeded()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = true
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAway()
             reconcileTimer()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = false
             updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
-            storeExit?.onReturn()
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileTimer()
             completeDeferredTerminalIfPossible()
@@ -690,7 +695,12 @@ private struct RewardedGameView: View {
                 },
                 onOutcome: { outcome in
                     recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                    if let route = outcome.storeDwellRoute {
+                        storeExit?.recordStoreOpen(
+                            ClickSource.autoRedirect.storeDwellTrigger,
+                            route: route
+                        )
+                    }
                 }
             )
             handleStorePromptTap(execution: execution)
@@ -874,7 +884,9 @@ private struct RewardedGameView: View {
                 updateClickHandoff(.creative, pending: $0)
             },
             onAttributionRouteOutcome: { outcome in
-                if outcome.success { storeExit?.recordStoreOpen("cta") }
+                if let route = outcome.storeDwellRoute {
+                    storeExit?.recordStoreOpen(ClickSource.primaryCTA.storeDwellTrigger, route: route)
+                }
             },
             onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
             onStoreDismissRequest: { dismissSKOverlay() },
@@ -1287,7 +1299,9 @@ private struct RewardedGameView: View {
                     onUIHandoffReleased: { updateClickHandoff(.creative, pending: false) },
                     onOutcome: { outcome in
                         recordAttributionRoute(outcome: outcome, source: .primaryCTA)
-                        if outcome.success { storeExit?.recordStoreOpen("cta") }
+                        if let route = outcome.storeDwellRoute {
+                            storeExit?.recordStoreOpen(ClickSource.primaryCTA.storeDwellTrigger, route: route)
+                        }
                     }
                 )
                 routeCommittedUserHandoff(
@@ -1349,7 +1363,12 @@ private struct RewardedGameView: View {
                     },
                     onOutcome: { outcome in
                         recordAttributionRoute(outcome: outcome, source: .storePrompt)
-                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let route = outcome.storeDwellRoute {
+                            storeExit?.recordStoreOpen(
+                                ClickSource.storePrompt.storeDwellTrigger,
+                                route: route
+                            )
+                        }
                         if let generation = gestureGuard.complete() {
                             DispatchQueue.main.asyncAfter(
                                 deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout

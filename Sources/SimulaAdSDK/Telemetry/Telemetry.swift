@@ -265,12 +265,18 @@ final class Telemetry: @unchecked Sendable {
         errorCode: String? = nil,
         trigger: String? = nil,
         cacheSource: String? = nil,
-        breadcrumb: String? = nil
+        breadcrumb: String? = nil,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
             serveId: serveId, durationMs: durationMs, errorCode: errorCode,
-            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb
+            trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb,
+            endEvent: endEvent, opens: opens, contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
     }
 
@@ -286,13 +292,19 @@ final class Telemetry: @unchecked Sendable {
         cacheSource: String? = nil,
         breadcrumb: String? = nil,
         interactionId: String,
-        clickSource: ClickSource
+        clickSource: ClickSource,
+        endEvent: String? = nil,
+        opens: Int? = nil,
+        contaminated: Bool? = nil,
+        freeSpaceDeltaBytes: Int64? = nil
     ) {
         current?.recordLifecycle(
             stage: stage, adFormat: adFormat, adUnitId: adUnitId, adId: adId,
             serveId: serveId, durationMs: durationMs, errorCode: errorCode,
             trigger: trigger, cacheSource: cacheSource, breadcrumb: breadcrumb,
-            interactionId: interactionId, clickSource: clickSource.rawValue
+            interactionId: interactionId, clickSource: clickSource.rawValue,
+            endEvent: endEvent, opens: opens, contaminated: contaminated,
+            freeSpaceDeltaBytes: freeSpaceDeltaBytes
         )
     }
 

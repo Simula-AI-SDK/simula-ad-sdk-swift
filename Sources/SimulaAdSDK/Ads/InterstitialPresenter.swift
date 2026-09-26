@@ -113,6 +113,7 @@ final class InterstitialPresenter {
         videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
+        storeExitTracker: StoreExitTracker? = nil,
         onWillPresent: () -> Void = {},
         onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping (ClickInteraction) -> Void,
@@ -143,6 +144,7 @@ final class InterstitialPresenter {
             videoPlayer: videoPlayer,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExit: storeExitTracker,
             originatingScene: scene,
             bridge: bridge,
             onVideoStarted: onVideoStarted,
@@ -186,6 +188,7 @@ final class InterstitialPresenter {
         videoAssetLease: VideoAssetLease? = nil,
         videoPlanScope: VideoPlanPresentationScope? = nil,
         admission: FullscreenPresentationAdmission,
+        storeExitTracker: StoreExitTracker? = nil,
         onWillPresent: () -> Void = {},
         onVideoStarted: @escaping () -> Void = {},
         onClick: @escaping () -> Void,
@@ -199,6 +202,7 @@ final class InterstitialPresenter {
             videoAssetLease: videoAssetLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExitTracker: storeExitTracker,
             onWillPresent: onWillPresent,
             onVideoStarted: onVideoStarted,
             onClick: { _ in onClick() },
@@ -283,6 +287,7 @@ private struct CreativeInterstitialView: View {
     let videoPlanScope: VideoPlanPresentationScope?
     let admission: FullscreenPresentationAdmission
     let admissionOwner: FullscreenVisualSurfaceToken
+    let storeExit: StoreExitTracker?
     let originatingScene: UIWindowScene
     /// WebView ↔ SDK bridge (PRD §3). `AD_EARLY_COMPLETE` flips `earlyComplete` (observed below).
     let bridge: CreativeBridge
@@ -297,9 +302,6 @@ private struct CreativeInterstitialView: View {
     @State private var appForegrounded = true
     @State private var storeSheetPresented = false
     @State private var viewAppeared = false
-    /// Store-exit funnel tracker (store_opened/returned/abandoned), created on appear.
-    @State private var storeExit: StoreExitTracker?
-
     @State private var visible = true
 
     /// Whether the close button may be shown/tapped. Starts `false` when a close delay
@@ -338,7 +340,7 @@ private struct CreativeInterstitialView: View {
     @State private var storePromptTask: Task<Void, Never>?
     @State private var storePromptGestureGuard = StorePromptGestureGuard()
     @State private var clickHandoffs = FullscreenClickHandoffState()
-    @State private var attributionRouteLifecycle = AttributionRouteLifecycle()
+    @State private var attributionRouteLifecycle: AttributionRouteLifecycle
 
     // SKOverlay install banner (`skoverlay`) — resolved app id + one-shot presentation.
     @State private var resolvedAppID: String?
@@ -359,6 +361,7 @@ private struct CreativeInterstitialView: View {
         videoPlayer: FullscreenVideoPlayer?,
         videoPlanScope: VideoPlanPresentationScope?,
         admission: FullscreenPresentationAdmission,
+        storeExit: StoreExitTracker?,
         originatingScene: UIWindowScene,
         bridge: CreativeBridge,
         onVideoStarted: @escaping () -> Void,
@@ -371,6 +374,10 @@ private struct CreativeInterstitialView: View {
         self.videoPlanScope = videoPlanScope
         self.admission = admission
         self.admissionOwner = FullscreenVisualSurfaceToken()
+        self.storeExit = storeExit
+        _attributionRouteLifecycle = State(initialValue: AttributionRouteLifecycle(
+            storeDwellPresentationID: storeExit?.presentationID
+        ))
         self.originatingScene = originatingScene
         self.bridge = bridge
         self.onVideoStarted = onVideoStarted
@@ -498,20 +505,15 @@ private struct CreativeInterstitialView: View {
         .hideStatusBar(true)
         .onAppear {
             appForegrounded = UIApplication.shared.applicationState == .active
-            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive
+            storeSheetPresented = CreativeCTARouter.isExternalPresentationActive(
+                ownershipToken: attributionRouteLifecycle.storeProductOwnership
+            )
             admission.setBlocked(fullscreenPresentationBlocked(
                 appForegrounded: appForegrounded,
                 storeSheetPresented: storeSheetPresented
             ))
             viewAppeared = true
             attributionRouteLifecycle.activate()
-            if storeExit == nil {
-                storeExit = StoreExitTracker(
-                    adId: response.impressionId,
-                    adFormat: "interstitial",
-                    adUnitId: response.adUnitId
-                )
-            }
             reconcileGate()
             startStorePromptTrigger()
             if !suppressesLegacySKOverlay { startSKOverlay() }
@@ -547,7 +549,6 @@ private struct CreativeInterstitialView: View {
             skOverlayTask?.cancel()
             skOverlayTask = nil
             dismissSKOverlay()
-            storeExit?.onAdClosed() // resolve any outstanding store visit as an abandon
             storePromptGestureGuard.release()
             clickHandoffs.reset()
         }
@@ -558,14 +559,12 @@ private struct CreativeInterstitialView: View {
             appForegrounded = false
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAway() // a CTA that left the app (.external open)
             reconcileGate()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             appForegrounded = true
             updateVideoPlanBlocker(storeSheetPresented)
             admission.setBlocked(storeSheetPresented)
-            storeExit?.onReturn() // returned from an .external store/browser jump
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
             presentRequestedSKOverlayIfNeeded()
@@ -581,19 +580,19 @@ private struct CreativeInterstitialView: View {
             presentRequestedSKOverlayIfNeeded()
             startSKANViewThroughImpression()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetWillPresent)) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             endSKANViewThroughImpressionIfStarted()
             storeSheetPresented = true
             updateVideoPlanBlocker(true)
             admission.setBlocked(true)
-            storeExit?.onAway() // an in-app store/Safari sheet covered the ad
             reconcileGate()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .simulaAdExternalSheetDidDismiss)) { notification in
+            guard (notification.object as? StoreProductOwnershipToken)?.belongsToSamePresentation(as: attributionRouteLifecycle.storeProductOwnership) == true else { return }
             storeSheetPresented = false
             updateVideoPlanBlocker(!appForegrounded)
             admission.setBlocked(!appForegrounded)
-            storeExit?.onReturn() // the in-app sheet was dismissed
             storePromptGestureGuard.releaseAfterExternalReturn()
             reconcileGate()
             startSKANViewThroughImpression()
@@ -641,7 +640,12 @@ private struct CreativeInterstitialView: View {
                 },
                 onOutcome: { outcome in
                     recordAttributionRoute(outcome: outcome, source: .autoRedirect)
-                    if outcome.success { storeExit?.recordStoreOpen("auto_redirect") }
+                    if let route = outcome.storeDwellRoute {
+                        storeExit?.recordStoreOpen(
+                            ClickSource.autoRedirect.storeDwellTrigger,
+                            route: route
+                        )
+                    }
                 }
             )
             handleStorePromptTap(execution: execution)
@@ -676,7 +680,9 @@ private struct CreativeInterstitialView: View {
                 updateClickHandoff(.creative, pending: $0)
             },
             onAttributionRouteOutcome: { outcome in
-                if outcome.success { storeExit?.recordStoreOpen("cta") }
+                if let route = outcome.storeDwellRoute {
+                    storeExit?.recordStoreOpen(ClickSource.primaryCTA.storeDwellTrigger, route: route)
+                }
             },
             onStoreOverlayShowRequest: { showSKOverlayFromCreative() },
             onStoreDismissRequest: { dismissSKOverlay() },
@@ -1103,7 +1109,9 @@ private struct CreativeInterstitialView: View {
                     onUIHandoffReleased: { updateClickHandoff(.creative, pending: false) },
                     onOutcome: { outcome in
                         recordAttributionRoute(outcome: outcome, source: .primaryCTA)
-                        if outcome.success { storeExit?.recordStoreOpen("cta") }
+                        if let route = outcome.storeDwellRoute {
+                            storeExit?.recordStoreOpen(ClickSource.primaryCTA.storeDwellTrigger, route: route)
+                        }
                     }
                 )
                 routeCommittedUserHandoff(
@@ -1451,7 +1459,12 @@ private struct CreativeInterstitialView: View {
                     },
                     onOutcome: { outcome in
                         recordAttributionRoute(outcome: outcome, source: .storePrompt)
-                        if outcome.success { storeExit?.recordStoreOpen("store_prompt") }
+                        if let route = outcome.storeDwellRoute {
+                            storeExit?.recordStoreOpen(
+                                ClickSource.storePrompt.storeDwellTrigger,
+                                route: route
+                            )
+                        }
                         if let generation = gestureGuard.complete() {
                             DispatchQueue.main.asyncAfter(
                                 deadline: .now() + StorePromptGestureGuard.routedReleaseTimeout

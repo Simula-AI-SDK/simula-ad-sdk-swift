@@ -539,6 +539,11 @@ public final class SimulaInterstitialAd {
         self.videoPlanScope = videoPlanScope
         primaryV2VideoStarted = false
         let clickAdUnitId = adUnitId
+        let storeExit = StoreExitTracker(
+            adId: response.impressionId,
+            adFormat: Self.adFormat,
+            adUnitId: clickAdUnitId
+        )
         showStartNanos = DispatchTime.now().uptimeNanoseconds
         let presentationOwner = WeakFullscreenPresentationOwner(self)
         let accountingCallbacks = fullscreenPresentationAccountingCallbacks(
@@ -623,6 +628,7 @@ public final class SimulaInterstitialAd {
             videoAssetLease: preparedVideoLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExitTracker: storeExit,
             onWillPresent: {
                 if response.prewarmSKProduct {
                     CreativeCTARouter.prewarmStoreProduct(
@@ -661,6 +667,7 @@ public final class SimulaInterstitialAd {
             },
             onClose: { [weak self] presentationLease, originalKeyWindow in
                 guard let self else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.closePendingHandoff(
                         reason: FallbackOutcome.hostUnavailable.videoPlanCloseReason
                     )
@@ -680,6 +687,7 @@ public final class SimulaInterstitialAd {
                 self.releasePreparedVideo()
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.cancel()
                     self.videoPlanScope = nil
                     presentationLease.finishPostCloseTeardown()
@@ -687,6 +695,7 @@ public final class SimulaInterstitialAd {
                 }
                 let postPrimaryPolicy = FullscreenPostPrimaryPolicy(terminalOutcome: terminalOutcome)
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.cancel()
                     self.videoPlanScope = nil
                     self.discardFallbackPrefetch()
@@ -705,8 +714,10 @@ public final class SimulaInterstitialAd {
                     response: response,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     originalKeyWindow: originalKeyWindow,
+                    storeExitTracker: storeExit,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        storeExit.onAdClosed()
                         videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
                         videoPlanScope?.cancel()
                         SimulaInterstitialAd.recordFallbackOutcome(
@@ -1073,6 +1084,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1089,6 +1101,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1099,6 +1112,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1115,6 +1129,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1126,6 +1141,7 @@ public final class SimulaInterstitialAd {
                 response: response,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1148,6 +1164,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1167,6 +1184,7 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
@@ -1208,6 +1226,7 @@ public final class SimulaInterstitialAd {
         response: AdLoadResponse,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1234,6 +1253,7 @@ public final class SimulaInterstitialAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             presentationLease: presentationLease
         ) { [weak self] outcome in

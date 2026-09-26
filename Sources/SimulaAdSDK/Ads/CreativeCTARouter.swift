@@ -145,6 +145,8 @@ struct ClickSource: RawRepresentable, Codable, Sendable, Hashable {
 
     init(rawValue: String) { self.rawValue = rawValue }
 
+    var storeDwellTrigger: String { self == .primaryCTA ? "cta" : rawValue }
+
     static let autoRedirect = ClickSource(rawValue: "auto_redirect")
     static let companion = ClickSource(rawValue: "companion")
     static let cta = ClickSource(rawValue: "cta")
@@ -279,11 +281,27 @@ struct CreativeClickClaim {
     }
 }
 
-struct StoreProductOwnershipToken: Hashable, Sendable {
+final class StoreProductOwnershipToken: Hashable, @unchecked Sendable {
     fileprivate let id: UUID
+    let storeDwellPresentationID: UUID?
 
-    init(id: UUID = UUID()) {
+    init(id: UUID = UUID(), storeDwellPresentationID: UUID? = nil) {
         self.id = id
+        self.storeDwellPresentationID = storeDwellPresentationID
+    }
+
+    /// Surface ownership stays distinct; only presentation visibility is shared across fallbacks.
+    func belongsToSamePresentation(as other: StoreProductOwnershipToken) -> Bool {
+        self === other || (storeDwellPresentationID != nil
+            && storeDwellPresentationID == other.storeDwellPresentationID)
+    }
+
+    static func == (lhs: StoreProductOwnershipToken, rhs: StoreProductOwnershipToken) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
     }
 }
 
@@ -327,7 +345,11 @@ final class AttributionRouteLifecycle: @unchecked Sendable {
     private var active = false
     let automaticRoutes = AutomaticRouteCoordinator()
     let automaticRouteScope = AnyHashable(UUID())
-    let storeProductOwnership = StoreProductOwnershipToken()
+    let storeProductOwnership: StoreProductOwnershipToken
+
+    init(storeDwellPresentationID: UUID? = nil) {
+        storeProductOwnership = StoreProductOwnershipToken(storeDwellPresentationID: storeDwellPresentationID)
+    }
 
     func activate() {
         lock.lock(); active = true; lock.unlock()
@@ -354,6 +376,23 @@ struct AttributionRouteOutcome: Equatable {
     let path: AttributionRoutePath?
     let success: Bool
     let failureClass: String?
+    let storeDwellRoute: StoreDwellRoute?
+
+    init(
+        path: AttributionRoutePath?,
+        success: Bool,
+        failureClass: String?,
+        storeDwellRoute: StoreDwellRoute? = nil
+    ) {
+        self.path = path
+        self.success = success
+        self.failureClass = failureClass
+        self.storeDwellRoute = storeDwellRoute
+    }
+}
+
+func externalStoreDwellRoute(for url: URL) -> StoreDwellRoute? {
+    directAppStoreID(from: url) == nil ? nil : .externalAppStore
 }
 
 func preferredActiveScene<Scene: AnyObject>(
@@ -397,7 +436,8 @@ func preferredForegroundActiveWindowScene(originating: UIWindowScene? = nil) -> 
 final class AttributionRouteExecution {
     private enum State {
         case pending
-        case running(AttributionRoutePath)
+        case running(AttributionRoutePath, StoreDwellRoute?)
+        case awaitingExternalOpen(AttributionRoutePath, StoreDwellRoute?)
         case finished
     }
 
@@ -450,7 +490,7 @@ final class AttributionRouteExecution {
     /// committed user click may outlive its presentation; automatic routes remain presentation-bound.
     func deliverDeterministicTracker(_ tracker: URL, sender: (URL) -> Void) {
         switch state {
-        case .pending, .running:
+        case .pending, .running, .awaitingExternalOpen:
             break
         case .finished:
             return
@@ -474,7 +514,7 @@ final class AttributionRouteExecution {
         return true
     }
 
-    func begin(path: AttributionRoutePath) -> Bool {
+    func begin(path: AttributionRoutePath, storeDwellRoute: StoreDwellRoute? = nil) -> Bool {
         guard case .pending = state else { return false }
         guard presentationIsActive() else {
             state = .finished
@@ -486,12 +526,12 @@ final class AttributionRouteExecution {
             ))
             return false
         }
-        state = .running(path)
+        state = .running(path, storeDwellRoute)
         return true
     }
 
-    func complete(_ route: () -> Bool) {
-        guard case .running(let path) = state else { return }
+    func complete(storeDwellRoute: StoreDwellRoute? = nil, _ route: () -> Bool) {
+        guard case .running(let path, let begunStoreDwellRoute) = state else { return }
         state = .finished
         let presentationActive = presentationIsActive()
         let canCompleteCommittedRoute = !presentationActive
@@ -514,12 +554,63 @@ final class AttributionRouteExecution {
         onOutcome(AttributionRouteOutcome(
             path: path,
             success: success,
-            failureClass: success ? nil : "route_unavailable"
+            failureClass: success ? nil : "route_unavailable",
+            storeDwellRoute: success ? (storeDwellRoute ?? begunStoreDwellRoute) : nil
+        ))
+    }
+
+    /// UIApplication reports whether it accepted an external handoff asynchronously. Keep the
+    /// route alive until that bounded system callback rather than counting an attempted open.
+    func completeExternalOpen(
+        storeDwellRoute: StoreDwellRoute? = nil,
+        _ route: (@escaping (Bool) -> Void) -> Void
+    ) {
+        guard case .running(let path, let begunStoreDwellRoute) = state else { return }
+        let presentationActive = presentationIsActive()
+        let canCompleteCommittedRoute = !presentationActive
+            && survivesPresentationTeardownAfterBegin
+            && canCompleteAfterPresentationTeardown()
+        guard presentationActive || canCompleteCommittedRoute else {
+            state = .finished
+            releaseUIHandoff()
+            onOutcome(AttributionRouteOutcome(
+                path: path,
+                success: false,
+                failureClass: "inactive_presentation"
+            ))
+            return
+        }
+        let resolvedStoreDwellRoute = storeDwellRoute ?? begunStoreDwellRoute
+        state = .awaitingExternalOpen(path, resolvedStoreDwellRoute)
+        route { accepted in
+            DispatchQueue.main.async {
+                self.finishExternalOpen(
+                    path: path,
+                    storeDwellRoute: resolvedStoreDwellRoute,
+                    accepted: accepted
+                )
+            }
+        }
+        releaseUIHandoff()
+    }
+
+    private func finishExternalOpen(
+        path: AttributionRoutePath,
+        storeDwellRoute: StoreDwellRoute?,
+        accepted: Bool
+    ) {
+        guard case .awaitingExternalOpen(let activePath, _) = state, activePath == path else { return }
+        state = .finished
+        onOutcome(AttributionRouteOutcome(
+            path: path,
+            success: accepted,
+            failureClass: accepted ? nil : "route_unavailable",
+            storeDwellRoute: accepted ? storeDwellRoute : nil
         ))
     }
 
     func fail(_ failureClass: String) {
-        guard case .running(let path) = state else { return }
+        guard case .running(let path, _) = state else { return }
         state = .finished
         releaseUIHandoff()
         onOutcome(AttributionRouteOutcome(path: path, success: false, failureClass: failureClass))
@@ -529,7 +620,7 @@ final class AttributionRouteExecution {
         let path: AttributionRoutePath?
         switch state {
         case .pending: path = nil
-        case .running(let runningPath): path = runningPath
+        case .running(let runningPath, _), .awaitingExternalOpen(let runningPath, _): path = runningPath
         case .finished: return
         }
         state = .finished
@@ -1233,18 +1324,19 @@ enum CreativeCTARouter {
     ) {
         if let directStoreURL = validatedDirectAppStoreURL(trackingUrl),
            let appID = appStoreID(from: directStoreURL) {
-            guard execution.begin(path: .directStore) else { return }
-            execution.complete {
-                if storeOpen == .external {
-                    UIApplication.shared.open(directStoreURL)
-                    return true
+            if storeOpen == .external {
+                guard execution.begin(path: .directStore, storeDwellRoute: .externalAppStore) else { return }
+                openApplicationURL(directStoreURL, execution: execution)
+            } else {
+                guard execution.begin(path: .directStore, storeDwellRoute: .storeProductSheet) else { return }
+                execution.complete {
+                    presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
+                    )
                 }
-                return presentStoreProduct(
-                    appID: appID,
-                    attribution: attribution,
-                    originatingScene: execution.originatingScene,
-                    ownershipToken: storeProductOwnership
-                )
             }
             return
         }
@@ -1253,18 +1345,19 @@ enum CreativeCTARouter {
             // No tracker on the serve — a raw store link still gives the CTA somewhere to go
             // (previously a silent no-op). No tracker means no background click to fire.
             if destination == .appstore, let appID = appStoreID(fromString: storeUrl) {
-                guard execution.begin(path: .rawStoreFallback) else { return }
-                execution.complete {
-                    if storeOpen == .external, let storeURL = validatedDirectAppStoreURL(storeUrl) {
-                        UIApplication.shared.open(storeURL)
-                        return true
+                if storeOpen == .external, let storeURL = validatedDirectAppStoreURL(storeUrl) {
+                    guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .externalAppStore) else { return }
+                    openApplicationURL(storeURL, execution: execution)
+                } else {
+                    guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .storeProductSheet) else { return }
+                    execution.complete {
+                        presentStoreProduct(
+                            appID: appID,
+                            attribution: attribution,
+                            originatingScene: execution.originatingScene,
+                            ownershipToken: storeProductOwnership
+                        )
                     }
-                    return presentStoreProduct(
-                        appID: appID,
-                        attribution: attribution,
-                        originatingScene: execution.originatingScene,
-                        ownershipToken: storeProductOwnership
-                    )
                 }
                 return
             }
@@ -1292,7 +1385,7 @@ enum CreativeCTARouter {
             // Otherwise prefer the deterministic route (store id from the raw `ios_store_url`,
             // tracker fired in the background); only without one resolve the redirect chain.
             if let appID = appStoreID(from: url) {
-                guard execution.begin(path: .directStore) else { return }
+                guard execution.begin(path: .directStore, storeDwellRoute: .storeProductSheet) else { return }
                 execution.complete {
                     presentStoreProduct(
                         appID: appID,
@@ -1303,7 +1396,7 @@ enum CreativeCTARouter {
                 }
             } else if let appID = appStoreID(fromString: storeUrl) {
                 execution.deliverDeterministicTracker(url, sender: trackerSender)
-                guard execution.begin(path: .rawStoreFallback) else { return }
+                guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .storeProductSheet) else { return }
                 execution.complete {
                     return presentStoreProduct(
                         appID: appID,
@@ -1323,7 +1416,11 @@ enum CreativeCTARouter {
         case .web:
             guard execution.begin(path: .web) else { return }
             execution.complete {
-                presentSafari(url: url, originatingScene: execution.originatingScene)
+                presentSafari(
+                    url: url,
+                    originatingScene: execution.originatingScene,
+                    sheetScope: storeProductOwnership
+                )
             }
         }
     }
@@ -1360,29 +1457,35 @@ enum CreativeCTARouter {
             guard execution.begin(path: .mmpRedirect) else { return }
             execution.fail("invalid_url")
         case .directStore(let storeURL, let appID, let mode):
-            guard execution.begin(path: .directStore) else { return }
-            execution.complete {
-                openStoreDestination(
-                    storeURL: storeURL,
-                    appID: appID,
-                    storeOpen: mode,
-                    attribution: attribution,
-                    originatingScene: execution.originatingScene,
-                    ownershipToken: storeProductOwnership
-                )
+            if mode == .external {
+                guard execution.begin(path: .directStore, storeDwellRoute: .externalAppStore) else { return }
+                openApplicationURL(storeURL, execution: execution)
+            } else {
+                guard execution.begin(path: .directStore, storeDwellRoute: .storeProductSheet) else { return }
+                execution.complete {
+                    presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
+                    )
+                }
             }
         case .trackerWithStore(let tracker, let storeURL, let appID, let mode):
             execution.deliverDeterministicTracker(tracker, sender: trackerSender)
-            guard execution.begin(path: .rawStoreFallback) else { return }
-            execution.complete {
-                return openStoreDestination(
-                    storeURL: storeURL,
-                    appID: appID,
-                    storeOpen: mode,
-                    attribution: attribution,
-                    originatingScene: execution.originatingScene,
-                    ownershipToken: storeProductOwnership
-                )
+            if mode == .external {
+                guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .externalAppStore) else { return }
+                openApplicationURL(storeURL, execution: execution)
+            } else {
+                guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .storeProductSheet) else { return }
+                execution.complete {
+                    presentStoreProduct(
+                        appID: appID,
+                        attribution: attribution,
+                        originatingScene: execution.originatingScene,
+                        ownershipToken: storeProductOwnership
+                    )
+                }
             }
         case .resolveTracker(let tracker, let mode):
             if mode == .external {
@@ -1410,36 +1513,26 @@ enum CreativeCTARouter {
             } else {
                 guard execution.begin(path: .web) else { return }
                 execution.complete {
-                    presentSafari(url: webURL, originatingScene: execution.originatingScene)
+                    presentSafari(
+                        url: webURL,
+                        originatingScene: execution.originatingScene,
+                        sheetScope: storeProductOwnership
+                    )
                 }
             }
         case .customScheme(let customURL):
             guard execution.begin(path: .customScheme) else { return }
-            execution.complete {
-                UIApplication.shared.open(customURL)
-                return true
-            }
+            openApplicationURL(customURL, execution: execution)
         }
     }
 
-    private static func openStoreDestination(
-        storeURL: URL,
-        appID: String,
-        storeOpen: StoreOpen,
-        attribution: AdAttribution?,
-        originatingScene: UIWindowScene?,
-        ownershipToken: StoreProductOwnershipToken?
-    ) -> Bool {
-        if storeOpen == .external {
-            UIApplication.shared.open(storeURL)
-            return true
+    private static func openApplicationURL(
+        _ url: URL,
+        execution: AttributionRouteExecution
+    ) {
+        execution.completeExternalOpen { completion in
+            UIApplication.shared.open(url, options: [:], completionHandler: completion)
         }
-        return presentStoreProduct(
-            appID: appID,
-            attribution: attribution,
-            originatingScene: originatingScene,
-            ownershipToken: ownershipToken
-        )
     }
 
     /// Fires the MMP click tracker in the background (fire-and-forget GET), used when the store
@@ -1557,7 +1650,13 @@ enum CreativeCTARouter {
     /// no-window early-return can't wedge all future CTAs shut. Each sheet's delegate
     /// resets it on dismiss.
     private static var isPresentingExternal = false
-    static var isExternalPresentationActive: Bool { isPresentingExternal }
+    private static var activeExternalOwnership: StoreProductOwnershipToken?
+
+    static func isExternalPresentationActive(
+        ownershipToken: StoreProductOwnershipToken
+    ) -> Bool {
+        isPresentingExternal && activeExternalOwnership?.belongsToSamePresentation(as: ownershipToken) == true
+    }
     private static var presentationRootOverrideForTesting: (() -> UIViewController?)?
     private static var viewControllerPresenterForTesting: ((UIViewController) -> Bool)?
 
@@ -1565,6 +1664,7 @@ enum CreativeCTARouter {
     /// this only prevents a failed test from contaminating later route assertions.
     static func resetExternalPresentationStateForTesting() {
         isPresentingExternal = false
+        activeExternalOwnership = nil
         storeProductOwnership.reset()
         activeStoreProduct = WeakObjectReference()
         storeProductControllerProviderForTesting = nil
@@ -1649,8 +1749,9 @@ enum CreativeCTARouter {
             }
             activeStoreProduct = WeakObjectReference(storeVC)
             isPresentingExternal = true
+            activeExternalOwnership = owner
             storeVC.presentationController?.delegate = delegate
-            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
+            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: owner)
             return true
         }
         return false
@@ -1716,7 +1817,8 @@ enum CreativeCTARouter {
         guard storeProductOwnership.finishDismiss(owner: owner, controller: controllerID) else { return }
         activeStoreProduct = WeakObjectReference()
         isPresentingExternal = false
-        NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
+        if activeExternalOwnership === owner { activeExternalOwnership = nil }
+        NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: owner)
     }
 
     private static func finishObservedStoreProductDismiss(
@@ -1810,12 +1912,18 @@ enum CreativeCTARouter {
 
     /// Presents `SFSafariViewController` for external links.
     @discardableResult
-    static func presentSafari(url: URL, originatingScene: UIWindowScene? = nil) -> Bool {
+    static func presentSafari(
+        url: URL,
+        originatingScene: UIWindowScene? = nil,
+        sheetScope: StoreProductOwnershipToken? = nil
+    ) -> Bool {
         guard !isPresentingExternal else { return false }
+        let scope = sheetScope ?? StoreProductOwnershipToken()
         let safariVC = SFSafariViewController(url: url)
         let delegate = SafariDelegate {
             isPresentingExternal = false
-            NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: nil)
+            if activeExternalOwnership === scope { activeExternalOwnership = nil }
+            NotificationCenter.default.post(name: .simulaAdExternalSheetDidDismiss, object: scope)
         }
         safariVC.delegate = delegate
         // Catch the interactive swipe-down too — see the note in `presentStoreProduct`.
@@ -1827,7 +1935,8 @@ enum CreativeCTARouter {
         // Only mark "presenting" once the present actually succeeds.
         if presentViewController(safariVC, originatingScene: originatingScene) {
             isPresentingExternal = true
-            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: nil)
+            activeExternalOwnership = scope
+            NotificationCenter.default.post(name: .simulaAdExternalSheetWillPresent, object: scope)
             return true
         }
         return false
@@ -1900,11 +2009,11 @@ enum CreativeCTARouter {
             let path: AttributionRoutePath = appStoreID(from: initialURL) != nil
                 ? .directStore
                 : (destination == .web ? .web : .customScheme)
-            guard execution.begin(path: path) else { return }
-            execution.complete {
-                UIApplication.shared.open(initialURL)
-                return true
-            }
+            guard execution.begin(
+                path: path,
+                storeDwellRoute: externalStoreDwellRoute(for: initialURL)
+            ) else { return }
+            openApplicationURL(initialURL, execution: execution)
             return
         }
 
@@ -1912,11 +2021,8 @@ enum CreativeCTARouter {
         // to the App Store from the raw store link — no redirect-chain dependency.
         if let storeURL = validatedDirectAppStoreURL(storeUrl) {
             execution.deliverDeterministicTracker(initialURL, sender: trackerSender)
-            guard execution.begin(path: .rawStoreFallback) else { return }
-            execution.complete {
-                UIApplication.shared.open(storeURL)
-                return true
-            }
+            guard execution.begin(path: .rawStoreFallback, storeDwellRoute: .externalAppStore) else { return }
+            openApplicationURL(storeURL, execution: execution)
             return
         }
 
@@ -1932,9 +2038,10 @@ enum CreativeCTARouter {
                         finalURL,
                         execution: execution
                     ) else { return }
-                    execution.complete {
-                        UIApplication.shared.open(finalURL)
-                        return true
+                    execution.completeExternalOpen(
+                        storeDwellRoute: externalStoreDwellRoute(for: finalURL)
+                    ) { completion in
+                        UIApplication.shared.open(finalURL, options: [:], completionHandler: completion)
                     }
                 }
             }
@@ -1957,7 +2064,7 @@ enum CreativeCTARouter {
     ) {
         // Quick check — already an App Store URL?
         if let appID = appStoreID(from: url) {
-            guard execution.begin(path: .directStore) else { return }
+            guard execution.begin(path: .directStore, storeDwellRoute: .storeProductSheet) else { return }
             execution.complete {
                 presentStoreProduct(
                     appID: appID,
@@ -1986,7 +2093,7 @@ enum CreativeCTARouter {
                         finalURL,
                         execution: execution
                     ) else { return }
-                    execution.complete {
+                    execution.complete(storeDwellRoute: appStoreID(from: finalURL) == nil ? nil : .storeProductSheet) {
                         if let appID = appStoreID(from: finalURL) {
                             return presentStoreProduct(
                                 appID: appID,
@@ -1997,7 +2104,8 @@ enum CreativeCTARouter {
                         } else {
                             return presentSafari(
                                 url: finalURL,
-                                originatingScene: execution.originatingScene
+                                originatingScene: execution.originatingScene,
+                                sheetScope: storeProductOwnership
                             )
                         }
                     }

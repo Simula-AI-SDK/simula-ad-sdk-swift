@@ -152,7 +152,18 @@ final class TelemetryEnrichmentTests: XCTestCase {
             breadcrumb: "ctx=true",
             timeSinceInitMs: -4
         )
-        m.recordLifecycle(stage: "store_opened", adFormat: "interstitial", adUnitId: nil, adId: "a1", serveId: nil, durationMs: 1500, errorCode: nil, trigger: "cta")
+        m.recordLifecycle(
+            stage: "store_opened",
+            adFormat: "interstitial",
+            adUnitId: nil,
+            adId: "a1",
+            serveId: nil,
+            durationMs: 1500,
+            errorCode: nil,
+            trigger: "cta",
+            endEvent: "sheet_dismissed",
+            opens: 2
+        )
         await waitUntil { self.allEvents(sender.batches).contains { $0.name == "store_opened" } }
 
         let op = allEvents(sender.batches).first { $0.name == "session_failed" }
@@ -162,6 +173,10 @@ final class TelemetryEnrichmentTests: XCTestCase {
         let life = allEvents(sender.batches).first { $0.name == "store_opened" }
         XCTAssertEqual(life?.trigger, "cta")
         XCTAssertEqual(life?.durationMs, 1500)
+        XCTAssertEqual(life?.endEvent, "sheet_dismissed")
+        XCTAssertEqual(life?.opens, 2)
+        XCTAssertNil(life?.contaminated)
+        XCTAssertNil(life?.freeSpaceDeltaBytes)
     }
 
     func testClickSerializationCarriesInteractionSourceServeAndSampleRate() async throws {

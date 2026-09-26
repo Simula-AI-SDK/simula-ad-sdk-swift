@@ -463,6 +463,11 @@ public final class SimulaRewardedAd {
         // with `self == nil` — and must still be able to enqueue an earned reward.
         let salvageSessionId = sessionId
         let salvageAdUnitId = adUnitId
+        let storeExit = StoreExitTracker(
+            adId: response.impressionId,
+            adFormat: Self.adFormat,
+            adUnitId: salvageAdUnitId
+        )
         let unitEndReward = response.usesVideoPlanV2Contract
             && response.adBehavior?.reward.earnAt == .unitEnd
             ? UnitEndRewardClaim()
@@ -559,6 +564,7 @@ public final class SimulaRewardedAd {
             videoAssetLease: preparedVideoLease,
             videoPlanScope: videoPlanScope,
             admission: admission,
+            storeExitTracker: storeExit,
             close: response.adBehavior?.close,
             storePrompt: response.adBehavior?.storePrompt,
             trackingUrl: response.trackingUrl,
@@ -605,6 +611,7 @@ public final class SimulaRewardedAd {
             },
             onClose: { [weak self] earned, elapsedPlayTime, completionReason, presentationLease, originalKeyWindow in
                 guard let self else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.closePendingHandoff(
                         reason: FallbackOutcome.hostUnavailable.videoPlanCloseReason
                     )
@@ -657,6 +664,7 @@ public final class SimulaRewardedAd {
                 self.releasePreparedVideo()
                 self.state = .idle
                 guard let terminalOutcome = admission.finish() else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.cancel()
                     self.videoPlanScope = nil
                     presentationLease.finishPostCloseTeardown()
@@ -667,6 +675,7 @@ public final class SimulaRewardedAd {
                     earnedReward: earned
                 )
                 guard postPrimaryPolicy.presentsFallbacks else {
+                    storeExit.onAdClosed()
                     videoPlanScope?.cancel()
                     self.videoPlanScope = nil
                     self.unitEndRewardClaim = nil
@@ -689,8 +698,10 @@ public final class SimulaRewardedAd {
                     unitEndReward: unitEndReward,
                     autoStoreRedirect: response.adBehavior?.autoStoreRedirect,
                     originalKeyWindow: originalKeyWindow,
+                    storeExitTracker: storeExit,
                     presentationLease: presentationLease,
                     onFallbackFinished: { [weak self] outcome in
+                        storeExit.onAdClosed()
                         videoPlanScope?.closePendingHandoff(reason: outcome.videoPlanCloseReason)
                         videoPlanScope?.cancel()
                         SimulaRewardedAd.recordFallbackOutcome(
@@ -1284,6 +1295,7 @@ public final class SimulaRewardedAd {
         unitEndReward: UnitEndRewardClaim?,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1301,6 +1313,7 @@ public final class SimulaRewardedAd {
                 unitEndReward: unitEndReward,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1312,6 +1325,7 @@ public final class SimulaRewardedAd {
                 unitEndReward: unitEndReward,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1329,6 +1343,7 @@ public final class SimulaRewardedAd {
         unitEndReward: UnitEndRewardClaim?,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1341,6 +1356,7 @@ public final class SimulaRewardedAd {
                 unitEndReward: unitEndReward,
                 autoStoreRedirect: autoStoreRedirect,
                 originalKeyWindow: originalKeyWindow,
+                storeExitTracker: storeExitTracker,
                 presentationLease: presentationLease,
                 onFallbackFinished: onFallbackFinished
             )
@@ -1364,6 +1380,7 @@ public final class SimulaRewardedAd {
         unitEndReward: UnitEndRewardClaim?,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1384,6 +1401,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             onLoadingTimeout: { prefetch.cancel() },
             presentationLease: presentationLease
@@ -1424,6 +1442,7 @@ public final class SimulaRewardedAd {
         unitEndReward: UnitEndRewardClaim?,
         autoStoreRedirect: AutoStoreRedirect?,
         originalKeyWindow: UIWindow?,
+        storeExitTracker: StoreExitTracker,
         presentationLease: FullscreenPresentationLease,
         onFallbackFinished: @escaping @MainActor (FallbackOutcome) -> Void
     ) {
@@ -1452,6 +1471,7 @@ public final class SimulaRewardedAd {
             telemetryAdFormat: Self.adFormat,
             telemetryAdUnitId: fallbackAdUnitId,
             telemetryServeId: response.impressionId,
+            storeExitTracker: storeExitTracker,
             videoPlanScope: videoPlanScope,
             presentationLease: presentationLease
         ) { [weak self] outcome in

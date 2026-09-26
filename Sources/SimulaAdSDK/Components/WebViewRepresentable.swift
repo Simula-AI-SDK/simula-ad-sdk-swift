@@ -237,7 +237,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         self.onAttributionRouteOutcome = onAttributionRouteOutcome
         self.onStoreOverlayShowRequest = onStoreOverlayShowRequest
         self.onStoreDismissRequest = onStoreDismissRequest
-        self.storeProductOwnershipToken = storeProductOwnershipToken
+        // Playable fallbacks supply their route lifecycle without a separate sheet token. Keep
+        // routing, countdown visibility and presentation-owned dwell on that same existing token.
+        self.storeProductOwnershipToken = storeProductOwnershipToken ?? attributionRouteLifecycle?.storeProductOwnership
         self.attributionRouteLifecycle = attributionRouteLifecycle
         self.clickSource = clickSource
         self.clickBeaconImpressionId = clickBeaconImpressionId
