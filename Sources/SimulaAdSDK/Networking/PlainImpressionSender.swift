@@ -23,14 +23,32 @@ protocol PublicNetworkHostResolving: Sendable {
     func resolve(_ host: String, deadline: TimeInterval) async throws -> [String]
 }
 
-private final class PublicNetworkResolveRequest: @unchecked Sendable {
+protocol PublicNetworkDeadlineTimer: AnyObject {
+    func activate()
+    func cancel()
+}
+
+private final class DispatchPublicNetworkDeadlineTimer: PublicNetworkDeadlineTimer {
+    private let source: DispatchSourceTimer
+
+    init(delay: TimeInterval, onTimeout: @escaping @Sendable () -> Void) {
+        source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        source.schedule(deadline: .now() + max(0, delay))
+        source.setEventHandler(handler: onTimeout)
+    }
+
+    func activate() { source.activate() }
+    func cancel() { source.cancel() }
+}
+
+final class PublicNetworkResolveRequest: @unchecked Sendable {
     let id = UUID()
     let host: String
     let deadline: TimeInterval
     private let lock = NSLock()
     private var continuation: CheckedContinuation<[String], Error>?
     private var result: Result<[String], Error>?
-    private var timer: DispatchSourceTimer?
+    private var timer: (any PublicNetworkDeadlineTimer)?
 
     init(host: String, deadline: TimeInterval) {
         self.host = host
@@ -48,10 +66,14 @@ private final class PublicNetworkResolveRequest: @unchecked Sendable {
         lock.unlock()
     }
 
-    func armDeadline(after delay: TimeInterval, onTimeout: @escaping @Sendable () -> Void) {
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + max(0, delay))
-        timer.setEventHandler(handler: onTimeout)
+    func armDeadline(
+        after delay: TimeInterval,
+        makeTimer: (TimeInterval, @escaping @Sendable () -> Void) -> any PublicNetworkDeadlineTimer = {
+            DispatchPublicNetworkDeadlineTimer(delay: $0, onTimeout: $1)
+        },
+        onTimeout: @escaping @Sendable () -> Void
+    ) {
+        let timer = makeTimer(delay, onTimeout)
         // A dispatch source must be activated before cancellation/release. Activate before
         // publishing it so fast worker completion can only ever cancel an active source.
         timer.activate()

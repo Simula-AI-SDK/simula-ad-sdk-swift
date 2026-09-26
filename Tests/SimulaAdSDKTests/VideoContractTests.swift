@@ -694,20 +694,69 @@ final class VideoContractTests: XCTestCase {
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.5)
     }
 
-    func testResolverFastCompletionDeadlineRaceIsStable() async throws {
-        let resolver = BoundedPublicNetworkHostResolver(
-            maximumWorkers: 2,
-            maximumPending: 16,
-            lookup: { _ in ["8.8.8.8"] }
-        )
-
-        for index in 0..<2_000 {
-            let addresses = try await resolver.resolve(
-                "fast-\(index).example",
-                deadline: ProcessInfo.processInfo.systemUptime + 1
-            )
+    func testResolverCompletionAroundTimerInstallationIsOneShot() async throws {
+        // Exercise completion before, during, and after timer activation without racing CI time.
+        for completionOrder in 0..<3 {
+            let request = PublicNetworkResolveRequest(host: "fast.example", deadline: 1)
+            let timer = ManualResolverDeadlineTimer()
+            let addresses: [String] = try await withCheckedThrowingContinuation { continuation in
+                request.install(continuation)
+                if completionOrder == 0 {
+                    XCTAssertTrue(request.finish(.success(["8.8.8.8"])))
+                } else if completionOrder == 1 {
+                    timer.onActivate = { XCTAssertTrue(request.finish(.success(["8.8.8.8"]))) }
+                }
+                request.armDeadline(after: 1, makeTimer: { _, onTimeout in
+                    timer.onTimeout = onTimeout
+                    return timer
+                }) {
+                    request.finish(.failure(PublicNetworkResolverError.timedOut))
+                }
+                if completionOrder == 2 {
+                    XCTAssertTrue(request.finish(.success(["8.8.8.8"])))
+                }
+                // A timeout already enqueued before cancellation must not resume twice.
+                timer.onTimeout?()
+                XCTAssertFalse(request.finish(.failure(PublicNetworkResolverError.timedOut)))
+            }
             XCTAssertEqual(addresses, ["8.8.8.8"])
+            XCTAssertEqual(timer.events, ["activate", "cancel"])
         }
+    }
+
+    func testResolverDeadlineBeforeCompletionWinsExactlyOnce() async {
+        let request = PublicNetworkResolveRequest(host: "blocked.example", deadline: 1)
+        let timer = ManualResolverDeadlineTimer()
+        do {
+            let _: [String] = try await withCheckedThrowingContinuation { continuation in
+                request.install(continuation)
+                request.armDeadline(after: 1, makeTimer: { _, onTimeout in
+                    timer.onTimeout = onTimeout
+                    return timer
+                }) {
+                    request.finish(.failure(PublicNetworkResolverError.timedOut))
+                }
+                timer.onTimeout?()
+                XCTAssertFalse(request.finish(.success(["8.8.8.8"])))
+            }
+            XCTFail("Expected deadline failure")
+        } catch {
+            XCTAssertEqual(error as? PublicNetworkResolverError, .timedOut)
+        }
+        XCTAssertEqual(timer.events, ["activate", "cancel"])
+    }
+
+    private final class ManualResolverDeadlineTimer: PublicNetworkDeadlineTimer {
+        var onActivate: (() -> Void)?
+        var onTimeout: (@Sendable () -> Void)?
+        private(set) var events: [String] = []
+
+        func activate() {
+            events.append("activate")
+            onActivate?()
+        }
+
+        func cancel() { events.append("cancel") }
     }
 
     func testResolverOverloadAndQueuedCancellationFailClosed() async throws {
