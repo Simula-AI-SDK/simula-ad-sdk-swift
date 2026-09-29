@@ -104,15 +104,16 @@ xcodebuild -create-xcframework \
   -debug-symbols "$BUILD_DIR/ios-simulator.xcarchive/dSYMs/$SCHEME.framework.dSYM" \
   -output "$BUILD_DIR/$SCHEME.xcframework"
 
-# A stable binary must not retain the staging hostname even as dead data. Conversely, prove that
-# a dev-tagged artifact really contains the endpoint selected by its compile definition.
-if [[ "$ARTIFACT_FLAVOR" == "dev" ]]; then
-  grep -R -a -Fq "$STAGING_HOST" "$BUILD_DIR/$SCHEME.xcframework" \
-    || { echo "ERROR: dev XCFramework does not contain the staging endpoint"; exit 1; }
-elif grep -R -a -Fq "$STAGING_HOST" "$BUILD_DIR/$SCHEME.xcframework"; then
-  echo "ERROR: production XCFramework contains the staging endpoint"
-  exit 1
-fi
+# Check the binary and public Swift interfaces, including optimized QA artifacts.
+for marker in "$STAGING_HOST" "X-Simula-Dev-Hide-Companion" "SimulaDevOptions" "hidePlayableCompanion"; do
+  if [[ "$ARTIFACT_FLAVOR" == "dev" ]]; then
+    grep -R -a -Fq "$marker" "$BUILD_DIR/$SCHEME.xcframework" \
+      || { echo "ERROR: dev XCFramework is missing $marker"; exit 1; }
+  elif grep -R -a -Fq "$marker" "$BUILD_DIR/$SCHEME.xcframework"; then
+    echo "ERROR: production XCFramework contains $marker"
+    exit 1
+  fi
+done
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   echo "==> Signing"

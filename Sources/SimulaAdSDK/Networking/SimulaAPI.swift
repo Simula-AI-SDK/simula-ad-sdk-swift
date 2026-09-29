@@ -2109,7 +2109,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(), to: &request)
+        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
         request.httpBody = try JSONEncoder().encode(
             AdLoadRequest(
                 adUnitId: adUnitId,
@@ -2250,7 +2250,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(), to: &request)
+        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
         request.httpBody = try JSONEncoder().encode(
             RewardedInitRequest(
                 adUnitId: adUnitId,
@@ -2366,7 +2366,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(), to: &request)
+        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
