@@ -4,6 +4,23 @@ import XCTest
 
 @MainActor
 final class SessionForegroundRefreshTests: XCTestCase {
+    func testSessionIdentityRecordsOnlyTheUserAllowedByCreationConsent() async {
+        for snapshot in [ConsentSnapshot(hasPrivacyConsent: false), ConsentSnapshot(coppaApplies: true)] {
+            var sentUsers: [String?] = []
+            let provider = SimulaProvider(
+                testApiKey: "anonymous-creation", apiKeyOwnership: ProcessApiKeyOwnership(),
+                primaryUserID: "user-a",
+                sessionCreation: { user, _ in sentUsers.append(user); return "anonymous-session" },
+                privacySnapshotProvider: { snapshot }
+            )
+            let id = await provider.ensureSession()
+            XCTAssertEqual(id, "anonymous-session")
+            XCTAssertEqual(sentUsers.count, 1)
+            XCTAssertNil(sentUsers.first ?? nil)
+            XCTAssertNil(provider.sessionUserID)
+        }
+    }
+
     func testLifecycleDoesNotExpireAtTwentyNineMinutesFiftyNineSeconds() {
         let harness = makeLifecycleHarness()
 

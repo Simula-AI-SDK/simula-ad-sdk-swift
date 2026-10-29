@@ -1867,6 +1867,17 @@ public final class SimulaAPI: @unchecked Sendable {
         primaryUserID: String? = nil,
         privacy: ConsentSnapshot? = nil
     ) async throws -> String? {
+        try await createSession(apiKey: apiKey, devMode: devMode, primaryUserID: primaryUserID,
+                                privacy: privacy, applyTelemetryConfig: true)
+    }
+
+    func createSession(
+        apiKey: String,
+        devMode: Bool = false,
+        primaryUserID: String? = nil,
+        privacy: ConsentSnapshot? = nil,
+        applyTelemetryConfig: Bool
+    ) async throws -> String? {
         let sessionEnvironment = environment()
         guard let url = URL(string: "\(sessionEnvironment.baseURLString)/session/create") else {
             throw SimulaAPIError.invalidURL
@@ -1874,12 +1885,13 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
+        let consent = privacy ?? SimulaPrivacy.shared.currentSnapshot
+        applyHeaders(makeHeaders(apiKey: apiKey, consent: consent), to: &request)
         // Body carries dev/user identity, the device-capability handshake (so the backend never
         // assigns an unsupported variant), plus, when present, the consent block the backend ties
         // to the session and inherits on subsequent calls.
         var body: [String: Any] = ["devMode": devMode]
-        if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        if consent.allowsPrimaryUserID, let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
         body["capabilities"] = DeviceCapabilities.current.dictionary
         if let privacy { body["privacy"] = privacy.privacyBody() }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -1900,7 +1912,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         let json = try JSONDecoder().decode(CreateSessionResponse.self, from: data)
         // Honor a server-side telemetry directive (kill-switch / sampling) if present.
-        if json.telemetryEnabled != nil || json.telemetrySampleRate != nil {
+        if applyTelemetryConfig && (json.telemetryEnabled != nil || json.telemetrySampleRate != nil) {
             Telemetry.shared.applyServerConfig(
                 enabled: json.telemetryEnabled ?? true,
                 sampleRate: json.telemetrySampleRate ?? 1.0
@@ -1921,7 +1933,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// telemetry network event.
     @discardableResult
     public func updatePpid(apiKey: String, sessionId: String, ppid: String) async -> Bool {
-        guard !sessionId.isEmpty, !ppid.isEmpty else { return false }
+        guard !sessionId.isEmpty, !ppid.isEmpty, SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID else { return false }
         let encSession = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
         let encPpid = ppid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ppid
         guard let url = URL(string: "\(baseURLString)/session/\(encSession)/ppid/\(encPpid)") else { return false }
@@ -2341,12 +2353,17 @@ public final class SimulaAPI: @unchecked Sendable {
     /// Initializes a minigame and returns the iframe URL + ad id.
     /// Translates `getMinigame()` from api.ts
     public func getMinigame(_ params: InitMinigameRequest) async throws -> MinigameResponse {
+        try await getMinigame(params, companionEnabled: nil)
+    }
+
+    func getMinigame(_ params: InitMinigameRequest, companionEnabled: Bool?) async throws -> MinigameResponse {
         guard let url = URL(string: "\(baseURLString)/minigames/init") else {
             throw SimulaAPIError.invalidURL
         }
 
         var body: [String: Any] = [
             "game_type": params.gameType,
+            "game_id": params.gameType,
             "session_id": params.sessionId,
             "currency_mode": params.currencyMode,
             "w": params.w,
@@ -2367,6 +2384,9 @@ public final class SimulaAPI: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyHeaders(makeHeaders(), to: &request)
+        if let companionEnabled {
+            request.setValue(companionEnabled ? "enabled" : "disabled", forHTTPHeaderField: "X-Simula-Dev-Companion")
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
