@@ -1933,7 +1933,7 @@ public final class SimulaAPI: @unchecked Sendable {
     /// telemetry network event.
     @discardableResult
     public func updatePpid(apiKey: String, sessionId: String, ppid: String) async -> Bool {
-        guard !sessionId.isEmpty, !ppid.isEmpty else { return false }
+        guard !sessionId.isEmpty, !ppid.isEmpty, SimulaPrivacy.shared.currentSnapshot.allowsPrimaryUserID else { return false }
         let encSession = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
         let encPpid = ppid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ppid
         guard let url = URL(string: "\(baseURLString)/session/\(encSession)/ppid/\(encPpid)") else { return false }

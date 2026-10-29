@@ -106,10 +106,10 @@ public final class SimulaGameCatalog {
         await startup()
         try Task.checkCancellation()
         let privacy = privacySnapshot()
-        if sessionPrivacy != privacy {
+        if sessionPrivacy.map({ classifyPrivacyChange(from: $0, to: privacy).requiresSessionResync }) ?? true {
             sessionTask = nil
-            sessionPrivacy = privacy
         }
+        sessionPrivacy = privacy
         if sessionTask == nil {
             sessionGeneration += 1
             let api = self.api
@@ -131,7 +131,8 @@ public final class SimulaGameCatalog {
         }
         do {
             // An in-flight session for older consent must never initialize a game.
-            guard generation == sessionGeneration, privacy == privacySnapshot() else { throw CancellationError() }
+            guard generation == sessionGeneration,
+                  !classifyPrivacyChange(from: privacy, to: privacySnapshot()).requiresSessionResync else { throw CancellationError() }
             guard let sid = session, !sid.isEmpty else {
                 sessionTask = nil
                 throw SimulaAPIError.invalidResponse

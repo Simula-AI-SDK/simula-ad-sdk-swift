@@ -3,6 +3,37 @@ import XCTest
 
 final class CatalogLaunchTests: XCTestCase {
     @MainActor
+    func testInitialAttResolutionDoesNotCancelOrReplaceCatalogSession() async throws {
+        CatalogLaunchProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogLaunchProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let privacy = CatalogPrivacyState(ConsentSnapshot())
+        let catalog = SimulaGameCatalog(
+            api: SimulaAPI(session: session, environment: .production), apiKey: "test",
+            privacySnapshot: { privacy.read() }, startup: {}
+        )
+        CatalogLaunchProtocol.beforeSessionResponse = { privacy.write(ConsentSnapshot(attStatus: 0)) }
+        for _ in 0..<2 {
+            let url = try await catalog.load(
+                menuId: "menu", gameId: "chess", width: 390, height: 844,
+                charId: "", charName: "", charImage: ""
+            )
+            XCTAssertEqual(url, "https://example.com/game")
+        }
+        XCTAssertEqual(CatalogLaunchProtocol.requests.filter { $0.url?.path.hasSuffix("session/create") == true }.count, 1)
+
+        CatalogLaunchProtocol.beforeSessionResponse = nil
+        privacy.write(ConsentSnapshot(attStatus: 3))
+        _ = try await catalog.load(
+            menuId: "menu", gameId: "chess", width: 390, height: 844,
+            charId: "", charName: "", charImage: ""
+        )
+        XCTAssertEqual(CatalogLaunchProtocol.requests.filter { $0.url?.path.hasSuffix("session/create") == true }.count, 2)
+    }
+
+    @MainActor
     func testCatalogReusesOnlySessionsWithMatchingConsentAndSuppressesRestrictedIdentity() async throws {
         CatalogLaunchProtocol.reset()
         let configuration = URLSessionConfiguration.ephemeral
@@ -128,8 +159,13 @@ final class CatalogLaunchTests: XCTestCase {
 private final class CatalogLaunchProtocol: URLProtocol {
     private static let lock = NSLock()
     private static var captured: [URLRequest] = []
+    private static var sessionResponseHook: (@Sendable () -> Void)?
+    static var beforeSessionResponse: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return sessionResponseHook }
+        set { lock.lock(); sessionResponseHook = newValue; lock.unlock() }
+    }
     static var requests: [URLRequest] { lock.lock(); defer { lock.unlock() }; return captured }
-    static func reset() { lock.lock(); captured.removeAll(); lock.unlock() }
+    static func reset() { lock.lock(); captured.removeAll(); sessionResponseHook = nil; lock.unlock() }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -152,6 +188,7 @@ private final class CatalogLaunchProtocol: URLProtocol {
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let body: String
         if url.path.hasSuffix("session/create") {
+            Self.beforeSessionResponse?()
             body = #"{"sessionId":"catalog-session"}"#
         } else if url.path.hasSuffix("catalogv2") {
             body = #"{"menu_id":"catalog-menu","catalog":[{"id":"chess","name":"Chess"}]}"#
@@ -162,4 +199,12 @@ private final class CatalogLaunchProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private final class CatalogPrivacyState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: ConsentSnapshot
+    init(_ value: ConsentSnapshot) { self.value = value }
+    func read() -> ConsentSnapshot { lock.lock(); defer { lock.unlock() }; return value }
+    func write(_ value: ConsentSnapshot) { lock.lock(); self.value = value; lock.unlock() }
 }

@@ -667,7 +667,7 @@ public final class SimulaProvider: ObservableObject {
         // session's true identity (used to detect a stale session after a mid-session change).
         // Deliberately read at scheduling (not when the task runs): the created session represents
         // THIS identity, and `createAndPublishSession` reconciles any change that lands mid-flight.
-        let ppidAtCreation = telemetryIdentitySource.identity().primaryUserId
+        let ppidAtCreation = snapshot.allowsPrimaryUserID ? telemetryIdentitySource.identity().primaryUserId : nil
         let expirationEpoch = applicationSessionExpirationEpoch
         sessionGeneration &+= 1
         let generation = sessionGeneration
@@ -770,7 +770,7 @@ public final class SimulaProvider: ObservableObject {
         // Consume the refreshed value before the debounced publisher delivers the same change.
         // That delivery then becomes a no-op instead of clearing this foreground session.
         let privacyImpact = consumeSessionRefreshPrivacySnapshot(snapshot)
-        let ppid = telemetryIdentitySource.identity().primaryUserId
+        let ppid = snapshot.allowsPrimaryUserID ? telemetryIdentitySource.identity().primaryUserId : nil
         let resolved = await createAndPublishSession(
             generation: generation,
             expirationEpoch: expirationEpoch,
@@ -919,6 +919,7 @@ public final class SimulaProvider: ObservableObject {
     private func runPpidReconcile(after previous: Task<Void, Never>?) async {
         _ = await previous?.value
         while true {
+            guard privacySnapshotProvider().allowsPrimaryUserID else { break }
             let target = telemetryIdentitySource.identity().primaryUserId
             guard let target, let sid = sessionId, !sid.isEmpty else { break }
             if target == sessionUserID {
