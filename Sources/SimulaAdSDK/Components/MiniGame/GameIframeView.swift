@@ -36,6 +36,9 @@ public struct GameIframeView: View {
     /// Matches Kotlin's `onDimensionsOnClose`.
     var onDimensionsOnClose: ((CGFloat, Bool) -> Void)?
 
+    /// Already initialized by the scoped catalog session.
+    var preparedIframeUrl: String?
+
     // MARK: - State
 
     @EnvironmentObject private var provider: SimulaProvider
@@ -276,6 +279,11 @@ public struct GameIframeView: View {
     @MainActor
     private func loadMinigame() async {
         guard provider.canMakeRequests else { return }
+        if let preparedIframeUrl {
+            iframeUrl = preparedIframeUrl
+            loading = false
+            return
+        }
         // Wait for the session to be ready (or retried) rather than failing the
         // instant it isn't — a fast tap during launch, or a transient launch
         // failure, no longer hard-fails the minigame.
