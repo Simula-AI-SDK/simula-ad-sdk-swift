@@ -1885,12 +1885,13 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders(apiKey: apiKey, consent: privacy), to: &request)
+        let consent = privacy ?? SimulaPrivacy.shared.currentSnapshot
+        applyHeaders(makeHeaders(apiKey: apiKey, consent: consent), to: &request)
         // Body carries dev/user identity, the device-capability handshake (so the backend never
         // assigns an unsupported variant), plus, when present, the consent block the backend ties
         // to the session and inherits on subsequent calls.
         var body: [String: Any] = ["devMode": devMode]
-        if let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
+        if consent.allowsPrimaryUserID, let ppid = primaryUserID, !ppid.isEmpty { body["ppid"] = ppid }
         body["capabilities"] = DeviceCapabilities.current.dictionary
         if let privacy { body["privacy"] = privacy.privacyBody() }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)

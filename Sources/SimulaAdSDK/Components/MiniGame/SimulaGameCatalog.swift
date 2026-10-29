@@ -16,11 +16,21 @@ public final class SimulaGameCatalog {
     private let apiKey: String
     private let primaryUserID: String?
     private var sessionTask: Task<String?, Error>?
+    private var sessionPrivacy: ConsentSnapshot?
+    private var sessionGeneration = 0
+    private var privacySnapshot: @MainActor () -> ConsentSnapshot = { SimulaPrivacy.shared.currentSnapshot }
+    private var startup: @MainActor () async -> Void = { await SimulaGameCatalog.awaitHostStartup() }
 
-    init(api: SimulaAPI, apiKey: String, primaryUserID: String? = nil) {
+    init(
+        api: SimulaAPI, apiKey: String, primaryUserID: String? = nil,
+        privacySnapshot: (@MainActor () -> ConsentSnapshot)? = nil,
+        startup: (@MainActor () async -> Void)? = nil
+    ) {
         self.api = api
         self.apiKey = apiKey
         self.primaryUserID = primaryUserID
+        if let privacySnapshot { self.privacySnapshot = privacySnapshot }
+        if let startup { self.startup = startup }
     }
 
     /// Staging requires a development artifact and the host's explicit capability.
@@ -34,6 +44,10 @@ public final class SimulaGameCatalog {
 
     public func fetch() async throws -> CatalogResponse {
         try await api.fetchCatalog()
+    }
+
+    private static func awaitHostStartup() async {
+        if let provider = SimulaAds.shared { _ = await provider.ensureSession() }
     }
 
     /// Completion-based entry point for host toolchains; all async work stays in the SDK binary.
@@ -89,13 +103,18 @@ public final class SimulaGameCatalog {
         charId: String, charName: String, charImage: String, charDesc: String? = nil
     ) async throws -> String {
         // Reuse the canonical startup gate before reading consent for this session.
-        if let provider = SimulaAds.shared { _ = await provider.ensureSession() }
+        await startup()
         try Task.checkCancellation()
+        let privacy = privacySnapshot()
+        if sessionPrivacy != privacy {
+            sessionTask = nil
+            sessionPrivacy = privacy
+        }
         if sessionTask == nil {
+            sessionGeneration += 1
             let api = self.api
             let apiKey = self.apiKey
-            let primaryUserID = self.primaryUserID
-            let privacy = SimulaPrivacy.shared.currentSnapshot
+            let primaryUserID = privacy.allowsPrimaryUserID ? self.primaryUserID : nil
             sessionTask = Task {
                 try await api.createSession(
                     apiKey: apiKey, primaryUserID: primaryUserID, privacy: privacy,
@@ -103,10 +122,16 @@ public final class SimulaGameCatalog {
                 )
             }
         }
+        let generation = sessionGeneration
         let session: String?
         do { session = try await sessionTask?.value }
-        catch { sessionTask = nil; throw error }
+        catch {
+            if generation == sessionGeneration { sessionTask = nil }
+            throw error
+        }
         do {
+            // An in-flight session for older consent must never initialize a game.
+            guard generation == sessionGeneration, privacy == privacySnapshot() else { throw CancellationError() }
             guard let sid = session, !sid.isEmpty else {
                 sessionTask = nil
                 throw SimulaAPIError.invalidResponse
@@ -120,8 +145,10 @@ public final class SimulaGameCatalog {
             guard URL(string: result.iframeUrl)?.scheme == "https" else { throw SimulaAPIError.invalidResponse }
             return result.iframeUrl
         } catch {
-            if case SimulaAPIError.httpError(statusCode: 401) = error { sessionTask = nil }
-            if case SimulaAPIError.invalidApiKey = error { sessionTask = nil }
+            if generation == sessionGeneration {
+                if case SimulaAPIError.httpError(statusCode: 401) = error { sessionTask = nil }
+                if case SimulaAPIError.invalidApiKey = error { sessionTask = nil }
+            }
             throw error
         }
     }

@@ -3,6 +3,51 @@ import XCTest
 
 final class CatalogLaunchTests: XCTestCase {
     @MainActor
+    func testCatalogReusesOnlySessionsWithMatchingConsentAndSuppressesRestrictedIdentity() async throws {
+        CatalogLaunchProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogLaunchProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        var privacy = ConsentSnapshot()
+        let catalog = SimulaGameCatalog(
+            api: SimulaAPI(session: session, environment: .production), apiKey: "test",
+            primaryUserID: "publisher-user", privacySnapshot: { privacy }, startup: {}
+        )
+        for snapshot in [ConsentSnapshot(), ConsentSnapshot(), ConsentSnapshot(hasPrivacyConsent: false), ConsentSnapshot(coppaApplies: true)] {
+            privacy = snapshot
+            _ = try await catalog.load(
+                menuId: "menu", gameId: "chess", width: 390, height: 844,
+                charId: "", charName: "", charImage: ""
+            )
+        }
+        let requests = CatalogLaunchProtocol.requests.filter { $0.url?.path.hasSuffix("session/create") == true }
+        XCTAssertEqual(requests.count, 3, "Reuse only while consent is unchanged")
+        for (index, request) in requests.enumerated() {
+            let data = try XCTUnwrap(request.httpBody)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(json["ppid"] as? String, index == 0 ? "publisher-user" : nil)
+            XCTAssertNotNil(json["privacy"])
+        }
+    }
+
+    func testSessionSerializationSuppressesRawIdentifiersWhenConsentDisallowsThem() async throws {
+        CatalogLaunchProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogLaunchProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let api = SimulaAPI(session: session, environment: .production)
+        for privacy in [ConsentSnapshot(hasPrivacyConsent: false), ConsentSnapshot(coppaApplies: true)] {
+            _ = try await api.createSession(apiKey: "test", primaryUserID: "publisher-user", privacy: privacy, applyTelemetryConfig: false)
+        }
+        for request in CatalogLaunchProtocol.requests {
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+            XCTAssertNil(json["ppid"])
+        }
+    }
+
+    @MainActor
     func testPreparedPlayerRendersWithoutReadingAHostProvider() {
         let view = GameIframeView(
             gameId: "catalog", charID: "", charName: "", charImage: "",
@@ -105,9 +150,14 @@ private final class CatalogLaunchProtocol: URLProtocol {
         guard let url = request.url,
               let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil) else { return }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        let body = url.path.hasSuffix("catalogv2")
-            ? #"{"menu_id":"catalog-menu","catalog":[{"id":"chess","name":"Chess"}]}"#
-            : #"{"adType":"minigame","adInserted":true,"adResponse":{"ad_id":"ad","serve_id":"serve","iframe_url":"https://example.com/game"}}"#
+        let body: String
+        if url.path.hasSuffix("session/create") {
+            body = #"{"sessionId":"catalog-session"}"#
+        } else if url.path.hasSuffix("catalogv2") {
+            body = #"{"menu_id":"catalog-menu","catalog":[{"id":"chess","name":"Chess"}]}"#
+        } else {
+            body = #"{"adType":"minigame","adInserted":true,"adResponse":{"ad_id":"ad","serve_id":"serve","iframe_url":"https://example.com/game"}}"#
+        }
         client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
