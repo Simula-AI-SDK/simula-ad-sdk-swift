@@ -96,7 +96,7 @@ public struct GameIframeView: View {
     // MARK: - Body
 
     public var body: some View {
-        if provider.canMakeRequests {
+        if preparedIframeUrl != nil || provider.canMakeRequests {
             compatibleBody
         } else {
             Color.clear.frame(width: 0, height: 0)
@@ -245,14 +245,14 @@ public struct GameIframeView: View {
             #endif
         }
         // Single-call task closure into a named method — see the task-shape note in TelemetryManager.
-        .task { await appear() }
+        .task(id: preparedIframeUrl) { await appear() }
     }
 
     /// `.task` body (named method — see the task-shape note in TelemetryManager): size the sheet,
     /// fade in, then fetch the minigame.
     @MainActor
     private func appear() async {
-        guard provider.canMakeRequests else { return }
+        guard preparedIframeUrl != nil || provider.canMakeRequests else { return }
         currentHeight = calculateInitialHeight()
         appeared = true
         await loadMinigame()
@@ -261,7 +261,7 @@ public struct GameIframeView: View {
     // MARK: - Close Handler
 
     private func handleClose() {
-        guard provider.canMakeRequests else { return }
+        guard preparedIframeUrl != nil || provider.canMakeRequests else { return }
         // Report dimensions on close (matching Kotlin's onDimensionsOnClose)
         if isBottomSheetMode {
             let isStillBottomSheet = currentHeight < screenHeight * 0.95
@@ -278,12 +278,13 @@ public struct GameIframeView: View {
     /// thread (otherwise the URLSession continuation can land off-main).
     @MainActor
     private func loadMinigame() async {
-        guard provider.canMakeRequests else { return }
         if let preparedIframeUrl {
             iframeUrl = preparedIframeUrl
+            error = nil
             loading = false
             return
         }
+        guard provider.canMakeRequests else { return }
         // Wait for the session to be ready (or retried) rather than failing the
         // instant it isn't — a fast tap during launch, or a transient launch
         // failure, no longer hard-fails the minigame.

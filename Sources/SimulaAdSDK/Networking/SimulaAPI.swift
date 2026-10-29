@@ -2120,7 +2120,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
+        applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
             AdLoadRequest(
                 adUnitId: adUnitId,
@@ -2261,7 +2261,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
+        applyHeaders(makeHeaders(), to: &request)
         request.httpBody = try JSONEncoder().encode(
             RewardedInitRequest(
                 adUnitId: adUnitId,
@@ -2355,7 +2355,7 @@ public final class SimulaAPI: @unchecked Sendable {
         try await getMinigame(params, companionEnabled: nil)
     }
 
-    public func getMinigame(_ params: InitMinigameRequest, companionEnabled: Bool?) async throws -> MinigameResponse {
+    func getMinigame(_ params: InitMinigameRequest, companionEnabled: Bool?) async throws -> MinigameResponse {
         guard let url = URL(string: "\(baseURLString)/minigames/init") else {
             throw SimulaAPIError.invalidURL
         }
@@ -2382,7 +2382,7 @@ public final class SimulaAPI: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        applyHeaders(makeHeaders().merging(ArtifactRequestOptions.headers()) { _, new in new }, to: &request)
+        applyHeaders(makeHeaders(), to: &request)
         if let companionEnabled {
             request.setValue(companionEnabled ? "enabled" : "disabled", forHTTPHeaderField: "X-Simula-Dev-Companion")
         }

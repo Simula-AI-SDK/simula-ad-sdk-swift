@@ -1,6 +1,14 @@
 import Foundation
 import SwiftUI
 
+/// Cancels catalog work without creating Swift concurrency tasks in host-compiled bridges.
+public final class SimulaCatalogRequest {
+    private let task: Task<Void, Never>
+
+    init(task: Task<Void, Never>) { self.task = task }
+    public func cancel() { task.cancel() }
+}
+
 /// An immutable catalog environment, independent of the host's process-wide ad session.
 @MainActor
 public final class SimulaGameCatalog {
@@ -8,6 +16,12 @@ public final class SimulaGameCatalog {
     private let apiKey: String
     private let primaryUserID: String?
     private var sessionTask: Task<String?, Error>?
+
+    init(api: SimulaAPI, apiKey: String, primaryUserID: String? = nil) {
+        self.api = api
+        self.apiKey = apiKey
+        self.primaryUserID = primaryUserID
+    }
 
     /// Staging requires a development artifact and the host's explicit capability.
     public init?(apiKey: String, environment: SimulaAPIEnvironment, primaryUserID: String?) {
@@ -20,6 +34,52 @@ public final class SimulaGameCatalog {
 
     public func fetch() async throws -> CatalogResponse {
         try await api.fetchCatalog()
+    }
+
+    /// Completion-based entry point for host toolchains; all async work stays in the SDK binary.
+    @discardableResult
+    public func fetch(completion: @escaping @MainActor (Result<CatalogResponse, Error>) -> Void) -> SimulaCatalogRequest {
+        SimulaCatalogRequest(task: Task { await completeFetch(completion) })
+    }
+
+    private func completeFetch(_ completion: @escaping @MainActor (Result<CatalogResponse, Error>) -> Void) async {
+        do {
+            let result = try await fetch()
+            try Task.checkCancellation()
+            completion(.success(result))
+        } catch { completion(.failure(error)) }
+    }
+
+    @discardableResult
+    public func load(
+        menuId: String, gameId: String, companionEnabled: Bool? = nil,
+        width: CGFloat, height: CGFloat,
+        charId: String, charName: String, charImage: String, charDesc: String? = nil,
+        completion: @escaping @MainActor (Result<String, Error>) -> Void
+    ) -> SimulaCatalogRequest {
+        SimulaCatalogRequest(task: Task {
+            await completeLoad(
+                menuId: menuId, gameId: gameId, companionEnabled: companionEnabled,
+                width: width, height: height, charId: charId, charName: charName,
+                charImage: charImage, charDesc: charDesc, completion: completion
+            )
+        })
+    }
+
+    private func completeLoad(
+        menuId: String, gameId: String, companionEnabled: Bool?, width: CGFloat, height: CGFloat,
+        charId: String, charName: String, charImage: String, charDesc: String?,
+        completion: @escaping @MainActor (Result<String, Error>) -> Void
+    ) async {
+        do {
+            let url = try await load(
+                menuId: menuId, gameId: gameId, companionEnabled: companionEnabled,
+                width: width, height: height, charId: charId, charName: charName,
+                charImage: charImage, charDesc: charDesc
+            )
+            try Task.checkCancellation()
+            completion(.success(url))
+        } catch { completion(.failure(error)) }
     }
 
     /// Initializes the exact game; menu-expiry recovery and presentation belong to the caller.
@@ -78,11 +138,9 @@ public struct CatalogGamePlayer: View {
     }
 
     public var body: some View {
-        if let provider = SimulaAds.shared {
-            GameIframeView(
-                gameId: "catalog", charID: "", charName: "", charImage: "",
-                onClose: onClose, preparedIframeUrl: iframeUrl
-            ).environmentObject(provider)
-        }
+        GameIframeView(
+            gameId: "catalog", charID: "", charName: "", charImage: "",
+            onClose: onClose, preparedIframeUrl: iframeUrl
+        )
     }
 }

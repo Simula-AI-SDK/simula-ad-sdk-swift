@@ -308,7 +308,6 @@ public final class SimulaProvider: ObservableObject {
             return
         }
 
-        ArtifactRequestOptions.freeze()
         SDKInitializationOrigin.shared.markEntry()
 
         #if os(iOS)

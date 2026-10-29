@@ -2,6 +2,52 @@ import XCTest
 @testable import SimulaAdSDK
 
 final class CatalogLaunchTests: XCTestCase {
+    @MainActor
+    func testPreparedPlayerRendersWithoutReadingAHostProvider() {
+        let view = GameIframeView(
+            gameId: "catalog", charID: "", charName: "", charImage: "",
+            onClose: {}, preparedIframeUrl: "https://example.com/game"
+        )
+        // Accessing an absent EnvironmentObject would trap before returning this body.
+        XCTAssertFalse(String(describing: view.body).isEmpty)
+    }
+
+    @MainActor
+    func testCompletionFetchUsesTheScopedAPI() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogLaunchProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let catalog = SimulaGameCatalog(api: SimulaAPI(session: session, environment: .production), apiKey: "test")
+        let completed = expectation(description: "completion")
+        catalog.fetch { result in
+            switch result {
+            case .success(let value):
+                XCTAssertEqual(value.menuId, "catalog-menu")
+                XCTAssertEqual(value.games.first?.id, "chess")
+            case .failure(let error): XCTFail("Unexpected fetch failure: \(error)")
+            }
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 2)
+    }
+
+    @MainActor
+    func testCancelledCompletionFetchDoesNotDeliverSuccess() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogLaunchProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let catalog = SimulaGameCatalog(api: SimulaAPI(session: session, environment: .production), apiKey: "test")
+        let cancelled = expectation(description: "cancelled")
+        let request = catalog.fetch { result in
+            if case .success = result { XCTFail("Cancelled request delivered success") }
+            cancelled.fulfill()
+        }
+        request.cancel()
+        await fulfillment(of: [cancelled], timeout: 2)
+    }
+
     func testLaunchOptionsRemainScopedToTheirRequestAndEnvironment() async throws {
         CatalogLaunchProtocol.reset()
         let configuration = URLSessionConfiguration.ephemeral
@@ -59,7 +105,10 @@ private final class CatalogLaunchProtocol: URLProtocol {
         guard let url = request.url,
               let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil) else { return }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(#"{"adType":"minigame","adInserted":true,"adResponse":{"ad_id":"ad","serve_id":"serve","iframe_url":"https://example.com/game"}}"#.utf8))
+        let body = url.path.hasSuffix("catalogv2")
+            ? #"{"menu_id":"catalog-menu","catalog":[{"id":"chess","name":"Chess"}]}"#
+            : #"{"adType":"minigame","adInserted":true,"adResponse":{"ad_id":"ad","serve_id":"serve","iframe_url":"https://example.com/game"}}"#
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}

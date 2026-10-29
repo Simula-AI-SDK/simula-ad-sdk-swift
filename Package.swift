@@ -1,10 +1,6 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
-// Keep library and test conditions aligned. The release validator checks this
-// definition against the synchronized artifact version.
-let artifactSwiftSettings: [SwiftSetting] = [.define("SIMULA_DEV_ARTIFACT")]
-
 let package = Package(
     name: "SimulaAdSDK",
     platforms: [
@@ -32,13 +28,16 @@ let package = Package(
                 .copy("Resources/minigame_interstitial_background.png"),
                 .copy("Resources/game_icon.png")
             ],
-            swiftSettings: artifactSwiftSettings
+            swiftSettings: [
+                // Must exist only while the synchronized artifact version is X.Y.Z-dev.N.
+                // scripts/validate-artifact-flavor.sh enforces that relationship.
+                .define("SIMULA_DEV_ARTIFACT")
+            ]
         ),
         .testTarget(
             name: "SimulaAdSDKTests",
             dependencies: ["SimulaAdSDK"],
-            path: "Tests/SimulaAdSDKTests",
-            swiftSettings: artifactSwiftSettings
+            path: "Tests/SimulaAdSDKTests"
         ),
     ]
 )

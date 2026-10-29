@@ -126,14 +126,3 @@ Create and manage ad units, view analytics, and configure server-side verificati
 ## License
 
 MIT
-
-### Development-only playable companion preview
-
-In `X.Y.Z-dev.N` artifacts, call `SimulaDevOptions.configure(hidePlayableCompanion: true)` before SDK initialization.
-The default is false. The configuration is process-wide, covers all playable load
-paths, and returns false if a change would require restarting the process. It does
-not change `devMode`, campaign selection, native ads, or the API environment.
-
-The API honors the override only on local/staging servers explicitly configured with
-`ENABLE_DEV_PLAYABLE_OVERRIDES=true`. Stable artifacts exclude `SimulaDevOptions`
-and the override header; artifact verification checks the actual packaged output.
