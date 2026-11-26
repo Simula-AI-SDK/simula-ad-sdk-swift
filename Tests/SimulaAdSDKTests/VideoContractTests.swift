@@ -1031,7 +1031,7 @@ final class VideoAssetCacheTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let downloader = FakeVideoDownloader(bytes: 8, delayNanos: 5_000_000)
         let cache = VideoAssetCache(rootURL: root, downloader: downloader)
-        let remote = try XCTUnwrap(URL(string: "https://cdn.example/private/path.mp4?token=secret"))
+        let remote = try XCTUnwrap(URL(string: "https://cdn.example/private/path.MP4?token=secret"))
 
         async let first = cache.acquire(remote)
         async let second = cache.acquire(remote)
@@ -1042,11 +1042,35 @@ final class VideoAssetCacheTests: XCTestCase {
         XCTAssertEqual(leases[0].localURL, leases[1].localURL)
         XCTAssertTrue(FileManager.default.fileExists(atPath: leases[0].localURL.path))
         XCTAssertTrue(VideoAssetCache.isOpaqueAssetName(leases[0].localURL.lastPathComponent))
-        XCTAssertFalse(leases[0].localURL.lastPathComponent.contains("path"))
+        XCTAssertEqual(leases[0].localURL.lastPathComponent, "\(VideoAssetCache.key(for: remote)).mp4")
         let localURL = leases[0].localURL
         leases.forEach { $0.release() }
         await cache.waitUntilIdle()
         XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+    }
+
+    func testLegacyMP4CacheEntryIsRenamedWithoutDownloading() async throws {
+        let root = temporaryDirectory()
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+        let remote = try XCTUnwrap(URL(string: "https://cdn.example/legacy.mp4"))
+        let legacyURL = root.appendingPathComponent(VideoAssetCache.key(for: remote))
+        let original = Data([1, 2, 3])
+        try original.write(to: legacyURL)
+        let downloader = FakeVideoDownloader(bytes: 8)
+        let cache = VideoAssetCache(rootURL: root, downloader: downloader)
+
+        let lease = try await cache.acquire(remote)
+
+        let callCount = await downloader.callCount
+        XCTAssertEqual(callCount, 0)
+        XCTAssertEqual(lease.localURL, legacyURL.appendingPathExtension("mp4"))
+        XCTAssertEqual(try Data(contentsOf: lease.localURL), original)
+        XCTAssertFalse(fileManager.fileExists(atPath: legacyURL.path))
+        lease.release()
+        await cache.waitUntilIdle()
+        XCTAssertFalse(fileManager.fileExists(atPath: lease.localURL.path))
     }
 
     func testPerAssetLimitIsEnforcedWithoutContentLength() async throws {
@@ -1328,7 +1352,7 @@ final class VideoAssetCacheTests: XCTestCase {
         var oldURLs: [URL] = []
         for index in 0..<260 {
             let name = VideoAssetCache.key(for: URL(string: "https://old.example/\(index)") ?? root)
-            let url = root.appendingPathComponent(name)
+            let url = root.appendingPathComponent(index.isMultiple(of: 2) ? name : "\(name).mp4")
             FileManager.default.createFile(atPath: url.path, contents: Data([1]))
             try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: url.path)
             oldURLs.append(url)

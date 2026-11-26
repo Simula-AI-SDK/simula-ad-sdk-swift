@@ -266,9 +266,13 @@ actor VideoAssetCache {
               remoteURL.host?.isEmpty == false else { throw VideoAssetCacheError.invalidURL }
         do { try prepareDirectory() }
         catch { throw VideoAssetCacheError.cacheFull }
-        let key = Self.key(for: remoteURL)
+        let legacyKey = Self.key(for: remoteURL)
+        // AVFoundation uses the local file extension to recognize MP4 on iOS 27.
+        let key = remoteURL.pathExtension.lowercased() == "mp4" ? "\(legacyKey).mp4" : legacyKey
         let finalURL = rootURL.appendingPathComponent(key, isDirectory: false)
-        if validAsset(at: finalURL) {
+        if validAsset(at: finalURL) || (
+            key != legacyKey && inFlight[key] == nil && moveLegacyAsset(key: legacyKey, to: finalURL)
+        ) {
             touch(finalURL)
             return makeLease(key: key, localURL: finalURL)
         }
@@ -551,6 +555,15 @@ actor VideoAssetCache {
         return true
     }
 
+    private func moveLegacyAsset(key: String, to url: URL) -> Bool {
+        let legacyURL = rootURL.appendingPathComponent(key, isDirectory: false)
+        guard validAsset(at: legacyURL), (try? fileManager.moveItem(at: legacyURL, to: url)) != nil else {
+            return false
+        }
+        cacheIndex.removeValue(forKey: key)
+        return validAsset(at: url)
+    }
+
     private func reservePartialCapacity(bytes: Int64, replacingKey: String) throws {
         guard cacheIndexReady else { throw VideoAssetCacheError.cacheFull }
         pruneMissingIndexEntries()
@@ -612,9 +625,8 @@ actor VideoAssetCache {
     }
 
     private func partialOwnerKey(_ url: URL) -> String? {
-        let name = url.lastPathComponent
-        guard url.pathExtension == "partial", name.utf8.count > 64 else { return nil }
-        let key = String(name.prefix(64))
+        guard url.pathExtension == "partial" else { return nil }
+        let key = url.deletingPathExtension().deletingPathExtension().lastPathComponent
         return Self.isOpaqueAssetName(key) ? key : nil
     }
 
@@ -739,7 +751,8 @@ actor VideoAssetCache {
     }
 
     static func isOpaqueAssetName(_ value: String) -> Bool {
-        value.count == 64 && value.allSatisfy(\.isHexDigit)
+        let digest = value.hasSuffix(".mp4") ? value.dropLast(4) : value[...]
+        return digest.count == 64 && digest.allSatisfy(\.isHexDigit)
     }
 }
 
