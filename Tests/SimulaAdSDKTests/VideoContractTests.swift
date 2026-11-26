@@ -1487,12 +1487,8 @@ final class VideoAssetCacheTests: XCTestCase {
         }
         let cache = VideoAssetCache(rootURL: root, downloader: FakeVideoDownloader(bytes: 1))
         let remote = try XCTUnwrap(URL(string: "https://cdn.example/new.mp4"))
-        var lease: VideoAssetLease?
-        for _ in 0..<20 where lease == nil {
-            do { lease = try await cache.acquire(remote) }
-            catch VideoAssetCacheError.cacheFull { await Task.yield() }
-        }
-        let acquired = try XCTUnwrap(lease)
+        try await cache.waitUntilMaintenanceComplete()
+        let acquired = try await cache.acquire(remote)
         let files = try FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: nil
