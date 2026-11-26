@@ -686,6 +686,8 @@ private struct RewardedGameView: View {
         attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
             scope: attributionRouteLifecycle.automaticRouteScope
         ) {
+            let blocksAdvance = usesVideoPlanV2 && close?.action == .forward
+            if blocksAdvance { updateClickHandoff(.automaticRedirect, pending: true) }
             let execution = AttributionRouteExecution(
                 originatingScene: originatingScene,
                 isActive: {
@@ -701,6 +703,7 @@ private struct RewardedGameView: View {
                             route: route
                         )
                     }
+                    if blocksAdvance { updateClickHandoff(.automaticRedirect, pending: false) }
                 }
             )
             handleStorePromptTap(execution: execution)
@@ -1066,6 +1069,7 @@ private struct RewardedGameView: View {
                 status: status
             ) {
                 markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
+                fireAutoStoreRedirectIfCloseShown()
                 requestTerminal(earned: true)
             }
         case .failed(let reason):

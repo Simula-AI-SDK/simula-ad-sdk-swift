@@ -1084,9 +1084,7 @@ public struct AdOverlayView: View {
     private func resolvePendingPlayableFailureIfReady() -> Bool {
         guard pendingPlayableFailure, hasAppeared, !closing else { return false }
         pendingPlayableFailure = false
-        if ad.usesVideoPlanV2Contract {
-            videoPlanScope?.nextStepFailed()
-        }
+        // The presenter owns the handoff outcome because a later fallback may still load.
         if let onCreativeFailure { onCreativeFailure() }
         else { onClose() }
         return true
