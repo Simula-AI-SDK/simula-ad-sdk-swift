@@ -882,6 +882,7 @@ func canDismissFullscreen(dismissUnlocked: Bool, clickHandoffPending: Bool) -> B
 enum FullscreenClickHandoffOwner: Hashable, Sendable {
     case creative
     case storePrompt
+    case automaticRedirect
 }
 
 struct FullscreenClickHandoffState: Equatable, Sendable {

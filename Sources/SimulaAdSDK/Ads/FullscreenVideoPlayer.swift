@@ -513,10 +513,10 @@ func canUseVideoControls(firstFrameAdmitted: Bool, displayAdmitted: Bool) -> Boo
 
 func shouldAutomaticallyAdvanceCompletedVideo(
     usesVideoPlanV2: Bool,
+    closeAction: CloseAction?,
     status: FullscreenVideoStatus
 ) -> Bool {
-    // Completion unlocks the close gate. Slot transitions require the close tap.
-    false
+    usesVideoPlanV2 && closeAction == .forward && status == .ended
 }
 
 enum VideoPreFirstFrameEscapeSurface: Equatable, Sendable {

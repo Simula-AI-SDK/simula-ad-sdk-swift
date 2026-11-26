@@ -88,6 +88,10 @@ final class FallbackOutcomeTests: XCTestCase {
             FallbackOutcome.presentationUnavailable.unavailableReason,
             "presentation_unavailable"
         )
+        XCTAssertEqual(
+            FallbackOutcome.presentationUnavailable.videoPlanCloseReason,
+            FullscreenVideoTerminationReason.nextStepFailed
+        )
     }
 
     func testCreativeFailureAdvancesUntilFinalScreenThenResolvesUnavailable() {

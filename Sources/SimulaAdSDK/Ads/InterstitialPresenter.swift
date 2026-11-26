@@ -631,6 +631,8 @@ private struct CreativeInterstitialView: View {
         attributionRouteLifecycle.automaticRoutes.requestAutomaticRoute(
             scope: attributionRouteLifecycle.automaticRouteScope
         ) {
+            let blocksAdvance = usesVideoPlanV2 && closeConfig.action == .forward
+            if blocksAdvance { updateClickHandoff(.automaticRedirect, pending: true) }
             let execution = AttributionRouteExecution(
                 originatingScene: originatingScene,
                 isActive: {
@@ -646,6 +648,7 @@ private struct CreativeInterstitialView: View {
                             route: route
                         )
                     }
+                    if blocksAdvance { updateClickHandoff(.automaticRedirect, pending: false) }
                 }
             )
             handleStorePromptTap(execution: execution)
@@ -838,8 +841,11 @@ private struct CreativeInterstitialView: View {
             )
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
+                closeAction: closeConfig.action,
                 status: status
             ) {
+                markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
+                fireAutoStoreRedirectIfCloseShown()
                 requestPrimaryTerminalAdvance()
             }
         case .failed(let reason):
@@ -1056,8 +1062,11 @@ private struct CreativeInterstitialView: View {
 
     private func performPrimaryTerminalAdvance() {
         guard visible else { return }
+        endSKANViewThroughImpressionIfStarted()
         visible = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
+        let autoAdvancing = videoCompletionHandled && usesVideoPlanV2 && closeConfig.action == .forward
+        let delay = autoAdvancing ? 0 : dismissAnimationDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             onRequestDismiss()
         }
     }

@@ -712,9 +712,6 @@ public struct AdOverlayView: View {
                     }
                 }
             }
-            if ad.usesVideoPlanV2Contract, ad.mediaType == .playable {
-                videoPlanScope?.playableStepReady()
-            }
             if !hasLoadableCreative {
                 startCurrentCreativeLoadIfNeeded()
                 if ad.mediaType == .video {
@@ -1031,6 +1028,9 @@ public struct AdOverlayView: View {
         pendingPlayablePageFinish = false
         adPageReady = true
         pageFinished = true
+        if ad.usesVideoPlanV2Contract {
+            videoPlanScope?.playableStepReady()
+        }
         beginPresentationIfReady()
     }
 
@@ -1084,6 +1084,7 @@ public struct AdOverlayView: View {
     private func resolvePendingPlayableFailureIfReady() -> Bool {
         guard pendingPlayableFailure, hasAppeared, !closing else { return false }
         pendingPlayableFailure = false
+        // The presenter owns the handoff outcome because a later fallback may still load.
         if let onCreativeFailure { onCreativeFailure() }
         else { onClose() }
         return true
