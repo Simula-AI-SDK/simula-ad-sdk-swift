@@ -400,7 +400,9 @@ public final class SimulaRewardedAd {
         guard !Task.isCancelled,
               case .ready(let readyResponse, _, _) = state,
               readyResponse.impressionId == impressionId,
-              readyResponse.creative?.mediaType != .video else { return }
+              readyResponse.creative?.mediaType != .video
+                || (readyResponse.primaryUsesVideoPlanV2
+                    && readyResponse.adBehavior?.close.action == .forward) else { return }
         FullscreenPresentationRegistry.shared.prewarmIfEligible {
             WebViewPool.shared.prewarm(trigger: "rewarded_ready")
         }
@@ -450,6 +452,14 @@ public final class SimulaRewardedAd {
             return
         }
 
+        // A host can show in its load callback, before the ready-state warm-up runs.
+        // Prepare only a blank renderer, while the fullscreen registry is still idle.
+        if response.primaryUsesVideoPlanV2, response.adBehavior?.close.action == .forward,
+           LaunchSettledGate.shared.isSettled {
+            FullscreenPresentationRegistry.shared.prewarmIfEligible {
+                WebViewPool.shared.prewarm(trigger: "rewarded_ready")
+            }
+        }
         let presenter = RewardedPresenter()
         videoPlanScope?.cancel()
         let videoPlanScope = response.usesVideoPlanV2Contract

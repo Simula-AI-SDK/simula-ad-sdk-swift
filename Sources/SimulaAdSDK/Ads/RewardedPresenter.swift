@@ -1604,7 +1604,9 @@ private struct RewardedGameView: View {
         guard visible else { return }
         admission.visualBecameUnavailable(owner: admissionOwner)
         visible = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
+        let autoAdvancing = videoCompletionHandled && usesVideoPlanV2 && close?.action == .forward
+        let delay = autoAdvancing ? 0 : dismissAnimationDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             onFinish(outcome.earned, outcome.elapsedPlayTime, outcome.completionReason)
         }
     }

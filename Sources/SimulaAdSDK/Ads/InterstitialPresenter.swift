@@ -1060,7 +1060,9 @@ private struct CreativeInterstitialView: View {
         guard visible else { return }
         endSKANViewThroughImpressionIfStarted()
         visible = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
+        let autoAdvancing = videoCompletionHandled && usesVideoPlanV2 && closeConfig.action == .forward
+        let delay = autoAdvancing ? 0 : dismissAnimationDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             onRequestDismiss()
         }
     }
