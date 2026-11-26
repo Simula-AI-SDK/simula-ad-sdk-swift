@@ -216,7 +216,7 @@ final class CreativeVideoTests: XCTestCase {
             behavior: response.adBehavior,
             isVideoPlanV2: false
         ))
-        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: false, status: .ended))
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: false, closeAction: .forward, status: .ended))
     }
 
     func testClipMetadataNeverActivatesV2WithoutCanonicalResponseMarker() throws {
@@ -265,7 +265,21 @@ final class CreativeVideoTests: XCTestCase {
         XCTAssertEqual(ads.first?.usesVideoPlanV2, true)
         XCTAssertEqual(ads.first?.creative?.segments.count, 1)
         XCTAssertEqual(upcomingFallbackVideoIndices(ads), [0])
-        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(usesVideoPlanV2: true, status: .ended))
+    }
+
+    func testContractTwoPrimaryVideoAdvancesOnlyOnNaturalEndWithForwardAction() {
+        XCTAssertTrue(shouldAutomaticallyAdvanceCompletedVideo(
+            usesVideoPlanV2: true, closeAction: .forward, status: .ended
+        ))
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(
+            usesVideoPlanV2: true, closeAction: .closeX, status: .ended
+        ))
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(
+            usesVideoPlanV2: true, closeAction: nil, status: .ended
+        ))
+        XCTAssertFalse(shouldAutomaticallyAdvanceCompletedVideo(
+            usesVideoPlanV2: true, closeAction: .forward, status: .failed(.playbackFailed)
+        ))
     }
 
     func testAllPlayableGoldenFlowRemainsPrimaryThenES1ThenES2() throws {

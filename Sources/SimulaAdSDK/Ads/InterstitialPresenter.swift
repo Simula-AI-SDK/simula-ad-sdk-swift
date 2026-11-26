@@ -838,8 +838,10 @@ private struct CreativeInterstitialView: View {
             )
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
+                closeAction: closeConfig.action,
                 status: status
             ) {
+                markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
                 requestPrimaryTerminalAdvance()
             }
         case .failed(let reason):
@@ -1056,6 +1058,7 @@ private struct CreativeInterstitialView: View {
 
     private func performPrimaryTerminalAdvance() {
         guard visible else { return }
+        endSKANViewThroughImpressionIfStarted()
         visible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
             onRequestDismiss()

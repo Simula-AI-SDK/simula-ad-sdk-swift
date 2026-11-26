@@ -1062,8 +1062,10 @@ private struct RewardedGameView: View {
             )
             if shouldAutomaticallyAdvanceCompletedVideo(
                 usesVideoPlanV2: usesVideoPlanV2,
+                closeAction: close?.action,
                 status: status
             ) {
+                markVideoHandoff(player: player, reason: FullscreenVideoTerminationReason.completed)
                 requestTerminal(earned: true)
             }
         case .failed(let reason):

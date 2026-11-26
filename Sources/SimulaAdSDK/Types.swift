@@ -501,8 +501,8 @@ public enum ClosePosition: Sendable, Equatable {
     }
 }
 
-/// The visual meaning of the close affordance. Both actions invoke the surface's existing
-/// navigation callback; `.forward` changes only the glyph and accessibility copy.
+/// Both actions invoke the surface's existing navigation callback. A fullscreen contract-2
+/// primary video with `.forward` also progresses when the video naturally ends.
 public enum CloseAction: Sendable, Equatable {
     case closeX, forward
 
