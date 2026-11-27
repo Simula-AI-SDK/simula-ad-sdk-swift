@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Rewrites Package.swift into the consumer binary manifest and adds the same
-# artifact checksum to the CocoaPods HTTP source for a release tag.
+# Rewrites Package.swift into the consumer binary manifest for a release tag.
 #
 # Distribution model: `main` keeps the source manifest (so `swift build && swift test`,
 # CI, and @testable tests all work unchanged), while each release TAG carries a manifest
@@ -9,8 +8,7 @@
 # resolve the binary; the repo itself always builds from source.
 #
 # The release workflow calls this after building the artifact. It commits the generated
-# files only on the release tag; main retains the source Package.swift and checksum-free
-# development podspec.
+# manifest only on the release tag. Main retains the source Package.swift.
 
 set -euo pipefail
 
@@ -54,16 +52,4 @@ let package = Package(
 )
 EOF
 
-ruby - "$CHECKSUM" <<'RUBY'
-path = "SimulaAdSDK.podspec"
-checksum = ARGV.fetch(0)
-lines = File.readlines(path)
-lines.reject! { |line| line.match?(/^\s*:sha256\s*=>/) }
-http_index = lines.index { |line| line.match?(/^\s*:http\s*=>/) }
-abort "ERROR: CocoaPods HTTP source not found" unless http_index
-lines[http_index] = lines[http_index].rstrip.sub(/,?$/, ",") + "\n"
-lines.insert(http_index + 1, "    :sha256 => \"#{checksum}\"\n")
-File.write(path, lines.join)
-RUBY
-
-echo "Wrote release manifests for ${VERSION} (checksum ${CHECKSUM})"
+echo "Wrote release manifest for ${VERSION} (checksum ${CHECKSUM})"

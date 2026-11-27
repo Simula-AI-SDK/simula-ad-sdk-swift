@@ -11,8 +11,9 @@ description: >-
 
 # Swift Concurrency Task Shape
 
-This SDK ships as **source** (CocoaPods/SPM) and is compiled by each host app's
-own Xcode. Swift 6.1–6.3 optimizers (Xcode 16.3 through at least 26.x) can
+Release tags distribute a prebuilt XCFramework through Swift Package Manager. The SDK
+source is still compiled for CI, source checkouts, and release builds. Swift 6.1–6.3
+optimizers (Xcode 16.3 through at least 26.x) can
 miscompile certain async-closure shapes into out-of-LIFO-order task-stack
 deallocations. The result is a hard `abort()` in the host app at task teardown:
 
@@ -23,9 +24,8 @@ libswift_Concurrency  StackAllocator::dealloc / swift_task_dealloc
 libswift_Concurrency  completeTaskWithClosure              (or asyncLet_finish_after_task_completion)
 ```
 
-Our code is valid Swift — the bug is in the toolchain — but because hosts
-compile us with affected Xcodes, we must avoid the implicated shapes. This
-crashed a production host app at startup (telemetry flush tasks, July 2026;
+Avoid the implicated shapes when changing SDK code. This compiler bug crashed a
+production host app at startup (telemetry flush tasks, July 2026;
 confirmed by the crash disappearing with `telemetryEnabled=false`).
 
 ## Rules
