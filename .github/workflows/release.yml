@@ -1,22 +1,17 @@
-name: Release XCFramework and CocoaPods
+name: Release Swift Package
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (must match the podspec and telemetry version)"
+        description: "Release version (must match the telemetry version)"
         required: true
         type: string
-      retry_cocoapods:
-        description: "Publish CocoaPods from an existing, verified GitHub release"
-        type: boolean
-        default: false
 
 env:
   # The binary bakes in this toolchain's codegen. Bump only after validating the
   # optimized suite against the replacement compiler.
   XCODE_VERSION: "26.4.1"
-  COCOAPODS_DISABLE_STATS: "true"
 
 concurrency:
   group: swift-release
@@ -24,11 +19,9 @@ concurrency:
 
 jobs:
   publish:
-    if: ${{ !inputs.retry_cocoapods }}
     name: Validate and publish
     runs-on: macos-26
     timeout-minutes: 90
-    environment: Cocoa Pod
     permissions:
       actions: read
       contents: write
@@ -47,13 +40,8 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
-          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
         run: |
           set -euo pipefail
-          [[ -n "${COCOAPODS_TRUNK_TOKEN:-}" ]] || {
-            echo "::error::Cocoa Pod environment is missing COCOAPODS_TRUNK_TOKEN"
-            exit 1
-          }
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
             echo "::error::Releases must be dispatched from main"
             exit 1
@@ -80,10 +68,6 @@ jobs:
             echo "::error::main must contain the source Package.swift manifest"
             exit 1
           }
-          grep -Fq "s.version          = \"$VERSION\"" SimulaAdSDK.podspec || {
-            echo "::error::podspec version does not match $VERSION"
-            exit 1
-          }
           grep -Fq "let SIMULA_SDK_VERSION = \"$VERSION\"" \
             Sources/SimulaAdSDK/Telemetry/Telemetry.swift || {
               echo "::error::telemetry version does not match $VERSION"
@@ -96,10 +80,6 @@ jobs:
           fi
           if gh release view "$VERSION" >/dev/null 2>&1; then
             echo "::error::GitHub release $VERSION already exists"
-            exit 1
-          fi
-          if pod trunk info SimulaAdSDK | grep -Fq -- "- $VERSION ("; then
-            echo "::error::CocoaPods version $VERSION already exists"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -127,27 +107,19 @@ jobs:
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
 
-      - name: Generate release manifests
+      - name: Generate binary Swift package manifest
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           CHECKSUM=$(<build/SimulaAdSDK.xcframework.zip.checksum)
           ./scripts/make-release-manifest.sh "$VERSION" "$CHECKSUM"
-          [[ "$(git diff --name-only)" == $'Package.swift\nSimulaAdSDK.podspec' ]] || {
+          [[ "$(git diff --name-only)" == "Package.swift" ]] || {
             echo "::error::Release generation changed unexpected files"
             git diff --name-only
             exit 1
           }
-
-      - name: Validate CocoaPods package locally
-        run: |
-          set -euo pipefail
-          STAGING="$RUNNER_TEMP/pod-staging"
-          mkdir -p "$STAGING"
-          cp SimulaAdSDK.podspec "$STAGING/"
-          ditto build/SimulaAdSDK.xcframework "$STAGING/SimulaAdSDK.xcframework"
-          pod lib lint "$STAGING/SimulaAdSDK.podspec" --allow-warnings --verbose
+          swift package dump-package >/dev/null
 
       - name: Create and push binary release tag
         env:
@@ -156,8 +128,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Package.swift SimulaAdSDK.podspec
-          git commit -m "Point release manifests at the $VERSION binary XCFramework."
+          git add Package.swift
+          git commit -m "Point the release manifest at the $VERSION binary XCFramework."
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "refs/tags/$VERSION"
 
@@ -201,74 +173,3 @@ jobs:
             echo "::error::Published XCFramework checksum does not match the validated artifact"
             exit 1
           }
-
-      - name: Publish to CocoaPods trunk
-        env:
-          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
-        run: |
-          pod trunk push "$RUNNER_TEMP/pod-staging/SimulaAdSDK.podspec" \
-            --allow-warnings \
-            --verbose
-
-
-  retry-cocoapods:
-    if: inputs.retry_cocoapods
-    name: Retry CocoaPods publication
-    runs-on: macos-26
-    timeout-minutes: 20
-    environment: Cocoa Pod
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Select pinned Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: ${{ env.XCODE_VERSION }}
-
-      - name: Verify and publish the existing release
-        env:
-          VERSION: ${{ inputs.version }}
-          GH_TOKEN: ${{ github.token }}
-          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF" == "refs/heads/main" ]]
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
-          git fetch origin main --tags
-          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]]
-          SOURCE_COMMIT=$(git rev-parse "refs/tags/$VERSION^{commit}^")
-          git merge-base --is-ancestor "$SOURCE_COMMIT" HEAD
-          STAGING=$(mktemp -d)
-          git show "refs/tags/$VERSION:SimulaAdSDK.podspec" > "$STAGING/SimulaAdSDK.podspec"
-          gh release download "$VERSION" --pattern 'SimulaAdSDK.xcframework.zip*' --dir "$STAGING"
-          CHECKSUM=$(swift package compute-checksum "$STAGING/SimulaAdSDK.xcframework.zip")
-          [[ "$CHECKSUM" == "$(<"$STAGING/SimulaAdSDK.xcframework.zip.checksum")" ]]
-          unzip -q "$STAGING/SimulaAdSDK.xcframework.zip" -d "$STAGING"
-          pod ipc spec "$STAGING/SimulaAdSDK.podspec" | jq -e \
-            --arg version "$VERSION" --arg checksum "$CHECKSUM" \
-            --arg source "https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/SimulaAdSDK.xcframework.zip" \
-            '.name == "SimulaAdSDK" and .version == $version and .source.http == $source and .source.sha256 == $checksum'
-
-          published() {
-            curl -fsS --max-time 15 "https://trunk.cocoapods.org/api/v1/pods/SimulaAdSDK?check=$(date +%s)" \
-              | jq -e --arg version "$VERSION" 'any(.versions[]; .name == $version)' > /dev/null
-          }
-
-          for attempt in 1 2 3; do
-            if published; then exit 0; fi
-            if pod trunk push "$STAGING/SimulaAdSDK.podspec" --allow-warnings > "$STAGING/trunk.log" 2>&1; then
-              cat "$STAGING/trunk.log"
-              exit 0
-            fi
-            cat "$STAGING/trunk.log"
-            if ! grep -Fq 'Calling the GitHub commit API timed out' "$STAGING/trunk.log"; then
-              published
-              exit
-            fi
-            sleep 30
-          done
-          published

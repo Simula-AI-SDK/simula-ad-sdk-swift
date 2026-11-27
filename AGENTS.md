@@ -54,7 +54,7 @@ Never introduce:
 - `UIDevice` (battery, etc.) reads off the main thread — snapshot on main, read the snapshot under lock
 - POSIX signal handlers (conflicts with host crash reporters; MetricKit + NSSetUncaughtExceptionHandler only)
 - A second initialization path bypassing `SimulaProvider.init`
-- New dependencies in `Package.swift` / the podspec
+- New dependencies in `Package.swift`
 - Query strings, tokens, or PII in telemetry `message`/`breadcrumb`/paths
 - iOS-only APIs without `#if os(iOS)` / `#if canImport(UIKit)` guards (tests build on macOS)
 
@@ -123,15 +123,14 @@ Tests in `Tests/SimulaAdSDKTests/`, XCTest with `@testable import`. Tier 0: pure
 Consumers get a **prebuilt XCFramework** — host Xcodes never compile SDK source (the mitigation for the Swift 6.1–6.3 optimizer task-teardown miscompile; see `.cursor/skills/swift-concurrency-task-shape/SKILL.md`). Consequences for code changes:
 
 - `main` keeps the source manifest; each release **tag** carries a generated binary manifest (`scripts/make-release-manifest.sh`). Never hand-edit a tag's `Package.swift`.
-- The release workflow (`.github/workflows/release.yml`) runs only from `main`: pinned Xcode, optimized macOS and iOS tests, `scripts/build-xcframework.sh`, local CocoaPods lint, generated binary/checksummed release manifests, binary tag + GitHub Release, asset checksum verification, then `pod trunk push`. The `Cocoa Pod` GitHub environment holds the trunk credentials for the irreversible publication step.
+- The release workflow (`.github/workflows/release.yml`) runs only from `main`. It uses pinned Xcode, runs optimized macOS and iOS tests, builds the XCFramework, generates the binary Swift package manifest, creates the release tag and GitHub release, and verifies the published asset checksum.
 - The public API must stay **library-evolution clean** (`BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — CI checks this). No `@inlinable`/`@_alwaysEmitIntoClient` on public API: inlined bodies would be compiled by host toolchains, re-opening the miscompile.
 - Resources (including `PrivacyInfo.xcprivacy`) ship inside the framework's `SimulaAdSDK_SimulaAdSDK.bundle`; the build script hard-fails if they're missing.
 
 ## Version sync (all, always together)
 
 1. `Sources/SimulaAdSDK/Telemetry/Telemetry.swift` — `SIMULA_SDK_VERSION`
-2. `SimulaAdSDK.podspec` — `s.version`
-3. The release tag (created by the release workflow, which also writes the binary `Package.swift` url/checksum for that tag)
+2. The release tag (created by the release workflow, which also writes the binary `Package.swift` url/checksum for that tag)
 
 ## Definition of done — mandatory gate
 
